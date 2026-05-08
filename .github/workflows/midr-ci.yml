@@ -1,0 +1,44 @@
+name: midr-ci
+
+on:
+  pull_request:
+    branches: [midr]
+  push:
+    branches: [midr]
+
+concurrency:
+  group: midr-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, netlab]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Bootstrap
+        run: ./bootstrap.sh
+
+      - name: Configure
+        run: |
+          ./configure \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --localstatedir=/var \
+            --sbindir=/usr/lib/frr \
+            --enable-vtysh \
+            --enable-multipath=256 \
+            --enable-user=frr \
+            --enable-group=frr \
+            --enable-vty-group=frrvty \
+            --with-pkg-git-version
+
+      - name: Build
+        run: make -j$(nproc)
