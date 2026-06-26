@@ -61,6 +61,8 @@
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
+#include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_vty.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_nhg.h"
@@ -3932,6 +3934,7 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
+		bgp_midr_init(bgp);
 	}
 
 	/*initialize global GR FSM */
@@ -4753,6 +4756,7 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
+	bgp_midr_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
@@ -9374,6 +9378,7 @@ void bgp_init(unsigned short instance)
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
+	bgp_midr_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();

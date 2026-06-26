@@ -73,6 +73,7 @@ extern unsigned long conf_bgp_debug_bfd;
 extern unsigned long conf_bgp_debug_cond_adv;
 extern unsigned long conf_bgp_debug_aggregate;
 extern unsigned long conf_bgp_debug_linkstate;
+extern unsigned long conf_bgp_debug_midr;
 
 extern unsigned long term_bgp_debug_as4;
 extern unsigned long term_bgp_debug_neighbor_events;
@@ -93,6 +94,7 @@ extern unsigned long term_bgp_debug_bfd;
 extern unsigned long term_bgp_debug_cond_adv;
 extern unsigned long term_bgp_debug_aggregate;
 extern unsigned long term_bgp_debug_linkstate;
+extern unsigned long term_bgp_debug_midr;
 
 extern struct list *bgp_debug_neighbor_events_peers;
 extern struct list *bgp_debug_keepalive_peers;
@@ -143,6 +145,8 @@ struct bgp_debug_filter {
 #define BGP_DEBUG_COND_ADV 0x01
 #define BGP_DEBUG_AGGREGATE	      0x01
 #define BGP_DEBUG_LINKSTATE	      0x01
+#define BGP_DEBUG_MIDR		      0x01
+#define BGP_DEBUG_MIDR_DISCOVERY      0x02
 
 #define CONF_DEBUG_ON(a, b)	(conf_bgp_debug_ ## a |= (BGP_DEBUG_ ## b))
 #define CONF_DEBUG_OFF(a, b)	(conf_bgp_debug_ ## a &= ~(BGP_DEBUG_ ## b))
@@ -163,6 +167,11 @@ struct bgp_debug_filter {
 
 #define BGP_DEBUG(a, b)	     (unlikely(term_bgp_debug_##a & BGP_DEBUG_##b))
 #define CONF_BGP_DEBUG(a, b) (unlikely(conf_bgp_debug_##a & BGP_DEBUG_##b))
+
+/* MIDR hierarchical-discovery flow logs: shown when either the general MIDR
+ * switch or the dedicated discovery channel is on. */
+#define BGP_DEBUG_MIDR_FLOW                                                     \
+	(BGP_DEBUG(midr, MIDR) || BGP_DEBUG(midr, MIDR_DISCOVERY))
 
 extern const char *const bgp_type_str[];
 extern const char *const bgp_global_gr_mode_str[];

@@ -837,6 +837,9 @@ struct bgp {
 	/* BGP-LS specific data */
 	struct bgp_ls *ls_info;
 
+	/* MIDR specific data */
+	struct bgp_midr *midr_info;
+
 	/* BGP table route-map.  */
 	struct bgp_rmap table_map[AFI_MAX][SAFI_MAX];
 
