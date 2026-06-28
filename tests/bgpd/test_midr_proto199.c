@@ -118,7 +118,15 @@ int main(void)
 	rtnl_route_set_family(rt, AF_INET);
 	rtnl_route_set_type(rt, RTN_UNICAST);
 	rtnl_route_set_table(rt, RT_TABLE_MAIN);
-	if (rtnl_route_delete(sk, rt, 0) < 0) { printf("  WARN: delete failed\n"); }
+	/* Must set nexthop to match the route added in Step 3 */
+	nh = rtnl_route_nh_alloc();
+	nl_addr_parse("203.0.113.1", AF_INET, &gw);
+	rtnl_route_nh_set_gateway(nh, gw);
+	rtnl_route_nh_set_ifindex(nh, ifindex);
+	rtnl_route_add_nexthop(rt, nh);
+	if (rtnl_route_delete(sk, rt, 0) < 0) {
+		printf("  FAIL: rtnl_route_delete failed\n"); rc = 1;
+	}
 	rtnl_route_put(rt);
 	sleep(1);
 

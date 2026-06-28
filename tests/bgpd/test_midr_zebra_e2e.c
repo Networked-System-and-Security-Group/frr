@@ -23,6 +23,7 @@
 #include "lib/hash.h"
 #include "lib/zclient.h"
 #include "lib/frrdistance.h"
+#include "lib/libfrr.h"
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_zebra.h"
 
@@ -34,10 +35,7 @@ struct event_loop *master = NULL;
 struct bgp_master *bm;
 struct zclient *bgp_zclient;
 
-/* zclient options – minimal for test */
-static const struct zclient_options zclient_options_test = {
-	.receive_notify = false,
-};
+/* Use default zclient options (no special flags needed) */
 
 /* ------------------------------------------------------------------
  * Test prefix: 10.254.254.0/24 via 192.0.2.1 (dummy nexthop)
@@ -121,12 +119,17 @@ int main(int argc, char **argv)
 	dummy_bm.master = master;
 	bm = &dummy_bm;
 
-	bgp_zclient = zclient_new(master, &zclient_options_test, NULL);
+	bgp_zclient = zclient_new(master, &zclient_options_default, NULL, 0);
 	if (!bgp_zclient) {
 		printf("FAIL: zclient_new returned NULL\n");
 		return 1;
 	}
 	zclient_init(bgp_zclient, ZEBRA_ROUTE_BGP_MIDR, 0, &bgpd_privs);
+	/* Set the zebra socket path before connecting */
+	if (!frr_zclient_addr(&zclient_addr, &zclient_addr_len, zebra_sock)) {
+		printf("FAIL: invalid zserv socket path: %s\n", zebra_sock);
+		return 1;
+	}
 	if (zclient_socket_connect(bgp_zclient) < 0) {
 		printf("FAIL: could not connect to zebra at %s\n", zebra_sock);
 		return 1;
@@ -157,12 +160,11 @@ int main(int argc, char **argv)
 
 	/* Process ZAPI send (event loop needs to run briefly) */
 	{
-		struct event *t;
+		struct event t;
 		int i;
 		for (i = 0; i < 10; i++) {
 			event_fetch(master, &t);
-			if (t)
-				event_call(t);
+			event_call(&t);
 		}
 	}
 
@@ -184,12 +186,11 @@ int main(int argc, char **argv)
 	midr_zebra_route_flush(&bgp);
 
 	{
-		struct event *t;
+		struct event t;
 		int i;
 		for (i = 0; i < 10; i++) {
 			event_fetch(master, &t);
-			if (t)
-				event_call(t);
+			event_call(&t);
 		}
 	}
 	sleep(1);

@@ -33,7 +33,8 @@ def test_unit_build_and_run():
         "tests/bgpd/test_midr_zebra.c "
         "bgpd/libbgp.a lib/.libs/libfrr.a "
         "-ljson-c -lrt -lcap -lreadline -lm -lpthread -lcrypt "
-        "$(pkg-config --libs libyang 2>/dev/null || echo '-lyang') 2>&1"
+        "$(pkg-config --libs libyang 2>/dev/null || echo '-lyang') "
+        "$(pkg-config --libs lua5.3 2>/dev/null || echo '-llua5.3') 2>&1"
     )
     assert "error:" not in out, f"Unit build failed:\n{out}"
     out = run("/tmp/test_midr_ut")

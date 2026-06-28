@@ -243,7 +243,8 @@ echo thu325325 | sudo -S docker exec frr-ubuntu24-ymy bash -c \
 
 | 日期 | 单元测试 | Topotest | Proto 199 | 环境 |
 |------|---------|---------|-----------|------|
-| 2026-06-21 | **35/35 通过** | **7/7 通过** | ✅ `ip route show proto midr` | Docker `frr-ubuntu24-ymy` |
+| 2026-06-21 | **35/35 通过** | **7/7 通过** | ✅ | Docker `frr-ubuntu24-ymy` |
+| **2026-06-28** | **42/42 通过** | **7/7 通过** | **✅** | Docker `frr-ubuntu24-ymy` |
 
 ### 7.1 Proto 199 验证详情
 
