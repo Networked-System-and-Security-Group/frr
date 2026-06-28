@@ -230,7 +230,9 @@ static uint16_t neigh_state_to_netlink(uint16_t dplane_state)
 
 static inline bool is_selfroute(int proto)
 {
-	if ((proto == RTPROT_BGP) || (proto == RTPROT_OSPF)
+	if ((proto == RTPROT_BGP)
+	    || (proto == RTPROT_BGP_MIDR) /* Reason: FRR owns RFC 9815 routes. */
+	    || (proto == RTPROT_OSPF)
 	    || (proto == RTPROT_ZSTATIC) || (proto == RTPROT_ZEBRA)
 	    || (proto == RTPROT_ISIS) || (proto == RTPROT_RIPNG)
 	    || (proto == RTPROT_NHRP) || (proto == RTPROT_EIGRP)
@@ -252,6 +254,10 @@ int zebra2proto(int proto)
 		break;
 	case ZEBRA_ROUTE_BGP:
 		proto = RTPROT_BGP;
+		break;
+	case ZEBRA_ROUTE_BGP_MIDR:
+		/* Reason: keep kernel route protocol aligned with zebra type. */
+		proto = RTPROT_BGP_MIDR;
 		break;
 	case ZEBRA_ROUTE_OSPF:
 	case ZEBRA_ROUTE_OSPF6:
@@ -324,6 +330,10 @@ static inline int proto2zebra(int proto, int family, bool is_nexthop)
 		break;
 	case RTPROT_BGP:
 		proto = ZEBRA_ROUTE_BGP;
+		break;
+	case RTPROT_BGP_MIDR:
+		/* Reason: re-read kernel routes back into the same zebra type. */
+		proto = ZEBRA_ROUTE_BGP_MIDR;
 		break;
 	case RTPROT_OSPF:
 		proto = (family == AF_INET) ? ZEBRA_ROUTE_OSPF

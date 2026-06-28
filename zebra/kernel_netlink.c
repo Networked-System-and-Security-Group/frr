@@ -129,6 +129,7 @@ static const struct message rtproto_str[] = {
 #endif /* RTPROT_BIRD */
 	{RTPROT_MROUTED, "mroute"},
 	{RTPROT_BGP, "BGP"},
+	{RTPROT_BGP_MIDR, "MIDR"},
 	{RTPROT_OSPF, "OSPF"},
 	{RTPROT_ISIS, "IS-IS"},
 	{RTPROT_RIP, "RIP"},

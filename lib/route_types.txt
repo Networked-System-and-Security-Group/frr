@@ -57,6 +57,9 @@ ZEBRA_ROUTE_OSPF,       ospf,      ospfd,  'O', 1, 0, 1,     "OSPF",          os
 ZEBRA_ROUTE_OSPF6,      ospf6,     ospf6d, 'O', 0, 1, 1,     "OSPFv3",        ospf6d
 ZEBRA_ROUTE_ISIS,       isis,      isisd,  'I', 1, 1, 1,     "IS-IS",         isisd
 ZEBRA_ROUTE_BGP,        bgp,       bgpd,   'B', 1, 1, 1,     "BGP",           bgpd
+# Reason: keep RFC 9815 SPF-computed routes separate from ordinary BGP and
+# avoid enabling redistribution before policy/loop handling is implemented.
+ZEBRA_ROUTE_BGP_MIDR, midr, bgpd,  'l', 1, 1, 0,     "MIDR",    bgpd
 ZEBRA_ROUTE_PIM,	pim,	   pimd,   'P', 0, 0, 0,     "PIM",           pimd
 ZEBRA_ROUTE_EIGRP,      eigrp,     eigrpd, 'E', 1, 0, 1,     "EIGRP",         eigrpd
 ZEBRA_ROUTE_NHRP,       nhrp,      nhrpd,  'N', 1, 1, 1,     "NHRP",          nhrpd
@@ -103,6 +106,7 @@ ZEBRA_ROUTE_OSPF,   "Open Shortest Path First (OSPFv2)"
 ZEBRA_ROUTE_OSPF6,  "Open Shortest Path First (IPv6) (OSPFv3)"
 ZEBRA_ROUTE_ISIS,   "Intermediate System to Intermediate System (IS-IS)"
 ZEBRA_ROUTE_BGP,    "Border Gateway Protocol (BGP)"
+ZEBRA_ROUTE_BGP_MIDR, "BGP Link-State SPF (MIDR)"
 ZEBRA_ROUTE_PIM,    "Protocol Independent Multicast (PIM)"
 ZEBRA_ROUTE_EIGRP,  "Enhanced Interior Gateway Routing Protocol (EIGRP)"
 ZEBRA_ROUTE_NHRP,   "Next Hop Resolution Protocol (NHRP)"
