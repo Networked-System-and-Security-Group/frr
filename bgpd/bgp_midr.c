@@ -184,16 +184,14 @@ static bool midr_discovery_should_peer(struct bgp *bgp,
 static void midr_nds_on_node_discovered(struct bgp *bgp,
 					struct midr_node_entry *entry)
 {
-	struct prefix locator;
-
 	/* 1. 探测前粗筛（用户的 stub，现仅排除 self）。 */
 	if (!midr_discovery_filter(bgp, entry))
 		return;
 
-	/* 2. 测性能：I-1 启动对其真实可达地址（TLV 1188，而非不可路由的
-	 * router-id）的探测。stub 同步把指标灌进 link_entry。 */
-	midr_node_get_locator(entry, &locator);
-	midr_pm_add_target(bgp, &locator, MIDR_SRC_GOSSIP, entry->capabilities);
+	/* 2. 测性能：I-1 以 router-id（node_id）为探测上下文的 key；PM 从
+	 * global_view 条目取 transport_addr 作为实际探测目标。 */
+	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_GOSSIP,
+			   entry->capabilities);
 
 	/* 3. 判断是否建邻居（保守 stub：本群匹配；未来基于 link_entry 指标）。 */
 	if (!midr_discovery_should_peer(bgp, entry)) {
@@ -307,11 +305,8 @@ void midr_nds_on_node_withdraw(struct bgp *bgp, struct bgp_ls_nlri *nlri)
 	if (!entry)
 		return;
 
-	/* I-2: tell PM to stop probing this node (uses its locator). */
-	struct prefix locator;
-
-	midr_node_get_locator(entry, &locator);
-	midr_pm_remove_target(bgp, &locator, MIDR_STOP_GRACEFUL_SHUTDOWN);
+	/* I-2: stop probing by node_id (PM's probe_contexts hash key). */
+	midr_pm_remove_target(bgp, &entry->node_id, MIDR_STOP_GRACEFUL_SHUTDOWN);
 
 	midr_ctrl_on_node_remove(bgp, entry);
 	midr_node_hash_del(&gv->nodes, entry);
@@ -333,7 +328,6 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_global_view *gv;
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
-	struct prefix locator;
 
 	if (!bgp || !bgp->midr_info)
 		return;
@@ -355,9 +349,8 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 	entry->is_adjacent = true; /* 成员表里的成员就是要建邻居的对象 */
 
-	/* I-1：探测其真实可达地址（TLV 1188）。 */
-	midr_node_get_locator(entry, &locator);
-	midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP,
+	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
+	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
 }
 
@@ -487,14 +480,11 @@ static void midr_expire_check_timer(struct event *t)
 		if (entry->is_self)
 			continue;
 		if (now - entry->last_seen > MIDR_NODE_EXPIRE_TIME) {
-			struct prefix locator;
-
 			if (BGP_DEBUG(midr, MIDR))
 				zlog_debug("MIDR: node %pFX (group %u) expired",
 					   &entry->node_id, entry->group_id);
-			/* I-2: stop probing the expired node (by its locator). */
-			midr_node_get_locator(entry, &locator);
-			midr_pm_remove_target(bgp, &locator,
+			/* I-2: stop probing by node_id (PM's hash key). */
+			midr_pm_remove_target(bgp, &entry->node_id,
 					      MIDR_STOP_KEEPALIVE_TIMEOUT);
 			midr_ctrl_on_node_remove(bgp, entry);
 			midr_node_hash_del(&mi->global_view->nodes, entry);
@@ -523,6 +513,15 @@ static void midr_keepalive_timer(struct event *t)
 
 	event_add_timer(bm->master, midr_keepalive_timer, bgp,
 			MIDR_KEEPALIVE_INTERVAL, &mi->t_keepalive);
+}
+
+/* Deferred join-phase triggers: fire after MIDR_JOIN_PROBE_WAIT_SECS to give
+ * the PM long-term EWMA time to warm up before CL evaluates link quality. */
+static void midr_join_rep_probe_done_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	MIDR_FLOW_LOG("MIDR 加入：REP_PROBE_DONE 定时器触发，通知 CL");
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_REP_PROBE_DONE);
 }
 
 /*
@@ -992,9 +991,13 @@ void midr_join_on_rep_list(struct bgp *bgp)
 			      &r->rep_transport, r->group_id);
 	}
 
-	/* 探完整批群代表后，编排层显式发 REP_PROBE_DONE，交 CL 选最优代表
-	 * （I-7 RECOMMEND）。一整批只发一次，避免每个代表各 notify 一次。 */
-	midr_nds_notify_cl(bgp, MIDR_TRIGGER_REP_PROBE_DONE);
+	/* 延迟 MIDR_JOIN_PROBE_WAIT_SECS 秒再发 REP_PROBE_DONE，让 PM 的
+	 * 长期 EWMA（α=0.05）先积累足够样本，使 CL 能区分好/坏链路。 */
+	event_cancel(&mi->t_rep_probe_done);
+	event_add_timer(bm->master, midr_join_rep_probe_done_cb, bgp,
+			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_rep_probe_done);
+	MIDR_FLOW_LOG("MIDR 加入：REP_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+		      MIDR_JOIN_PROBE_WAIT_SECS);
 }
 
 /* ===========================================================================
@@ -1054,6 +1057,8 @@ void bgp_midr_finish(struct bgp *bgp)
 	event_cancel(&mi->t_expire_check);
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);
+	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_member_probe_done);
 
 	/* Stop PM periodic probe timer */
 	midr_pm_finish(bgp);

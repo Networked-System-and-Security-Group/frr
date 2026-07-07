@@ -972,7 +972,11 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 	struct bgp_ls_attr *ls_attr;
 	int ret;
 
-	if (!bgp || !bgp->ls_info || !bgp->ls_info->enable_distribution)
+	/* MIDR always distributes its Node NLRI regardless of enable_distribution.
+	 * Standard BGP-LS distribution also requires enable_distribution=true. */
+	if (!bgp || !bgp->ls_info)
+		return 0;
+	if (!bgp->ls_info->enable_distribution && !bgp->midr_info)
 		return 0;
 
 	nlri = bgp_ls_nlri_alloc();

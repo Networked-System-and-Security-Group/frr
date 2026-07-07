@@ -50,6 +50,10 @@
 #define MIDR_EXPIRE_CHECK_INTERVAL  5  /* scan period for expired nodes */
 #define MIDR_PERIODIC_SYNC_INTERVAL 30 /* CL periodic re-evaluation */
 #define MIDR_PM_PROBE_INTERVAL	    10 /* periodic PM probe of connected nodes */
+/* Seconds to wait after I-1 before firing REP/MEMBER_PROBE_DONE.  Lets the
+ * long-term EWMA (α=0.05) warm up enough for CL to see a clear difference
+ * between good links (RTT ≪ 20 ms) and bad links (RTT ≫ 20 ms). */
+#define MIDR_JOIN_PROBE_WAIT_SECS   20
 
 /* Forward declarations */
 struct bgp;
@@ -211,6 +215,8 @@ struct bgp_midr {
 
 	/* === PM === */
 	struct hash *probe_contexts; /* prefix -> midr_probe_ctx (PM owns) */
+	int pm_sock;		     /* UDP fd for PM probing, -1 when closed */
+	struct event *t_pm_read;     /* read event on pm_sock */
 
 	/* === CL === */
 	uint32_t local_group_id;     /* local group-id (TLV 1185) */
@@ -228,11 +234,13 @@ struct bgp_midr {
 	uint32_t cap_seqno;  /* TLV 1187 seqno */
 
 	/* === Timers === */
-	struct event *t_periodic_sync; /* CL periodic re-evaluation */
-	struct event *t_probe_timeout; /* PM probe timeout */
-	struct event *t_keepalive;     /* re-originate self Node NLRI */
-	struct event *t_expire_check;  /* scan for expired nodes */
-	struct event *t_pm_probe;      /* periodic PM probe of connected nodes */
+	struct event *t_periodic_sync;	  /* CL periodic re-evaluation */
+	struct event *t_probe_timeout;	  /* PM probe timeout */
+	struct event *t_keepalive;	  /* re-originate self Node NLRI */
+	struct event *t_expire_check;	  /* scan for expired nodes */
+	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
+	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
+	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
 	union sockunion bootstrap_su; /* bootstrap node address */
