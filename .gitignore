@@ -119,3 +119,10 @@ refix
 pceplib/test/*.log
 pceplib/test/*.trs
 /tests/topotests/lib/mgmt_pb2.py
+
+# MIDR test run artifacts (logs, pcaps, pid files) — keep scripts/configs tracked
+midr-test/pm-test/*.log
+midr-test/pm-test/*.rtl
+midr-test/pm-test/*.flow
+midr-test/pm-test/*.png
+midr-test/cl-test/logs/
