@@ -47,6 +47,13 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 static void midr_ctrl_send_peer_request(struct bgp *bgp,
 					const struct midr_node_entry *entry);
 static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type);
+
+static void midr_ctrl_member_probe_done_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	MIDR_FLOW_LOG("MIDR 加入：MEMBER_PROBE_DONE 定时器触发，通知 CL");
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
+}
 static void midr_ctrl_retx_timer(struct event *t);
 static void midr_ctrl_udp_recv(struct event *t);
 
@@ -415,9 +422,11 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	 * （I-7 JOIN/CREATE）。一整批只发一次。不在此清 join_phase：收尾在
 	 * midr_nds_on_cluster_decision 的 JOIN/CREATE 分支。
 	 */
-	MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，探测完成 → MEMBER_PROBE_DONE",
-		      mi->join_group_id);
-	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
+	MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+		      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);
+	event_cancel(&mi->t_member_probe_done);
+	event_add_timer(bm->master, midr_ctrl_member_probe_done_cb, bgp,
+			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_member_probe_done);
 }
 
 /* Read one control datagram and dispatch on its type. */
