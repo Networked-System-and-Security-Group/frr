@@ -412,6 +412,14 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 				      ntohl(items[i].group_id));
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测成员 %pI4（群 %u）",
 			      &items[i].rid, ntohl(items[i].group_id));
+
+		/*
+		 * 该成员从未跟我们交换过任何报文（我们是从群代表的
+		 * MEMBER_LIST_RESP 里间接得知它的），它的 pm_is_known_transport
+		 * 校验会把我们刚发起的探测包当未知来源丢弃。发一个单向 ANNOUNCE
+		 * 自报身份，让它记住我们——不等回复、不触发建连。
+		 */
+		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
 	}
 
 	/* 收到成员列表响应 → 停止重传 MEMBER_LIST_REQ（UDP 重传队列机制）。 */
@@ -494,6 +502,12 @@ static void midr_ctrl_udp_recv(struct event *t)
 		if (n < (ssize_t)sizeof(msg))
 			return;
 		memcpy(&msg, buf, sizeof(msg));
+		/* Requester will PM-probe us back next; without this it has no
+		 * global_view entry here yet and pm_is_known_transport() would
+		 * drop its probe packets as an unknown source. */
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
 		MIDR_FLOW_LOG("midr_ctrl: REP_LIST_REQ from %pI4 — replying with rep directory",
 			  &msg.requester_transport);
 		midr_ctrl_send_rep_list(mi, msg.requester_transport);
@@ -514,6 +528,10 @@ static void midr_ctrl_udp_recv(struct event *t)
 				   mi->local_group_id);
 			return;
 		}
+		/* Same reasoning as REP_LIST_REQ above. */
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
 		MIDR_FLOW_LOG("midr_ctrl: MEMBER_LIST_REQ for group %u from %pI4 — replying",
 			  group, &msg.requester_transport);
 		midr_ctrl_send_member_list(bgp, msg.requester_transport, group);
@@ -524,6 +542,22 @@ static void midr_ctrl_udp_recv(struct event *t)
 		break;
 	case MIDR_CTRL_MEMBER_LIST_RESP:
 		midr_ctrl_recv_member_list(bgp, buf, n);
+		break;
+	case MIDR_CTRL_ANNOUNCE:
+		/*
+		 * 一个候选群成员在被灌入某加入节点的探测列表前，双方从未交换过
+		 * 任何报文——PM 的来源校验（pm_is_known_transport）会把加入节点
+		 * 的探测包当作未知来源丢弃。这里只是记住发送者身份，不回复、不
+		 * 建连（保持"探成员阶段只探不连"）。
+		 */
+		if (n < (ssize_t)sizeof(msg))
+			return;
+		memcpy(&msg, buf, sizeof(msg));
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
+		MIDR_FLOW_LOG("midr_ctrl: ANNOUNCE from %pI4 — noted for PM source validation",
+			  &msg.requester_transport);
 		break;
 	default:
 		break;

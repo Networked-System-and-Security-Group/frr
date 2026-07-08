@@ -254,6 +254,12 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 			if (link && link->long_term.loss_rate > worst_loss)
 				worst_loss = link->long_term.loss_rate;
 		}
+		MIDR_LOG("MIDR CL: 成员候选 %pFX group=%u link=%s status=%d rtt=%u loss=%.4f",
+			 &entry->node_id, entry->group_id,
+			 link ? "found" : "missing",
+			 link ? (int)link->status : -1,
+			 link ? link->long_term.rtt_us : 0,
+			 link ? link->long_term.loss_rate : 0.0);
 	}
 
 	if (out_worst_rtt_us)

@@ -285,6 +285,15 @@ extern void midr_nds_on_node_withdraw(struct bgp *bgp,
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 				  struct in_addr transport, uint32_t group_id);
 
+/*
+ * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时，为请求方灌入一条最小 global_view
+ * 条目（仅 transport_addr，用于 PM 的 pm_is_known_transport 来源校验），不置
+ * is_adjacent、不触发 I-1——请求方是否真正入群由 CL 决定，这里只是让它作为
+ * "自证身份的探测来源"被接受，不代表已建立邻居关系。
+ */
+extern void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid,
+				     as_t asn, struct in_addr transport);
+
 /* Refresh the local self-entry after originating the local Node NLRI */
 extern void midr_nds_local_node_update(struct bgp *bgp);
 

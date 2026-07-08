@@ -355,6 +355,40 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 }
 
 /*
+ * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时调用：请求方在其自身的 join 流程里会
+ * 反过来对我们发 PM 探测包，而 midr_pm_recv() 的 pm_is_known_transport() 只
+ * 接受 global_view 里已知的来源地址——请求方此时还没有 BGP-LS 会话，我们的
+ * global_view 里没有它，探测包会被当成未知来源静默丢弃。
+ * 这里用请求帧自带的身份（router-id/transport/asn）灌一条最小条目，仅用于
+ * 通过来源校验；不置 is_adjacent、不触发 I-1——是否真正建邻居仍由 CL 决定。
+ */
+void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid, as_t asn,
+			      struct in_addr transport)
+{
+	struct midr_global_view *gv;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_info)
+		return;
+
+	gv = bgp->midr_info->global_view;
+	midr_prefix_from_in_addr(&key.node_id, rid);
+
+	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!entry) {
+		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
+		entry->node_id = key.node_id;
+		midr_node_hash_add(&gv->nodes, entry);
+	}
+	entry->asn = asn;
+	entry->transport_addr = transport;
+	entry->has_transport_addr = true;
+	entry->last_seen = monotime(NULL);
+	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
+}
+
+/*
  * Refresh the local self-entry from local configuration.
  * Called after bgp_ls_originate_bgp_node() succeeds.
  */
@@ -632,6 +666,24 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 	if (long_term)
 		link->long_term = *long_term;
 
+	/*
+	 * 一次成功的探测回复本身就是活性信号。稳态邻居的 last_seen 靠 BGP-LS
+	 * NLRI 泛洪刷新，但"只探不连"阶段的候选成员（midr_nds_learn_member 灌入，
+	 * is_adjacent=true 但尚无 BGP-LS 会话）没有任何 NLRI 泛洪可刷新它——若不
+	 * 在这里补上，MIDR_NODE_EXPIRE_TIME（15s）会在 MIDR_JOIN_PROBE_WAIT_SECS
+	 * （20s）的 CL 评估窗口结束前就把这些条目过期删除，MEMBER_PROBE_DONE 到
+	 * 时发现候选全部消失，误判为 0 条好链路。
+	 */
+	if (status == MIDR_LINK_UP) {
+		struct midr_node_entry key = {};
+		struct midr_node_entry *node;
+
+		key.node_id = *node_id;
+		node = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (node)
+			node->last_seen = monotime(NULL);
+	}
+
 	/* E-1: write short-term metrics into BGP-LS */
 	midr_e1_write_to_bgpls(bgp, link);
 
@@ -752,9 +804,18 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 					    decision->old_group_id);
 		break;
 	case MIDR_DECISION_CREATE:
-		/* 所有候选群均不满足 → 自建新群。同属 join 第二段，幂等收尾。 */
-		if (mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
-			MIDR_LOG("MIDR I-7：CREATE 但不在探成员阶段，忽略");
+		/*
+		 * 自建新群。CREATE 有两个可能来源，二者都应被接受：
+		 *   - PROBING_REPS：REP_PROBE_DONE 时没有任何群代表探到数据
+		 *     （cl_handle_rep_probe_done 的"无可用候选"分支），根本没
+		 *     进入过 PROBING_MEMBERS；
+		 *   - PROBING_MEMBERS：所选群的成员链路数达不到入群阈值
+		 *     （cl_handle_member_probe_done 的兜底分支）。
+		 * 只在真正不在加入流程中（IDLE）时才视为过期/重复通知而忽略。
+		 */
+		if (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+		    mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
+			MIDR_LOG("MIDR I-7：CREATE 但不在加入流程中，忽略");
 			break;
 		}
 		mi->local_group_id = decision->new_group_id;
@@ -984,8 +1045,32 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	/* I-1：对每个群代表启动探测（PM stub 同步把指标灌进 link_entry，不再 notify）。 */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
 		struct prefix locator;
+		struct midr_node_entry key = {};
+		struct midr_node_entry *entry;
 
 		midr_prefix_from_in_addr(&locator, r->rep_transport);
+
+		/*
+		 * 群代表此时尚未有 BGP-LS 会话（bootstrap 只是 UDP 通道），
+		 * global_view 里还没有它的条目，而 midr_pm_add_target() 要求
+		 * 探测目标已存在于 global_view 才会启动探测。这里以 transport
+		 * addr 本身作为 node_id 灌一条占位条目（与 cl_find_link_by_ipv4
+		 * 按 transport addr 查链路的假设一致），否则探测请求会被静默
+		 * 丢弃，REP_PROBE_DONE 永远拿不到数据。
+		 */
+		key.node_id = locator;
+		entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (!entry) {
+			entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
+			entry->node_id = locator;
+			midr_node_hash_add(&mi->global_view->nodes, entry);
+		}
+		entry->asn = r->rep_asn;
+		entry->group_id = r->group_id;
+		entry->transport_addr = r->rep_transport;
+		entry->has_transport_addr = true;
+		entry->last_seen = monotime(NULL);
+
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
 			      &r->rep_transport, r->group_id);
