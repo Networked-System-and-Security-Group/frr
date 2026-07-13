@@ -22,8 +22,11 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_vty.h"
 #include "bgpd/bgp_debug.h"
+#include "bgpd/bgp_nexthop.h"
+#include "bgpd/bgp_table.h"
 #include "monotime.h"
 
 /* ------------------------------------------------------------------ */
@@ -438,27 +441,18 @@ static const char *midr_caps_str(uint32_t caps, char *buf, size_t len)
 	return buf;
 }
 
-DEFUN(show_midr_nodes,
-      show_midr_nodes_cmd,
-      "show midr nodes",
-      SHOW_STR
-      "MIDR information\n"
-      "Show MIDR node table\n")
+/*
+ * 三个节点表视图命令 (nodes/reps/bootstraps) 共用的表格体: required_caps=0
+ * 列全部, 非 0 只列 capabilities 含全部所要位的节点。reps/bootstraps 是同一
+ * 张表的过滤视图, 含 expired 条目 (诊断命令要能看见异常; 协议侧 REP_LIST 组
+ * 装另用严过滤, 见 midr_rep_candidates)。
+ */
+static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
+				 uint32_t required_caps)
 {
-	struct bgp *bgp = bgp_get_default();
 	struct midr_node_entry *entry;
 	char caps_buf[64];
 	time_t now = monotime(NULL);
-
-	if (!bgp) {
-		vty_out(vty, "%% No BGP instance found\n");
-		return CMD_WARNING;
-	}
-
-	if (!bgp->midr_info) {
-		vty_out(vty, "%% MIDR not initialized\n");
-		return CMD_WARNING;
-	}
 
 	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
 		"Router-ID", "Transport-Addr", "ASN", "Group-ID", "Status",
@@ -471,6 +465,9 @@ DEFUN(show_midr_nodes,
 		bool active = entry->is_self ||
 			      (now - entry->last_seen) <= MIDR_NODE_EXPIRE_TIME;
 		char taddr[INET_ADDRSTRLEN];
+
+		if ((entry->capabilities & required_caps) != required_caps)
+			continue;
 
 		if (entry->has_transport_addr)
 			inet_ntop(AF_INET, &entry->transport_addr, taddr,
@@ -487,6 +484,90 @@ DEFUN(show_midr_nodes,
 			midr_caps_str(entry->capabilities, caps_buf,
 				      sizeof(caps_buf)));
 	}
+}
+
+DEFUN(show_midr_nodes,
+      show_midr_nodes_cmd,
+      "show midr nodes",
+      SHOW_STR
+      "MIDR information\n"
+      "Show MIDR node table\n")
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		vty_out(vty, "%% No BGP instance found\n");
+		return CMD_WARNING;
+	}
+
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	midr_show_node_table(vty, bgp, 0);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_reps,
+      show_midr_reps_cmd,
+      "show midr reps",
+      SHOW_STR
+      "MIDR information\n"
+      "Show group representatives (nodes with the GROUP_REP capability)\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct listnode *node;
+	struct midr_rep_entry *r;
+
+	if (!bgp) {
+		vty_out(vty, "%% No BGP instance found\n");
+		return CMD_WARNING;
+	}
+
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	midr_show_node_table(vty, bgp, MIDR_CAP_GROUP_REP);
+
+	/* 本地 rep_dir (手配/学来, REP_LIST 应答排前的来源) 恒显示——一眼区
+	 * 分"全网视图"(上表, 按位推导)与"本地目录"(本段); 手配/学来的区分标
+	 * 记是未来项 F (from_config)。 */
+	vty_out(vty, "\nLocal rep directory (rep_dir, served first in REP_LIST):\n");
+	if (list_isempty(bgp->midr_info->rep_dir))
+		vty_out(vty, "  (none)\n");
+	else
+		for (ALL_LIST_ELEMENTS_RO(bgp->midr_info->rep_dir, node, r))
+			vty_out(vty, "  group %u -> %pI4 (AS %u)\n",
+				r->group_id, &r->rep_transport,
+				(unsigned int)r->rep_asn);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_bootstraps,
+      show_midr_bootstraps_cmd,
+      "show midr bootstraps",
+      SHOW_STR
+      "MIDR information\n"
+      "Show bootstrap nodes (nodes with the BOOTSTRAP capability)\n")
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp) {
+		vty_out(vty, "%% No BGP instance found\n");
+		return CMD_WARNING;
+	}
+
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	midr_show_node_table(vty, bgp, MIDR_CAP_BOOTSTRAP);
 
 	return CMD_SUCCESS;
 }
@@ -500,6 +581,47 @@ DEFUN(show_midr_nodes,
 /* with the BGP-LS address-family activated.  Group-id / capabilities  */
 /* are cross-referenced from the node table when available.            */
 /* ------------------------------------------------------------------ */
+
+/*
+ * BGP RIB（ipv4 unicast）里有没有覆盖该前缀的路由。注意这只是"BGP 视角
+ * 有无覆盖路由"，不是严格的转发可达性（zebra/内核 FIB 才是权威）；用途是
+ * 给 show 命令里"卡住"的目标一个可行动的提示（underlay 路由缺失时 UDP 黑洞
+ * / 会话卡 Active 都是静默的，见 transport 互通部署契约）。
+ */
+static bool midr_bgp_rib_covers(struct bgp *bgp, const struct prefix *p)
+{
+	struct bgp_dest *dest;
+
+	if (!bgp->rib[AFI_IP][SAFI_UNICAST])
+		return true; /* 判不了当可达，不误报 */
+
+	dest = bgp_node_match(bgp->rib[AFI_IP][SAFI_UNICAST], p);
+	if (!dest)
+		return false;
+	bgp_dest_unlock_node(dest); /* bgp_node_match 返回已加锁节点 */
+	return true;
+}
+
+/*
+ * 对端 transport 地址在本端是否可达：优先查 BGP nexthop tracking 缓存
+ * （multihop peer 建连时经 FSM 注册，键 = connection->su 的 /32 host 前缀，
+ * 见 bgp_find_or_add_nexthop 的 peer 分支）；无缓存条目（peer 未注册 NHT）
+ * 再退化查 BGP RIB 覆盖路由。只读，不注册、不改状态。
+ */
+static bool midr_underlay_reachable(struct bgp *bgp, union sockunion *su)
+{
+	struct prefix p;
+	struct bgp_nexthop_cache *bnc;
+
+	if (sockunion_family(su) != AF_INET || !sockunion2hostprefix(su, &p))
+		return true; /* 判不了当可达，不误报 */
+
+	bnc = bnc_find(&bgp->nexthop_cache_table[AFI_IP], &p, 0, 0);
+	if (bnc)
+		return CHECK_FLAG(bnc->flags, BGP_NEXTHOP_VALID);
+
+	return midr_bgp_rib_covers(bgp, &p);
+}
 
 DEFUN(show_midr_neighbors,
       show_midr_neighbors_cmd,
@@ -535,7 +657,9 @@ DEFUN(show_midr_neighbors,
 
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
 		struct midr_node_entry *ne = NULL;
-		struct midr_node_entry *it;
+		const char *nbr_disp;
+		char taddr[INET_ADDRSTRLEN];
+		char state_buf[32];
 
 		/* Only peers carrying the BGP-LS AF are MIDR sessions. */
 		if (!peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
@@ -544,30 +668,45 @@ DEFUN(show_midr_neighbors,
 		any = true;
 
 		/*
-		 * Cross-reference the node table by matching the peer's IPv4
-		 * address against each node's locator (transport addr, or
-		 * router-id when none) — the table is keyed by router-id, but
-		 * we peer by the locator, so a hash lookup by peer address
-		 * would miss.
+		 * 按对端 router-id 反查节点表：节点表以 node_id(router-id) 为键，
+		 * peer->remote_id 是对端 OPEN 报文里的 router-id，与会话用哪个地址
+		 * 建立无关——故直连静态链路会话也能命中。旧版按 peer 连接地址匹配
+		 * 节点 locator，静态会话的链路地址对不上 transport，会错误显示 n/a。
 		 */
-		if (sockunion_family(&peer->connection->su) == AF_INET) {
-			struct in_addr pa = peer->connection->su.sin.sin_addr;
+		if (peer->remote_id.s_addr != INADDR_ANY) {
+			struct midr_node_entry key = {};
 
-			frr_each (midr_node_hash, nodes, it) {
-				struct prefix loc;
-
-				midr_node_get_locator(it, &loc);
-				if (loc.family == AF_INET &&
-				    IPV4_ADDR_SAME(&loc.u.prefix4, &pa)) {
-					ne = it;
-					break;
-				}
-			}
+			key.node_id.family = AF_INET;
+			key.node_id.prefixlen = IPV4_MAX_BITLEN;
+			key.node_id.u.prefix4 = peer->remote_id;
+			ne = midr_node_hash_find(nodes, &key);
 		}
 
-		vty_out(vty, "%-18s %-8u %-14s ", peer->host, peer->as,
-			lookup_msg(bgp_status_msg, peer->connection->status,
-				   NULL));
+		/*
+		 * 命中节点则统一显示其 transport（稳定 loopback，比链路地址直观）；
+		 * 否则回退显示 peer 的连接地址。
+		 */
+		nbr_disp = peer->host;
+		if (ne && ne->has_transport_addr) {
+			inet_ntop(AF_INET, &ne->transport_addr, taddr,
+				  sizeof(taddr));
+			nbr_disp = taddr;
+		}
+
+		/*
+		 * 卡在非 Established 时区分两种情形：对端尚未拨入（正常等待）
+		 * vs 到对端 transport 无路由（underlay 断，坏事）——后者追加
+		 * " (no route)" 标注。
+		 */
+		snprintf(state_buf, sizeof(state_buf), "%s",
+			 lookup_msg(bgp_status_msg, peer->connection->status,
+				    NULL));
+		if (peer->connection->status != Established &&
+		    !midr_underlay_reachable(bgp, &peer->connection->su))
+			strlcat(state_buf, " (no route)", sizeof(state_buf));
+
+		vty_out(vty, "%-18s %-8u %-14s ", nbr_disp, peer->as,
+			state_buf);
 
 		if (ne)
 			vty_out(vty, "%-10u %s\n", ne->group_id,
@@ -587,6 +726,19 @@ DEFUN(show_midr_neighbors,
 /* show midr join                                                      */
 /* ------------------------------------------------------------------ */
 
+static const char *midr_join_phase_str(enum midr_join_phase phase)
+{
+	switch (phase) {
+	case MIDR_JOIN_IDLE:
+		return "idle";
+	case MIDR_JOIN_PROBING_REPS:
+		return "probing-reps";
+	case MIDR_JOIN_PROBING_MEMBERS:
+		return "probing-members";
+	}
+	return "unknown";
+}
+
 DEFUN(show_midr_join,
       show_midr_join_cmd,
       "show midr join",
@@ -596,6 +748,8 @@ DEFUN(show_midr_join,
 {
 	struct bgp *bgp = bgp_get_default();
 	struct bgp_midr *mi;
+	struct listnode *node;
+	struct midr_ctrl_pending *pend;
 
 	if (!bgp || !bgp->midr_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
@@ -603,18 +757,38 @@ DEFUN(show_midr_join,
 	}
 	mi = bgp->midr_info;
 
-	if (!mi->bootstrap_set) {
-		vty_out(vty, "No bootstrap configured\n");
-		return CMD_SUCCESS;
-	}
-
-	vty_out(vty, "Bootstrap node : %pSU AS %u\n", &mi->bootstrap_su,
-		mi->bootstrap_asn);
+	/* 未配 bootstrap 也继续输出：稳态的 PEER_REQUEST pending 与
+	 * bootstrap 无关，卡住的请求同样要在这里可见。 */
+	if (mi->bootstrap_set)
+		vty_out(vty, "Bootstrap node : %pSU AS %u\n",
+			&mi->bootstrap_su, mi->bootstrap_asn);
+	else
+		vty_out(vty, "Bootstrap node : (not configured)\n");
 	vty_out(vty, "Join state     : %s\n",
 		mi->join_in_progress ? "in-progress" : "idle/done");
+	vty_out(vty, "Join phase     : %s\n",
+		midr_join_phase_str(mi->join_phase));
 	vty_out(vty, "Local group-id : %u\n", mi->local_group_id);
 	vty_out(vty, "Joined group   : %u\n", mi->join_group_id);
 	vty_out(vty, "Members linked : %u\n", mi->join_members);
+
+	vty_out(vty, "Pending ctrl requests:\n");
+	if (!mi->ctrl_pending || list_isempty(mi->ctrl_pending)) {
+		vty_out(vty, "  (none)\n");
+		return CMD_SUCCESS;
+	}
+	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_pending, node, pend)) {
+		struct prefix p = {};
+
+		p.family = AF_INET;
+		p.prefixlen = IPV4_MAX_BITLEN;
+		p.u.prefix4 = pend->target_transport;
+		vty_out(vty, "  %-16s -> %-15pI4  retries_left=%d%s\n",
+			midr_ctrl_msg_type_str(pend->type),
+			&pend->target_transport, pend->retries_left,
+			midr_bgp_rib_covers(bgp, &p) ? ""
+						     : "  [no BGP route]");
+	}
 	return CMD_SUCCESS;
 }
 
@@ -683,6 +857,11 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "    %sshow midr nodes%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        显示 MIDR 节点表(由 BGP-LS Node NLRI 学到的所有节点)\n");
+	vty_out(vty, "    %sshow midr reps%s\n", C_CMD, C_RST);
+	vty_out(vty,
+		"        列全网群代表(按 GROUP_REP 能力位过滤节点表) + 本地 rep 目录\n");
+	vty_out(vty, "    %sshow midr bootstraps%s\n", C_CMD, C_RST);
+	vty_out(vty, "        列全网引导节点(按 BOOTSTRAP 能力位过滤节点表)\n");
 	vty_out(vty, "    %sshow midr neighbors%s\n", C_CMD, C_RST);
 	vty_out(vty, "        显示已建立的 MIDR(BGP-LS)直连会话\n");
 	vty_out(vty, "    %sshow midr join%s\n", C_CMD, C_RST);
@@ -730,6 +909,8 @@ void bgp_midr_vty_init(void)
 	install_element(VIEW_NODE, &midr_help_cmd);
 	install_element(ENABLE_NODE, &midr_help_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
+	install_element(VIEW_NODE, &show_midr_reps_cmd);
+	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);
 	install_element(VIEW_NODE, &show_midr_neighbors_cmd);
 	install_element(VIEW_NODE, &show_midr_join_cmd);
 }

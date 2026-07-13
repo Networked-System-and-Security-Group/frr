@@ -135,6 +135,26 @@ midr_global_view_find_link(struct midr_global_view *gv,
 	return NULL;
 }
 
+/*
+ * 按键删除一条 link_entry（命中返回 true）。links 表此前只增不减：node 下线
+ * 只删 node 表却漏删对应 link，仅探未连的节点探测后也残留——孤儿长期堆积。
+ * MTYPE_MIDR_LINK_ENTRY 是本文件 DEFINE_MTYPE_STATIC，释放只能在这里做。
+ */
+static bool midr_global_view_del_link(struct midr_global_view *gv,
+				      const struct prefix *key)
+{
+	struct listnode *node, *nnode;
+	struct midr_link_entry *link;
+
+	for (ALL_LIST_ELEMENTS(gv->links, node, nnode, link))
+		if (prefix_same(&link->remote_node_id, key)) {
+			list_delete_node(gv->links, node);
+			XFREE(MTYPE_MIDR_LINK_ENTRY, link);
+			return true;
+		}
+	return false;
+}
+
 /* ===========================================================================
  * NDS node table
  * =========================================================================*/
@@ -169,6 +189,33 @@ static bool midr_discovery_should_peer(struct bgp *bgp,
 }
 
 /*
+ * 解除与一个节点的探测/邻居关系：I-2 停探 + 清残留 link_entry + 清 is_adjacent，
+ * 可选拆掉动态会话。节点条目本身的去留由调用方决定（本函数不动 node 表）。
+ *
+ * 双键清理：发现阶段的探测入口按 locator(transport /32) 建 link，而 PM 周期
+ * loop 按 node_id(router-id) 回灌又建一条——同一节点最多两条 link，两个键都删。
+ * 有 transport 时二者不同、各删一次；无 transport 时 locator 回落到 node_id，
+ * prefix_same 为真只删一次。del_link 未命中返回 false，故本函数天然幂等。
+ */
+static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
+				 enum midr_stop_reason reason,
+				 bool teardown_session)
+{
+	struct midr_global_view *gv = bgp->midr_info->global_view;
+	struct prefix locator;
+
+	midr_node_get_locator(entry, &locator);
+	/* I-2 停探（stub 下为空操作；PM 异步化后此调用即成完整语义）。 */
+	midr_pm_remove_target(bgp, &locator, reason);
+	midr_global_view_del_link(gv, &locator);
+	if (!prefix_same(&locator, &entry->node_id))
+		midr_global_view_del_link(gv, &entry->node_id);
+	entry->is_adjacent = false;
+	if (teardown_session)
+		midr_ctrl_on_node_remove(bgp, entry);
+}
+
+/*
  * 收到一条经 BGP-LS 泛洪学到的节点后的接收侧反应（相当于 bootstrap 加入编排
  * 的单节点镜像版）。次序：粗筛 → 测性能 → 判断是否 peer → 直连：
  *
@@ -199,8 +246,9 @@ static void midr_nds_on_node_discovered(struct bgp *bgp,
 	if (!midr_discovery_should_peer(bgp, entry)) {
 		MIDR_LOG("MIDR 发现：节点 %pFX 群 %u -> 仅探测，不建邻居",
 			 &entry->node_id, entry->group_id);
-		/* TODO（探测生命周期）：不建邻居时此处应 I-2 停探 + 清残留
-		 * link_entry；stub 下 remove_target 是空操作，待 PM 异步化统一做。 */
+		/* 不建邻居：I-2 停探 + 清掉刚探测建的残留 link_entry（不拆会话，
+		 * 本就没建）。否则跨群/非邻居节点探测后 link 永久堆积。 */
+		midr_nds_detach_node(bgp, entry, MIDR_STOP_CLUSTER_CHANGE, false);
 		return;
 	}
 
@@ -217,6 +265,13 @@ static void midr_nds_on_node_discovered(struct bgp *bgp,
  * Update or insert a node entry from a received Node NLRI.
  * Called from bgp_nlri_parse_ls() for UPDATE messages (receive entry point).
  这是AI自己写的函数,收到NODE NLRI后如何存储里面的节点信息，对单个entry进行处理，调用点有while循环
+ *
+ * ===== 传播面单点 (2/3) = backend 替换边界 =====
+ * MIDR 的"收包入口"单点: 远端 Node NLRI 经此进节点表。它本身【不】产生
+ * origination (无 bgp_ls_originate_* 调用), 是三个 backend 替换边界之一
+ * ——将来切到第二组 remote-view 回调 / gossip (C 计划) 时, 收侧数据源在此
+ * 换掉, 边界外的节点表消费者不感知。见 midr_propagate_self 头注释的完整
+ * 三点说明。
  */
 void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 			   struct bgp_ls_attr *ls_attr)
@@ -307,13 +362,9 @@ void midr_nds_on_node_withdraw(struct bgp *bgp, struct bgp_ls_nlri *nlri)
 	if (!entry)
 		return;
 
-	/* I-2: tell PM to stop probing this node (uses its locator). */
-	struct prefix locator;
-
-	midr_node_get_locator(entry, &locator);
-	midr_pm_remove_target(bgp, &locator, MIDR_STOP_GRACEFUL_SHUTDOWN);
-
-	midr_ctrl_on_node_remove(bgp, entry);
+	/* I-2 停探 + 清 link_entry + 拆动态会话（必须在删 node 之前，detach
+	 * 内部要读 entry 的 locator）。 */
+	midr_nds_detach_node(bgp, entry, MIDR_STOP_GRACEFUL_SHUTDOWN, true);
 	midr_node_hash_del(&gv->nodes, entry);
 	XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
 
@@ -441,6 +492,19 @@ static const char *midr_origin_reason_str(enum midr_origin_reason reason)
  * guard and logging live in one place.  A withdraw is always honoured; a
  * re-origination is suppressed while gracefully shut down (otherwise a later
  * cap/group/transport change would silently undo a `midr shutdown`).
+ *
+ * ===== 传播面单点 (1/3) = backend 替换边界 =====
+ * 这是 MIDR "自通告出口"，也是三个允许触碰 BGP-LS 数据库写入
+ * (bgp_ls_originate_* / bgp_ls_withdraw_*) 的单点之一。三点为:
+ *   (1) midr_propagate_self      —— 自通告出口 (本函数)
+ *   (2) midr_nds_on_node_nlri    —— 收包入口 (不产生 origination)
+ *   (3) midr_e1_write_to_bgpls   —— E-1 链路指标出口
+ * 三者构成 backend 替换边界: 自有 BGP-LS origination <-> 第二组 upsert+回调
+ * <-> gossip (C 计划) 可整体替换其内部实现, 边界外调用方 (9 处调用本函数的
+ * keepalive/set_capability/set_group_id/originate_group_update/vty 命令等)
+ * 不感知实现切换。除这三点外, MIDR 层不得直调 origination/withdraw 族
+ * (2026-07-10 全树盘点确认无旁路; 详见 docs/decisions/
+ * midr-propagation-plane-and-gossip.md)。
  */
 void midr_propagate_self(struct bgp *bgp, enum midr_origin_reason reason)
 {
@@ -487,16 +551,12 @@ static void midr_expire_check_timer(struct event *t)
 		if (entry->is_self)
 			continue;
 		if (now - entry->last_seen > MIDR_NODE_EXPIRE_TIME) {
-			struct prefix locator;
-
 			if (BGP_DEBUG(midr, MIDR))
 				zlog_debug("MIDR: node %pFX (group %u) expired",
 					   &entry->node_id, entry->group_id);
-			/* I-2: stop probing the expired node (by its locator). */
-			midr_node_get_locator(entry, &locator);
-			midr_pm_remove_target(bgp, &locator,
-					      MIDR_STOP_KEEPALIVE_TIMEOUT);
-			midr_ctrl_on_node_remove(bgp, entry);
+			/* I-2 停探 + 清 link_entry + 拆动态会话（删 node 之前）。 */
+			midr_nds_detach_node(bgp, entry,
+					     MIDR_STOP_KEEPALIVE_TIMEOUT, true);
 			midr_node_hash_del(&mi->global_view->nodes, entry);
 			XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
 			/* I-3: node membership changed */
@@ -552,6 +612,12 @@ static void midr_periodic_sync_timer(struct event *t)
  *
  * loss_rate (double 0.0-1.0) is scaled to micro-units (×10^6) for the
  * uint32_t wire field, matching RFC 7471 millionths-of-loss convention.
+ *
+ * ===== 传播面单点 (3/3) = backend 替换边界 =====
+ * MIDR 的 "E-1 链路指标出口" 单点 (定义见下方 midr_e1_write_to_bgpls):
+ * 唯一从 PM 侧把链路性能写入 BGP-LS Link NLRI 的地方, 是三个 backend 替换
+ * 边界之一——将来 origination 移交第二组 (直接带 rtt/loss/bw+seqno 三元指标
+ * 由对方编码) 时在此换 backend。见 midr_propagate_self 头注释的完整三点说明。
  */
 struct peer *midr_node_established_peer(struct bgp *bgp,
 				       const struct prefix *node_id)
@@ -886,6 +952,42 @@ void midr_group_members(struct bgp *bgp, uint32_t group_id, struct list *out)
 	}
 }
 
+/*
+ * rep 目录推导（任务甲）：收集有资格进 REP_LIST 应答的节点——GROUP_REP 位
+ * + 活性 + 群号/ASN/transport 三字段可用。含 self（引导节点自兼群代表）。
+ * 不走 midr_node_get_locator 回落：router-id 可能不可路由，rep 目录是新
+ * 节点入网第一跳，宁缺毋黑洞（比 MEMBER_LIST 组装的回落处理更严）。
+ * `out` 收 borrowed 指针（list 归调用方，条目归 hash）。
+ * 目前唯一消费者 = midr_ctrl_build_rep_list；未来 bootstrap failover /
+ * 目录持久化复用。数据源随传播面 backend 迁移（现 = 自有收包路径灌的
+ * global_view，迁移后换第二组 remote view）。
+ */
+void midr_rep_candidates(struct bgp *bgp, struct list *out)
+{
+	struct midr_node_entry *entry;
+	time_t now = monotime(NULL);
+
+	if (!bgp || !bgp->midr_info || !out)
+		return;
+
+	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
+		if (!(entry->capabilities & MIDR_CAP_GROUP_REP))
+			continue;
+		/* 活性兜底；主防线是 expire 定时器删表（≤5s 扫描周期） */
+		if (!entry->is_self &&
+		    (now - entry->last_seen) > MIDR_NODE_EXPIRE_TIME)
+			continue;
+		if (entry->group_id == 0 || entry->asn == 0 ||
+		    !entry->has_transport_addr) {
+			MIDR_LOG("midr: rep 候选 %pI4 跳过 (group=%u asn=%u has_transport=%d)",
+				 &entry->node_id.u.prefix4, entry->group_id,
+				 entry->asn, entry->has_transport_addr);
+			continue;
+		}
+		listnode_add(out, entry);
+	}
+}
+
 /* ===========================================================================
  * Read-only getters (for external modules, e.g. ④ flooding control)
  * =========================================================================*/
@@ -923,11 +1025,12 @@ bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
 }
 
 /* ===========================================================================
- * New-node join (bootstrap) — hierarchical UDP discovery
+ * New-node join (bootstrap) — hierarchical discovery
  *
- * Stage 0: `midr bootstrap <IP> ...` -> REP_LIST_REQ to the bootstrap (UDP).
+ * Stage 0: `midr bootstrap <IP> ...` -> REP_LIST_REQ to the bootstrap (TCP
+ *          list exchange).
  * Stage 1 (midr_join_on_rep_list): probe reps (I-1), pick a group, then
- *          MEMBER_LIST_REQ to that group's representative.
+ *          MEMBER_LIST_REQ to that group's representative (TCP).
  * Stage 3 (in bgp_midr_ctrl.c, on MEMBER_LIST_RESP): connect every member
  *          (the representative included).
  * No BGP-LS session is opened to the bootstrap, so there is no full-table dump.
@@ -952,9 +1055,9 @@ void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 	mi->bootstrap_asn = asn;
 	mi->bootstrap_set = true;
 
-	/* Ask the bootstrap for its representative directory over UDP. */
+	/* Ask the bootstrap for its representative directory (TCP list exchange). */
 	midr_ctrl_send_rep_request(bgp, su->sin.sin_addr);
-	MIDR_FLOW_LOG("MIDR JOIN: sent REP_LIST_REQ to bootstrap %pSU (UDP discovery)",
+	MIDR_FLOW_LOG("MIDR JOIN: sent REP_LIST_REQ to bootstrap %pSU (TCP list exchange)",
 		  su);
 }
 

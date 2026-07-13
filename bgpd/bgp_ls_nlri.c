@@ -6048,6 +6048,17 @@ struct json_object *bgp_ls_attr_to_json(struct bgp_ls_attr *ls_attr)
 		json_object_object_add(json_ls_attr, "midrNodeCap", jcap);
 	}
 
+	/* MIDR Transport Address (TLV 1188) */
+	if (CHECK_FLAG(ls_attr->present_tlvs,
+		       BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
+		char taddr[INET_ADDRSTRLEN];
+
+		inet_ntop(AF_INET, &ls_attr->midr_transport_addr, taddr,
+			  sizeof(taddr));
+		json_object_string_add(json_ls_attr, "midrTransportAddr",
+				       taddr);
+	}
+
 	return json_ls_attr;
 }
 
@@ -6378,6 +6389,14 @@ void bgp_ls_attr_display(struct vty *vty, struct bgp_ls_attr *ls_attr)
 	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
 		CHECK_WRAP();
 		col += vty_out(vty, "MIDR Caps: 0x%08x", ls_attr->midr_node_caps);
+	}
+
+	/* MIDR Transport Address (TLV 1188) */
+	if (CHECK_FLAG(ls_attr->present_tlvs,
+		       BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
+		CHECK_WRAP();
+		col += vty_out(vty, "MIDR Transport: %pI4",
+			       &ls_attr->midr_transport_addr);
 	}
 
 	(void)col; /* Don't complain about last 'col +=' */

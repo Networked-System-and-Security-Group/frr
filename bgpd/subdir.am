@@ -59,6 +59,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_cl.c \
 	bgpd/bgp_midr_tlv.c \
 	bgpd/bgp_midr_ctrl.c \
+	bgpd/bgp_midr_ctrl_tcp.c \
 	bgpd/bgp_midr_vty.c \
 	bgpd/bgp_mac.c \
 	bgpd/bgp_memory.c \

@@ -115,7 +115,12 @@ struct midr_node_entry {
 	struct in_addr transport_addr;
 	bool has_transport_addr;
 	time_t last_seen;	/* last keepalive timestamp (local clock) */
-	bool is_group_rep;	/* node is a group representative */
+	/*
+	 * 接口设计文档 §2.3 规格字段，现实现未接线（全树零读写）——判断群
+	 * 代表一律用 capabilities & MIDR_CAP_GROUP_REP（rep 目录推导/闸门
+	 * 均如此）。裁撤或接线待与 CL owner 的 cap 位核对对话一并定。
+	 */
+	bool is_group_rep;
 	bool is_self;		/* this entry describes the local node */
 	/*
 	 * 是否为本节点的"邻居"：仅经 BGP-LS 泛洪收到（view-only）= false；
@@ -244,14 +249,22 @@ struct bgp_midr {
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */
 
-	/* === Control channel (peer-request UDP) — independent of PM ===
-	 * Own socket / port / message format; PM has its own.  See
-	 * bgp_midr_ctrl.{c,h}.
+	/* === Control channel — independent of PM ===
+	 * 端口 5859 上并存两条传输 (内核 TCP/UDP 端口空间独立):
+	 *  - UDP: PEER_REQUEST (反向建连 nudge) + ctrl_pending 重传队列;
+	 *  - TCP 短连接: REP_LIST / MEMBER_LIST 列表交换 (传输层在
+	 *    bgp_midr_ctrl_tcp.c)。
+	 * 各自 socket/格式，PM 另有自己的通道。见 bgp_midr_ctrl.{c,h}。
 	 */
 	int ctrl_sock;		   /* UDP socket fd, -1 when closed */
 	struct event *t_ctrl_read; /* read event on ctrl_sock */
 	struct list *ctrl_pending; /* struct midr_ctrl_pending (retransmit) */
 	struct event *t_ctrl_retx; /* PEER_REQUEST retransmit timer */
+
+	/* TCP 列表交换通道 (bgp_midr_ctrl_tcp.c 私有管理其内部 conn 结构) */
+	int ctrl_tcp_lsock;		 /* TCP 监听 fd, -1 when closed */
+	struct event *t_ctrl_tcp_accept; /* accept event on ctrl_tcp_lsock */
+	struct list *ctrl_tcp_conns;	 /* 活动 TCP 连接 (tcp.c 私有元素类型) */
 };
 
 /* ===========================================================================
@@ -265,7 +278,8 @@ extern void bgp_midr_finish(struct bgp *bgp);
  * NDS node table (migrated from the old bgp_midr_node.c)
  * =========================================================================*/
 
-/* Receive entry: update/insert from a Node NLRI (called from bgp_ls.c) */
+/* Receive entry: update/insert from a Node NLRI (called from bgp_ls.c).
+ * 传播面单点 (2/3) —— 收包入口 backend 替换边界; 完整说明见 bgp_midr.c 定义处。 */
 extern void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 				  struct bgp_ls_attr *ls_attr);
 
@@ -294,6 +308,9 @@ extern void midr_nds_set_group_id(struct bgp *bgp, uint32_t new_gid);
  * previously scattered across every bgp_ls_originate_bgp_node() call site.
  * The reason only drives logging (and future differentiation); it does not
  * change semantics, except LEAVE -> withdraw and everything else -> originate.
+ *
+ * 传播面单点 (1/3) —— 自通告出口 backend 替换边界; 完整三点说明见
+ * bgp_midr.c 的 midr_propagate_self() 定义处。
  */
 enum midr_origin_reason {
 	MIDR_ORIGIN_INIT,
@@ -362,6 +379,13 @@ extern void midr_join_on_rep_list(struct bgp *bgp);
  */
 extern void midr_group_members(struct bgp *bgp, uint32_t group_id,
 			       struct list *out);
+
+/*
+ * Collect borrowed pointers to nodes qualified for the served rep directory
+ * (REP_LIST): GROUP_REP bit + alive + usable group/asn/transport.  Includes
+ * self.  Single source of truth for the derived directory view (任务甲).
+ */
+extern void midr_rep_candidates(struct bgp *bgp, struct list *out);
 
 /* Group-representative directory (bootstrap config + learned). */
 extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
