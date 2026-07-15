@@ -10,6 +10,8 @@
 #                             connects (default: 5)
 #   --iperf-duration N        Duration of the iperf3 flow in seconds (default: 10)
 #   --iperf-bandwidth BW      Target UDP send rate, e.g. 10M, 100M (default: 10M)
+#   -d, --duration N          Stop the experiment automatically after N seconds
+#                             (default: unlimited — press Ctrl-C to stop)
 #   -c, --config FILE         Rattan TOML config (default: midr-pm-test.toml)
 #   -h, --help                Show this help
 
@@ -25,6 +27,7 @@ IPERF_ENABLE=0
 IPERF_START_TIME=5
 IPERF_DURATION=10
 IPERF_BANDWIDTH=10M
+DURATION=
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +42,9 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --iperf-bandwidth)
             IPERF_BANDWIDTH="$2"
+            shift 2 ;;
+        -d|--duration)
+            DURATION="$2"
             shift 2 ;;
         -c|--config)
             CONFIG="$2"
@@ -60,6 +66,19 @@ else
     echo "[run_test] iperf3 OFF"
 fi
 echo "[run_test] config: $CONFIG"
+if [ -n "$DURATION" ]; then
+    echo "[run_test] duration: ${DURATION}s (auto-stop)"
+else
+    echo "[run_test] duration: unlimited (press Ctrl-C to stop)"
+fi
 echo
 
-rattan run -c "$CONFIG" --left-stdout --right-stdout 2>&1 | tee "$SCRIPT_DIR/rattan.log"
+if [ -n "$DURATION" ]; then
+    # Send SIGINT first (same as a manual Ctrl-C) so rattan's own cleanup
+    # (tearing down namespaces, stopping bgpd) runs normally; force-kill
+    # only if it hasn't exited 10s after that.
+    timeout --signal=INT --kill-after=10 "$DURATION" \
+        rattan run -c "$CONFIG" --left-stdout --right-stdout 2>&1 | tee "$SCRIPT_DIR/rattan.log"
+else
+    rattan run -c "$CONFIG" --left-stdout --right-stdout 2>&1 | tee "$SCRIPT_DIR/rattan.log"
+fi
