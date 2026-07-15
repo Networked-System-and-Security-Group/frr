@@ -44,6 +44,13 @@ struct bgp;
 #define MIDR_PM_ALPHA_SHORT	    0.2  /* short-term EWMA decay */
 #define MIDR_PM_ALPHA_LONG	    0.05 /* long-term EWMA decay */
 
+/* Floor applied to loss before it's used as bw_score's divisor operand
+ * (sqrt(loss) in the denominator): loss -> 0 would blow bw_score up
+ * towards +inf, so clamp to a minimum of 1% instead of a near-zero
+ * epsilon. This caps bw_score at a finite, sane ceiling on very clean
+ * links instead of letting it explode. */
+#define MIDR_PM_BW_SCORE_LOSS_FLOOR 0.01
+
 /* Wire format: 20 bytes, network byte order */
 struct midr_probe_pkt {
 	uint32_t magic;	  /* MIDR_PM_PROBE_MAGIC */

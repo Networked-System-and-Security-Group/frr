@@ -6,8 +6,14 @@
  *   - One shared UDP socket bound to the local transport_addr (not INADDR_ANY)
  *   - Per-target probe contexts with their own probe/timeout timers
  *   - EWMA RTT (short-term α=0.2, long-term α=0.05)
- *   - Sliding-window loss rate (100 samples)
- *   - Bandwidth score: sqrt(1.5) / (rtt_s * sqrt(max(loss, 1e-6)))
+ *   - Sliding-window loss rate (100 samples): the window itself counts
+ *     round-trip (bidirectional) outcomes, since a single-socket probe
+ *     can't tell which leg dropped a lost round trip. pm_loss_rate()
+ *     converts that measured bidirectional rate L into a one-way estimate
+ *     p = 1 - sqrt(1-L), assuming both directions are equally lossy — this
+ *     one-way p is what's reported as loss_rate and used below.
+ *   - Bandwidth score: sqrt(1.5) / (rtt_s * sqrt(max(loss, MIDR_PM_BW_SCORE_LOSS_FLOOR))),
+ *     loss = one-way estimate above, floored at 1% so a clean link doesn't blow the score up
  *   - Fast-probe mode (200 ms) after 3 consecutive failures; normal (1 s) otherwise
  *   - Security: source IP validated against global_view before processing any packet
  *
@@ -24,6 +30,7 @@
 
 #include "log.h"
 #include "memory.h"
+#include "monotime.h"
 #include "prefix.h"
 #include "hash.h"
 #include "network.h"
@@ -75,7 +82,26 @@ static struct midr_probe_ctx *pm_ctx_find(struct bgp_midr *mi,
 	return hash_lookup(mi->probe_contexts, &key);
 }
 
-/* Compute the current loss rate from the sliding window. */
+/*
+ * Estimate the one-way (single-direction) loss rate from the sliding
+ * window of probe round-trips.
+ *
+ * What the sliding window actually counts is round-trip (bidirectional)
+ * outcomes: a sample is "received" only if the REQ made it to the
+ * responder AND the REP made it back — a loss on either leg looks
+ * identical (timeout) to the prober. So the raw window statistic is the
+ * *bidirectional* loss rate L, not the one-way loss rate of the link.
+ *
+ * Assuming both directions have the same one-way loss probability p
+ * (documented simplifying assumption — we have no way to distinguish
+ * forward/reverse loss from a single-socket round-trip probe):
+ *
+ *     L = 1 - (1-p)^2   =>   p = 1 - sqrt(1-L)
+ *
+ * This derived one-way p is what gets reported as loss_rate (short-term
+ * and long-term) and fed into bw_score — both are defined in terms of a
+ * single link direction, not a round trip.
+ */
 static double pm_loss_rate(const struct midr_probe_ctx *ctx)
 {
 	uint32_t total = ctx->loss_win_total < MIDR_PM_LOSS_WINDOW_SIZE
@@ -83,13 +109,19 @@ static double pm_loss_rate(const struct midr_probe_ctx *ctx)
 				 : MIDR_PM_LOSS_WINDOW_SIZE;
 	uint32_t received = 0;
 	uint32_t i;
+	double bidir_loss;
 
 	if (total == 0)
 		return 0.0;
 
 	for (i = 0; i < total; i++)
 		received += ctx->loss_win[i];
-	return 1.0 - (double)received / total;
+
+	bidir_loss = 1.0 - (double)received / total;
+
+	/* fmax() guards against a negative operand from floating-point
+	 * rounding when bidir_loss is exactly 1.0. */
+	return 1.0 - sqrt(fmax(0.0, 1.0 - bidir_loss));
 }
 
 /* Build and push an I-5 update to NDS. */
@@ -109,10 +141,18 @@ static void pm_push_i5(struct midr_probe_ctx *ctx,
 	st.loss_rate = loss;
 
 	/* Bandwidth score per stage1_design §2.2:
-	 *   score = sqrt(1.5) / (rtt_s * sqrt(max(loss, 1e-6))) */
+	 *   score = sqrt(1.5) / (rtt_s * sqrt(max(loss, MIDR_PM_BW_SCORE_LOSS_FLOOR)))
+	 *
+	 * loss is floored at 1% (not a near-zero epsilon) purely for this
+	 * division: as loss -> 0 the score would otherwise blow up towards
+	 * +inf on a clean link. The reported loss_rate itself (st.loss_rate /
+	 * lt.loss_rate below) is NOT clamped — only the value plugged into
+	 * this formula's denominator is. */
 	if (ctx->st_init && ctx->st_rtt_us > 0) {
 		rtt_s = ctx->st_rtt_us / 1e6;
-		bw_score = sqrt(1.5) / (rtt_s * sqrt(fmax(loss, 1e-6)));
+		bw_score = sqrt(1.5)
+			   / (rtt_s
+			      * sqrt(fmax(loss, MIDR_PM_BW_SCORE_LOSS_FLOOR)));
 		st.bw_score = (uint32_t)fmin(bw_score, (double)UINT32_MAX);
 	}
 
@@ -125,7 +165,8 @@ static void pm_push_i5(struct midr_probe_ctx *ctx,
 			rtt_s = ctx->lt_rtt_us / 1e6;
 			bw_score = sqrt(1.5)
 				   / (rtt_s
-				      * sqrt(fmax(ctx->lt_loss_rate, 1e-6)));
+				      * sqrt(fmax(ctx->lt_loss_rate,
+						  MIDR_PM_BW_SCORE_LOSS_FLOOR)));
 			lt.bw_score =
 				(uint32_t)fmin(bw_score, (double)UINT32_MAX);
 		}
@@ -278,6 +319,19 @@ static void midr_pm_probe_timer_fn(struct event *t)
  * Probes travel between transport_addrs (loopback IPs), not router-ids.
  * Falls back to comparing against node_id if no transport_addr is set.
  * O(n) — acceptable for a small peer set.
+ *
+ * A validated packet (REQ or REP) from a known source is itself a liveness
+ * signal, same reasoning as I-5's last_seen refresh in
+ * midr_nds_on_link_update() (bgp_midr.c) — but that refresh only covers the
+ * *prober's* view of a target it successfully probed. A "probe-only" peer
+ * that is purely a *responder* (e.g. a rep being probed by a joining node)
+ * never goes through that path for the requester's entry in its own
+ * global_view: midr_nds_learn_requester()/_learn_member() stamp last_seen
+ * once, at seed time, and nothing refreshes it afterwards even while probes
+ * keep arriving — so the entry silently expires (MIDR_NODE_EXPIRE_TIME,
+ * 15s) mid-test and every subsequent probe from that source gets rejected
+ * as "unknown transport", regardless of how recently it last sent one.
+ * Refreshing last_seen here, on every validated packet, closes that gap.
  */
 static bool pm_is_known_transport(struct bgp_midr *mi, struct in_addr addr)
 {
@@ -287,12 +341,16 @@ static bool pm_is_known_transport(struct bgp_midr *mi, struct in_addr addr)
 		if (entry->is_self)
 			continue;
 		if (entry->has_transport_addr) {
-			if (entry->transport_addr.s_addr == addr.s_addr)
+			if (entry->transport_addr.s_addr == addr.s_addr) {
+				entry->last_seen = monotime(NULL);
 				return true;
+			}
 		} else {
 			if (entry->node_id.family == AF_INET
-			    && entry->node_id.u.prefix4.s_addr == addr.s_addr)
+			    && entry->node_id.u.prefix4.s_addr == addr.s_addr) {
+				entry->last_seen = monotime(NULL);
 				return true;
+			}
 		}
 	}
 	return false;
