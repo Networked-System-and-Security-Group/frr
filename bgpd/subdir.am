@@ -61,6 +61,10 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_network.c \
 	bgpd/bgp_nexthop.c \
 	bgpd/bgp_nht.c \
+	bgpd/midr_ip2asn.c \
+	bgpd/midr_tier1.c \
+	bgpd/midr_tier1_vty.c \
+	bgpd/midr_trace_observer.c \
 	bgpd/bgp_open.c \
 	bgpd/bgp_packet.c \
 	bgpd/bgp_pbr.c \

@@ -67,6 +67,8 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
+#include "bgpd/midr_ip2asn.h"
+#include "bgpd/midr_tier1_vty.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
@@ -21902,6 +21904,9 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
+	if (midr_ip2asn_config_write(vty))
+		vty_out(vty, "!\n");
+
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
@@ -24561,6 +24566,9 @@ void bgp_vty_init(void)
 
 	/* "show bgp vrfs bestpath" command. */
 	install_element(VIEW_NODE, &show_bgp_vrf_bestpath_cmd);
+
+	/* MIDR application-layer underlay observation helpers. */
+	midr_tier1_vty_init();
 
 	/* Community-list. */
 	community_list_vty();
