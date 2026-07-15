@@ -52,8 +52,11 @@
 #define MIDR_PM_PROBE_INTERVAL	    10 /* periodic PM probe of connected nodes */
 /* Seconds to wait after I-1 before firing REP/MEMBER_PROBE_DONE.  Lets the
  * long-term EWMA (α=0.05) warm up enough for CL to see a clear difference
- * between good links (RTT ≪ 20 ms) and bad links (RTT ≫ 20 ms). */
-#define MIDR_JOIN_PROBE_WAIT_SECS   20
+ * between good links (RTT ≪ 20 ms) and bad links (RTT ≫ 20 ms). At α=0.05,
+ * 60 samples (60s at 1 probe/s) gives 1-0.95^60 ≈ 0.954 convergence, vs.
+ * 1-0.95^20 ≈ 0.641 at the old 20s — a wider safety margin between the good-
+ * and bad-link RTTs before CL evaluates. */
+#define MIDR_JOIN_PROBE_WAIT_SECS   60
 
 /* Forward declarations */
 struct bgp;

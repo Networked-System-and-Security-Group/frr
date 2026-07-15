@@ -123,6 +123,15 @@ extern void midr_ctrl_send_member_request(struct bgp *bgp,
 					  uint32_t group_id);
 
 /*
+ * New node -> an arbitrary candidate's transport address: one-way
+ * MIDR_CTRL_ANNOUNCE self-identification, no retransmit/response tracking.
+ * Lets the receiver recognise our subsequent PM probes as coming from a
+ * known source even though it never sent us a REP_LIST_REQ/MEMBER_LIST_REQ
+ * itself (e.g. a non-bootstrap rep in the representative directory).
+ */
+extern void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst);
+
+/*
  * Mark a qualifying connection into the topology graph.  Skeleton stub: the
  * real topology-graph bookkeeping lands in a later phase.
  */

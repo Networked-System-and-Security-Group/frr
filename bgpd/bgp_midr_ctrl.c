@@ -160,6 +160,23 @@ void midr_ctrl_send_member_request(struct bgp *bgp, struct in_addr rep_transport
 		  &rep_transport, group_id);
 }
 
+/*
+ * New node -> an arbitrary candidate (rep or member): self-announce so the
+ * receiver can validate our subsequent PM probes without an explicit
+ * request/response round trip. One-way, fire-and-forget — same frame as
+ * MIDR_CTRL_ANNOUNCE's existing use from midr_ctrl_recv_member_list(), just
+ * exposed for callers outside this file (e.g. midr_join_on_rep_list() in
+ * bgp_midr.c, which needs to announce to *every* rep in the directory, not
+ * only the bootstrap that already received a REP_LIST_REQ from us).
+ */
+void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
+{
+	if (!bgp || !bgp->midr_info)
+		return;
+	midr_ctrl_send_req(bgp->midr_info, dst, MIDR_CTRL_ANNOUNCE, 0);
+	MIDR_FLOW_LOG("midr_ctrl: sent ANNOUNCE to %pI4", &dst);
+}
+
 /* Drop all pending retransmits of a given request type (response arrived). */
 static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type)
 {

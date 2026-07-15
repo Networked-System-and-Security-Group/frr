@@ -671,7 +671,7 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 	 * NLRI 泛洪刷新，但"只探不连"阶段的候选成员（midr_nds_learn_member 灌入，
 	 * is_adjacent=true 但尚无 BGP-LS 会话）没有任何 NLRI 泛洪可刷新它——若不
 	 * 在这里补上，MIDR_NODE_EXPIRE_TIME（15s）会在 MIDR_JOIN_PROBE_WAIT_SECS
-	 * （20s）的 CL 评估窗口结束前就把这些条目过期删除，MEMBER_PROBE_DONE 到
+	 * （60s）的 CL 评估窗口结束前就把这些条目过期删除，MEMBER_PROBE_DONE 到
 	 * 时发现候选全部消失，误判为 0 条好链路。
 	 */
 	if (status == MIDR_LINK_UP) {
@@ -1070,6 +1070,20 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		entry->transport_addr = r->rep_transport;
 		entry->has_transport_addr = true;
 		entry->last_seen = monotime(NULL);
+
+		/*
+		 * Only the bootstrap rep (the one that received our
+		 * REP_LIST_REQ) already knows who we are — bootstrap != a
+		 * given rep in general (a rep_dir can list reps other than
+		 * the bootstrap itself, e.g. group 2's rep here). Any other
+		 * rep has never exchanged a single control message with us,
+		 * so its own global_view has no entry for us at all and
+		 * pm_is_known_transport() will reject every PM probe we send
+		 * it. Self-announce to each rep before I-1 starts probing so
+		 * midr_nds_learn_requester() seeds that entry up front
+		 * (harmless — and idempotent — if the rep already knows us).
+		 */
+		midr_ctrl_send_announce(bgp, r->rep_transport);
 
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
