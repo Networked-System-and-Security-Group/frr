@@ -6,15 +6,15 @@
 #   Group 1 (g1a-g1e): 3 ms  → PM long-term RTT ≈  3 ms  (< 20 ms threshold)
 #   Group 2 (g2a-g2b): 50 ms → PM long-term RTT ≈ 50 ms  (> 20 ms threshold)
 #
-# Expected result: newnode JOINs group 1 after ≈60 seconds.
-# Timing breakdown:
+# Expected result: newnode JOINs group 1 after ≈125 seconds.
+# Timing breakdown (MIDR_JOIN_PROBE_WAIT_SECS = 60):
 #   t=0    All nodes start; newnode sends REP_LIST_REQ immediately.
 #   t≈5    BGP-LS sessions establish; g1a builds full group-1 member list.
 #   t≈3    g1a replies to REP_LIST_REQ (or retry at t≈3 if g1a not ready yet).
-#   t≈23   REP_PROBE_DONE fires (20 s EWMA warm-up):
-#             g1a long-term RTT ≈ 1.9 ms  < g2a ≈ 32 ms → CL RECOMMEND group 1
-#   t≈23   NDS sends MEMBER_LIST_REQ; g1a replies with 5 members (g1a-g1e).
-#   t≈43   MEMBER_PROBE_DONE fires (20 s EWMA warm-up):
+#   t≈63   REP_PROBE_DONE fires (60 s EWMA warm-up):
+#             g1a long-term RTT ≈ 2.9 ms  < g2a ≈ 48 ms → CL RECOMMEND group 1
+#   t≈63   NDS sends MEMBER_LIST_REQ; g1a replies with 5 members (g1a-g1e).
+#   t≈123  MEMBER_PROBE_DONE fires (60 s EWMA warm-up):
 #             5 members × RTT < 20 ms → CL JOIN group 1
 #
 # Usage: sudo ./run_test.sh [--no-setup] [--timeout SECS]
@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
 TESTDIR="$SCRIPT_DIR"
-TIMEOUT=90   # seconds to wait for JOIN decision
+TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
 
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
