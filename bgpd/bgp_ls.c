@@ -779,9 +779,9 @@ int bgp_nlri_parse_ls(struct peer *peer, struct attr *attr, struct bgp_nlri *pac
 			bgp_withdraw(peer, &p, 0, packet->afi, packet->safi, ZEBRA_ROUTE_BGP,
 				     BGP_ROUTE_NORMAL, NULL, NULL, 0);
 
-			/* MIDR: graceful departure — a withdrawn Node NLRI means
-			 * that node left; remove it now instead of waiting for the
-			 * expire timer. */
+			/* MIDR: an ordinary path withdrawal is suspicion evidence.
+			 * Explicit graceful departure uses a separate LEAVE rumor.
+			 */
 			if (nlri->nlri_type == BGP_LS_NLRI_TYPE_NODE)
 				midr_nds_on_node_withdraw(peer->bgp, nlri);
 		}
@@ -972,7 +972,8 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 	struct bgp_ls_attr *ls_attr;
 	int ret;
 
-	if (!bgp || !bgp->ls_info || !bgp->ls_info->enable_distribution)
+	if (!bgp || !bgp->ls_info || !bgp->ls_info->enable_distribution ||
+	    (bgp->midr_info && bgp->midr_info->shutdown))
 		return 0;
 
 	nlri = bgp_ls_nlri_alloc();

@@ -7,7 +7,7 @@
  * interfaces (I-3 / I-5 / I-7) and the BGP-LS export (E-1).
  *
  * The node table is populated from BGP-LS Node NLRIs carrying TLV 1185 /
- * TLV 1187; two timers (keepalive / expire-check) keep it fresh.
+ * TLV 1187; the liveness module owns periodic refresh and confirmation.
  */
 
 #ifndef _FRR_BGP_MIDR_H
@@ -45,9 +45,9 @@
 	} while (0)
 
 /* Timer intervals (seconds) */
-#define MIDR_KEEPALIVE_INTERVAL	    5  /* re-originate self Node NLRI */
-#define MIDR_NODE_EXPIRE_TIME	   15  /* mark gone after this long */
-#define MIDR_EXPIRE_CHECK_INTERVAL  5  /* scan period for expired nodes */
+#define MIDR_KEEPALIVE_INTERVAL	    5  /* default self Node refresh */
+#define MIDR_NODE_EXPIRE_TIME	   15  /* default transition to SUSPECT */
+#define MIDR_EXPIRE_CHECK_INTERVAL  5  /* default node-table scan period */
 #define MIDR_PERIODIC_SYNC_INTERVAL 30 /* CL periodic re-evaluation */
 #define MIDR_PM_PROBE_INTERVAL	    10 /* periodic PM probe of connected nodes */
 
@@ -56,6 +56,7 @@ struct bgp;
 struct peer;
 struct bgp_ls_nlri;
 struct bgp_ls_attr;
+struct midr_liveness;
 
 /* ===========================================================================
  * Core data structures (see 接口实现文档 §2)
@@ -87,6 +88,21 @@ struct midr_link_entry {
 };
 
 PREDECL_HASH(midr_node_hash);
+
+/* A DEAD/LEAVE node has no stable table entry.  REMOVING only guards the
+ * short, re-entrant detach/free commit window.
+ */
+enum midr_node_liveness_state {
+	MIDR_NODE_ACTIVE = 0,
+	MIDR_NODE_SUSPECT = 1,
+	MIDR_NODE_REMOVING = 2, /* transient re-entrancy guard */
+};
+
+enum midr_node_suspect_cause {
+	MIDR_NODE_SUSPECT_NONE = 0,
+	MIDR_NODE_SUSPECT_TIMEOUT = (1U << 0),
+	MIDR_NODE_SUSPECT_WITHDRAW = (1U << 1),
+};
 
 /*
  * §2.3 One node in the global view.
@@ -129,6 +145,13 @@ struct midr_node_entry {
 	 * 本字段与 on_node_nlri 的逐字段更新正交，泛洪不会把它清掉。
 	 */
 	bool is_adjacent;
+
+	/* Liveness confirmation state.  SUSPECT keeps the entry, links and BGP
+	 * session intact, but excludes it from new protocol decisions.
+	 */
+	enum midr_node_liveness_state liveness_state;
+	uint8_t liveness_suspect_causes;
+	time_t suspect_since;
 
 	struct midr_node_hash_item hash_item;
 };
@@ -213,6 +236,7 @@ struct bgp_midr {
 
 	/* === NDS === */
 	struct midr_global_view *global_view;
+	struct midr_liveness *liveness; /* opaque failure-confirmation context */
 
 	/* === PM === */
 	struct hash *probe_contexts; /* prefix -> midr_probe_ctx (PM owns) */
@@ -236,7 +260,7 @@ struct bgp_midr {
 	struct event *t_periodic_sync; /* CL periodic re-evaluation */
 	struct event *t_probe_timeout; /* PM probe timeout */
 	struct event *t_keepalive;     /* re-originate self Node NLRI */
-	struct event *t_expire_check;  /* scan for expired nodes */
+	struct event *t_expire_check;  /* liveness scan/confirmation tick */
 	struct event *t_pm_probe;      /* periodic PM probe of connected nodes */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
@@ -251,7 +275,7 @@ struct bgp_midr {
 
 	/* === Control channel — independent of PM ===
 	 * 端口 5859 上并存两条传输 (内核 TCP/UDP 端口空间独立):
-	 *  - UDP: PEER_REQUEST (反向建连 nudge) + ctrl_pending 重传队列;
+	 *  - UDP: PEER_REQUEST + liveness 确认/Gossip;
 	 *  - TCP 短连接: REP_LIST / MEMBER_LIST 列表交换 (传输层在
 	 *    bgp_midr_ctrl_tcp.c)。
 	 * 各自 socket/格式，PM 另有自己的通道。见 bgp_midr_ctrl.{c,h}。
@@ -283,9 +307,20 @@ extern void bgp_midr_finish(struct bgp *bgp);
 extern void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 				  struct bgp_ls_attr *ls_attr);
 
-/* Remove entry on a Node NLRI WITHDRAW */
+/* Treat an ordinary Node NLRI WITHDRAW as suspicion evidence. */
 extern void midr_nds_on_node_withdraw(struct bgp *bgp,
 				      struct bgp_ls_nlri *nlri);
+
+/* Runtime removal is centralized here because NDS owns the node/link tables
+ * and their private memory types.  The operation is idempotent.
+ */
+enum midr_node_remove_cause {
+	MIDR_NODE_REMOVE_QUORUM_DEAD,
+	MIDR_NODE_REMOVE_GRACEFUL_LEAVE,
+};
+extern bool midr_nds_commit_node_remove(struct bgp *bgp,
+					const struct prefix *node_id,
+					enum midr_node_remove_cause cause);
 
 /* 把一个群成员（MEMBER_LIST_RESP）灌入 global_view、标记邻居并 I-1 探测 */
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,

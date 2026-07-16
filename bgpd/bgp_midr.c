@@ -3,8 +3,7 @@
  * MIDR core (NDS - Neighbor Discovery & Selection).
  *
  * Owns bgp->midr_info: the global view (node/link/group tables), the
- * node-table keepalive/expire timers (migrated from the old
- * bgp_midr_node.c), and the internal interfaces I-3 / I-5 / I-7 plus the
+ * node table, and the internal interfaces I-3 / I-5 / I-7 plus the
  * BGP-LS export E-1.
  *
  * Skeleton stage: node-table + timers are fully wired; PM/CL/E-1 bodies
@@ -25,6 +24,7 @@
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_ctrl.h"
+#include "bgpd/bgp_midr_liveness.h"
 #include "bgpd/bgp_midr_cl.h"
 #include "bgpd/bgp_midr_pm.h"
 #include "bgpd/bgp_midr_tlv.h"
@@ -170,6 +170,8 @@ static bool midr_discovery_filter(struct bgp *bgp, struct midr_node_entry *entry
 	(void)bgp;
 	if (entry->is_self)
 		return false;
+	if (!midr_liveness_node_usable(entry))
+		return false;
 	/* TODO：真实粗筛规则（暂为 stub）。 */
 	return true;
 }
@@ -185,7 +187,8 @@ static bool midr_discovery_should_peer(struct bgp *bgp,
 {
 	struct bgp_midr *mi = bgp->midr_info;
 
-	return entry->group_id != 0 && entry->group_id == mi->local_group_id;
+	return midr_liveness_node_usable(entry) && entry->group_id != 0 &&
+	       entry->group_id == mi->local_group_id;
 }
 
 /*
@@ -213,6 +216,36 @@ static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
 	entry->is_adjacent = false;
 	if (teardown_session)
 		midr_ctrl_on_node_remove(bgp, entry);
+}
+
+bool midr_nds_commit_node_remove(struct bgp *bgp,
+				 const struct prefix *node_id,
+				 enum midr_node_remove_cause cause)
+{
+	struct midr_global_view *gv;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *entry;
+	enum midr_stop_reason stop_reason;
+
+	if (!bgp || !bgp->midr_info || !node_id)
+		return false;
+	gv = bgp->midr_info->global_view;
+	prefix_copy(&key.node_id, node_id);
+	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!entry || entry->is_self ||
+	    entry->liveness_state == MIDR_NODE_REMOVING)
+		return false;
+
+	stop_reason = cause == MIDR_NODE_REMOVE_GRACEFUL_LEAVE
+			      ? MIDR_STOP_GRACEFUL_SHUTDOWN
+			      : MIDR_STOP_KEEPALIVE_TIMEOUT;
+	entry->liveness_state = MIDR_NODE_REMOVING;
+	midr_liveness_on_node_removed(bgp, &entry->node_id);
+	midr_nds_detach_node(bgp, entry, stop_reason, true);
+	midr_node_hash_del(&gv->nodes, entry);
+	XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
+	return true;
 }
 
 /*
@@ -290,6 +323,8 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 				 nlri->nlri_data.node.local_node.bgp_router_id);
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (entry && entry->liveness_state == MIDR_NODE_REMOVING)
+		return;
 	if (!entry) {
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
@@ -329,6 +364,7 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 
 	entry->last_seen = monotime(NULL);
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
+	midr_liveness_on_alive(bgp, entry);
 
 	/*
 	 * Receive-side reaction.  A keepalive refresh of an already-known node
@@ -344,32 +380,19 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	}
 }
 
-/* Remove a node entry on a Node NLRI WITHDRAW. */
+/* An ordinary path withdrawal is only suspicion evidence.  Explicit local
+ * departure is carried separately by GRACEFUL_LEAVE gossip.
+ */
 void midr_nds_on_node_withdraw(struct bgp *bgp, struct bgp_ls_nlri *nlri)
 {
-	struct midr_global_view *gv;
 	struct midr_node_entry key = {};
-	struct midr_node_entry *entry;
 
 	if (!bgp || !bgp->midr_info || !nlri)
 		return;
 
-	gv = bgp->midr_info->global_view;
 	midr_prefix_from_in_addr(&key.node_id,
 				 nlri->nlri_data.node.local_node.bgp_router_id);
-
-	entry = midr_node_hash_find(&gv->nodes, &key);
-	if (!entry)
-		return;
-
-	/* I-2 停探 + 清 link_entry + 拆动态会话（必须在删 node 之前，detach
-	 * 内部要读 entry 的 locator）。 */
-	midr_nds_detach_node(bgp, entry, MIDR_STOP_GRACEFUL_SHUTDOWN, true);
-	midr_node_hash_del(&gv->nodes, entry);
-	XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
-
-	/* I-3: node membership changed */
-	midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
+	midr_liveness_on_withdraw(bgp, &key.node_id);
 }
 
 /*
@@ -385,6 +408,7 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
 	struct prefix locator;
+	bool is_new = false;
 
 	if (!bgp || !bgp->midr_info)
 		return;
@@ -394,15 +418,29 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
 	if (!entry) {
+		if (!midr_liveness_indirect_discovery_allowed(bgp,
+							       &key.node_id)) {
+			MIDR_LOG("MIDR: ignore indirect rediscovery of removed member %pFX",
+				 &key.node_id);
+			return;
+		}
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
 		midr_node_hash_add(&gv->nodes, entry);
+		is_new = true;
 	}
+	if (entry->liveness_state == MIDR_NODE_REMOVING)
+		return;
 	entry->asn = asn;
 	entry->group_id = group_id;
 	entry->transport_addr = transport;
 	entry->has_transport_addr = true;
-	entry->last_seen = monotime(NULL);
+	/* MEMBER_LIST is discovery metadata, not a Node NLRI keepalive.  Give a
+	 * newly discovered member an initial grace window, but never let a
+	 * delayed list refresh or recover an existing SUSPECT node.
+	 */
+	if (is_new)
+		entry->last_seen = monotime(NULL);
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 	entry->is_adjacent = true; /* 成员表里的成员就是要建邻居的对象 */
 
@@ -445,6 +483,7 @@ void midr_nds_local_node_update(struct bgp *bgp)
 	}
 	entry->last_seen = monotime(NULL);
 	entry->is_self = true;
+	midr_liveness_on_alive(bgp, entry);
 }
 
 void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
@@ -515,6 +554,10 @@ void midr_propagate_self(struct bgp *bgp, enum midr_origin_reason reason)
 	mi = bgp->midr_info;
 
 	if (reason == MIDR_ORIGIN_LEAVE) {
+		/* Raw MP_UNREACH cannot distinguish a graceful origin leave from
+		 * ordinary path loss, so publish the explicit rumor first.
+		 */
+		midr_liveness_publish_leave(bgp);
 		bgp_ls_withdraw_bgp_node(bgp);
 	} else {
 		if (mi->shutdown) {
@@ -534,56 +577,6 @@ void midr_propagate_self(struct bgp *bgp, enum midr_origin_reason reason)
 /* ===========================================================================
  * Timers
  * =========================================================================*/
-
-/*
- * Expire-check timer: drop remote nodes not refreshed within the expiry
- * window.  Staleness is measured purely on the local clock (last_seen is
- * stamped at receive time), so cross-node clock skew is irrelevant.
- */
-static void midr_expire_check_timer(struct event *t)
-{
-	struct bgp *bgp = EVENT_ARG(t);
-	struct bgp_midr *mi = bgp->midr_info;
-	struct midr_node_entry *entry;
-	time_t now = monotime(NULL);
-
-	frr_each_safe (midr_node_hash, &mi->global_view->nodes, entry) {
-		if (entry->is_self)
-			continue;
-		if (now - entry->last_seen > MIDR_NODE_EXPIRE_TIME) {
-			if (BGP_DEBUG(midr, MIDR))
-				zlog_debug("MIDR: node %pFX (group %u) expired",
-					   &entry->node_id, entry->group_id);
-			/* I-2 停探 + 清 link_entry + 拆动态会话（删 node 之前）。 */
-			midr_nds_detach_node(bgp, entry,
-					     MIDR_STOP_KEEPALIVE_TIMEOUT, true);
-			midr_node_hash_del(&mi->global_view->nodes, entry);
-			XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
-			/* I-3: node membership changed */
-			midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
-		}
-	}
-
-	event_add_timer(bm->master, midr_expire_check_timer, bgp,
-			MIDR_EXPIRE_CHECK_INTERVAL, &mi->t_expire_check);
-}
-
-/*
- * Keepalive timer: re-originate the local Node NLRI (TLV 1185/1187) so
- * remote nodes keep our entry fresh.
- */
-static void midr_keepalive_timer(struct event *t)
-{
-	struct bgp *bgp = EVENT_ARG(t);
-	struct bgp_midr *mi = bgp->midr_info;
-
-	/* The shutdown guard lives in midr_propagate_self() now, so a graceful
-	 * `midr shutdown` is not undone by this 5s refresh. */
-	midr_propagate_self(bgp, MIDR_ORIGIN_KEEPALIVE);
-
-	event_add_timer(bm->master, midr_keepalive_timer, bgp,
-			MIDR_KEEPALIVE_INTERVAL, &mi->t_keepalive);
-}
 
 /*
  * Periodic-sync timer: hand the global view to CL for a full re-evaluation
@@ -946,6 +939,8 @@ void midr_group_members(struct bgp *bgp, uint32_t group_id, struct list *out)
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
 		if (entry->is_self)
 			continue;
+		if (!midr_liveness_node_usable(entry))
+			continue;
 		if (entry->group_id != group_id)
 			continue;
 		listnode_add(out, entry);
@@ -965,7 +960,6 @@ void midr_group_members(struct bgp *bgp, uint32_t group_id, struct list *out)
 void midr_rep_candidates(struct bgp *bgp, struct list *out)
 {
 	struct midr_node_entry *entry;
-	time_t now = monotime(NULL);
 
 	if (!bgp || !bgp->midr_info || !out)
 		return;
@@ -973,9 +967,9 @@ void midr_rep_candidates(struct bgp *bgp, struct list *out)
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
 		if (!(entry->capabilities & MIDR_CAP_GROUP_REP))
 			continue;
-		/* 活性兜底；主防线是 expire 定时器删表（≤5s 扫描周期） */
-		if (!entry->is_self &&
-		    (now - entry->last_seen) > MIDR_NODE_EXPIRE_TIME)
+		if (entry->is_self && bgp->midr_info->shutdown)
+			continue;
+		if (!midr_liveness_node_usable(entry))
 			continue;
 		if (entry->group_id == 0 || entry->asn == 0 ||
 		    !entry->has_transport_addr) {
@@ -1017,7 +1011,7 @@ bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
 
 	prefix_copy(&key.node_id, node_id);
 	entry = midr_node_hash_find(&bgp->midr_info->global_view->nodes, &key);
-	if (!entry)
+	if (!entry || !midr_liveness_node_usable(entry))
 		return false;
 
 	*out = entry->group_id;
@@ -1089,6 +1083,8 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
 		struct prefix locator;
 
+		if (!midr_liveness_transport_usable(bgp, r->rep_transport))
+			continue;
 		midr_prefix_from_in_addr(&locator, r->rep_transport);
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
@@ -1126,17 +1122,16 @@ void bgp_midr_init(struct bgp *bgp)
 	/* CL registers its global-view callback */
 	midr_cl_init(bgp);
 
+	/* Create liveness state before opening its shared UDP ingress. */
+	midr_liveness_init(bgp);
+
 	/* Open the peer-request UDP control channel (bidirectional build-up) */
 	midr_ctrl_init(bgp);
 
 	/* PM arms its periodic probe-of-connected-nodes timer (I-1 loop) */
 	midr_pm_init(bgp);
 
-	/* Arm node-table keepalive / expire-check + CL periodic-sync timers */
-	event_add_timer(bm->master, midr_keepalive_timer, bgp,
-			MIDR_KEEPALIVE_INTERVAL, &mi->t_keepalive);
-	event_add_timer(bm->master, midr_expire_check_timer, bgp,
-			MIDR_EXPIRE_CHECK_INTERVAL, &mi->t_expire_check);
+	/* Liveness owns keepalive plus the expire/confirmation tick. */
 	event_add_timer(bm->master, midr_periodic_sync_timer, bgp,
 			MIDR_PERIODIC_SYNC_INTERVAL, &mi->t_periodic_sync);
 
@@ -1153,8 +1148,6 @@ void bgp_midr_finish(struct bgp *bgp)
 
 	mi = bgp->midr_info;
 
-	event_cancel(&mi->t_keepalive);
-	event_cancel(&mi->t_expire_check);
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);
 
@@ -1163,6 +1156,9 @@ void bgp_midr_finish(struct bgp *bgp)
 
 	/* Close the peer-request UDP control channel */
 	midr_ctrl_finish(bgp);
+
+	/* Cancel confirmation/GC tick and release rounds after ingress closes. */
+	midr_liveness_finish(bgp);
 
 	midr_global_view_free(mi->global_view);
 	if (mi->rep_dir) {

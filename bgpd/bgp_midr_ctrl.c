@@ -6,8 +6,8 @@
  * peer FSM (peer_remote_as / peer_delete) accordingly.
  *
  * 控制通道双传输 (端口 5859, 语义在此、TCP 传输在 bgp_midr_ctrl_tcp.c):
- *  - UDP: PEER_REQUEST —— 新节点选群后向各群成员 transport 单播 "请反向建连"
- *    通知, 成员反向发起多跳 eBGP, 双向建立 (独立于 PM 探测通道)。
+ *  - UDP: PEER_REQUEST + liveness —— 前者驱动反向建连，后者只在独立
+ *    bgp_midr_liveness.c 中处理确认与 Gossip 语义 (独立于 PM 探测通道)。
  *  - TCP 短连接: REP_LIST / MEMBER_LIST 列表交换 —— 本文件负责消息构造 / 资格
  *    闸门 / 列表内容组装 (on_tcp_request/on_tcp_response 回调), 连接机制在
  *    bgp_midr_ctrl_tcp.c。载荷随规模增长撞 UDP 尺寸墙故迁 TCP, 决策见
@@ -29,6 +29,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_ctrl.h"
+#include "bgpd/bgp_midr_liveness.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_PENDING, "MIDR ctrl pending peer-request");
 
@@ -41,7 +42,7 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_PENDING, "MIDR ctrl pending peer-request");
 
 static void midr_ctrl_send_req(struct bgp_midr *mi, struct in_addr dst,
 			       uint8_t type, uint32_t target_group);
-static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
+static bool midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 				      uint8_t type, uint32_t target_group);
 static void midr_ctrl_send_peer_request(struct bgp *bgp,
 					const struct midr_node_entry *entry);
@@ -73,6 +74,14 @@ const char *midr_ctrl_msg_type_str(uint8_t type)
 		return "MEMBER_LIST_REQ";
 	case MIDR_CTRL_MEMBER_LIST_RESP:
 		return "MEMBER_LIST_RESP";
+	case MIDR_LIVENESS_PROBE_REQ:
+		return "PROBE_REQ";
+	case MIDR_LIVENESS_PROBE_RESP:
+		return "PROBE_RESP";
+	case MIDR_LIVENESS_DEAD:
+		return "DEAD";
+	case MIDR_LIVENESS_GRACEFUL_LEAVE:
+		return "GRACEFUL_LEAVE";
 	default:
 		return "UNKNOWN";
 	}
@@ -100,6 +109,38 @@ void midr_ctrl_fill_msg(struct bgp *bgp, struct midr_ctrl_msg *msg, uint8_t type
 	msg->target_group = htonl(target_group);
 }
 
+int midr_ctrl_udp_send(struct bgp *bgp,
+		       const struct sockaddr_in *destination,
+		       const void *payload, size_t length)
+{
+	struct bgp_midr *mi;
+	ssize_t sent;
+
+	if (!bgp || !bgp->midr_info || !destination || !payload ||
+	    destination->sin_family != AF_INET || destination->sin_port == 0 ||
+	    length == 0 || length > MIDR_LIVENESS_MAX_WIRE_SIZE)
+		return -1;
+	mi = bgp->midr_info;
+	if (mi->ctrl_sock < 0)
+		return -1;
+
+	sent = sendto(mi->ctrl_sock, payload, length, MSG_DONTWAIT,
+		      (const struct sockaddr *)destination,
+		      sizeof(*destination));
+	if (sent < 0) {
+		if (!ERRNO_IO_RETRY(errno))
+			zlog_warn("midr_ctrl: UDP sendto %pI4 failed: %s",
+				  &destination->sin_addr, safe_strerror(errno));
+		return -1;
+	}
+	if ((size_t)sent != length) {
+		zlog_warn("midr_ctrl: UDP short send to %pI4 (%zd/%zu)",
+			  &destination->sin_addr, sent, length);
+		return -1;
+	}
+	return 0;
+}
+
 /* Low-level send: build a request frame (PEER_REQUEST / REP_LIST_REQ /
  * MEMBER_LIST_REQ) carrying our identity and unicast it. */
 static void midr_ctrl_send_req(struct bgp_midr *mi, struct in_addr dst,
@@ -117,10 +158,7 @@ static void midr_ctrl_send_req(struct bgp_midr *mi, struct in_addr dst,
 	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
 	sa.sin_addr = dst;
 
-	if (sendto(mi->ctrl_sock, &msg, sizeof(msg), 0, (struct sockaddr *)&sa,
-		   sizeof(sa)) < 0)
-		zlog_warn("midr_ctrl: request type %u sendto %pI4 failed: %s",
-			  type, &dst, safe_strerror(errno));
+	midr_ctrl_udp_send(mi->bgp, &sa, &msg, sizeof(msg));
 }
 
 /*
@@ -139,7 +177,7 @@ static void midr_ctrl_request_attempt(struct bgp *bgp, struct in_addr dst,
 }
 
 /* Send a request once and enqueue (or refresh) a retransmit keyed by (dst,type). */
-static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
+static bool midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 				      uint8_t type, uint32_t target_group)
 {
 	struct bgp_midr *mi = bgp->midr_info;
@@ -149,7 +187,12 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 	if (!mi->transport_addr_set) {
 		zlog_warn("midr_ctrl: local transport-address unset; cannot send request type %u",
 			  type);
-		return;
+		return false;
+	}
+	if (!midr_liveness_transport_usable(bgp, dst)) {
+		MIDR_LOG("midr_ctrl: refusing %s to quarantined transport %pI4",
+			 midr_ctrl_msg_type_str(type), &dst);
+		return false;
 	}
 
 	midr_ctrl_request_attempt(bgp, dst, type, target_group);
@@ -159,7 +202,7 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 		    p->type == type) {
 			p->target_group = target_group;
 			p->retries_left = MIDR_CTRL_RETX_MAX;
-			return;
+			return true;
 		}
 
 	p = XCALLOC(MTYPE_MIDR_CTRL_PENDING, sizeof(*p));
@@ -172,6 +215,7 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 	if (!mi->t_ctrl_retx)
 		event_add_timer(bm->master, midr_ctrl_retx_timer, bgp,
 				MIDR_CTRL_RETX_INTERVAL, &mi->t_ctrl_retx);
+	return true;
 }
 
 /* New node -> bootstrap: request the representative directory. */
@@ -180,9 +224,10 @@ void midr_ctrl_send_rep_request(struct bgp *bgp,
 {
 	if (!bgp || !bgp->midr_info)
 		return;
-	midr_ctrl_enqueue_request(bgp, bootstrap_transport,
-				  MIDR_CTRL_REP_LIST_REQ, 0);
-	MIDR_FLOW_LOG("midr_ctrl: sent REP_LIST_REQ to %pI4", &bootstrap_transport);
+	if (midr_ctrl_enqueue_request(bgp, bootstrap_transport,
+				      MIDR_CTRL_REP_LIST_REQ, 0))
+		MIDR_FLOW_LOG("midr_ctrl: sent REP_LIST_REQ to %pI4",
+			      &bootstrap_transport);
 }
 
 /* New node -> representative: request the group's member list (table A). */
@@ -191,10 +236,10 @@ void midr_ctrl_send_member_request(struct bgp *bgp, struct in_addr rep_transport
 {
 	if (!bgp || !bgp->midr_info)
 		return;
-	midr_ctrl_enqueue_request(bgp, rep_transport, MIDR_CTRL_MEMBER_LIST_REQ,
-				  group_id);
-	MIDR_FLOW_LOG("midr_ctrl: sent MEMBER_LIST_REQ to %pI4 (group %u)",
-		  &rep_transport, group_id);
+	if (midr_ctrl_enqueue_request(bgp, rep_transport,
+				      MIDR_CTRL_MEMBER_LIST_REQ, group_id))
+		MIDR_FLOW_LOG("midr_ctrl: sent MEMBER_LIST_REQ to %pI4 (group %u)",
+			      &rep_transport, group_id);
 }
 
 /* Drop all pending retransmits of a given request type (response arrived). */
@@ -224,10 +269,11 @@ static void midr_ctrl_send_peer_request(struct bgp *bgp,
 	if (locator.family != AF_INET)
 		return;
 
-	midr_ctrl_enqueue_request(bgp, locator.u.prefix4,
-				  MIDR_CTRL_PEER_REQUEST, mi->local_group_id);
-	MIDR_FLOW_LOG("midr_ctrl: sent PEER_REQUEST to %pI4 (group %u)",
-		  &locator.u.prefix4, mi->local_group_id);
+	if (midr_ctrl_enqueue_request(bgp, locator.u.prefix4,
+				      MIDR_CTRL_PEER_REQUEST,
+				      mi->local_group_id))
+		MIDR_FLOW_LOG("midr_ctrl: sent PEER_REQUEST to %pI4 (group %u)",
+			      &locator.u.prefix4, mi->local_group_id);
 }
 
 /*
@@ -244,6 +290,15 @@ static void midr_ctrl_retx_timer(struct event *t)
 	struct midr_ctrl_pending *p;
 
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p)) {
+		if (!midr_liveness_transport_usable(bgp,
+						      p->target_transport)) {
+			MIDR_LOG("midr_ctrl: cancel pending %s to SUSPECT transport %pI4",
+				 midr_ctrl_msg_type_str(p->type),
+				 &p->target_transport);
+			list_delete_node(mi->ctrl_pending, node);
+			XFREE(MTYPE_MIDR_CTRL_PENDING, p);
+			continue;
+		}
 		if (p->type == MIDR_CTRL_PEER_REQUEST) {
 			union sockunion su;
 			struct peer *peer;
@@ -359,6 +414,11 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 			zlog_warn("midr_ctrl: rep directory exceeds 65535 — REP_LIST_RESP truncated");
 			break;
 		}
+		/* Preserve unknown/manual bootstrap entries, but quarantine a
+		 * directory locator that maps to a known SUSPECT node.
+		 */
+		if (!midr_liveness_transport_usable(bgp, r->rep_transport))
+			continue;
 		item.group_id = htonl(r->group_id);
 		item.rep_transport = r->rep_transport;
 		item.rep_asn = htonl((uint32_t)r->rep_asn);
@@ -575,9 +635,15 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 {
 	struct bgp_midr *mi = bgp->midr_info;
 	struct midr_ctrl_msg msg;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *known;
 
 	if (!mi)
 		return NULL;
+	if (mi->shutdown) {
+		MIDR_LOG("midr_ctrl: ignoring TCP list request while MIDR is shut down");
+		return NULL;
+	}
 	if (len != sizeof(msg)) {
 		MIDR_LOG("midr_ctrl: TCP request bad length %zu (want %zu) from %pI4",
 			 len, sizeof(msg), &remote);
@@ -586,6 +652,19 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 	memcpy(&msg, payload, sizeof(msg));
 	if (msg.version != MIDR_CTRL_MSG_VERSION)
 		return NULL;
+	key.node_id.family = AF_INET;
+	key.node_id.prefixlen = IPV4_MAX_BITLEN;
+	key.node_id.u.prefix4 = msg.requester_rid;
+	known = midr_node_hash_find(&mi->global_view->nodes, &key);
+	if ((known && !midr_liveness_node_usable(known)) ||
+	    (!known &&
+	     (!midr_liveness_indirect_discovery_allowed(bgp, &key.node_id) ||
+	      !midr_liveness_transport_usable(bgp,
+						msg.requester_transport)))) {
+		MIDR_LOG("midr_ctrl: ignoring list request from quarantined node %pFX",
+			 &key.node_id);
+		return NULL;
+	}
 
 	switch (msg.type) {
 	case MIDR_CTRL_REP_LIST_REQ:
@@ -627,10 +706,16 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
  * 配对校验, 防串台); 转现有 recv_rep_list / recv_member_list 灌视图 + 推进 join。
  */
 void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
-			       const uint8_t *payload, size_t len)
+			       const uint8_t *payload, size_t len,
+			       struct in_addr remote)
 {
 	const struct midr_ctrl_list_hdr *hdr;
 
+	if (!midr_liveness_transport_usable(bgp, remote)) {
+		MIDR_LOG("midr_ctrl: ignoring TCP response from quarantined transport %pI4",
+			 &remote);
+		return;
+	}
 	if (len < sizeof(*hdr)) {
 		MIDR_LOG("midr_ctrl: TCP response too short (%zu)", len);
 		return;
@@ -662,28 +747,44 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 	}
 }
 
-/* Read one control datagram and dispatch on its type.  UDP now only carries
- * PEER_REQUEST (20B); list exchange (REP/MEMBER_LIST) moved to TCP. */
+/* Read one control datagram and dispatch on its type.  UDP carries the fixed
+ * PEER_REQUEST plus liveness confirmation/gossip; list exchange remains TCP.
+ */
 static void midr_ctrl_udp_recv(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	struct bgp_midr *mi = bgp->midr_info;
-	uint8_t buf[sizeof(struct midr_ctrl_msg)];
+	uint8_t buf[MIDR_LIVENESS_MAX_WIRE_SIZE];
 	struct midr_ctrl_msg msg;
+	struct sockaddr_in from = {};
+	struct iovec iov = {
+		.iov_base = buf,
+		.iov_len = sizeof(buf),
+	};
+	struct msghdr msgh = {
+		.msg_name = &from,
+		.msg_namelen = sizeof(from),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
 	ssize_t n;
 
 	/* Keep listening regardless of how this datagram is handled. */
 	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, mi->ctrl_sock,
 		       &mi->t_ctrl_read);
 
-	n = recvfrom(mi->ctrl_sock, buf, sizeof(buf), 0, NULL, NULL);
+	n = recvmsg(mi->ctrl_sock, &msgh, MSG_DONTWAIT);
 	if (n < 2) {
-		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		if (n < 0 && !ERRNO_IO_RETRY(errno))
 			zlog_warn("midr_ctrl: recvfrom failed: %s",
 				  safe_strerror(errno));
 		return;
 	}
+	if ((msgh.msg_flags & MSG_TRUNC) || from.sin_family != AF_INET)
+		return;
 	if (buf[0] != MIDR_CTRL_MSG_VERSION)
+		return;
+	if (midr_liveness_handle_ctrl(bgp, buf, (size_t)n, &from))
 		return;
 
 	switch (buf[1]) {
@@ -691,7 +792,7 @@ static void midr_ctrl_udp_recv(struct event *t)
 		uint32_t target_group;
 		struct midr_node_entry req = {};
 
-		if (n < (ssize_t)sizeof(msg))
+		if (n != (ssize_t)sizeof(msg))
 			return;
 		memcpy(&msg, buf, sizeof(msg));
 		target_group = ntohl(msg.target_group);
@@ -716,7 +817,7 @@ static void midr_ctrl_udp_recv(struct event *t)
 		req.transport_addr = msg.requester_transport;
 		req.has_transport_addr = true;
 
-		MIDR_FLOW_LOG("midr_ctrl: PEER_REQUEST from rid %pI4 transport %pI4 AS %u group %u — peering back",
+		MIDR_FLOW_LOG("midr_ctrl: PEER_REQUEST rid %pI4 transport %pI4 AS %u group %u",
 			  &msg.requester_rid, &msg.requester_transport,
 			  (unsigned int)req.asn, target_group);
 
@@ -757,6 +858,12 @@ void midr_ctrl_init(struct bgp *bgp)
 	if (sock < 0) {
 		zlog_warn("midr_ctrl: UDP socket() failed: %s",
 			  safe_strerror(errno));
+		return;
+	}
+	if (set_cloexec(sock) < 0) {
+		zlog_warn("midr_ctrl: UDP set_cloexec() failed: %s",
+			  safe_strerror(errno));
+		close(sock);
 		return;
 	}
 	sockopt_reuseaddr(sock);
@@ -812,9 +919,36 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 {
 	union sockunion su;
 	struct prefix locator;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *known;
 	struct peer *peer;
-	as_t asn = entry->asn;
+	as_t asn;
 	int ret;
+
+	if (!bgp || !bgp->midr_info || !entry || bgp->midr_info->shutdown)
+		return;
+	asn = entry->asn;
+	midr_node_get_locator(entry, &locator);
+
+	/* A transient PEER_REQUEST entry may bypass the node table.  Allow an
+	 * unknown joiner unless a recent DEAD/LEAVE quarantines its identity or
+	 * locator; never recreate a session for a known SUSPECT.
+	 */
+	prefix_copy(&key.node_id, &entry->node_id);
+	known = midr_node_hash_find(&bgp->midr_info->global_view->nodes, &key);
+	if (known && !midr_liveness_node_usable(known)) {
+		MIDR_LOG("midr_ctrl: skip peering with SUSPECT node %pFX",
+			 &entry->node_id);
+		return;
+	}
+	if (!known &&
+	    (!midr_liveness_indirect_discovery_allowed(bgp, &entry->node_id) ||
+	     locator.family != AF_INET ||
+	     !midr_liveness_transport_usable(bgp, locator.u.prefix4))) {
+		MIDR_LOG("midr_ctrl: skip recently removed unknown node %pFX",
+			 &entry->node_id);
+		return;
+	}
 
 	if (asn == 0) {
 		zlog_warn("midr_ctrl: skipping %pFX — ASN not yet known",
@@ -824,7 +958,6 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 
 	/* Peer with the node's real reachable address (TLV 1188), not its
 	 * router-id; router-id is only an identity and may be unroutable. */
-	midr_node_get_locator(entry, &locator);
 	prefix2sockunion(&locator, &su);
 
 	/*
@@ -848,7 +981,10 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 		return;
 	}
 
-	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
+	/* AS_SPECIFIED naturally creates iBGP for the same ASN and eBGP for a
+	 * different ASN; both cases are permitted by MIDR.
+	 */
+	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_SPECIFIED, NULL);
 	if (ret != 0) {
 		zlog_warn("midr_ctrl: peer_remote_as(%pFX AS %u) failed: %d",
 			  &entry->node_id, asn, ret);
@@ -863,7 +999,8 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	if (peer) {
 		struct bgp_midr *mi = bgp->midr_info;
 
-		peer_ebgp_multihop_set(peer, MAXTTL);
+		if (asn != bgp->as)
+			peer_ebgp_multihop_set(peer, MAXTTL);
 		/* Activate BGP-LS so topology info flows directly between
 		 * MIDR peers, not only via relay nodes. */
 		peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
@@ -922,6 +1059,19 @@ static void midr_try_disconnect(struct bgp *bgp,
 
 void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
 {
+	struct bgp_midr *mi = bgp->midr_info;
+	struct listnode *node, *next;
+	struct midr_ctrl_pending *pending;
+	struct prefix locator;
+
+	midr_node_get_locator(entry, &locator);
+	if (locator.family == AF_INET && mi->ctrl_pending)
+		for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, next, pending))
+			if (IPV4_ADDR_SAME(&pending->target_transport,
+					   &locator.u.prefix4)) {
+				list_delete_node(mi->ctrl_pending, node);
+				XFREE(MTYPE_MIDR_CTRL_PENDING, pending);
+			}
 	midr_try_disconnect(bgp, entry);
 }
 
@@ -944,6 +1094,8 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id)
 
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
 		if (entry->is_self)
+			continue;
+		if (!midr_liveness_node_usable(entry))
 			continue;
 		if (entry->group_id != group_id)
 			continue;

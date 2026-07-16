@@ -13,6 +13,7 @@
 #include "zebra.h"
 
 #include "command.h"
+#include "hook.h"
 #include "vty.h"
 #include "log.h"
 #include "sockunion.h"
@@ -23,11 +24,11 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_ctrl.h"
+#include "bgpd/bgp_midr_liveness.h"
 #include "bgpd/bgp_midr_vty.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_table.h"
-#include "monotime.h"
 
 /* ------------------------------------------------------------------ */
 /* midr group-id <N>                                                   */
@@ -77,7 +78,7 @@ DEFUN(midr_neighbor,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
+	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_SPECIFIED, NULL);
 	if (ret != 0) {
 		vty_out(vty, "%% Failed to add neighbor %s (err %d)\n",
 			argv[2]->arg, ret);
@@ -86,7 +87,8 @@ DEFUN(midr_neighbor,
 
 	struct peer *peer = peer_lookup(bgp, &su);
 	if (peer) {
-		peer_ebgp_multihop_set(peer, MAXTTL);
+		if (asn != bgp->as)
+			peer_ebgp_multihop_set(peer, MAXTTL);
 		peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
 	}
 
@@ -420,6 +422,151 @@ DEFUN(no_midr_shutdown,
 }
 
 /* ------------------------------------------------------------------ */
+/* MIDR liveness configuration                                        */
+/* ------------------------------------------------------------------ */
+
+static int midr_liveness_apply_vty(struct vty *vty, struct bgp *bgp,
+				   const struct midr_liveness_config *config)
+{
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	if (!midr_liveness_set_config(bgp, config)) {
+		vty_out(vty,
+			"%% Invalid MIDR liveness configuration: suspect must exceed keepalive, scan must not exceed suspect, and quorum must be a strict majority\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	return CMD_SUCCESS;
+}
+
+DEFUN(midr_liveness_timers,
+      midr_liveness_timers_cmd,
+      "midr liveness timers keepalive (1-3600) suspect (2-7200) scan (1-3600) confirm (1-300) retry (1-300)",
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Configure liveness timers atomically\n"
+      "BGP-LS Node keepalive interval\n"
+      "Seconds\n"
+      "Age that moves a node to SUSPECT\n"
+      "Seconds\n"
+      "Node-table scan interval\n"
+      "Seconds\n"
+      "Indirect confirmation timeout\n"
+      "Seconds\n"
+      "Retry backoff after an inconclusive round\n"
+      "Seconds\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config;
+
+	midr_liveness_get_config(bgp, &config);
+	config.keepalive_interval = strtoul(argv[4]->arg, NULL, 10);
+	config.suspect_timeout = strtoul(argv[6]->arg, NULL, 10);
+	config.scan_interval = strtoul(argv[8]->arg, NULL, 10);
+	config.confirm_timeout = strtoul(argv[10]->arg, NULL, 10);
+	config.retry_backoff = strtoul(argv[12]->arg, NULL, 10);
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+DEFUN(no_midr_liveness_timers,
+      no_midr_liveness_timers_cmd,
+      "no midr liveness timers",
+      NO_STR
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Restore default liveness timers\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config, defaults;
+
+	midr_liveness_get_config(bgp, &config);
+	midr_liveness_config_defaults(&defaults);
+	config.keepalive_interval = defaults.keepalive_interval;
+	config.suspect_timeout = defaults.suspect_timeout;
+	config.scan_interval = defaults.scan_interval;
+	config.confirm_timeout = defaults.confirm_timeout;
+	config.retry_backoff = defaults.retry_backoff;
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+DEFUN(midr_liveness_voting,
+      midr_liveness_voting_cmd,
+      "midr liveness voting sample-size (2-16) quorum (2-16)",
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Configure indirect voting\n"
+      "Maximum stable voter sample\n"
+      "Number of voters\n"
+      "Required STALE votes\n"
+      "Number of votes\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config;
+
+	midr_liveness_get_config(bgp, &config);
+	config.voter_sample_size = strtoul(argv[4]->arg, NULL, 10);
+	config.quorum = strtoul(argv[6]->arg, NULL, 10);
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+DEFUN(no_midr_liveness_voting,
+      no_midr_liveness_voting_cmd,
+      "no midr liveness voting",
+      NO_STR
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Restore default indirect voting\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config, defaults;
+
+	midr_liveness_get_config(bgp, &config);
+	midr_liveness_config_defaults(&defaults);
+	config.voter_sample_size = defaults.voter_sample_size;
+	config.quorum = defaults.quorum;
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+DEFUN(midr_liveness_gossip,
+      midr_liveness_gossip_cmd,
+      "midr liveness gossip hop-limit (1-255) cache-ttl (1-3600)",
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Configure DEAD/LEAVE gossip\n"
+      "Maximum gossip hops\n"
+      "Hop count\n"
+      "Seen-message cache lifetime\n"
+      "Seconds\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config;
+
+	midr_liveness_get_config(bgp, &config);
+	config.hop_limit = strtoul(argv[4]->arg, NULL, 10);
+	config.cache_ttl = strtoul(argv[6]->arg, NULL, 10);
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+DEFUN(no_midr_liveness_gossip,
+      no_midr_liveness_gossip_cmd,
+      "no midr liveness gossip",
+      NO_STR
+      "MIDR configuration\n"
+      "Node liveness confirmation\n"
+      "Restore default gossip settings\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct midr_liveness_config config, defaults;
+
+	midr_liveness_get_config(bgp, &config);
+	midr_liveness_config_defaults(&defaults);
+	config.hop_limit = defaults.hop_limit;
+	config.cache_ttl = defaults.cache_ttl;
+	return midr_liveness_apply_vty(vty, bgp, &config);
+}
+
+/* ------------------------------------------------------------------ */
 /* show midr nodes                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -444,7 +591,7 @@ static const char *midr_caps_str(uint32_t caps, char *buf, size_t len)
 /*
  * 三个节点表视图命令 (nodes/reps/bootstraps) 共用的表格体: required_caps=0
  * 列全部, 非 0 只列 capabilities 含全部所要位的节点。reps/bootstraps 是同一
- * 张表的过滤视图, 含 expired 条目 (诊断命令要能看见异常; 协议侧 REP_LIST 组
+ * 张表的过滤视图, 含 SUSPECT 条目 (诊断命令要能看见异常; 协议侧 REP_LIST 组
  * 装另用严过滤, 见 midr_rep_candidates)。
  */
 static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
@@ -452,7 +599,6 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 {
 	struct midr_node_entry *entry;
 	char caps_buf[64];
-	time_t now = monotime(NULL);
 
 	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
 		"Router-ID", "Transport-Addr", "ASN", "Group-ID", "Status",
@@ -462,8 +608,6 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 		"----------", "--------", "------------");
 
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
-		bool active = entry->is_self ||
-			      (now - entry->last_seen) <= MIDR_NODE_EXPIRE_TIME;
 		char taddr[INET_ADDRSTRLEN];
 
 		if ((entry->capabilities & required_caps) != required_caps)
@@ -480,7 +624,7 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 			taddr,
 			entry->asn,
 			entry->group_id,
-			active ? "active" : "expired",
+			midr_liveness_state_name(entry),
 			midr_caps_str(entry->capabilities, caps_buf,
 				      sizeof(caps_buf)));
 	}
@@ -507,6 +651,23 @@ DEFUN(show_midr_nodes,
 
 	midr_show_node_table(vty, bgp, 0);
 
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_liveness,
+      show_midr_liveness_cmd,
+      "show midr liveness",
+      SHOW_STR
+      "MIDR information\n"
+      "Show liveness configuration and confirmation rounds\n")
+{
+	struct bgp *bgp = bgp_get_default();
+
+	if (!bgp || !bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	midr_liveness_show(vty, bgp);
 	return CMD_SUCCESS;
 }
 
@@ -704,6 +865,8 @@ DEFUN(show_midr_neighbors,
 		if (peer->connection->status != Established &&
 		    !midr_underlay_reachable(bgp, &peer->connection->su))
 			strlcat(state_buf, " (no route)", sizeof(state_buf));
+		if (ne && !midr_liveness_node_usable(ne))
+			strlcat(state_buf, " (suspect)", sizeof(state_buf));
 
 		vty_out(vty, "%-18s %-8u %-14s ", nbr_disp, peer->as,
 			state_buf);
@@ -850,6 +1013,18 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "        优雅下线本节点(撤销自通告,抑制 keepalive)\n");
 	vty_out(vty, "    %sno midr shutdown%s\n", C_CMD, C_RST);
 	vty_out(vty, "        重新上线(恢复自通告)\n");
+	vty_out(vty,
+		"    %smidr liveness timers keepalive <S> suspect <S> scan <S> confirm <S> retry <S>%s\n",
+		C_CMD, C_RST);
+	vty_out(vty, "        原子配置保活、怀疑扫描和确认重试定时器\n");
+	vty_out(vty,
+		"    %smidr liveness voting sample-size <K> quorum <Q>%s\n",
+		C_CMD, C_RST);
+	vty_out(vty, "        配置稳定邻居样本与严格多数门限\n");
+	vty_out(vty,
+		"    %smidr liveness gossip hop-limit <N> cache-ttl <S>%s\n",
+		C_CMD, C_RST);
+	vty_out(vty, "        配置 DEAD/LEAVE Gossip 扩散范围与去重缓存\n");
 
 	/* 查看 / 帮助命令组:vtysh 顶层(enable/view)直接可用 */
 	vty_out(vty, "\n%s查看 / 帮助命令(vtysh 顶层直接可用,无需进配置态):%s\n",
@@ -857,6 +1032,8 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "    %sshow midr nodes%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        显示 MIDR 节点表(由 BGP-LS Node NLRI 学到的所有节点)\n");
+	vty_out(vty, "    %sshow midr liveness%s\n", C_CMD, C_RST);
+	vty_out(vty, "        显示保活参数、SUSPECT 数量与进行中的确认轮次\n");
 	vty_out(vty, "    %sshow midr reps%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        列全网群代表(按 GROUP_REP 能力位过滤节点表) + 本地 rep 目录\n");
@@ -904,13 +1081,22 @@ void bgp_midr_vty_init(void)
 	install_element(BGP_NODE, &no_midr_transport_address_cmd);
 	install_element(BGP_NODE, &midr_shutdown_cmd);
 	install_element(BGP_NODE, &no_midr_shutdown_cmd);
+	install_element(BGP_NODE, &midr_liveness_timers_cmd);
+	install_element(BGP_NODE, &no_midr_liveness_timers_cmd);
+	install_element(BGP_NODE, &midr_liveness_voting_cmd);
+	install_element(BGP_NODE, &no_midr_liveness_voting_cmd);
+	install_element(BGP_NODE, &midr_liveness_gossip_cmd);
+	install_element(BGP_NODE, &no_midr_liveness_gossip_cmd);
 	install_element(BGP_NODE, &midr_help_cmd);
 	/* `midr help` 也在 vtysh 顶层可用(enable/view),无需进配置态 */
 	install_element(VIEW_NODE, &midr_help_cmd);
 	install_element(ENABLE_NODE, &midr_help_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
+	install_element(VIEW_NODE, &show_midr_liveness_cmd);
 	install_element(VIEW_NODE, &show_midr_reps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);
 	install_element(VIEW_NODE, &show_midr_neighbors_cmd);
 	install_element(VIEW_NODE, &show_midr_join_cmd);
+
+	hook_register(bgp_inst_config_write, midr_liveness_config_write);
 }

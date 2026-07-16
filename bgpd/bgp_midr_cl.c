@@ -24,6 +24,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_cl.h"
+#include "bgpd/bgp_midr_liveness.h"
 
 /*
  * I-3 处理：NDS 把全局视图连同触发事件交给 CL。CL 据 trigger 分支决策，
@@ -40,7 +41,8 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 	switch (trigger) {
 	case MIDR_TRIGGER_REP_PROBE_DONE: {
 		struct midr_cluster_decision d = {};
-		struct midr_rep_entry *chosen;
+		struct midr_rep_entry *chosen = NULL;
+		struct listnode *node;
 
 		/*
 		 * CL 对 REP_PROBE_DONE 的响应：从候选群代表里选一个（= 选群），
@@ -57,8 +59,17 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		 * I-5 喂入的链路指标（各代表 is_adjacent 链路的 delay/loss/bw）选
 		 * 最优，此处即其落点。 */
 
-		/* --- 策略一：取首条（默认启用）--- */
-		chosen = listgetdata(listhead(mi->rep_dir));
+		/* --- 策略一：取首条 ACTIVE/未知手工项（默认启用）--- */
+		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, chosen))
+			if (midr_liveness_transport_usable(
+				    bgp, chosen->rep_transport))
+				break;
+		if (!chosen ||
+		    !midr_liveness_transport_usable(bgp,
+						   chosen->rep_transport)) {
+			MIDR_LOG("MIDR CL：REP_PROBE_DONE 无可用群代表（均为 SUSPECT）");
+			break;
+		}
 
 		/* --- 策略二：随机选（并列备选，默认注释；联调可解开）---
 		{

@@ -71,6 +71,7 @@
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_midr_liveness.h"
 
 // 自己注册的命令
 
@@ -20500,12 +20501,11 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->instance_id = instance_id;
 	bgp->ls_info->enable_distribution = true;
 
-	/*
-	 * Defer the actual export to the keepalive timer (fires within
-	 * MIDR_KEEPALIVE_INTERVAL seconds) to avoid a deep call-chain that
-	 * can overflow the stack when bgp_ls_export_bgp_topology() is invoked
-	 * synchronously during frr.conf loading or VTY processing.
+	/* Defer the first Node advertisement to the next event-loop turn to avoid
+	 * the deep synchronous export call-chain.  The regular configurable MIDR
+	 * keepalive timer owns subsequent refreshes.
 	 */
+	midr_liveness_schedule_self_advertisement(bgp);
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty,
 			"BGP-LS: BGP fabric topology export enabled (instance-id %" PRIu64 ")\n",

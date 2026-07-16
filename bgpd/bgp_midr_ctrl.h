@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <netinet/in.h>
 
 struct bgp;
@@ -24,10 +25,9 @@ struct stream;
  *
  * 端口 5859 上并存两条传输（内核 TCP/UDP 端口空间独立，同号无冲突）：
  *
- *  - UDP :5859 —— PEER_REQUEST 专用。新节点选定群后向各群成员的 transport
- *    地址单播 PEER_REQUEST，成员反向建连（双向）。载荷固定 20B、永不撞尺寸墙，
- *    以反向会话 Established 为隐式 ack，保留原 3s×5 次重传。此通道独立于 PM
- *    探测通道（各自 socket/端口/格式），PM 设计变更不影响它。
+ *  - UDP :5859 —— PEER_REQUEST 与小型 liveness 确认/Gossip 共用。新节点选定
+ *    群后单播 PEER_REQUEST；PROBE/DEAD/LEAVE 的语义和状态位于独立的
+ *    bgp_midr_liveness.c。此通道独立于 PM 探测通道。
  *
  *  - TCP :5859 短连接 —— REP_LIST / MEMBER_LIST 请求-响应（列表交换）。载荷随
  *    全网群数 / 群规模增长会撞 UDP 尺寸墙（rep 目录 ~122 群、成员表 >91 人即
@@ -101,15 +101,20 @@ struct midr_ctrl_pending {
 	int retries_left;
 };
 
-/* Human-readable name of an enum midr_ctrl_msg_type value (for logs/show). */
+/* Human-readable name of control or liveness UDP message types. */
 extern const char *midr_ctrl_msg_type_str(uint8_t type);
 
 /* Open / close the control-channel UDP socket (called from bgp_midr_init/finish). */
 extern void midr_ctrl_init(struct bgp *bgp);
 extern void midr_ctrl_finish(struct bgp *bgp);
 
+/* Shared non-blocking UDP transport for PEER_REQUEST and liveness messages. */
+extern int midr_ctrl_udp_send(struct bgp *bgp,
+			      const struct sockaddr_in *destination,
+			      const void *payload, size_t length);
+
 /*
- * Called by bgp_midr.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
+ * Called by bgp_midr.c (NDS) to initiate an iBGP/eBGP + BGP-LS session to
  * a node, after NDS has decided to peer.  Dedups against an existing peer and
  * sends a reverse PEER_REQUEST so the far end peers back.
  */
@@ -117,8 +122,8 @@ extern void midr_ctrl_connect(struct bgp *bgp,
 			      const struct midr_node_entry *entry);
 
 /*
- * Called by bgp_midr.c (NDS) before a node entry is removed (withdraw or
- * expiry). Tears down the dynamically-created BGP session if one exists.
+ * Called by bgp_midr.c (NDS) when a confirmed DEAD or graceful LEAVE is
+ * committed. Tears down the dynamically-created BGP session if one exists.
  */
 extern void midr_ctrl_on_node_remove(struct bgp *bgp,
 				     struct midr_node_entry *entry);
@@ -187,7 +192,8 @@ extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
  * join 状态机。
  */
 extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
-				      const uint8_t *payload, size_t len);
+				      const uint8_t *payload, size_t len,
+				      struct in_addr remote);
 
 /* --- 传输层 (tcp.c) 提供给语义层调用 --- */
 

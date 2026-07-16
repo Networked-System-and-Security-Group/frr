@@ -333,7 +333,8 @@ static void midr_ctrl_tcp_read(struct event *t)
 		stream_free(resp);
 		midr_ctrl_tcp_start_send(conn);
 	} else {
-		midr_ctrl_on_tcp_response(bgp, conn->type, payload, plen);
+		midr_ctrl_on_tcp_response(bgp, conn->type, payload, plen,
+					  conn->remote);
 		midr_ctrl_tcp_conn_close(conn);
 	}
 }
