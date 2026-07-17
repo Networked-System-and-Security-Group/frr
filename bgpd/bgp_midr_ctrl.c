@@ -948,6 +948,12 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id)
 		if (entry->group_id != group_id)
 			continue;
 		midr_ctrl_connect(bgp, entry);
+		/*
+		 * 标记为邻居——与发现路径 midr_nds_on_node_discovered 一致。少了这句，
+		 * connect_group 建的会话不带 is_adjacent，后续换组/离群时按 is_adjacent
+		 * 判据的拆连（midr_group_reconverge 第 3 步）就找不到它们、造成会话泄漏。
+		 */
+		entry->is_adjacent = true;
 		midr_mark_topology(bgp, entry);
 		count++;
 	}

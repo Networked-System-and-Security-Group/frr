@@ -281,6 +281,8 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	struct midr_node_entry *entry;
 	bool is_new = false;
 	bool changed = false;
+	bool group_changed = false; /* 群号本次实际变了（对端改组对称反应用） */
+	uint32_t prev_gid = 0;	    /* 变更前的群号（仅 group_changed 时有效） */
 
 	if (!bgp || !bgp->midr_info || !nlri || !ls_attr)
 		return;
@@ -304,8 +306,11 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 
 	/* Group ID (TLV 1185) */
 	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT)) {
-		if (entry->group_id != ls_attr->midr_group_id)
+		if (entry->group_id != ls_attr->midr_group_id) {
 			changed = true;
+			group_changed = true;
+			prev_gid = entry->group_id;
+		}
 		entry->group_id = ls_attr->midr_group_id;
 	}
 
@@ -337,10 +342,46 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	 * (looped back) is skipped too.
 	 */
 	if (!entry->is_self) {
-		if (is_new)
+		if (is_new) {
 			midr_nds_on_node_discovered(bgp, entry);
-		else if (changed)
-			midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
+		} else if (changed) {
+			bool handled_by_discovery = false;
+
+			/*
+			 * 对端改组对称反应：远端把自己的群号改了，本地动态会话要
+			 * 跟着重收敛，不必等 CL。判据复用 should_peer（本群且群号非 0）。
+			 */
+			if (group_changed) {
+				struct bgp_midr *mi = bgp->midr_info;
+				bool was_mine = (prev_gid != 0 &&
+						 prev_gid == mi->local_group_id);
+				bool now_mine =
+					midr_discovery_should_peer(bgp, entry);
+
+				if (was_mine && !now_mine && entry->is_adjacent) {
+					/* 原本同群、现已离本群：拆掉动态会话。 */
+					midr_nds_detach_node(
+						bgp, entry,
+						MIDR_STOP_CLUSTER_CHANGE, true);
+					MIDR_FLOW_LOG("MIDR 对端改组：%pFX 群 %u -> %u（离本群），拆会话",
+						      &entry->node_id, prev_gid,
+						      entry->group_id);
+				} else if (now_mine && !entry->is_adjacent) {
+					/* 现进本群、尚未邻接：走发现全链建连
+					 * （其内部建邻居后自会 notify CL）。 */
+					midr_nds_on_node_discovered(bgp, entry);
+					handled_by_discovery = true;
+					MIDR_FLOW_LOG("MIDR 对端改组：%pFX 群 %u -> %u（进本群），建连",
+						      &entry->node_id, prev_gid,
+						      entry->group_id);
+				}
+			}
+
+			/* 发现路径已自带 notify；其余变更在此统一 notify 一次。 */
+			if (!handled_by_discovery)
+				midr_nds_notify_cl(bgp,
+						   MIDR_TRIGGER_NODE_CHANGE);
+		}
 	}
 }
 
@@ -456,13 +497,81 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
 	midr_propagate_self(bgp, MIDR_ORIGIN_CAP_UPDATE);
 }
 
+/*
+ * 换组重收敛编排核心：把本地群号切到 new_gid，并让动态会话跟随重收敛。
+ * 手动通道（midr_nds_set_group_id）与 I-7 JOIN 决策共用这一段，返回与新群
+ * 建连的成员数。三步次序有讲究：
+ *
+ *   1. 先改群号 + 重通告——必须早于建连：PEER_REQUEST 资格闸门按 local_group_id
+ *      过滤，若先建连、群号还是旧的，对端回来的反向建连会被自己的闸门挡掉。
+ *      重通告走 midr_originate_group_update（薄封装）→ midr_propagate_self 传播面
+ *      单点，不绕过 backend 替换边界。
+ *   2. 与新群成员建连（connect_group 遍历 global_view 中群号==new_gid 的成员）。
+ *      new_gid==0（手动离群）时跳过——0 号非有效群，无成员可连。
+ *   3. 拆旧群：凡"仍标 is_adjacent 却已不属于本群"的节点一律 detach，判据用
+ *      !should_peer 而非 ==old_gid，顺带清掉任何历史残留的错群邻接。detach 复用
+ *      links 泄漏修复轮的统一清理（I-2 停探 + 双键删 link_entry + 复位 is_adjacent
+ *      + 拆动态会话），不删 node 条目。PM 真实化后第 2 步的停探语义自动完整。
+ */
+static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	uint32_t old_gid = mi->local_group_id;
+	struct midr_node_entry *entry;
+	uint32_t connected = 0, detached = 0;
+
+	/* 1. 改群号 + 重通告（先于建连）。 */
+	midr_originate_group_update(bgp, new_gid, old_gid);
+
+	/* 2. 与新群成员建连（离群 new_gid==0 时无成员可连，跳过）。 */
+	if (new_gid != 0)
+		connected = midr_ctrl_connect_group(bgp, new_gid);
+
+	/* 3. 拆旧群：邻接但已不同群的节点全部 detach。 */
+	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
+		if (entry->is_self || !entry->is_adjacent)
+			continue;
+		if (midr_discovery_should_peer(bgp, entry))
+			continue; /* 仍属本群，留着 */
+		midr_nds_detach_node(bgp, entry, MIDR_STOP_CLUSTER_CHANGE, true);
+		detached++;
+	}
+
+	MIDR_FLOW_LOG("MIDR 换组重收敛：群 %u -> %u（建连 %u 个新群成员，拆除 %u 个旧群邻接）",
+		      old_gid, new_gid, connected, detached);
+	return connected;
+}
+
 void midr_nds_set_group_id(struct bgp *bgp, uint32_t new_gid)
 {
+	struct bgp_midr *mi;
+
 	if (!bgp || !bgp->midr_info)
 		return;
+	mi = bgp->midr_info;
 
-	bgp->midr_info->local_group_id = new_gid;
-	midr_propagate_self(bgp, MIDR_ORIGIN_GROUP_UPDATE);
+	/* old==new 短路：无变化不折腾会话。 */
+	if (mi->local_group_id == new_gid) {
+		MIDR_LOG("MIDR 换组(手动)：群号未变（%u），无动作", new_gid);
+		return;
+	}
+
+	/*
+	 * 中止在途/待发的 join：运维手动换组 = 强制切换，放弃经 bootstrap 加入的
+	 * 意图。作废 join_intent 是关键——REP_LIST_REQ 可能已发出、响应尚未到达
+	 * （此刻 join_in_progress 还是 false），若不作废意图，迟到的 REP_LIST_RESP
+	 * 会把 join 重新拉起、CL 决策再把运维刚设的群号改掉（静默覆盖）。
+	 */
+	if (mi->join_intent || mi->join_in_progress) {
+		mi->join_intent = false;
+		mi->join_in_progress = false;
+		mi->join_phase = MIDR_JOIN_IDLE;
+		mi->join_group_id = 0;
+		MIDR_LOG("MIDR 换组(手动)：作废在途加入意图");
+	}
+
+	MIDR_FLOW_LOG("MIDR 换组(手动)：群 %u -> %u", mi->local_group_id, new_gid);
+	midr_group_reconverge(bgp, new_gid);
 }
 
 static const char *midr_origin_reason_str(enum midr_origin_reason reason)
@@ -793,21 +902,20 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			MIDR_LOG("MIDR I-7：JOIN 但不在探成员阶段，忽略");
 			break;
 		}
-		mi->local_group_id = decision->new_group_id;
-		midr_originate_group_update(bgp, decision->new_group_id,
-					    decision->old_group_id);
 		/*
-		 * ⑥ 入群确认后才与群内成员建连（探成员阶段只探不连）。connect_group
-		 * 遍历 global_view 中 group==new_group_id 的成员（learn_member 已灌入）
-		 * 发起多跳 eBGP。
+		 * ⑥ 入群：走与手动换组共用的重收敛编排——改群号+重通告、与新群成员
+		 * 建连、并拆掉旧群残留邻接。首次分群 old_group_id==0 时无旧群可拆
+		 * （reconverge 内按"邻接却已不同群"判据自然拆 0 个）；非首次（换群）
+		 * 则顺带断开原群会话，补上旧版 JOIN 只建不拆的缺口。
 		 */
 		mi->join_members =
-			midr_ctrl_connect_group(bgp, decision->new_group_id);
-		/* join 完成回稳态：此后探测的 I-5 回灌按 NODE_CHANGE 处理，
-		 * 不再是 rep/member 段。 */
+			midr_group_reconverge(bgp, decision->new_group_id);
+		/* join 落定回稳态：清意图（此后迟到的 REP_LIST_RESP 不再重启 join），
+		 * 此后探测的 I-5 回灌按 NODE_CHANGE 处理，不再是 rep/member 段。 */
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_in_progress = false;
-		MIDR_FLOW_LOG("MIDR I-7：JOIN 群 %u 完成（建连 %u 个成员），加入流程结束（回稳态）",
+		mi->join_intent = false;
+		MIDR_FLOW_LOG("MIDR I-7：JOIN 群 %u 完成（经重收敛编排建连 %u 个成员），加入流程结束（回稳态）",
 			      decision->new_group_id, mi->join_members);
 		break;
 	case MIDR_DECISION_LEAVE:
@@ -835,6 +943,7 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		 */
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_in_progress = false;
+		mi->join_intent = false; /* join 落定，清意图与 JOIN 一致，堵迟到响应重启 */
 		MIDR_FLOW_LOG("MIDR I-7：CREATE 自建群 %u，加入流程结束（回稳态）",
 			      decision->new_group_id);
 		break;
@@ -1054,6 +1163,9 @@ void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 	mi->bootstrap_su = *su;
 	mi->bootstrap_asn = asn;
 	mi->bootstrap_set = true;
+	/* 表达一个尚未落定的加入意图：REP_LIST_RESP 到达时凭此放行进入 join。
+	 * 手动换组会作废它，届时迟到的响应被丢弃（见 midr_nds_set_group_id）。 */
+	mi->join_intent = true;
 
 	/* Ask the bootstrap for its representative directory (TCP list exchange). */
 	midr_ctrl_send_rep_request(bgp, su->sin.sin_addr);
@@ -1070,6 +1182,16 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	if (!bgp || !bgp->midr_info)
 		return;
 	mi = bgp->midr_info;
+
+	/*
+	 * 加入意图守卫：只有意图仍有效才进入 join。运维手动换组会作废意图，此后
+	 * 迟到的 REP_LIST_RESP（REP_LIST_REQ 3s×5 重传可能在换组后才回来）到这里
+	 * 被静默丢弃，避免 join 把运维强制切换的群号覆盖掉。
+	 */
+	if (!mi->join_intent) {
+		MIDR_LOG("MIDR 加入：加入意图已作废（多半被手动换组中止），丢弃迟到的 REP_LIST_RESP");
+		return;
+	}
 
 	if (!mi->rep_dir || list_isempty(mi->rep_dir)) {
 		MIDR_FLOW_LOG("MIDR 加入：群代表目录为空，放弃加入");

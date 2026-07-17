@@ -245,6 +245,10 @@ struct bgp_midr {
 	bool bootstrap_set;	      /* a bootstrap node is configured */
 	bool join_in_progress;	      /* guard：join 进行中，等价于 join_phase != IDLE，
 				       * 保留给 show midr join，由 join_phase 同步维护 */
+	bool join_intent;	      /* 存在一个尚未落定的加入意图：配 bootstrap 置起，
+				       * join 落定（JOIN/CREATE 回稳态）或被手动换组作废时清。
+				       * midr_join_on_rep_list 据此丢弃"意图已作废后才迟到的
+				       * REP_LIST_RESP"，防止运维强制换组被 join 静默覆盖。 */
 	enum midr_join_phase join_phase; /* 加入流程阶段，决定 I-5 回灌发哪个 trigger */
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */

@@ -48,9 +48,27 @@ DEFUN(midr_group_id,
 	}
 
 	uint32_t gid = (uint32_t)atol(argv[2]->arg);
+	uint32_t old_gid = bgp->midr_info->local_group_id;
+
 	midr_nds_set_group_id(bgp, gid);
 
 	vty_out(vty, "MIDR group-id set to %u\n", gid);
+
+	/*
+	 * 运维反馈：真正切了群且目标群当前无已知成员时，提示本节点将成为该群
+	 * 首个成员（强制切换语义下不阻断——群号是标签非注册制实体，允许开新群）。
+	 */
+	if (gid != old_gid && gid != 0) {
+		struct list *members = list_new();
+
+		midr_group_members(bgp, gid, members);
+		if (list_isempty(members))
+			vty_out(vty,
+				"%% 群 %u 当前无已知成员，本节点将成为该群首个成员\n",
+				gid);
+		list_delete(&members);
+	}
+
 	return CMD_SUCCESS;
 }
 
