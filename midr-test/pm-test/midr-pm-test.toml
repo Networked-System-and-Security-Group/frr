@@ -1,0 +1,65 @@
+[general]
+packet_log = "midr-pm-test.rtl"
+
+[env]
+mode = "Isolated"
+left_veth_count = 1
+right_veth_count = 1
+
+# HTTP API for runtime link condition changes (§6.2 of testing guide)
+[http]
+enable = true
+port = 8086
+
+# ── Uplink cells (ns-left → ns-right) ─────────────────────────────────────────
+[cells.up_bw]
+type = "Bw"
+bw_type = "NetworkLayer"
+bandwidth = "10Mbps"
+queue = "DropTail"
+
+[cells.up_bw.queue_config]
+byte_limit = 62500
+
+[cells.up_delay]
+type = "Delay"
+delay = "20ms"
+
+[cells.up_loss]
+type = "Loss"
+pattern = [0.0]
+
+# ── Downlink cells (ns-right → ns-left) ───────────────────────────────────────
+[cells.dn_bw]
+type = "Bw"
+bw_type = "NetworkLayer"
+bandwidth = "10Mbps"
+queue = "DropTail"
+
+[cells.dn_bw.queue_config]
+byte_limit = 62500
+
+[cells.dn_delay]
+type = "Delay"
+delay = "20ms"
+
+[cells.dn_loss]
+type = "Loss"
+pattern = [0.0]
+
+# ── Wiring: uplink left→right, downlink right→left ─────────────────────────────
+[links]
+left     = "up_bw"
+up_bw    = "up_delay"
+up_delay = "up_loss"
+up_loss  = "right"
+
+right    = "dn_loss"
+dn_loss  = "dn_delay"
+dn_delay = "dn_bw"
+dn_bw    = "left"
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+[commands]
+left  = ["bash", "start-node-a.sh"]
+right = ["bash", "start-node-b.sh"]

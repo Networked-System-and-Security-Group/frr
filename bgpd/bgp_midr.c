@@ -205,8 +205,10 @@ static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
 	struct prefix locator;
 
 	midr_node_get_locator(entry, &locator);
-	/* I-2 停探（stub 下为空操作；PM 异步化后此调用即成完整语义）。 */
-	midr_pm_remove_target(bgp, &locator, reason);
+	/* I-2 停探。键必须与 I-1 配对：add 侧按 node_id 建探测 ctx（join 占位
+	 * 条目 node_id==locator，仍一致），故删也统一按 node_id——按 locator 删
+	 * 会在 transport≠router-id 的节点上找不到 ctx → 探测泄漏。 */
+	midr_pm_remove_target(bgp, &entry->node_id, reason);
 	midr_global_view_del_link(gv, &locator);
 	if (!prefix_same(&locator, &entry->node_id))
 		midr_global_view_del_link(gv, &entry->node_id);
@@ -231,16 +233,14 @@ static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
 static void midr_nds_on_node_discovered(struct bgp *bgp,
 					struct midr_node_entry *entry)
 {
-	struct prefix locator;
-
 	/* 1. 探测前粗筛（用户的 stub，现仅排除 self）。 */
 	if (!midr_discovery_filter(bgp, entry))
 		return;
 
-	/* 2. 测性能：I-1 启动对其真实可达地址（TLV 1188，而非不可路由的
-	 * router-id）的探测。stub 同步把指标灌进 link_entry。 */
-	midr_node_get_locator(entry, &locator);
-	midr_pm_add_target(bgp, &locator, MIDR_SRC_GOSSIP, entry->capabilities);
+	/* 2. 测性能：I-1 以 router-id（node_id）为探测上下文的 key；PM 从
+	 * global_view 条目取 transport_addr 作为实际探测目标。 */
+	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_GOSSIP,
+			   entry->capabilities);
 
 	/* 3. 判断是否建邻居（保守 stub：本群匹配；未来基于 link_entry 指标）。 */
 	if (!midr_discovery_should_peer(bgp, entry)) {
@@ -425,7 +425,6 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_global_view *gv;
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
-	struct prefix locator;
 
 	if (!bgp || !bgp->midr_info)
 		return;
@@ -447,10 +446,43 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 	entry->is_adjacent = true; /* 成员表里的成员就是要建邻居的对象 */
 
-	/* I-1：探测其真实可达地址（TLV 1188）。 */
-	midr_node_get_locator(entry, &locator);
-	midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP,
+	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
+	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
+}
+
+/*
+ * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时调用：请求方在其自身的 join 流程里会
+ * 反过来对我们发 PM 探测包，而 midr_pm_recv() 的 pm_is_known_transport() 只
+ * 接受 global_view 里已知的来源地址——请求方此时还没有 BGP-LS 会话，我们的
+ * global_view 里没有它，探测包会被当成未知来源静默丢弃。
+ * 这里用请求帧自带的身份（router-id/transport/asn）灌一条最小条目，仅用于
+ * 通过来源校验；不置 is_adjacent、不触发 I-1——是否真正建邻居仍由 CL 决定。
+ */
+void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid, as_t asn,
+			      struct in_addr transport)
+{
+	struct midr_global_view *gv;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_info)
+		return;
+
+	gv = bgp->midr_info->global_view;
+	midr_prefix_from_in_addr(&key.node_id, rid);
+
+	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!entry) {
+		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
+		entry->node_id = key.node_id;
+		midr_node_hash_add(&gv->nodes, entry);
+	}
+	entry->asn = asn;
+	entry->transport_addr = transport;
+	entry->has_transport_addr = true;
+	entry->last_seen = monotime(NULL);
+	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 }
 
 /*
@@ -694,6 +726,15 @@ static void midr_keepalive_timer(struct event *t)
 			MIDR_KEEPALIVE_INTERVAL, &mi->t_keepalive);
 }
 
+/* Deferred join-phase triggers: fire after MIDR_JOIN_PROBE_WAIT_SECS to give
+ * the PM long-term EWMA time to warm up before CL evaluates link quality. */
+static void midr_join_rep_probe_done_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	MIDR_FLOW_LOG("MIDR 加入：REP_PROBE_DONE 定时器触发，通知 CL");
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_REP_PROBE_DONE);
+}
+
 /*
  * Periodic-sync timer: hand the global view to CL for a full re-evaluation
  * on a fixed cadence (independent of probe/membership events).
@@ -807,6 +848,24 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 		link->short_term = *short_term;
 	if (long_term)
 		link->long_term = *long_term;
+
+	/*
+	 * 一次成功的探测回复本身就是活性信号。稳态邻居的 last_seen 靠 BGP-LS
+	 * NLRI 泛洪刷新，但"只探不连"阶段的候选成员（midr_nds_learn_member 灌入，
+	 * is_adjacent=true 但尚无 BGP-LS 会话）没有任何 NLRI 泛洪可刷新它——若不
+	 * 在这里补上，MIDR_NODE_EXPIRE_TIME（15s）会在 MIDR_JOIN_PROBE_WAIT_SECS
+	 * （60s）的 CL 评估窗口结束前就把这些条目过期删除，MEMBER_PROBE_DONE 到
+	 * 时发现候选全部消失，误判为 0 条好链路。
+	 */
+	if (status == MIDR_LINK_UP) {
+		struct midr_node_entry key = {};
+		struct midr_node_entry *node;
+
+		key.node_id = *node_id;
+		node = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (node)
+			node->last_seen = monotime(NULL);
+	}
 
 	/* E-1: write short-term metrics into BGP-LS */
 	midr_e1_write_to_bgpls(bgp, link);
@@ -927,9 +986,18 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 					    decision->old_group_id);
 		break;
 	case MIDR_DECISION_CREATE:
-		/* 所有候选群均不满足 → 自建新群。同属 join 第二段，幂等收尾。 */
-		if (mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
-			MIDR_LOG("MIDR I-7：CREATE 但不在探成员阶段，忽略");
+		/*
+		 * 自建新群。CREATE 有两个可能来源，二者都应被接受：
+		 *   - PROBING_REPS：REP_PROBE_DONE 时没有任何群代表探到数据
+		 *     （cl_handle_rep_probe_done 的"无可用候选"分支），根本没
+		 *     进入过 PROBING_MEMBERS；
+		 *   - PROBING_MEMBERS：所选群的成员链路数达不到入群阈值
+		 *     （cl_handle_member_probe_done 的兜底分支）。
+		 * 只在真正不在加入流程中（IDLE）时才视为过期/重复通知而忽略。
+		 */
+		if (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+		    mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
+			MIDR_LOG("MIDR I-7：CREATE 但不在加入流程中，忽略");
 			break;
 		}
 		mi->local_group_id = decision->new_group_id;
@@ -1210,16 +1278,58 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	/* I-1：对每个群代表启动探测（PM stub 同步把指标灌进 link_entry，不再 notify）。 */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
 		struct prefix locator;
+		struct midr_node_entry key = {};
+		struct midr_node_entry *entry;
 
 		midr_prefix_from_in_addr(&locator, r->rep_transport);
+
+		/*
+		 * 群代表此时尚未有 BGP-LS 会话（bootstrap 只是 UDP 通道），
+		 * global_view 里还没有它的条目，而 midr_pm_add_target() 要求
+		 * 探测目标已存在于 global_view 才会启动探测。这里以 transport
+		 * addr 本身作为 node_id 灌一条占位条目（与 cl_find_link_by_ipv4
+		 * 按 transport addr 查链路的假设一致），否则探测请求会被静默
+		 * 丢弃，REP_PROBE_DONE 永远拿不到数据。
+		 */
+		key.node_id = locator;
+		entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (!entry) {
+			entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
+			entry->node_id = locator;
+			midr_node_hash_add(&mi->global_view->nodes, entry);
+		}
+		entry->asn = r->rep_asn;
+		entry->group_id = r->group_id;
+		entry->transport_addr = r->rep_transport;
+		entry->has_transport_addr = true;
+		entry->last_seen = monotime(NULL);
+
+		/*
+		 * Only the bootstrap rep (the one that received our
+		 * REP_LIST_REQ) already knows who we are — bootstrap != a
+		 * given rep in general (a rep_dir can list reps other than
+		 * the bootstrap itself, e.g. group 2's rep here). Any other
+		 * rep has never exchanged a single control message with us,
+		 * so its own global_view has no entry for us at all and
+		 * pm_is_known_transport() will reject every PM probe we send
+		 * it. Self-announce to each rep before I-1 starts probing so
+		 * midr_nds_learn_requester() seeds that entry up front
+		 * (harmless — and idempotent — if the rep already knows us).
+		 */
+		midr_ctrl_send_announce(bgp, r->rep_transport);
+
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
 			      &r->rep_transport, r->group_id);
 	}
 
-	/* 探完整批群代表后，编排层显式发 REP_PROBE_DONE，交 CL 选最优代表
-	 * （I-7 RECOMMEND）。一整批只发一次，避免每个代表各 notify 一次。 */
-	midr_nds_notify_cl(bgp, MIDR_TRIGGER_REP_PROBE_DONE);
+	/* 延迟 MIDR_JOIN_PROBE_WAIT_SECS 秒再发 REP_PROBE_DONE，让 PM 的
+	 * 长期 EWMA（α=0.05）先积累足够样本，使 CL 能区分好/坏链路。 */
+	event_cancel(&mi->t_rep_probe_done);
+	event_add_timer(bm->master, midr_join_rep_probe_done_cb, bgp,
+			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_rep_probe_done);
+	MIDR_FLOW_LOG("MIDR 加入：REP_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+		      MIDR_JOIN_PROBE_WAIT_SECS);
 }
 
 /* ===========================================================================
@@ -1279,6 +1389,8 @@ void bgp_midr_finish(struct bgp *bgp)
 	event_cancel(&mi->t_expire_check);
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);
+	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_member_probe_done);
 
 	/* Stop PM periodic probe timer */
 	midr_pm_finish(bgp);

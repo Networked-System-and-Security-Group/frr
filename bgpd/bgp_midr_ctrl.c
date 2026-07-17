@@ -46,6 +46,13 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 static void midr_ctrl_send_peer_request(struct bgp *bgp,
 					const struct midr_node_entry *entry);
 static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type);
+
+static void midr_ctrl_member_probe_done_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	MIDR_FLOW_LOG("MIDR 加入：MEMBER_PROBE_DONE 定时器触发，通知 CL");
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
+}
 static void midr_ctrl_retx_timer(struct event *t);
 static void midr_ctrl_udp_recv(struct event *t);
 
@@ -195,6 +202,23 @@ void midr_ctrl_send_member_request(struct bgp *bgp, struct in_addr rep_transport
 				  group_id);
 	MIDR_FLOW_LOG("midr_ctrl: sent MEMBER_LIST_REQ to %pI4 (group %u)",
 		  &rep_transport, group_id);
+}
+
+/*
+ * New node -> an arbitrary candidate (rep or member): self-announce so the
+ * receiver can validate our subsequent PM probes without an explicit
+ * request/response round trip. One-way, fire-and-forget — same frame as
+ * MIDR_CTRL_ANNOUNCE's existing use from midr_ctrl_recv_member_list(), just
+ * exposed for callers outside this file (e.g. midr_join_on_rep_list() in
+ * bgp_midr.c, which needs to announce to *every* rep in the directory, not
+ * only the bootstrap that already received a REP_LIST_REQ from us).
+ */
+void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
+{
+	if (!bgp || !bgp->midr_info)
+		return;
+	midr_ctrl_send_req(bgp->midr_info, dst, MIDR_CTRL_ANNOUNCE, 0);
+	MIDR_FLOW_LOG("midr_ctrl: sent ANNOUNCE to %pI4", &dst);
 }
 
 /* Drop all pending retransmits of a given request type (response arrived). */
@@ -546,6 +570,14 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 				      ntohl(items[i].group_id));
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测成员 %pI4（群 %u）",
 			      &items[i].rid, ntohl(items[i].group_id));
+
+		/*
+		 * 该成员从未跟我们交换过任何报文（我们是从群代表的
+		 * MEMBER_LIST_RESP 里间接得知它的），它的 pm_is_known_transport
+		 * 校验会把我们刚发起的探测包当未知来源丢弃。发一个单向 ANNOUNCE
+		 * 自报身份，让它记住我们——不等回复、不触发建连。
+		 */
+		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
 	}
 
 	/* 收到成员列表响应 → 停止重传 MEMBER_LIST_REQ（UDP 重传队列机制）。 */
@@ -556,9 +588,11 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	 * （I-7 JOIN/CREATE）。一整批只发一次。不在此清 join_phase：收尾在
 	 * midr_nds_on_cluster_decision 的 JOIN/CREATE 分支。
 	 */
-	MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，探测完成 → MEMBER_PROBE_DONE",
-		      mi->join_group_id);
-	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
+	MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+		      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);
+	event_cancel(&mi->t_member_probe_done);
+	event_add_timer(bm->master, midr_ctrl_member_probe_done_cb, bgp,
+			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_member_probe_done);
 }
 
 /* ------------------------------------------------------------------ */
@@ -597,6 +631,13 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 				 &remote, mi->local_capabilities);
 			return NULL;
 		}
+		/* 请求方接下来会反过来对我们发 PM 探测, 而此刻它尚无 BGP-LS 会话,
+		 * 我们的 global_view 里没有它, pm_is_known_transport() 会把其探测包
+		 * 当未知来源丢弃。先学一条最小条目放行探测(队友在 UDP 列表 handler
+		 * 的原逻辑, 随列表交换迁 TCP 落位到此)。 */
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
 		MIDR_FLOW_LOG("midr_ctrl: REP_LIST_REQ from %pI4 — replying with rep directory",
 			      &msg.requester_transport);
 		return midr_ctrl_build_rep_list(bgp, remote);
@@ -611,6 +652,10 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 				 mi->local_group_id);
 			return NULL;
 		}
+		/* 同 REP_LIST_REQ: 先学请求方身份, 放行其后续 PM 探测。 */
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
 		MIDR_FLOW_LOG("midr_ctrl: MEMBER_LIST_REQ for group %u from %pI4 — replying",
 			      group, &msg.requester_transport);
 		return midr_ctrl_build_member_list(bgp, remote, group);
@@ -731,6 +776,22 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * 兼容, 既定决策)。留此提示便于将来误用混版本时定位。 */
 		MIDR_LOG("midr_ctrl: 忽略 UDP 列表报文 type=%s —— 列表交换已迁 TCP (旧版本节点?)",
 			 midr_ctrl_msg_type_str(buf[1]));
+		break;
+	case MIDR_CTRL_ANNOUNCE:
+		/*
+		 * 一个候选群成员在被灌入某加入节点的探测列表前，双方从未交换过
+		 * 任何报文——PM 的来源校验（pm_is_known_transport）会把加入节点
+		 * 的探测包当作未知来源丢弃。这里只是记住发送者身份，不回复、不
+		 * 建连（保持"探成员阶段只探不连"）。
+		 */
+		if (n < (ssize_t)sizeof(msg))
+			return;
+		memcpy(&msg, buf, sizeof(msg));
+		midr_nds_learn_requester(bgp, msg.requester_rid,
+					 (as_t)ntohl(msg.requester_asn),
+					 msg.requester_transport);
+		MIDR_FLOW_LOG("midr_ctrl: ANNOUNCE from %pI4 — noted for PM source validation",
+			  &msg.requester_transport);
 		break;
 	default:
 		break;

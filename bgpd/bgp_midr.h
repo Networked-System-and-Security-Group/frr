@@ -50,6 +50,13 @@
 #define MIDR_EXPIRE_CHECK_INTERVAL  5  /* scan period for expired nodes */
 #define MIDR_PERIODIC_SYNC_INTERVAL 30 /* CL periodic re-evaluation */
 #define MIDR_PM_PROBE_INTERVAL	    10 /* periodic PM probe of connected nodes */
+/* Seconds to wait after I-1 before firing REP/MEMBER_PROBE_DONE.  Lets the
+ * long-term EWMA (α=0.05) warm up enough for CL to see a clear difference
+ * between good links (RTT ≪ 20 ms) and bad links (RTT ≫ 20 ms). At α=0.05,
+ * 60 samples (60s at 1 probe/s) gives 1-0.95^60 ≈ 0.954 convergence, vs.
+ * 1-0.95^20 ≈ 0.641 at the old 20s — a wider safety margin between the good-
+ * and bad-link RTTs before CL evaluates. */
+#define MIDR_JOIN_PROBE_WAIT_SECS   60
 
 /* Forward declarations */
 struct bgp;
@@ -216,6 +223,8 @@ struct bgp_midr {
 
 	/* === PM === */
 	struct hash *probe_contexts; /* prefix -> midr_probe_ctx (PM owns) */
+	int pm_sock;		     /* UDP fd for PM probing, -1 when closed */
+	struct event *t_pm_read;     /* read event on pm_sock */
 
 	/* === CL === */
 	uint32_t local_group_id;     /* local group-id (TLV 1185) */
@@ -233,11 +242,13 @@ struct bgp_midr {
 	uint32_t cap_seqno;  /* TLV 1187 seqno */
 
 	/* === Timers === */
-	struct event *t_periodic_sync; /* CL periodic re-evaluation */
-	struct event *t_probe_timeout; /* PM probe timeout */
-	struct event *t_keepalive;     /* re-originate self Node NLRI */
-	struct event *t_expire_check;  /* scan for expired nodes */
-	struct event *t_pm_probe;      /* periodic PM probe of connected nodes */
+	struct event *t_periodic_sync;	  /* CL periodic re-evaluation */
+	struct event *t_probe_timeout;	  /* PM probe timeout */
+	struct event *t_keepalive;	  /* re-originate self Node NLRI */
+	struct event *t_expire_check;	  /* scan for expired nodes */
+	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
+	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
+	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
 	union sockunion bootstrap_su; /* bootstrap node address */
@@ -294,6 +305,15 @@ extern void midr_nds_on_node_withdraw(struct bgp *bgp,
 /* 把一个群成员（MEMBER_LIST_RESP）灌入 global_view、标记邻居并 I-1 探测 */
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 				  struct in_addr transport, uint32_t group_id);
+
+/*
+ * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时，为请求方灌入一条最小 global_view
+ * 条目（仅 transport_addr，用于 PM 的 pm_is_known_transport 来源校验），不置
+ * is_adjacent、不触发 I-1——请求方是否真正入群由 CL 决定，这里只是让它作为
+ * "自证身份的探测来源"被接受，不代表已建立邻居关系。
+ */
+extern void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid,
+				     as_t asn, struct in_addr transport);
 
 /* Refresh the local self-entry after originating the local Node NLRI */
 extern void midr_nds_local_node_update(struct bgp *bgp);

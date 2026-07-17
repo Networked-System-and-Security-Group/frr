@@ -23,6 +23,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_ctrl.h"
+#include "bgpd/bgp_midr_pm.h"
 #include "bgpd/bgp_midr_vty.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_nexthop.h"
@@ -364,6 +365,11 @@ DEFUN(midr_transport_address,
 	bgp->midr_info->local_transport_addr = addr;
 	bgp->midr_info->transport_addr_set = true;
 	midr_propagate_self(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE); /* +TLV 1188 */
+
+	/* Open PM socket now that we have an address to bind to.  midr_pm_init()
+	 * runs before the config file is read, so the socket is deferred until
+	 * this command is processed. */
+	midr_pm_on_transport_addr_set(bgp);
 
 	vty_out(vty, "MIDR transport-address set to %s\n", argv[2]->arg);
 	return CMD_SUCCESS;

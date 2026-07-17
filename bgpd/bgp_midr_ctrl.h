@@ -46,15 +46,20 @@ enum midr_ctrl_msg_type {
 	MIDR_CTRL_REP_LIST_RESP = 3,	  /* bootstrap -> new node: rep directory */
 	MIDR_CTRL_MEMBER_LIST_REQ = 4,	  /* new node -> rep: send group members */
 	MIDR_CTRL_MEMBER_LIST_RESP = 5,	  /* rep -> new node: member list (table A) */
+	MIDR_CTRL_ANNOUNCE = 6,	  /* new node -> each candidate member: "this is
+					   * who I am" so it can validate my PM probes.
+					   * One-way, no reply expected. */
 };
 
 /*
  * Request frame, fixed 20 bytes, network byte order.  Shared by PEER_REQUEST,
- * REP_LIST_REQ and MEMBER_LIST_REQ: all three carry the requester's identity
- * so the responder can reply / peer back without a node-table lookup.
+ * REP_LIST_REQ, MEMBER_LIST_REQ and ANNOUNCE: all carry the requester's
+ * identity so the responder can reply / peer back / recognise it without a
+ * node-table lookup.
  *   - PEER_REQUEST     : target_group = the group the requester joined
  *   - REP_LIST_REQ     : target_group = 0 (ignored)
  *   - MEMBER_LIST_REQ  : target_group = the group whose members are wanted
+ *   - ANNOUNCE         : target_group = 0 (ignored)
  */
 struct midr_ctrl_msg {
 	uint8_t version;
@@ -143,6 +148,15 @@ extern void midr_ctrl_send_rep_request(struct bgp *bgp,
 extern void midr_ctrl_send_member_request(struct bgp *bgp,
 					  struct in_addr rep_transport,
 					  uint32_t group_id);
+
+/*
+ * New node -> an arbitrary candidate's transport address: one-way
+ * MIDR_CTRL_ANNOUNCE self-identification, no retransmit/response tracking.
+ * Lets the receiver recognise our subsequent PM probes as coming from a
+ * known source even though it never sent us a REP_LIST_REQ/MEMBER_LIST_REQ
+ * itself (e.g. a non-bootstrap rep in the representative directory).
+ */
+extern void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst);
 
 /*
  * Mark a qualifying connection into the topology graph.  Skeleton stub: the
