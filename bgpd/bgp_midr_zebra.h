@@ -36,12 +36,23 @@ struct bgp;
  *    The midr_path_result is the ONLY CP→DP data carrier – both the
  *    standard-SPF path and the TE CSPF SRv6 path use the same struct.
  *
+ *  dual-instance TE model:
+ *    instance == 0 (MIDR_INSTANCE_SPF) → standard SPF route
+ *    instance == 1 (MIDR_INSTANCE_TE)  → TE SRv6 override route
+ *    Both instances coexist in zebra's RIB for the same prefix;
+ *    the TE instance uses metric=1 to win rib_choose_best().
+ *    Deleting the TE instance automatically restores the SPF instance.
+ *
  *  zero-value semantics:
  *    sid_count == 0  →  pure IP forwarding  (BASIC / ECMP / UCMP)
  *    sid_count  > 0  →  SRv6 Segment Routing Header encapsulation
  *    weight   == 0  →  equal-cost ECMP
  *    weight    > 0  →  unequal-cost UCMP (proportional to weight)
  */
+
+/* Dual-instance identifiers */
+#define MIDR_INSTANCE_SPF  0
+#define MIDR_INSTANCE_TE   1
 
 /* ------------------------------------------------------------------ *
  *  single path entry
@@ -113,6 +124,22 @@ struct midr_path_result {
 		struct in6_addr	sid_list[SRV6_MAX_SEGS];
 		uint8_t		sid_count;
 	} explicit;
+
+	/*
+	 * dual-instance identifier (MIDR_INSTANCE_SPF or MIDR_INSTANCE_TE).
+	 *
+	 * instance == MIDR_INSTANCE_SPF (0)  → standard SPF route
+	 *         uses zapi_route.instance=0, metric=IGP path metric,
+	 *         distance=115.  This is the default for non-SRv6 routes.
+	 *
+	 * instance == MIDR_INSTANCE_TE  (1)  → TE SRv6 override route
+	 *         uses zapi_route.instance=1, metric=1 (always beats SPF),
+	 *         distance=115.  When deleted, the SPF route (instance=0)
+	 *         is automatically re-promoted by zebra's rib_choose_best().
+	 *
+	 * zero-initialization (instance=0) defaults to SPF mode.
+	 */
+	uint8_t		instance;
 };
 
 /*

@@ -120,6 +120,7 @@ enum midr_op_type {
 struct midr_pending_op {
 	enum midr_op_type	op;
 	struct prefix		prefix;
+	uint8_t			instance;  /* MIDR_INSTANCE_SPF or MIDR_INSTANCE_TE */
 
 	/* ---- valid only for MIDR_OP_ADD ---- */
 	struct midr_path	*paths;
@@ -135,6 +136,7 @@ struct midr_pending_op {
  */
 struct midr_installed_entry {
 	struct prefix		prefix;
+	uint8_t			instance;  /* MIDR_INSTANCE_SPF or MIDR_INSTANCE_TE */
 
 	/* copies of the path + SID data that were last sent */
 	struct midr_path	*paths;
@@ -192,7 +194,7 @@ static unsigned int midr_prefix_hash_key(const void *data)
 {
 	const struct midr_installed_entry *e = data;
 
-	return prefix_hash_key(&e->prefix);
+	return prefix_hash_key(&e->prefix) ^ (e->instance * 31);
 }
 
 /*
@@ -204,7 +206,8 @@ static bool midr_prefix_cmp(const void *d1, const void *d2)
 	const struct midr_installed_entry *e1 = d1;
 	const struct midr_installed_entry *e2 = d2;
 
-	return prefix_same(&e1->prefix, &e2->prefix);
+	return prefix_same(&e1->prefix, &e2->prefix) &&
+	       (e1->instance == e2->instance);
 }
 
 /*
@@ -224,8 +227,9 @@ static bool midr_path_result_eq(const struct midr_installed_entry *a,
 {
 	uint8_t i;
 
-	/* Mismatched counts → definitely different */
-	if (a->path_count != b->path_count ||
+	/* Mismatched instance or counts → definitely different */
+	if (a->instance != b->instance ||
+	    a->path_count != b->path_count ||
 	    a->sid_count != b->sid_count)
 		return false;
 
@@ -235,14 +239,31 @@ static bool midr_path_result_eq(const struct midr_installed_entry *a,
 			return false;
 	}
 
-	/* Compare each path: nexthop, ifindex, weight */
+	/* Compare each path: nexthop (only relevant AF), ifindex, weight */
 	for (i = 0; i < a->path_count; i++) {
 		const struct midr_path *pa = &a->paths[i];
 		const struct midr_path *pb = &b->paths[i];
 
-		if (!IPV4_ADDR_SAME(&pa->nexthop.ipv4, &pb->nexthop.ipv4) ||
-		    !IPV6_ADDR_SAME(&pa->nexthop.ipv6, &pb->nexthop.ipv6))
-			return false;
+		/* Compare only the address family that the prefix uses.
+		 * The union g_addr contains both ipv4 and ipv6; comparing both
+		 * unconditionally is fragile when the unused field is zeroed.
+		 * We check the family stored in the prefix to decide which
+		 * address field matters. For IPv6 SID routes, the nexthop is
+		 * always IPv6; for pure-IP routes it follows p->family. */
+		switch (b->prefix.family) {
+		case AF_INET:
+			if (!IPV4_ADDR_SAME(&pa->nexthop.ipv4,
+					    &pb->nexthop.ipv4))
+				return false;
+			break;
+		case AF_INET6:
+			if (!IPV6_ADDR_SAME(&pa->nexthop.ipv6,
+					    &pb->nexthop.ipv6))
+				return false;
+			break;
+		default:
+			return false; /* unknown family – cannot compare */
+		}
 		if (pa->ifindex != pb->ifindex)
 			return false;
 		if (pa->weight != pb->weight)
@@ -321,7 +342,7 @@ static int midr_result_to_zapi(struct bgp *bgp, const struct prefix *p,
 			       const struct midr_path *paths,
 			       uint8_t path_count, uint8_t sid_count,
 			       const struct in6_addr *sid_list,
-			       struct zapi_route *api)
+			       uint8_t instance, struct zapi_route *api)
 {
 	uint8_t i;
 	bool any_weight = false;
@@ -343,17 +364,21 @@ static int midr_result_to_zapi(struct bgp *bgp, const struct prefix *p,
 	 *   - TE CSPF uses 1 with metric=1 to override.
 	 * See the file-header comment for details.
 	 */
-	api->instance = 0;
+	api->instance = instance;
 	api->safi = SAFI_UNICAST;
 	api->prefix = *p;
 
 	/*
-	 * Metric: DP uses 0 as default; CP can override per-path.
-	 * For TE routes (instance=1) the TE module may set metric=1
-	 * to ensure it wins against the SPF instance.
+	 * Dual-instance metric strategy:
+	 *   instance==MIDR_INSTANCE_SPF (0) → metric = first-path metric
+	 *   instance==MIDR_INSTANCE_TE  (1) → metric = 1
+	 *   This ensures TE always wins rib_choose_best() (1 < IGP metric).
 	 */
 	SET_FLAG(api->message, ZAPI_MESSAGE_METRIC);
-	api->metric = 0;
+	if (instance == MIDR_INSTANCE_TE)
+		api->metric = 1;
+	else
+		api->metric = (path_count > 0) ? paths[0].metric : 0;
 
 	/*
 	 * Administrative distance: 115 (same as IS-IS).
@@ -470,9 +495,12 @@ midr_zapi_send(struct bgp *bgp, struct zapi_route *api,
  * Returns NULL if no route for this prefix has been installed.
  */
 static struct midr_installed_entry *
-midr_installed_lookup(struct hash *h, const struct prefix *p)
+midr_installed_lookup(struct hash *h, const struct prefix *p, uint8_t instance)
 {
-	struct midr_installed_entry key = { .prefix = *p };
+	struct midr_installed_entry key = {
+		.prefix = *p,
+		.instance = instance,
+	};
 
 	return hash_lookup(h, &key);
 }
@@ -485,12 +513,13 @@ midr_installed_lookup(struct hash *h, const struct prefix *p)
 static void midr_installed_set(struct hash *h, const struct prefix *p,
 			       const struct midr_path *paths,
 			       uint8_t path_count, uint8_t sid_count,
-			       const struct in6_addr *sid_list)
+			       const struct in6_addr *sid_list,
+			       uint8_t instance)
 {
 	struct midr_installed_entry *e;
 
-	/* Remove and free any existing entry for this prefix. */
-	e = midr_installed_lookup(h, p);
+	/* Remove and free any existing entry for this (prefix, instance). */
+	e = midr_installed_lookup(h, p, instance);
 	if (e) {
 		hash_release(h, e);
 		XFREE(MTYPE_TMP, e->paths);
@@ -499,6 +528,7 @@ static void midr_installed_set(struct hash *h, const struct prefix *p,
 
 	e = XCALLOC(MTYPE_TMP, sizeof(*e));
 	prefix_copy(&e->prefix, p);
+	e->instance = instance;
 	e->path_count = path_count;
 	e->sid_count = sid_count;
 	memcpy(e->sid_list, sid_list, sizeof(*sid_list) * sid_count);
@@ -510,11 +540,12 @@ static void midr_installed_set(struct hash *h, const struct prefix *p,
 /*
  * Remove a route from the installed hash and free its memory.
  */
-static void midr_installed_unset(struct hash *h, const struct prefix *p)
+static void midr_installed_unset(struct hash *h, const struct prefix *p,
+				 uint8_t instance)
 {
 	struct midr_installed_entry *e;
 
-	e = midr_installed_lookup(h, p);
+	e = midr_installed_lookup(h, p, instance);
 	if (!e)
 		return;
 
@@ -553,7 +584,8 @@ static void midr_process_one_op(struct bgp *bgp, struct bgp_midr_dp *dp,
 
 	switch (op->op) {
 	case MIDR_OP_ADD:
-		installed = midr_installed_lookup(dp->installed, &op->prefix);
+		installed = midr_installed_lookup(dp->installed, &op->prefix,
+						  op->instance);
 
 		/* No-op: the route hasn't changed. */
 		if (installed && midr_path_result_eq(installed, op))
@@ -564,7 +596,7 @@ static void midr_process_one_op(struct bgp *bgp, struct bgp_midr_dp *dp,
 			zapi_route_init(&api);
 			api.vrf_id = bgp->vrf_id;
 			api.type = ZEBRA_ROUTE_BGP_MIDR;
-			api.instance = 0;
+			api.instance = installed->instance;
 			api.safi = SAFI_UNICAST;
 			api.prefix = op->prefix;
 
@@ -575,30 +607,32 @@ static void midr_process_one_op(struct bgp *bgp, struct bgp_midr_dp *dp,
 		if (midr_result_to_zapi(bgp, &op->prefix,
 					op->paths, op->path_count,
 					op->sid_count, op->sid_list,
-					&api) == 0)
+					op->instance, &api) == 0)
 			midr_zapi_send(bgp, &api, ZEBRA_ROUTE_ADD);
 
 		/* Update installed-state snapshot. */
 		midr_installed_set(dp->installed, &op->prefix,
 				   op->paths, op->path_count,
-				   op->sid_count, op->sid_list);
+				   op->sid_count, op->sid_list,
+				   op->instance);
 		break;
 
 	case MIDR_OP_DEL:
-		installed = midr_installed_lookup(dp->installed, &op->prefix);
+		installed = midr_installed_lookup(dp->installed, &op->prefix,
+						  op->instance);
 		if (!installed)
 			return; /* already absent — no-op */
 
 		zapi_route_init(&api);
 		api.vrf_id = bgp->vrf_id;
 		api.type = ZEBRA_ROUTE_BGP_MIDR;
-		api.instance = 0;
+		api.instance = op->instance;
 		api.safi = SAFI_UNICAST;
 		api.prefix = op->prefix;
 
 		midr_zapi_send(bgp, &api, ZEBRA_ROUTE_DELETE);
 
-		midr_installed_unset(dp->installed, &op->prefix);
+		midr_installed_unset(dp->installed, &op->prefix, op->instance);
 		break;
 	}
 }
@@ -753,6 +787,9 @@ void midr_zebra_route_add(struct bgp *bgp, struct prefix *p,
 	op->path_count = result->path_count;
 	op->paths = midr_paths_dup(result->paths, result->path_count);
 
+	/* Copy instance (SPF vs TE) */
+	op->instance = result->instance;
+
 	/* Copy SID list if present. */
 	op->sid_count = result->explicit.sid_count;
 	if (op->sid_count)
@@ -775,6 +812,7 @@ void midr_zebra_route_del(struct bgp *bgp, struct prefix *p)
 
 	op = XCALLOC(MTYPE_TMP, sizeof(*op));
 	op->op = MIDR_OP_DEL;
+	op->instance = MIDR_INSTANCE_SPF;
 	prefix_copy(&op->prefix, p);
 
 	listnode_add(dp->pending_ops, op);

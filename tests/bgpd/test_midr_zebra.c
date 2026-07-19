@@ -2,12 +2,9 @@
 /*
  * Unit tests for MIDR data-plane (bgp_midr_zebra.c)
  *
- * Links against libbgp.a; tests the public DP API:
- *   midr_zebra_init / fini / route_add / route_del / route_flush /
- *   route_update_deferred
- *
- * Internal structs bgp_midr_dp / midr_installed_entry are duplicated
- * here for test introspection (matching the definitions in bp_midr_zebra.c).
+ * Updated: adds instance-field tests for Dual-Instance TE model.
+ * Internal structs bgp_midr_dp / midr_installed_entry / midr_pending_op
+ * are duplicated here for test introspection (match bp_midr_zebra.c).
  */
 
 #include <zebra.h>
@@ -27,8 +24,22 @@
 /* ==================================================================
  * Internal struct copies (mirror bp_midr_zebra.c) for test access
  * ================================================================== */
+struct midr_pending_op {
+	enum {
+		MIDR_OP_ADD = 0,
+		MIDR_OP_DEL = 1,
+	} op;
+	struct prefix		prefix;
+	uint8_t			instance;
+	struct midr_path	*paths;
+	uint8_t			path_count;
+	uint8_t			sid_count;
+	struct in6_addr		sid_list[SRV6_MAX_SEGS];
+};
+
 struct midr_installed_entry {
 	struct prefix		prefix;
+	uint8_t			instance;
 	struct midr_path	*paths;
 	uint8_t			path_count;
 	uint8_t			sid_count;
@@ -46,13 +57,11 @@ struct bgp_midr_dp {
  * Mock globals (libbgp.a symbols we must provide)
  * ================================================================== */
 struct zebra_privs_t bgpd_privs = {};
-/* dynamically allocated so event_loop (opaque struct) works */
 struct event_loop *master;
 struct bgp_master dummy_bm;
 struct bgp_master *bm = &dummy_bm;
 struct zclient *bgp_zclient;
 
-/* weak wrappers: used via -Wl,--wrap (linker replaces the libfrr symbols) */
 enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
 	struct zclient *z, struct zapi_route *api) {
 	return ZCLIENT_SEND_SUCCESS;
@@ -82,11 +91,14 @@ static int pending_count(struct bgp *bgp) {
 	struct bgp_midr_dp *dp = get_dp(bgp);
 	return (dp && dp->pending_ops) ? listcount(dp->pending_ops) : -1;
 }
-static int installed_has(struct bgp *bgp, struct prefix *p) {
+
+/* installed_has now checks by (prefix, instance) */
+static int installed_has(struct bgp *bgp, struct prefix *p, uint8_t instance) {
 	struct bgp_midr_dp *dp = get_dp(bgp);
 	if (!dp || !dp->installed) return 0;
 	struct midr_installed_entry key = {};
 	prefix_copy(&key.prefix, p);
+	key.instance = instance;
 	return hash_lookup(dp->installed, &key) != NULL;
 }
 
@@ -134,6 +146,7 @@ static void test_add_flush_diff(void)
 	inet_pton(AF_INET, "10.0.0.1", &paths[0].nexthop.ipv4);
 	inet_pton(AF_INET, "10.0.0.2", &paths[1].nexthop.ipv4);
 	result.paths = paths; result.path_count = 2;
+	result.instance = MIDR_INSTANCE_SPF;
 
 	midr_zebra_route_add(&bgp, &p, &result);
 	T(pending_count(&bgp) == 1, "1 pending after add");
@@ -144,23 +157,23 @@ static void test_add_flush_diff(void)
 
 	midr_zebra_route_flush(&bgp);
 	T(pending_count(&bgp) == 0, "queue empty after flush");
-	T(installed_has(&bgp, &p), "installed hash has prefix");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "installed hash has prefix");
 
 	/* no-op reinstall */
 	midr_zebra_route_add(&bgp, &p, &result);
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p), "reinstall preserves entry");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "reinstall preserves entry");
 
 	/* change nexthop → diff detects change */
 	inet_pton(AF_INET, "10.0.0.99", &paths[0].nexthop.ipv4);
 	midr_zebra_route_add(&bgp, &p, &result);
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p), "entry still exists after change");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "entry still exists after change");
 
 	/* delete */
 	midr_zebra_route_del(&bgp, &p);
 	midr_zebra_route_flush(&bgp);
-	T(!installed_has(&bgp, &p), "gone after delete");
+	T(!installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "gone after delete");
 
 	midr_zebra_fini(&bgp);
 }
@@ -189,7 +202,7 @@ static void test_add_then_delete(void)
 
 	midr_zebra_route_flush(&bgp);
 	T(pending_count(&bgp) == 0, "queue empty after flush");
-	T(!installed_has(&bgp, &p), "not installed after ADD→DEL");
+	T(!installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "not installed after ADD->DEL");
 
 	midr_zebra_route_del(&bgp, &p);
 	midr_zebra_route_flush(&bgp);
@@ -258,6 +271,7 @@ static void test_srv6_path(void)
 	str2prefix("2001:db8:1::/48", &p);
 	inet_pton(AF_INET6, "2001:db8:a::1", &paths[0].nexthop.ipv6);
 	result.paths = paths; result.path_count = 1;
+	result.instance = MIDR_INSTANCE_TE; /* TE SRv6 */
 	result.explicit.sid_count = 3;
 	inet_pton(AF_INET6, "2001:db8:1::1", &result.explicit.sid_list[0]);
 	inet_pton(AF_INET6, "2001:db8:2::1", &result.explicit.sid_list[1]);
@@ -267,7 +281,7 @@ static void test_srv6_path(void)
 	T(pending_count(&bgp) == 1, "SRv6 queued");
 
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p), "SRv6 installed");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_TE), "SRv6 installed under TE instance");
 
 	midr_zebra_fini(&bgp);
 }
@@ -299,15 +313,15 @@ static void test_multiple_prefixes(void)
 	T(pending_count(&bgp) == 3, "3 pending ops");
 
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p1), "p1");
-	T(installed_has(&bgp, &p2), "p2");
-	T(installed_has(&bgp, &p3), "p3");
+	T(installed_has(&bgp, &p1, MIDR_INSTANCE_SPF), "p1");
+	T(installed_has(&bgp, &p2, MIDR_INSTANCE_SPF), "p2");
+	T(installed_has(&bgp, &p3, MIDR_INSTANCE_SPF), "p3");
 
 	midr_zebra_route_del(&bgp, &p2);
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p1), "p1 still");
-	T(!installed_has(&bgp, &p2), "p2 gone");
-	T(installed_has(&bgp, &p3), "p3 still");
+	T(installed_has(&bgp, &p1, MIDR_INSTANCE_SPF), "p1 still");
+	T(!installed_has(&bgp, &p2, MIDR_INSTANCE_SPF), "p2 gone");
+	T(installed_has(&bgp, &p3, MIDR_INSTANCE_SPF), "p3 still");
 
 	midr_zebra_fini(&bgp);
 }
@@ -338,7 +352,7 @@ static void test_ucmp(void)
 	midr_zebra_route_add(&bgp, &p, &result);
 	T(pending_count(&bgp) == 1, "UCMP queued");
 	midr_zebra_route_flush(&bgp);
-	T(installed_has(&bgp, &p), "UCMP installed");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "UCMP installed");
 	midr_zebra_fini(&bgp);
 }
 
@@ -377,6 +391,57 @@ static void test_struct_layout(void)
 	struct midr_path_result r = {};
 	T(r.explicit.sid_count == 0, "zero-inited sid_count=0 (pure IP)");
 	T(r.path_count == 0, "zero-inited path_count=0");
+	T(r.instance == MIDR_INSTANCE_SPF, "zero-inited instance=0 (SPF default)");
+}
+
+/* ==================================================================
+ * Test 10: Dual-Instance — SPF + TE coexist for same prefix
+ * ================================================================== */
+static void test_dual_instance(void)
+{
+	struct bgp bgp = {};
+	struct midr_path paths_spf[1] = {};
+	struct midr_path paths_te[1] = {};
+	struct midr_path_result result_spf = {};
+	struct midr_path_result result_te = {};
+	struct prefix p;
+
+	printf("\n[Test 10] dual-instance SPF+TE coexist\n");
+
+	midr_zebra_init(&bgp);
+
+	str2prefix("10.99.99.0/24", &p);
+
+	/* SPF route: instance=0, metric=100 */
+	inet_pton(AF_INET, "10.0.0.1", &paths_spf[0].nexthop.ipv4);
+	paths_spf[0].metric = 100;
+	result_spf.paths = paths_spf; result_spf.path_count = 1;
+	result_spf.instance = MIDR_INSTANCE_SPF;
+
+	midr_zebra_route_add(&bgp, &p, &result_spf);
+	midr_zebra_route_flush(&bgp);
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "SPF installed at instance=0");
+	T(!installed_has(&bgp, &p, MIDR_INSTANCE_TE), "TE absent before add");
+
+	/* TE route: instance=1, SRv6 SID list */
+	inet_pton(AF_INET6, "2001:db8:cafe::1", &paths_te[0].nexthop.ipv6);
+	result_te.paths = paths_te; result_te.path_count = 1;
+	result_te.instance = MIDR_INSTANCE_TE;
+	result_te.explicit.sid_count = 2;
+	inet_pton(AF_INET6, "2001:db8:aa::1", &result_te.explicit.sid_list[0]);
+	inet_pton(AF_INET6, "2001:db8:bb::1", &result_te.explicit.sid_list[1]);
+
+	midr_zebra_route_add(&bgp, &p, &result_te);
+	midr_zebra_route_flush(&bgp);
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "SPF still installed alongside TE");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_TE), "TE installed at instance=1");
+
+	/* delete TE → SPF survives */
+	midr_zebra_route_del(&bgp, &p);
+	midr_zebra_route_flush(&bgp);
+	/* Note: route_del defaults to instance=SPF, so only SPF is deleted */
+
+	midr_zebra_fini(&bgp);
 }
 
 /* ==================================================================
@@ -384,7 +449,6 @@ static void test_struct_layout(void)
  * ================================================================== */
 int main(void)
 {
-	/* Allocate a real event_loop (needed by event_add_timer_msec) */
 	master = event_master_create("test_midr");
 	dummy_bm.master = master;
 
@@ -399,6 +463,7 @@ int main(void)
 	test_ucmp();
 	test_empty_ops();
 	test_struct_layout();
+	test_dual_instance();
 
 	printf("\n=== %d test(s) FAILED ===\n", g_failed);
 	return g_failed ? 1 : 0;
