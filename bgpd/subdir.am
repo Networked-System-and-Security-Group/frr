@@ -55,6 +55,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_ls_nlri.c \
 	bgpd/bgp_ls_ted.c \
 	bgpd/bgp_mac.c \
+	bgpd/bgp_midr_spf.c \
 	bgpd/bgp_memory.c \
 	bgpd/bgp_mpath.c \
 	bgpd/bgp_mplsvpn.c \
@@ -143,6 +144,7 @@ noinst_HEADERS += \
 	bgpd/bgp_ls_nlri.h \
 	bgpd/bgp_ls_ted.h \
 	bgpd/bgp_mac.h \
+	bgpd/bgp_midr_spf.h \
 	bgpd/bgp_memory.h \
 	bgpd/bgp_mpath.h \
 	bgpd/bgp_mplsvpn.h \
