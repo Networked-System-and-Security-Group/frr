@@ -987,6 +987,22 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	/* Peer with the node's real reachable address (TLV 1188), not its
 	 * router-id; router-id is only an identity and may be unroutable. */
 	midr_node_get_locator(entry, &locator);
+
+	/*
+	 * B1-Q2（doc/change.md）：运维 `no midr session` 持久排除的地址，任何
+	 * 自动路径（发现建邻居、connect_group 换组/退群重收敛）都不得在这里
+	 * 悄悄把会话建回来——这正是 change.md 里"两头不靠"问题的根：
+	 * connect_group 直接按群号遍历成员调用本函数，完全不经
+	 * midr_discovery_should_peer 那道闸门。此处补上是唯一能覆盖所有调用
+	 * 路径的地方。`midr session`（手工escape hatch）不走本函数，不受影响。
+	 */
+	if (locator.family == AF_INET &&
+	    midr_nds_is_session_excluded(bgp, locator.u.prefix4)) {
+		MIDR_LOG("midr_ctrl: %pFX 在会话排除名单中，跳过自动建连",
+			 &entry->node_id);
+		return;
+	}
+
 	prefix2sockunion(&locator, &su);
 
 	/*

@@ -43,6 +43,7 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_ENTRY, "MIDR node entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_LINK_ENTRY, "MIDR link entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_ENTRY, "MIDR rep directory entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_BOOTSTRAP_ENTRY, "MIDR bootstrap candidate");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_EXCLUDE, "MIDR excluded session");
 
 /* ===========================================================================
  * Hash helpers (node table is keyed by node_id prefix)
@@ -185,6 +186,65 @@ static bool midr_global_view_del_link(struct midr_global_view *gv,
 }
 
 /* ===========================================================================
+ * B1-Q2（doc/change.md）：`no midr session` 持久排除名单
+ * =========================================================================*/
+
+bool midr_nds_is_session_excluded(struct bgp *bgp, struct in_addr locator)
+{
+	struct bgp_midr *mi;
+	struct listnode *node;
+	struct in_addr *a;
+
+	if (!bgp || !bgp->midr_info || !bgp->midr_info->session_blacklist)
+		return false;
+	mi = bgp->midr_info;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->session_blacklist, node, a))
+		if (a->s_addr == locator.s_addr)
+			return true;
+	return false;
+}
+
+void midr_nds_session_exclude_add(struct bgp *bgp, struct in_addr locator)
+{
+	struct bgp_midr *mi;
+	struct in_addr *a;
+
+	if (!bgp || !bgp->midr_info || !bgp->midr_info->session_blacklist)
+		return;
+	mi = bgp->midr_info;
+
+	if (midr_nds_is_session_excluded(bgp, locator))
+		return; /* 已在名单，幂等 */
+
+	a = XMALLOC(MTYPE_MIDR_SESSION_EXCLUDE, sizeof(*a));
+	*a = locator;
+	listnode_add(mi->session_blacklist, a);
+	MIDR_FLOW_LOG("MIDR B1-Q2：%pI4 加入会话排除名单（持久排除，不再自动重连）",
+		      &locator);
+}
+
+void midr_nds_session_exclude_del(struct bgp *bgp, struct in_addr locator)
+{
+	struct bgp_midr *mi;
+	struct listnode *node;
+	struct in_addr *a;
+
+	if (!bgp || !bgp->midr_info || !bgp->midr_info->session_blacklist)
+		return;
+	mi = bgp->midr_info;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->session_blacklist, node, a))
+		if (a->s_addr == locator.s_addr) {
+			listnode_delete(mi->session_blacklist, a);
+			XFREE(MTYPE_MIDR_SESSION_EXCLUDE, a);
+			MIDR_FLOW_LOG("MIDR B1-Q2：%pI4 移出会话排除名单（运维手工 midr session 显式覆盖）",
+				      &locator);
+			return;
+		}
+}
+
+/* ===========================================================================
  * NDS node table
  * =========================================================================*/
 
@@ -213,8 +273,20 @@ static bool midr_discovery_should_peer(struct bgp *bgp,
 				       const struct midr_node_entry *entry)
 {
 	struct bgp_midr *mi = bgp->midr_info;
+	struct prefix locator;
 
-	return entry->group_id != 0 && entry->group_id == mi->local_group_id;
+	if (entry->group_id == 0 || entry->group_id != mi->local_group_id)
+		return false;
+
+	/* B1-Q2（doc/change.md）：运维 `no midr session` 持久排除的节点，哪怕
+	 * 仍同群，也不再自动纳入邻居——否则下一次发现/重收敛会把它悄悄连
+	 * 回来，运维命令形同虚设。 */
+	midr_node_get_locator(entry, &locator);
+	if (locator.family == AF_INET &&
+	    midr_nds_is_session_excluded(bgp, locator.u.prefix4))
+		return false;
+
+	return true;
 }
 
 /*
@@ -1993,6 +2065,7 @@ void bgp_midr_init(struct bgp *bgp)
 	mi->local_capabilities = 0;
 	mi->rep_dir = list_new();
 	mi->bootstrap_list = list_new(); /* §8.32 候选引导节点清单 */
+	mi->session_blacklist = list_new(); /* B1-Q2 会话排除名单 */
 	mi->perf_seqno = 0;
 	mi->cap_seqno = 0;
 
@@ -2064,6 +2137,14 @@ void bgp_midr_finish(struct bgp *bgp)
 			XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, b);
 		list_delete(&mi->bootstrap_list);
 		mi->bootstrap_cur = NULL;
+	}
+	if (mi->session_blacklist) { /* B1-Q2 排除名单 */
+		struct listnode *node, *nnode;
+		struct in_addr *a;
+
+		for (ALL_LIST_ELEMENTS(mi->session_blacklist, node, nnode, a))
+			XFREE(MTYPE_MIDR_SESSION_EXCLUDE, a);
+		list_delete(&mi->session_blacklist);
 	}
 
 	XFREE(MTYPE_BGP_MIDR, mi);

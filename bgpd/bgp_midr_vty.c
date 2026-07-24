@@ -121,6 +121,14 @@ DEFUN(midr_session,
 	}
 
 	/*
+	 * B1-Q2（doc/change.md）：手工敲这条命令是运维显式意图，必须能覆盖此
+	 * 前的 `no midr session` 排除——否则下一次自动重收敛（connect_group）
+	 * 又会被排除名单挡住，运维刚建好的会话反而在下一次换组/退群时消失，
+	 * 从"手工建连"退化成"手工建一次性连接"。
+	 */
+	midr_nds_session_exclude_del(bgp, su.sin.sin_addr);
+
+	/*
 	 * S3 撞车守卫：必须拦在 peer_remote_as 之前——它对已存在 peer 会直接复用，
 	 * ASN 不同还静默改 AS（bgpd.c peer_as_change），随后整形把活的 underlay
 	 * 会话就地改造成 overlay（撤 IPv4、multihop），砸掉转发面（洞 #3）。
@@ -219,7 +227,17 @@ DEFUN(no_midr_session,
 	if (!midr_nds_detach_by_locator(bgp, su.sin.sin_addr))
 		peer_delete(peer);
 
-	vty_out(vty, "MIDR session %s removed\n", argv[3]->arg);
+	/*
+	 * B1-Q2（doc/change.md），选项(b)：持久排除而非临时拔线——运维显式敲
+	 * 这条命令表达"不想再跟这个节点做邻居"，不该被下一次自动重收敛
+	 * （换组/退群时的 connect_group）悄悄连回来。写名单在 detach 之后，
+	 * 不影响本次清账本身。
+	 */
+	midr_nds_session_exclude_add(bgp, su.sin.sin_addr);
+
+	vty_out(vty,
+		"MIDR session %s removed and persistently excluded (use `midr session %s remote-as <ASN>` to reconnect)\n",
+		argv[3]->arg, argv[3]->arg);
 	return CMD_SUCCESS;
 }
 
@@ -1004,7 +1022,8 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 		"        旧名 midr neighbor 过渡期仍可用(不再出现在补全里)\n");
 	vty_out(vty, "    %sno midr session <IP>%s\n", C_CMD, C_RST);
 	vty_out(vty,
-		"        拆一条 MIDR 会话并清账(带守卫:运维会话拒删;旧名 no midr neighbor 同上)\n");
+		"        拆一条 MIDR 会话并清账，且持久排除该地址(不会被下次自动重收敛连回来；"
+		"带守卫:运维会话拒删；重敲 midr session <IP> remote-as <ASN> 可解除排除；旧名 no midr neighbor 同上)\n");
 	vty_out(vty, "    %smidr role bootstrap%s\n", C_CMD, C_RST);
 	vty_out(vty, "        将本节点设为 bootstrap(引导)节点\n");
 	vty_out(vty, "    %sno midr role bootstrap%s\n", C_CMD, C_RST);

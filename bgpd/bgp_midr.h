@@ -311,6 +311,14 @@ struct bgp_midr {
 	 */
 	time_t group_settled_at;
 
+	/*
+	 * B1-Q2（doc/change.md）：`no midr session` 持久排除名单——list of
+	 * `struct in_addr *`（locator，与 midr session 命令按同一地址操作）。
+	 * 只影响"自动重连"（midr_ctrl_connect / midr_discovery_should_peer），
+	 * 不影响运维用 `midr session` 手工显式重连（那条路径先移出名单）。
+	 */
+	struct list *session_blacklist;
+
 	/* === Local transport address (TLV 1188) + graceful shutdown === */
 	struct in_addr local_transport_addr; /* our reachable locator */
 	bool transport_addr_set;	     /* operator configured one */
@@ -522,6 +530,19 @@ extern struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
 /* ⑦ `no midr neighbor` 清账：按地址反查节点表条目并 detach 全套（停探+删 link+
  * 清 is_adjacent+拆会话）。查到返回 true，查不到 false（调用方退化为只拆会话）。 */
 extern bool midr_nds_detach_by_locator(struct bgp *bgp, struct in_addr addr);
+
+/*
+ * B1-Q2（doc/change.md）：`no midr session` 持久排除名单存取。add/del 由 VTY
+ * 的 `no midr session` / `midr session` 调用；is_excluded 由
+ * midr_discovery_should_peer（本文件）与 midr_ctrl_connect（bgp_midr_ctrl.c）
+ * 调用，拦截自动重连（发现阶段建邻居、换组/退群重收敛的 connect_group）。
+ */
+extern bool midr_nds_is_session_excluded(struct bgp *bgp,
+					 struct in_addr locator);
+extern void midr_nds_session_exclude_add(struct bgp *bgp,
+					 struct in_addr locator);
+extern void midr_nds_session_exclude_del(struct bgp *bgp,
+					 struct in_addr locator);
 extern bool midr_rep_dir_del(struct bgp *bgp, uint32_t group_id,
 			     struct in_addr rep_transport);
 extern void midr_rep_dir_clear(struct bgp *bgp);
