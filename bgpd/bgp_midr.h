@@ -356,6 +356,7 @@ struct bgp_midr {
 	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
 	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
 	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
+	struct event *t_anchor_probe_done; /* B2/疑2：deferred ANCHOR_PROBE_DONE，见 anchor_group_id */
 	struct event *t_bootstrap_boot;	  /* §8.31 一次性种子自举定时器 */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
@@ -422,6 +423,12 @@ extern void midr_nds_on_node_withdraw(struct bgp *bgp,
 /* 把一个群成员（MEMBER_LIST_RESP）灌入 global_view、标记邻居并 I-1 探测 */
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 				  struct in_addr transport, uint32_t group_id);
+
+/* B2/疑2：同上，但不标邻居——锚点候选是跨群评估节点，不是本群成员。 */
+extern void midr_nds_learn_anchor_candidate(struct bgp *bgp,
+					    struct in_addr rid, as_t asn,
+					    struct in_addr transport,
+					    uint32_t group_id);
 
 /*
  * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时，为请求方灌入一条最小 global_view

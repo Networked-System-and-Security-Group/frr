@@ -218,11 +218,15 @@ extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
 
 /*
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型，供响应
- * 类型配对校验；内部转现有 recv_rep_list / recv_member_list 灌全局视图并推进
- * join 状态机。
+ * 类型配对校验；src = 响应来源（即当初请求的目的地），供 B2/疑2 并发多个
+ * MEMBER_LIST_REQ（主候选群 + 至多 2 个次优群）时精确清对应的重传 pending
+ * 条目（按 (dst,type) 而非只按 type，否则某个目标的响应会误清掉另一个尚未
+ * 响应的目标的重传追踪）；内部转现有 recv_rep_list / recv_member_list 灌全
+ * 局视图并推进 join 状态机。
  */
 extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
-				      const uint8_t *payload, size_t len);
+				      const uint8_t *payload, size_t len,
+				      struct in_addr src);
 
 /* --- 传输层 (tcp.c) 提供给语义层调用 --- */
 

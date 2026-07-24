@@ -46,13 +46,22 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 				      uint8_t type, uint32_t target_group);
 static void midr_ctrl_send_peer_request(struct bgp *bgp,
 					const struct midr_node_entry *entry);
-static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type);
+static void midr_ctrl_drop_pending(struct bgp_midr *mi, struct in_addr dst,
+				   uint8_t type);
 
 static void midr_ctrl_member_probe_done_cb(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	MIDR_FLOW_LOG("MIDR 加入：MEMBER_PROBE_DONE 定时器触发，通知 CL");
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
+}
+
+/* B2/疑2（doc/change.md）：两个次优群限时探测完成，交 CL 选锚点。 */
+static void midr_ctrl_anchor_probe_done_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	MIDR_FLOW_LOG("MIDR B2/疑2：ANCHOR_PROBE_DONE 定时器触发，通知 CL");
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_ANCHOR_PROBE_DONE);
 }
 static void midr_ctrl_retx_timer(struct event *t);
 static void midr_ctrl_udp_recv(struct event *t);
@@ -222,14 +231,22 @@ void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
 	MIDR_FLOW_LOG("midr_ctrl: sent ANNOUNCE to %pI4", &dst);
 }
 
-/* Drop all pending retransmits of a given request type (response arrived). */
-static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type)
+/*
+ * Drop the pending retransmit for (dst,type) — response arrived from that
+ * specific destination.  Scoped by dst (not just type) since B2/疑2 can have
+ * several MEMBER_LIST_REQ in flight to different reps at once; filtering by
+ * type alone would drop other still-outstanding destinations' retransmit
+ * tracking the moment any one of them responds.
+ */
+static void midr_ctrl_drop_pending(struct bgp_midr *mi, struct in_addr dst,
+				   uint8_t type)
 {
 	struct listnode *node, *nnode;
 	struct midr_ctrl_pending *p;
 
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p))
-		if (p->type == type) {
+		if (p->type == type &&
+		    p->target_transport.s_addr == dst.s_addr) {
 			list_delete_node(mi->ctrl_pending, node);
 			XFREE(MTYPE_MIDR_CTRL_PENDING, p);
 		}
@@ -522,7 +539,7 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 
 /* New node: store the bootstrap's rep directory, then run join stage 1. */
 static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
-				    ssize_t n)
+				    ssize_t n, struct in_addr src)
 {
 	struct bgp_midr *mi = bgp->midr_info;
 	const struct midr_ctrl_list_hdr *hdr =
@@ -549,7 +566,7 @@ static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
 				 (as_t)ntohl(items[i].rep_asn),
 				 items[i].rep_rid);
 
-	midr_ctrl_drop_pending(mi, MIDR_CTRL_REP_LIST_REQ);
+	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_REP_LIST_REQ);
 	MIDR_FLOW_LOG("midr_ctrl: REP_LIST_RESP with %u reps — starting join", count);
 	midr_join_on_rep_list(bgp);
 }
@@ -558,15 +575,25 @@ static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
  * New node: learn the rep's member list (table A) into the global view and
  * probe each (I-1).  Connecting is deferred to the JOIN decision (see ⑥):
  * only after CL judges the group worth joining does NDS connect_group.
+ *
+ * B2/疑2（doc/change.md）：RECOMMEND 阶段现在最多并发发出 3 个 MEMBER_LIST_REQ
+ * ——主候选群（mi->join_group_id）+ 至多 2 个次优群（mi->anchor_group_id[]）。
+ * 三路响应都会落到这同一个函数，靠响应里自带的 group_id（items[0]，代表本身
+ * 那条）区分是哪一路：命中 join_group_id 走原有入群评估路径；命中
+ * anchor_group_id[] 走新的锚点候选路径（不置 is_adjacent，避免污染本群邻接
+ * 统计；见 midr_nds_learn_anchor_candidate 头注释）；两者都不命中视为过期/
+ * 串台响应（例如上一轮 join 的迟到响应），只清 pending、不灌表。
  */
 static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
-				       ssize_t n)
+				       ssize_t n, struct in_addr src)
 {
 	struct bgp_midr *mi = bgp->midr_info;
 	const struct midr_ctrl_list_hdr *hdr =
 		(const struct midr_ctrl_list_hdr *)buf;
 	const struct midr_ctrl_member_item *items;
 	uint16_t count, i;
+	uint32_t resp_group;
+	bool is_join_candidate, is_anchor;
 
 	if (n < (ssize_t)sizeof(*hdr))
 		return;
@@ -579,43 +606,90 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	}
 	items = (const struct midr_ctrl_member_item *)(buf + sizeof(*hdr));
 
+	/* 收到响应 → 停止对这个目的地重传（不管下面判到哪一路）。 */
+	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_MEMBER_LIST_REQ);
+
+	if (count == 0) {
+		MIDR_LOG("midr_ctrl: MEMBER_LIST_RESP from %pI4 为空，无法判断所属群，忽略",
+			 &src);
+		return;
+	}
+	/* 代表自己那条（组装时放最前）自带真实群号，用它判定这是哪一路响应。 */
+	resp_group = ntohl(items[0].group_id);
+	is_join_candidate =
+		mi->join_group_id != 0 && resp_group == mi->join_group_id;
+	is_anchor = !is_join_candidate && resp_group != 0 &&
+		    (resp_group == mi->anchor_group_id[0] ||
+		     resp_group == mi->anchor_group_id[1]);
+
+	if (!is_join_candidate && !is_anchor) {
+		MIDR_LOG("midr_ctrl: MEMBER_LIST_RESP 群 %u 与当前候选群/锚点群都不符（过期响应？），忽略",
+			 resp_group);
+		return;
+	}
+
 	/*
-	 * ⑥ 先探后判：把成员表灌入 global_view、标记邻居（is_adjacent）并 I-1 探测，
-	 * 但【不在此建连】。建连推迟到 CL 判定入群（JOIN）之后，由
-	 * midr_nds_on_cluster_decision 的 JOIN 分支调 connect_group。
+	 * ⑥ 先探后判：把成员表灌入 global_view、按所属路径决定是否标邻居
+	 * （is_adjacent，仅 join 候选群路径）并 I-1 探测，但【不在此建连】。
+	 * 建连推迟到 I-7 决策之后（JOIN 走 connect_group；ANCHOR 走
+	 * midr_ctrl_connect，见 midr_nds_on_cluster_decision）。
 	 */
 	for (i = 0; i < count; i++) {
+		uint32_t item_gid = ntohl(items[i].group_id);
+
 		if (IPV4_ADDR_SAME(&items[i].rid, &bgp->router_id))
 			continue; /* 跳过描述自己的条目 */
 
-		midr_nds_learn_member(bgp, items[i].rid, ntohl(items[i].asn),
-				      items[i].transport,
-				      ntohl(items[i].group_id));
-		MIDR_FLOW_LOG("MIDR 加入：I-1 探测成员 %pI4（群 %u）",
-			      &items[i].rid, ntohl(items[i].group_id));
+		if (is_join_candidate) {
+			midr_nds_learn_member(bgp, items[i].rid,
+					      ntohl(items[i].asn),
+					      items[i].transport, item_gid);
+			MIDR_FLOW_LOG("MIDR 加入：I-1 探测成员 %pI4（群 %u）",
+				      &items[i].rid, item_gid);
+		} else {
+			midr_nds_learn_anchor_candidate(
+				bgp, items[i].rid, ntohl(items[i].asn),
+				items[i].transport, item_gid);
+			MIDR_FLOW_LOG("MIDR B2/疑2：I-1 探测锚点候选 %pI4（次优群 %u）",
+				      &items[i].rid, item_gid);
+		}
 
 		/*
 		 * 该成员从未跟我们交换过任何报文（我们是从群代表的
 		 * MEMBER_LIST_RESP 里间接得知它的），它的 pm_is_known_transport
 		 * 校验会把我们刚发起的探测包当未知来源丢弃。发一个单向 ANNOUNCE
-		 * 自报身份，让它记住我们——不等回复、不触发建连。
+		 * 自报身份，让它记住我们——不等回复、不触发建连。两条路径的候选
+		 * 都需要，语义相同。
 		 */
 		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
 	}
 
-	/* 收到成员列表响应 → 停止重传 MEMBER_LIST_REQ（UDP 重传队列机制）。 */
-	midr_ctrl_drop_pending(mi, MIDR_CTRL_MEMBER_LIST_REQ);
-
-	/*
-	 * 探完整批成员后，编排层显式发 MEMBER_PROBE_DONE，交 CL 评估是否入群
-	 * （I-7 JOIN/CREATE）。一整批只发一次。不在此清 join_phase：收尾在
-	 * midr_nds_on_cluster_decision 的 JOIN/CREATE 分支。
-	 */
-	MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
-		      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);
-	event_cancel(&mi->t_member_probe_done);
-	event_add_timer(bm->master, midr_ctrl_member_probe_done_cb, bgp,
-			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_member_probe_done);
+	if (is_join_candidate) {
+		/*
+		 * 探完整批成员后，编排层显式发 MEMBER_PROBE_DONE，交 CL 评估是否
+		 * 入群（I-7 JOIN/CREATE）。一整批只发一次。不在此清 join_phase：
+		 * 收尾在 midr_nds_on_cluster_decision 的 JOIN/CREATE 分支。
+		 */
+		MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+			      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);
+		event_cancel(&mi->t_member_probe_done);
+		event_add_timer(bm->master, midr_ctrl_member_probe_done_cb,
+				bgp, MIDR_JOIN_PROBE_WAIT_SECS,
+				&mi->t_member_probe_done);
+	} else {
+		/*
+		 * B2/疑2：两个次优群各自异步到达，共用一个定时器——每到一路就
+		 * 重新起 MIDR_JOIN_PROBE_WAIT_SECS 秒倒计时（与 REP/MEMBER 热身
+		 * 同款手法），保证较晚到的那一路也能拿到足够的探测热身时间；只
+		 * 有一路候选时同样适用（第一路到达即开始倒计时）。
+		 */
+		MIDR_FLOW_LOG("MIDR B2/疑2：收到次优群 %u 成员列表，ANCHOR_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+			      resp_group, MIDR_JOIN_PROBE_WAIT_SECS);
+		event_cancel(&mi->t_anchor_probe_done);
+		event_add_timer(bm->master, midr_ctrl_anchor_probe_done_cb,
+				bgp, MIDR_JOIN_PROBE_WAIT_SECS,
+				&mi->t_anchor_probe_done);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -692,10 +766,13 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 
 /*
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型 (响应类型
- * 配对校验, 防串台); 转现有 recv_rep_list / recv_member_list 灌视图 + 推进 join。
+ * 配对校验, 防串台); src = 响应来源 (B2/疑2 并发多路 MEMBER_LIST_REQ 时, 供
+ * drop_pending 精确清对应 (dst,type) 条目, 见 bgp_midr_ctrl.h 声明处注释);
+ * 转现有 recv_rep_list / recv_member_list 灌视图 + 推进 join。
  */
 void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
-			       const uint8_t *payload, size_t len)
+			       const uint8_t *payload, size_t len,
+			       struct in_addr src)
 {
 	const struct midr_ctrl_list_hdr *hdr;
 
@@ -714,7 +791,7 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 				 req_type);
 			return;
 		}
-		midr_ctrl_recv_rep_list(bgp, payload, (ssize_t)len);
+		midr_ctrl_recv_rep_list(bgp, payload, (ssize_t)len, src);
 		break;
 	case MIDR_CTRL_MEMBER_LIST_RESP:
 		if (req_type != MIDR_CTRL_MEMBER_LIST_REQ) {
@@ -722,7 +799,7 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 				 req_type);
 			return;
 		}
-		midr_ctrl_recv_member_list(bgp, payload, (ssize_t)len);
+		midr_ctrl_recv_member_list(bgp, payload, (ssize_t)len, src);
 		break;
 	default:
 		MIDR_LOG("midr_ctrl: TCP unexpected response type %u", hdr->type);

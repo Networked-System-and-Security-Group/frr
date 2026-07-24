@@ -558,6 +558,50 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 }
 
 /*
+ * B2/疑2（doc/change.md）：把一个锚点候选群成员（来自 MEMBER_LIST_RESP，群号
+ * 命中 mi->anchor_group_id[]，而非 mi->join_group_id）灌入 global_view 并
+ * I-1 启动探测。与 midr_nds_learn_member() 几乎相同，唯一差别是【不】置
+ * is_adjacent——锚点候选是跨群评估节点，不是本群邻居，一旦被算进
+ * cl_count_good_member_links() 的统计口径就会污染 B1 的留群/退群判定。
+ * 不复用同一函数：调用点意图（"这是要入的群"还是"这是拿来探探看的次优
+ * 群"）完全不同，硬把 bool 参数塞进 learn_member() 会让这个关键区别散落在
+ * 各调用点，不如各自独立、名字各自说明白自己在干什么。
+ */
+void midr_nds_learn_anchor_candidate(struct bgp *bgp, struct in_addr rid,
+				     as_t asn, struct in_addr transport,
+				     uint32_t group_id)
+{
+	struct midr_global_view *gv;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_info)
+		return;
+
+	gv = bgp->midr_info->global_view;
+	midr_prefix_from_in_addr(&key.node_id, rid);
+
+	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!entry) {
+		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
+		entry->node_id = key.node_id;
+		midr_node_hash_add(&gv->nodes, entry);
+	}
+	entry->asn = asn;
+	entry->group_id = group_id;
+	entry->transport_addr = transport;
+	entry->has_transport_addr = true;
+	entry->last_seen = monotime(NULL);
+	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
+	/* 有意不碰 is_adjacent：若条目已存在且已是邻居（理论上不该发生——本群
+	 * 与次优群不同），保守起见也不去清它，只负责"不主动置真"。 */
+
+	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
+	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
+			   entry->capabilities);
+}
+
+/*
  * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时调用：请求方在其自身的 join 流程里会
  * 反过来对我们发 PM 探测包，而 midr_pm_recv() 的 pm_is_known_transport() 只
  * 接受 global_view 里已知的来源地址——请求方此时还没有 BGP-LS 会话，我们的
@@ -1236,6 +1280,33 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 					      decision->new_group_id);
 		MIDR_FLOW_LOG("MIDR I-7：RECOMMEND 群代表 %pFX → 进入探成员阶段，请求群 %u 成员",
 			      &decision->recommended_rep, decision->new_group_id);
+
+		/*
+		 * B2/疑2（doc/change.md）：顺带向 CL 选出的至多 2 个次优代表也发
+		 * MEMBER_LIST_REQ，为群间锚点连接收集候选。先重置两个槽位——
+		 * 上一轮 join（若有）留下的群号不能带进这一轮，否则新到达的
+		 * MEMBER_LIST_RESP 可能被误判成命中旧槽位。候选不足 2 个时，
+		 * 未用到的槽位保持 0（cl_handle_anchor_probe_done 按 0 跳过）。
+		 */
+		mi->anchor_group_id[0] = 0;
+		mi->anchor_group_id[1] = 0;
+		if (decision->anchor_reps) {
+			struct listnode *an;
+			struct midr_rep_entry *ar;
+			int slot = 0;
+
+			for (ALL_LIST_ELEMENTS_RO(decision->anchor_reps, an,
+						  ar)) {
+				if (slot >= 2)
+					break;
+				mi->anchor_group_id[slot] = ar->group_id;
+				midr_ctrl_send_member_request(
+					bgp, ar->rep_transport, ar->group_id);
+				MIDR_FLOW_LOG("MIDR I-7：RECOMMEND 附带请求次优群 %u 成员（锚点候选）",
+					      ar->group_id);
+				slot++;
+			}
+		}
 		break;
 	case MIDR_DECISION_JOIN:
 		/*
@@ -1405,18 +1476,42 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		MIDR_FLOW_LOG("MIDR I-7：REP_RESIGN 群 %u，本节点卸任代表",
 			      mi->local_group_id);
 		break;
-	case MIDR_DECISION_ANCHOR:
+	case MIDR_DECISION_ANCHOR: {
 		/*
-		 * B2/疑2（doc/change.md）：CL 选出的锚点候选（decision->evidence，
-		 * 至多 4 条 node_id+metrics）。NDS 侧的请求成员列表/限时探测/
-		 * 触发本决策那半套编排是 B2/疑2（下）的活；这里先接执行分支占位
-		 * （待办：对 evidence 里每条按 node_id 查 global_view 拿到完整
-		 * entry，逐条 midr_ctrl_connect()，与 connect_group 同一原语）。
+		 * B2/疑2（doc/change.md）：CL 选出的至多 4 个锚点候选
+		 * （decision->evidence，仅 node_id+metrics）。逐条按 node_id 反查
+		 * global_view 拿完整 entry（锚点候选此前已经
+		 * midr_nds_learn_anchor_candidate 灌过表，一定能查到），直接
+		 * midr_ctrl_connect()——与 connect_group 建群内会话同一原语，
+		 * 天然带 S3/S5 那几道去重/归属守卫，不需要另外处理。
 		 */
-		MIDR_LOG("MIDR I-7：ANCHOR 收到 %u 个锚点候选（stub，执行编排见 B2/疑2 下）",
-			 decision->evidence ? listcount(decision->evidence)
-					     : 0);
+		struct listnode *en;
+		struct midr_node_evidence *ev;
+		uint32_t connected = 0;
+
+		if (decision->evidence)
+			for (ALL_LIST_ELEMENTS_RO(decision->evidence, en, ev)) {
+				struct midr_node_entry key = {};
+				struct midr_node_entry *entry;
+
+				key.node_id = ev->node_id;
+				entry = midr_node_hash_find(
+					&mi->global_view->nodes, &key);
+				if (!entry) {
+					MIDR_LOG("MIDR I-7：ANCHOR 候选 %pFX 不在 global_view，跳过",
+						 &ev->node_id);
+					continue;
+				}
+				midr_ctrl_connect(bgp, entry);
+				connected++;
+			}
+		MIDR_FLOW_LOG("MIDR I-7：ANCHOR 处理 %u 个锚点候选，尝试建连 %u 个",
+			      decision->evidence ? (uint32_t)listcount(
+						      decision->evidence)
+						  : 0,
+			      connected);
 		break;
+	}
 	}
 }
 
@@ -2128,6 +2223,7 @@ void bgp_midr_finish(struct bgp *bgp)
 	event_cancel(&mi->t_probe_timeout);
 	event_cancel(&mi->t_rep_probe_done);
 	event_cancel(&mi->t_member_probe_done);
+	event_cancel(&mi->t_anchor_probe_done);
 	event_cancel(&mi->t_bootstrap_boot);
 
 	/* Stop PM periodic probe timer */
