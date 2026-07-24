@@ -696,8 +696,41 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
  *   4. 停非本群群代表的评估期探测：join 第一段对 rep_dir 里【每个】群代表都起了
  *      探测（midr_join_on_rep_list），落定后除本群代表外都不再需要。它们不带
  *      is_adjacent（只探不纳入邻居），第 3 步扫不到，故按 rep_dir 单独收口——
- *      否则每 join 一次就永久多养一批跨群探测。
+ *      否则每 join 一次就永久多养一批跨群探测。**例外**：mi->anchor_group_id[]
+ *      这两个次优群的代表暂不收口——它们此刻可能还没被 ANCHOR_PROBE_DONE 读取
+ *      （该定时器与触发 JOIN 的定时器是各自独立调度的，落地时间只是相近，谁先
+ *      谁后不确定），这里提前删了 link 数据会让锚点评估白算。真正的收口挪到
+ *      ANCHOR 决策执行完之后（见 MIDR_DECISION_ANCHOR 分支尾部）。
  */
+
+/*
+ * 停止对 rep_dir 单条代表条目的评估期探测（I-2 + 删 link，不拆会话——只探不
+ * 连的代表本就没有会话）。midr_group_reconverge 第 4 步与 ANCHOR 决策执行后
+ * 的收尾共用，抽出来避免重复。键的取法必须与 midr_join_on_rep_list 起探时一
+ * 致（有真名用真名、否则用 transport 建的占位条目），否则找不到条目、停不掉。
+ */
+static void midr_stop_rep_probe_entry(struct bgp *bgp,
+				      const struct midr_rep_entry *r)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *rep_entry;
+
+	if (r->rep_rid.s_addr != INADDR_ANY)
+		midr_prefix_from_in_addr(&key.node_id, r->rep_rid);
+	else
+		midr_prefix_from_in_addr(&key.node_id, r->rep_transport);
+
+	rep_entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+	/* is_self：本节点自兼群代表时不能把自己停了。is_adjacent：该代表若已是
+	 * 本群邻居（如它换群进了本群、而 rep_dir 里还是旧群号），归 reconverge
+	 * 第 3 步管，这里不碰——避免误伤正经邻接。 */
+	if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent)
+		return;
+
+	midr_nds_detach_node(bgp, rep_entry, MIDR_STOP_CLUSTER_CHANGE, false);
+}
+
 static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 {
 	struct bgp_midr *mi = bgp->midr_info;
@@ -725,33 +758,17 @@ static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 	}
 
 	/*
-	 * 4. 停非本群群代表的评估期探测。键的取法必须与 midr_join_on_rep_list
-	 *    起探时一致（有真名用真名、否则用 transport 建的占位条目），否则找不到
-	 *    条目、停不掉。两道守卫：
-	 *      - is_self：本节点自兼群代表时不能把自己停了；
-	 *      - is_adjacent：该代表若已是本群邻居（如它换群进了本群、而 rep_dir 里
-	 *        还是旧群号），它归第 3 步管，这里不碰——避免误伤正经邻接。
-	 *    不拆会话（teardown=false）：只探不连的代表本就没有会话；万一它另有会话，
-	 *    那也不是本步该管的账。
+	 * 4. 停非本群群代表的评估期探测（例外：还留给锚点评估用的两个次优群，
+	 *    见本函数头注释）。
 	 */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r)) {
-		struct midr_node_entry key = {};
-		struct midr_node_entry *rep_entry;
-
 		if (r->group_id == new_gid)
 			continue; /* 本群代表，留着继续探 */
+		if (r->group_id == mi->anchor_group_id[0] ||
+		    r->group_id == mi->anchor_group_id[1])
+			continue; /* 锚点候选还没评估完，留给 ANCHOR 决策执行完后收口 */
 
-		if (r->rep_rid.s_addr != INADDR_ANY)
-			midr_prefix_from_in_addr(&key.node_id, r->rep_rid);
-		else
-			midr_prefix_from_in_addr(&key.node_id, r->rep_transport);
-
-		rep_entry = midr_node_hash_find(&mi->global_view->nodes, &key);
-		if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent)
-			continue;
-
-		midr_nds_detach_node(bgp, rep_entry, MIDR_STOP_CLUSTER_CHANGE,
-				     false);
+		midr_stop_rep_probe_entry(bgp, r);
 		reps_stopped++;
 	}
 
@@ -1507,6 +1524,25 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 						      decision->evidence)
 						  : 0,
 			      connected);
+
+		/*
+		 * 锚点数据已经消费完，收口 reconverge 第 4 步为它俩延后的停探
+		 * （见 midr_group_reconverge 头注释"例外"那段），并把槽位清零——
+		 * 不清的话下一轮 RECOMMEND 判断"是否还留着"会被这轮的旧群号
+		 * 误伤（虽然 RECOMMEND 分支本身也会先清零，这里是双保险，两条
+		 * 路径各自独立维护自己负责的状态更清楚）。
+		 */
+		{
+			struct listnode *rn;
+			struct midr_rep_entry *r;
+
+			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r))
+				if (r->group_id == mi->anchor_group_id[0] ||
+				    r->group_id == mi->anchor_group_id[1])
+					midr_stop_rep_probe_entry(bgp, r);
+		}
+		mi->anchor_group_id[0] = 0;
+		mi->anchor_group_id[1] = 0;
 		break;
 	}
 	}
