@@ -155,8 +155,8 @@ static uint32_t cl_max_group_id(const struct midr_global_view *gv)
 /*
  * 判断 cand（配其链路 cand_link）排名是否严格优于 best（配 best_link）：
  *   长期 RTT 更低 → 丢包率更低 → 带宽分数更高 → group_id 更小（稳定排序）。
- * best 为 NULL（尚无候选）时 cand 总是更优。抽成独立函数是因为 B2/疑2 的
- * 前 3 名排序需要反复用它（不只是找单一最优）。
+ * best 为 NULL（尚无候选）时 cand 总是更优。抽成独立函数是因为前 3 名排序
+ * 需要反复用它（不只是找单一最优）。
  */
 static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
 			     const struct midr_link_entry *cand_link,
@@ -176,10 +176,10 @@ static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
 
 /*
  * 从 mi->rep_dir（群代表目录）中，结合 gv->links 的长期探测指标，选出性能最优的
- * 群代表，经 I-7 RECOMMEND 回灌；同时保留第 2、3 名（B2/疑2，doc/change.md：
- * 群间锚点连接方案），随 RECOMMEND 一并回灌给 NDS 供其请求这两个次优群的成员
- * 列表。REP_PROBE_DONE 本来就已对目录里每个代表探测过一轮，第 2/3 名不需要
- * 任何额外探测代价，只是原先探完即弃。
+ * 群代表，经 I-7 RECOMMEND 回灌；同时保留第 2、3 名（用于群间锚点连接方案），
+ * 随 RECOMMEND 一并回灌给 NDS 供其请求这两个次优群的成员列表。REP_PROBE_DONE
+ * 本来就已对目录里每个代表探测过一轮，第 2/3 名不需要任何额外探测代价，只是
+ * 原先探完即弃。
  *
  * 候选筛选条件：链路状态 UP 且已有探测数据（rtt_us > 0）。
  * 排序规则见 cl_rep_is_better()。
@@ -242,7 +242,7 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		d.recommended_rep.prefixlen = IPV4_MAX_BITLEN;
 		d.recommended_rep.u.prefix4 = top_rep[0]->rep_transport;
 
-		/* B2/疑2：第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
+		/* 第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
 		d.anchor_reps = list_new();
 		if (top_rep[1])
 			listnode_add(d.anchor_reps, top_rep[1]);
@@ -274,9 +274,8 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
  * 用于日志的最差 RTT 和最差 loss_rate（便于排查未达标原因）。
  *
  * 两处复用同一把尺子：MEMBER_PROBE_DONE 拿它评估候选群（target=join_group_id）
- * 决定要不要 JOIN；PERIODIC_SYNC（B1，doc/change.md）拿它评估本节点当前所在
- * 群（target=local_group_id）决定要不要 LEAVE——入群/留群用同一阈值，保持
- * 对称。
+ * 决定要不要 JOIN；PERIODIC_SYNC 拿它评估本节点当前所在群
+ * （target=local_group_id）决定要不要 LEAVE——入群/留群用同一阈值，保持对称。
  */
 static size_t cl_count_good_member_links(const struct bgp *bgp,
 					 const struct midr_global_view *gv,
@@ -372,7 +371,7 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 }
 
 /* ===========================================================================
- * ANCHOR_PROBE_DONE 处理（B2/疑2，doc/change.md：群间锚点连接）
+ * ANCHOR_PROBE_DONE 处理（群间锚点连接）
  * =========================================================================*/
 
 /*
@@ -442,8 +441,8 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
  * 评估 mi->anchor_group_id[0]/[1]（NDS 在 RECOMMEND 阶段从次优代表拿到、限时
  * 探测后回调的两个次优群号，0 = 该槽位无候选）：分别选出连接最好的至多 2 个
  * 节点，合并进 evidence，输出 ANCHOR 决策。NDS 收到后对 evidence 里每条直接
- * midr_ctrl_connect()，形成群间锚点连接（doc/change.md 疑2 采纳方案）。
- * 不改变本节点的 group_id，new/old_group_id 均取 local_group_id 仅作记录。
+ * midr_ctrl_connect()，形成群间锚点连接。不改变本节点的 group_id，
+ * new/old_group_id 均取 local_group_id 仅作记录。
  */
 static void cl_handle_anchor_probe_done(struct bgp *bgp,
 					const struct midr_global_view *gv)
@@ -474,7 +473,7 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
 }
 
 /* ===========================================================================
- * PERIODIC_SYNC 处理（B1，doc/change.md：稳态退群判定）
+ * PERIODIC_SYNC 处理（稳态退群判定）
  * =========================================================================*/
 
 /*
@@ -483,9 +482,9 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
  * "入群"用同一把尺子，够格才留、不够格就走。
  *
  * 两个前置守卫：
- *   - 本节点是群代表时不评估：代表退群目前没有"先卸任再走"的编排（A1 的
- *     REP_ELECT/REP_RESIGN 判定算法还没做），贸然退群会让整群瞬间失去代表、
- *     答不了 MEMBER_LIST，留给后续把 A1 接上后再一并处理。
+ *   - 本节点是群代表时不评估：代表退群目前没有"先卸任再走"的编排
+ *     （REP_ELECT/REP_RESIGN 判定算法还没做），贸然退群会让整群瞬间失去
+ *     代表、答不了 MEMBER_LIST，留给后续把角色判定接上后再一并处理。
  *   - 群号刚变化不足 MIDR_JOIN_PROBE_WAIT_SECS 秒不评估：给 PM 长期 EWMA 留
  *     够收敛时间，否则刚 JOIN/CREATE 完成时群内链路数据还不够，会被误判成
  *     "好链路不够"立即又 LEAVE，形成抖动。
@@ -504,7 +503,7 @@ static void cl_handle_periodic_sync(struct bgp *bgp,
 		return;
 	}
 	if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
-		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点是群代表，跳过退群判定（待 A1 接上）");
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点是群代表，跳过退群判定");
 		return;
 	}
 	if (monotime(NULL) - mi->group_settled_at < MIDR_JOIN_PROBE_WAIT_SECS) {
@@ -582,10 +581,10 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 
 	case MIDR_TRIGGER_ANCHOR_PROBE_DONE:
 		/*
-		 * B2/疑2：评估的是次优群，跟正在加入的候选群是两码事，不受
-		 * join_phase 状态机约束（不像 REP/MEMBER_PROBE_DONE 那样要求
-		 * 处在对应加入阶段）。仅当 NDS 确实起了一轮锚点探测（至少一个
-		 * 槽位非 0）时才处理。
+		 * 评估的是次优群，跟正在加入的候选群是两码事，不受 join_phase
+		 * 状态机约束（不像 REP/MEMBER_PROBE_DONE 那样要求处在对应加入
+		 * 阶段）。仅当 NDS 确实起了一轮锚点探测（至少一个槽位非 0）时
+		 * 才处理。
 		 */
 		if (mi->anchor_group_id[0] == 0 && mi->anchor_group_id[1] == 0) {
 			MIDR_LOG("MIDR CL: ANCHOR_PROBE_DONE 但无锚点候选群，忽略");
@@ -604,10 +603,10 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 
 	case MIDR_TRIGGER_PERIODIC_SYNC:
 		/*
-		 * 周期同步（每 MIDR_PERIODIC_SYNC_INTERVAL 秒）：B1（doc/
-		 * change.md）稳态退群判定，见 cl_handle_periodic_sync()。
-		 * 换群（选到更优群后主动切换）仍是待办，退群判好之后 NDS 会
-		 * 自动重新走一遍加入流程，效果上覆盖了"退群+另择新群"的场景。
+		 * 周期同步（每 MIDR_PERIODIC_SYNC_INTERVAL 秒）：稳态退群判定，
+		 * 见 cl_handle_periodic_sync()。换群（选到更优群后主动切换）
+		 * 仍是待办，退群判好之后 NDS 会自动重新走一遍加入流程，效果上
+		 * 覆盖了"退群+另择新群"的场景。
 		 */
 		cl_handle_periodic_sync(bgp, gv);
 		break;

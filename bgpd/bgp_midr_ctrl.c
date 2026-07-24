@@ -56,11 +56,11 @@ static void midr_ctrl_member_probe_done_cb(struct event *t)
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_MEMBER_PROBE_DONE);
 }
 
-/* B2/疑2（doc/change.md）：两个次优群限时探测完成，交 CL 选锚点。 */
+/* 两个次优群限时探测完成，交 CL 选锚点。 */
 static void midr_ctrl_anchor_probe_done_cb(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
-	MIDR_FLOW_LOG("MIDR B2/疑2：ANCHOR_PROBE_DONE 定时器触发，通知 CL");
+	MIDR_FLOW_LOG("MIDR 锚点：ANCHOR_PROBE_DONE 定时器触发，通知 CL");
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_ANCHOR_PROBE_DONE);
 }
 static void midr_ctrl_retx_timer(struct event *t);
@@ -233,10 +233,10 @@ void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
 
 /*
  * Drop the pending retransmit for (dst,type) — response arrived from that
- * specific destination.  Scoped by dst (not just type) since B2/疑2 can have
- * several MEMBER_LIST_REQ in flight to different reps at once; filtering by
- * type alone would drop other still-outstanding destinations' retransmit
- * tracking the moment any one of them responds.
+ * specific destination.  Scoped by dst (not just type) since several
+ * MEMBER_LIST_REQ can be in flight to different reps at once (join candidate
+ * plus runner-up groups); filtering by type alone would drop other still-
+ * outstanding destinations' retransmit tracking the moment any one responds.
  */
 static void midr_ctrl_drop_pending(struct bgp_midr *mi, struct in_addr dst,
 				   uint8_t type)
@@ -576,8 +576,8 @@ static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
  * probe each (I-1).  Connecting is deferred to the JOIN decision (see ⑥):
  * only after CL judges the group worth joining does NDS connect_group.
  *
- * B2/疑2（doc/change.md）：RECOMMEND 阶段现在最多并发发出 3 个 MEMBER_LIST_REQ
- * ——主候选群（mi->join_group_id）+ 至多 2 个次优群（mi->anchor_group_id[]）。
+ * RECOMMEND 阶段现在最多并发发出 3 个 MEMBER_LIST_REQ——主候选群
+ * （mi->join_group_id）+ 至多 2 个次优群（mi->anchor_group_id[]）。
  * 三路响应都会落到这同一个函数，靠响应里自带的 group_id（items[0]，代表本身
  * 那条）区分是哪一路：命中 join_group_id 走原有入群评估路径；命中
  * anchor_group_id[] 走新的锚点候选路径（不置 is_adjacent，避免污染本群邻接
@@ -650,7 +650,7 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 			midr_nds_learn_anchor_candidate(
 				bgp, items[i].rid, ntohl(items[i].asn),
 				items[i].transport, item_gid);
-			MIDR_FLOW_LOG("MIDR B2/疑2：I-1 探测锚点候选 %pI4（次优群 %u）",
+			MIDR_FLOW_LOG("MIDR 锚点：I-1 探测锚点候选 %pI4（次优群 %u）",
 				      &items[i].rid, item_gid);
 		}
 
@@ -678,12 +678,12 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 				&mi->t_member_probe_done);
 	} else {
 		/*
-		 * B2/疑2：两个次优群各自异步到达，共用一个定时器——每到一路就
-		 * 重新起 MIDR_JOIN_PROBE_WAIT_SECS 秒倒计时（与 REP/MEMBER 热身
-		 * 同款手法），保证较晚到的那一路也能拿到足够的探测热身时间；只
-		 * 有一路候选时同样适用（第一路到达即开始倒计时）。
+		 * 两个次优群各自异步到达，共用一个定时器——每到一路就重新起
+		 * MIDR_JOIN_PROBE_WAIT_SECS 秒倒计时（与 REP/MEMBER 热身同款
+		 * 手法），保证较晚到的那一路也能拿到足够的探测热身时间；只有
+		 * 一路候选时同样适用（第一路到达即开始倒计时）。
 		 */
-		MIDR_FLOW_LOG("MIDR B2/疑2：收到次优群 %u 成员列表，ANCHOR_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+		MIDR_FLOW_LOG("MIDR 锚点：收到次优群 %u 成员列表，ANCHOR_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
 			      resp_group, MIDR_JOIN_PROBE_WAIT_SECS);
 		event_cancel(&mi->t_anchor_probe_done);
 		event_add_timer(bm->master, midr_ctrl_anchor_probe_done_cb,
@@ -766,7 +766,7 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 
 /*
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型 (响应类型
- * 配对校验, 防串台); src = 响应来源 (B2/疑2 并发多路 MEMBER_LIST_REQ 时, 供
+ * 配对校验, 防串台); src = 响应来源 (并发多路 MEMBER_LIST_REQ 时, 供
  * drop_pending 精确清对应 (dst,type) 条目, 见 bgp_midr_ctrl.h 声明处注释);
  * 转现有 recv_rep_list / recv_member_list 灌视图 + 推进 join。
  */
@@ -1066,9 +1066,8 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	midr_node_get_locator(entry, &locator);
 
 	/*
-	 * B1-Q2（doc/change.md）：运维 `no midr session` 持久排除的地址，任何
-	 * 自动路径（发现建邻居、connect_group 换组/退群重收敛）都不得在这里
-	 * 悄悄把会话建回来——这正是 change.md 里"两头不靠"问题的根：
+	 * 运维 `no midr session` 持久排除的地址，任何自动路径（发现建邻居、
+	 * connect_group 换组/退群重收敛）都不得在这里悄悄把会话建回来：
 	 * connect_group 直接按群号遍历成员调用本函数，完全不经
 	 * midr_discovery_should_peer 那道闸门。此处补上是唯一能覆盖所有调用
 	 * 路径的地方。`midr session`（手工escape hatch）不走本函数，不受影响。

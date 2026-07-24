@@ -121,10 +121,10 @@ DEFUN(midr_session,
 	}
 
 	/*
-	 * B1-Q2（doc/change.md）：手工敲这条命令是运维显式意图，必须能覆盖此
-	 * 前的 `no midr session` 排除——否则下一次自动重收敛（connect_group）
-	 * 又会被排除名单挡住，运维刚建好的会话反而在下一次换组/退群时消失，
-	 * 从"手工建连"退化成"手工建一次性连接"。
+	 * 手工敲这条命令是运维显式意图，必须能覆盖此前的 `no midr session`
+	 * 排除——否则下一次自动重收敛（connect_group）又会被排除名单挡住，
+	 * 运维刚建好的会话反而在下一次换组/退群时消失，从"手工建连"退化成
+	 * "手工建一次性连接"。
 	 */
 	midr_nds_session_exclude_del(bgp, su.sin.sin_addr);
 
@@ -228,10 +228,9 @@ DEFUN(no_midr_session,
 		peer_delete(peer);
 
 	/*
-	 * B1-Q2（doc/change.md），选项(b)：持久排除而非临时拔线——运维显式敲
-	 * 这条命令表达"不想再跟这个节点做邻居"，不该被下一次自动重收敛
-	 * （换组/退群时的 connect_group）悄悄连回来。写名单在 detach 之后，
-	 * 不影响本次清账本身。
+	 * 持久排除而非临时拔线——运维显式敲这条命令表达"不想再跟这个节点做
+	 * 邻居"，不该被下一次自动重收敛（换组/退群时的 connect_group）悄悄
+	 * 连回来。写名单在 detach 之后，不影响本次清账本身。
 	 */
 	midr_nds_session_exclude_add(bgp, su.sin.sin_addr);
 

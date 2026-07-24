@@ -238,9 +238,9 @@ enum midr_trigger_type {
 	MIDR_TRIGGER_PERIODIC_SYNC = 4,	    /* periodic sync timer */
 	MIDR_TRIGGER_NODE_CHANGE = 5,	    /* node join/leave/expire */
 	/*
-	 * B2/疑2（doc/change.md）：两个次优群的候选成员限时探测完成。NDS 在
-	 * RECOMMEND 阶段向两个次优代表要来成员列表、探测 MIDR_JOIN_PROBE_WAIT_SECS
-	 * 秒后发出，交 CL 选锚点（cl_handle_anchor_probe_done → I-7 ANCHOR）。
+	 * 两个次优群的候选成员限时探测完成。NDS 在 RECOMMEND 阶段向两个次优
+	 * 代表要来成员列表、探测 MIDR_JOIN_PROBE_WAIT_SECS 秒后发出，交 CL
+	 * 选锚点（cl_handle_anchor_probe_done → I-7 ANCHOR）。
 	 */
 	MIDR_TRIGGER_ANCHOR_PROBE_DONE = 6,
 };
@@ -253,17 +253,17 @@ enum midr_decision_type {
 	MIDR_DECISION_SPLIT = 4,
 	MIDR_DECISION_CREATE = 5,
 	/*
-	 * doc/change.md A1：本节点当选/卸任群代表。判定算法（谁来判、何时判）
-	 * 是 CL 稳态优化待办，这两个类型先落地供其接入；old_group_id/
-	 * new_group_id 均取 local_group_id（角色变更不改群归属）。
+	 * 本节点当选/卸任群代表。判定算法（谁来判、何时判）是 CL 稳态优化
+	 * 待办，这两个类型先落地供其接入；old_group_id/new_group_id 均取
+	 * local_group_id（角色变更不改群归属）。
 	 */
 	MIDR_DECISION_REP_ELECT = 6,
 	MIDR_DECISION_REP_RESIGN = 7,
 	/*
-	 * B2/疑2（doc/change.md，采纳方案）：群间锚点连接。不改变本节点的
-	 * group_id（old/new_group_id 均取 local_group_id，纯记录用）——真正
-	 * 的内容在 evidence：至多 4 个跨群锚点候选（node_id + 探测指标），NDS
-	 * 收到后对每条直接 midr_ctrl_connect()。
+	 * 群间锚点连接。不改变本节点的 group_id（old/new_group_id 均取
+	 * local_group_id，纯记录用）——真正的内容在 evidence：至多 4 个跨群
+	 * 锚点候选（node_id + 探测指标），NDS 收到后对每条直接
+	 * midr_ctrl_connect()。
 	 */
 	MIDR_DECISION_ANCHOR = 8,
 };
@@ -280,8 +280,8 @@ struct midr_cluster_decision {
 	struct prefix recommended_rep; /* only for RECOMMEND */
 	struct list *evidence;	       /* list of struct midr_node_evidence */
 	/*
-	 * B2/疑2：仅 RECOMMEND 有效，最多 2 个次优代表（探测中顺带得到，未被
-	 * 选中的第 2/3 名）。元素是借用指针，指向 mi->rep_dir 里的
+	 * 仅 RECOMMEND 有效，最多 2 个次优代表（探测中顺带得到，未被选中的
+	 * 第 2/3 名）。元素是借用指针，指向 mi->rep_dir 里的
 	 * struct midr_rep_entry，只在本次 I-7 同步调用期间有效——NDS 拿它去发
 	 * MEMBER_LIST_REQ，不得跨调用保存。候选不足 2 个时可能只有 0/1 个。
 	 */
@@ -323,19 +323,19 @@ struct bgp_midr {
 	struct list *rep_dir;	     /* list of struct midr_rep_entry (rep directory) */
 	midr_global_view_cb cl_callback;
 	/*
-	 * B1（doc/change.md）：local_group_id 最近一次实际变化（含首次落定）
-	 * 的本地时钟时间戳，唯一写手是 midr_originate_group_update()。CL 的
-	 * PERIODIC_SYNC 退群判定拿它做热身闸门——群号刚变化不足
-	 * MIDR_JOIN_PROBE_WAIT_SECS 秒时跳过评估，否则会在长期 EWMA 还没收
-	 * 敛的链路上误判"好链路不够"，导致刚入群就抖动着又退群。
+	 * local_group_id 最近一次实际变化（含首次落定）的本地时钟时间戳，
+	 * 唯一写手是 midr_originate_group_update()。CL 的 PERIODIC_SYNC 退群
+	 * 判定拿它做热身闸门——群号刚变化不足 MIDR_JOIN_PROBE_WAIT_SECS 秒时
+	 * 跳过评估，否则会在长期 EWMA 还没收敛的链路上误判"好链路不够"，导致
+	 * 刚入群就抖动着又退群。
 	 */
 	time_t group_settled_at;
 
 	/*
-	 * B1-Q2（doc/change.md）：`no midr session` 持久排除名单——list of
-	 * `struct in_addr *`（locator，与 midr session 命令按同一地址操作）。
-	 * 只影响"自动重连"（midr_ctrl_connect / midr_discovery_should_peer），
-	 * 不影响运维用 `midr session` 手工显式重连（那条路径先移出名单）。
+	 * `no midr session` 持久排除名单——list of `struct in_addr *`
+	 * （locator，与 midr session 命令按同一地址操作）。只影响"自动重连"
+	 * （midr_ctrl_connect / midr_discovery_should_peer），不影响运维用
+	 * `midr session` 手工显式重连（那条路径先移出名单）。
 	 */
 	struct list *session_blacklist;
 
@@ -356,7 +356,7 @@ struct bgp_midr {
 	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
 	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
 	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
-	struct event *t_anchor_probe_done; /* B2/疑2：deferred ANCHOR_PROBE_DONE，见 anchor_group_id */
+	struct event *t_anchor_probe_done; /* deferred ANCHOR_PROBE_DONE，见 anchor_group_id */
 	struct event *t_bootstrap_boot;	  /* §8.31 一次性种子自举定时器 */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
@@ -375,10 +375,10 @@ struct bgp_midr {
 	uint32_t join_members;	      /* members we initiated sessions to */
 
 	/*
-	 * B2/疑2（doc/change.md）：正在评估的两个次优群号（RECOMMEND 时从
-	 * CL 回灌的 anchor_reps 记下），0 = 该槽位无候选。NDS 向这两个群的
-	 * 代表发 MEMBER_LIST_REQ、限时探测后发 ANCHOR_PROBE_DONE，CL 据此
-	 * 重新从 gv->nodes 里按群号筛候选（见 cl_handle_anchor_probe_done）。
+	 * 正在评估的两个次优群号（RECOMMEND 时从 CL 回灌的 anchor_reps 记
+	 * 下），0 = 该槽位无候选。NDS 向这两个群的代表发 MEMBER_LIST_REQ、
+	 * 限时探测后发 ANCHOR_PROBE_DONE，CL 据此重新从 gv->nodes 里按群号
+	 * 筛候选（见 cl_handle_anchor_probe_done）。
 	 */
 	uint32_t anchor_group_id[2];
 
@@ -424,7 +424,7 @@ extern void midr_nds_on_node_withdraw(struct bgp *bgp,
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 				  struct in_addr transport, uint32_t group_id);
 
-/* B2/疑2：同上，但不标邻居——锚点候选是跨群评估节点，不是本群成员。 */
+/* 同上，但不标邻居——锚点候选是跨群评估节点，不是本群成员。 */
 extern void midr_nds_learn_anchor_candidate(struct bgp *bgp,
 					    struct in_addr rid, as_t asn,
 					    struct in_addr transport,
@@ -567,10 +567,10 @@ extern struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
 extern bool midr_nds_detach_by_locator(struct bgp *bgp, struct in_addr addr);
 
 /*
- * B1-Q2（doc/change.md）：`no midr session` 持久排除名单存取。add/del 由 VTY
- * 的 `no midr session` / `midr session` 调用；is_excluded 由
- * midr_discovery_should_peer（本文件）与 midr_ctrl_connect（bgp_midr_ctrl.c）
- * 调用，拦截自动重连（发现阶段建邻居、换组/退群重收敛的 connect_group）。
+ * `no midr session` 持久排除名单存取。add/del 由 VTY 的 `no midr session` /
+ * `midr session` 调用；is_excluded 由 midr_discovery_should_peer（本文件）
+ * 与 midr_ctrl_connect（bgp_midr_ctrl.c）调用，拦截自动重连（发现阶段建邻居、
+ * 换组/退群重收敛的 connect_group）。
  */
 extern bool midr_nds_is_session_excluded(struct bgp *bgp,
 					 struct in_addr locator);

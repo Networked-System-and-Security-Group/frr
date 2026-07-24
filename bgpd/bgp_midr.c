@@ -186,7 +186,7 @@ static bool midr_global_view_del_link(struct midr_global_view *gv,
 }
 
 /* ===========================================================================
- * B1-Q2（doc/change.md）：`no midr session` 持久排除名单
+ * `no midr session` 持久排除名单
  * =========================================================================*/
 
 bool midr_nds_is_session_excluded(struct bgp *bgp, struct in_addr locator)
@@ -220,7 +220,7 @@ void midr_nds_session_exclude_add(struct bgp *bgp, struct in_addr locator)
 	a = XMALLOC(MTYPE_MIDR_SESSION_EXCLUDE, sizeof(*a));
 	*a = locator;
 	listnode_add(mi->session_blacklist, a);
-	MIDR_FLOW_LOG("MIDR B1-Q2：%pI4 加入会话排除名单（持久排除，不再自动重连）",
+	MIDR_FLOW_LOG("MIDR 会话排除：%pI4 加入排除名单（持久排除，不再自动重连）",
 		      &locator);
 }
 
@@ -238,7 +238,7 @@ void midr_nds_session_exclude_del(struct bgp *bgp, struct in_addr locator)
 		if (a->s_addr == locator.s_addr) {
 			listnode_delete(mi->session_blacklist, a);
 			XFREE(MTYPE_MIDR_SESSION_EXCLUDE, a);
-			MIDR_FLOW_LOG("MIDR B1-Q2：%pI4 移出会话排除名单（运维手工 midr session 显式覆盖）",
+			MIDR_FLOW_LOG("MIDR 会话排除：%pI4 移出排除名单（运维手工 midr session 显式覆盖）",
 				      &locator);
 			return;
 		}
@@ -278,9 +278,8 @@ static bool midr_discovery_should_peer(struct bgp *bgp,
 	if (entry->group_id == 0 || entry->group_id != mi->local_group_id)
 		return false;
 
-	/* B1-Q2（doc/change.md）：运维 `no midr session` 持久排除的节点，哪怕
-	 * 仍同群，也不再自动纳入邻居——否则下一次发现/重收敛会把它悄悄连
-	 * 回来，运维命令形同虚设。 */
+	/* 运维 `no midr session` 持久排除的节点，哪怕仍同群，也不再自动纳入
+	 * 邻居——否则下一次发现/重收敛会把它悄悄连回来，运维命令形同虚设。 */
 	midr_node_get_locator(entry, &locator);
 	if (locator.family == AF_INET &&
 	    midr_nds_is_session_excluded(bgp, locator.u.prefix4))
@@ -558,14 +557,14 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 }
 
 /*
- * B2/疑2（doc/change.md）：把一个锚点候选群成员（来自 MEMBER_LIST_RESP，群号
- * 命中 mi->anchor_group_id[]，而非 mi->join_group_id）灌入 global_view 并
- * I-1 启动探测。与 midr_nds_learn_member() 几乎相同，唯一差别是【不】置
+ * 把一个锚点候选群成员（来自 MEMBER_LIST_RESP，群号命中
+ * mi->anchor_group_id[]，而非 mi->join_group_id）灌入 global_view 并 I-1
+ * 启动探测。与 midr_nds_learn_member() 几乎相同，唯一差别是【不】置
  * is_adjacent——锚点候选是跨群评估节点，不是本群邻居，一旦被算进
- * cl_count_good_member_links() 的统计口径就会污染 B1 的留群/退群判定。
- * 不复用同一函数：调用点意图（"这是要入的群"还是"这是拿来探探看的次优
- * 群"）完全不同，硬把 bool 参数塞进 learn_member() 会让这个关键区别散落在
- * 各调用点，不如各自独立、名字各自说明白自己在干什么。
+ * cl_count_good_member_links() 的统计口径就会污染留群/退群判定。不复用同一
+ * 函数：调用点意图（"这是要入的群"还是"这是拿来探探看的次优群"）完全不同，
+ * 硬把 bool 参数塞进 learn_member() 会让这个关键区别散落在各调用点，不如
+ * 各自独立、名字各自说明白自己在干什么。
  */
 void midr_nds_learn_anchor_candidate(struct bgp *bgp, struct in_addr rid,
 				     as_t asn, struct in_addr transport,
@@ -1282,8 +1281,8 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			      &decision->recommended_rep, decision->new_group_id);
 
 		/*
-		 * B2/疑2（doc/change.md）：顺带向 CL 选出的至多 2 个次优代表也发
-		 * MEMBER_LIST_REQ，为群间锚点连接收集候选。先重置两个槽位——
+		 * 顺带向 CL 选出的至多 2 个次优代表也发 MEMBER_LIST_REQ，为群间
+		 * 锚点连接收集候选。先重置两个槽位——
 		 * 上一轮 join（若有）留下的群号不能带进这一轮，否则新到达的
 		 * MEMBER_LIST_RESP 可能被误判成命中旧槽位。候选不足 2 个时，
 		 * 未用到的槽位保持 0（cl_handle_anchor_probe_done 按 0 跳过）。
@@ -1337,11 +1336,10 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		break;
 	case MIDR_DECISION_LEAVE:
 		/*
-		 * doc/change.md B1-Q1，选项(a)：退群后清群号、自动重新走一遍
-		 * 加入流程——而不是停在"群号=0"等外部决策（(b)），也不是整体
-		 * 下线（那是 midr shutdown 的语义，(c)）。守卫：只在真正稳态
-		 * （join_phase==IDLE）时处理，避免跟其它在途加入/建群冲突；
-		 * 本节点已无群号时视为过期通知，忽略。
+		 * 退群后清群号、自动重新走一遍加入流程——而不是停在"群号=0"
+		 * 等外部决策，也不是整体下线（那是 midr shutdown 的语义）。
+		 * 守卫：只在真正稳态（join_phase==IDLE）时处理，避免跟其它在
+		 * 途加入/建群冲突；本节点已无群号时视为过期通知，忽略。
 		 */
 		if (mi->join_phase != MIDR_JOIN_IDLE) {
 			MIDR_LOG("MIDR I-7：LEAVE 但不在稳态（join_phase=%d），忽略",
@@ -1447,11 +1445,10 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		break;
 	case MIDR_DECISION_REP_ELECT:
 		/*
-		 * doc/change.md A1：本节点当选群代表。CL 判定算法尚未实现（稳
-		 * 态优化待办），这里先接好 NDS 侧执行：幂等检查（已是代表则短
-		 * 路，避免重复置位/重复通告）→ 置 GROUP_REP 位 → 通告全网
-		 * （set_capability 内部发 Node NLRI）。能力位只改自己的，
-		 * ownership 无碍。
+		 * 本节点当选群代表。CL 判定算法尚未实现（稳态优化待办），这里
+		 * 先接好 NDS 侧执行：幂等检查（已是代表则短路，避免重复置位/
+		 * 重复通告）→ 置 GROUP_REP 位 → 通告全网（set_capability 内部
+		 * 发 Node NLRI）。能力位只改自己的，ownership 无碍。
 		 */
 		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
 			MIDR_LOG("MIDR I-7：REP_ELECT 但本节点已是群代表，忽略");
@@ -1464,8 +1461,8 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		break;
 	case MIDR_DECISION_REP_RESIGN:
 		/*
-		 * doc/change.md A1：本节点卸任群代表。幂等检查（已不是代表则
-		 * 短路）→ 清 GROUP_REP 位 → 通告全网。
+		 * 本节点卸任群代表。幂等检查（已不是代表则短路）→ 清
+		 * GROUP_REP 位 → 通告全网。
 		 */
 		if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP)) {
 			MIDR_LOG("MIDR I-7：REP_RESIGN 但本节点当前不是群代表，忽略");
@@ -1478,8 +1475,8 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		break;
 	case MIDR_DECISION_ANCHOR: {
 		/*
-		 * B2/疑2（doc/change.md）：CL 选出的至多 4 个锚点候选
-		 * （decision->evidence，仅 node_id+metrics）。逐条按 node_id 反查
+		 * CL 选出的至多 4 个锚点候选（decision->evidence，仅
+		 * node_id+metrics）。逐条按 node_id 反查
 		 * global_view 拿完整 entry（锚点候选此前已经
 		 * midr_nds_learn_anchor_candidate 灌过表，一定能查到），直接
 		 * midr_ctrl_connect()——与 connect_group 建群内会话同一原语，
@@ -2172,7 +2169,7 @@ void bgp_midr_init(struct bgp *bgp)
 	mi->local_capabilities = 0;
 	mi->rep_dir = list_new();
 	mi->bootstrap_list = list_new(); /* §8.32 候选引导节点清单 */
-	mi->session_blacklist = list_new(); /* B1-Q2 会话排除名单 */
+	mi->session_blacklist = list_new(); /* 会话排除名单 */
 	mi->perf_seqno = 0;
 	mi->cap_seqno = 0;
 
@@ -2246,7 +2243,7 @@ void bgp_midr_finish(struct bgp *bgp)
 		list_delete(&mi->bootstrap_list);
 		mi->bootstrap_cur = NULL;
 	}
-	if (mi->session_blacklist) { /* B1-Q2 排除名单 */
+	if (mi->session_blacklist) { /* 排除名单 */
 		struct listnode *node, *nnode;
 		struct in_addr *a;
 
