@@ -246,6 +246,13 @@ enum midr_decision_type {
 	MIDR_DECISION_LEAVE = 3,
 	MIDR_DECISION_SPLIT = 4,
 	MIDR_DECISION_CREATE = 5,
+	/*
+	 * doc/change.md A1：本节点当选/卸任群代表。判定算法（谁来判、何时判）
+	 * 是 CL 稳态优化待办，这两个类型先落地供其接入；old_group_id/
+	 * new_group_id 均取 local_group_id（角色变更不改群归属）。
+	 */
+	MIDR_DECISION_REP_ELECT = 6,
+	MIDR_DECISION_REP_RESIGN = 7,
 };
 
 struct midr_node_evidence {

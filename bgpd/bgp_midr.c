@@ -1250,6 +1250,37 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		MIDR_FLOW_LOG("MIDR I-7：CREATE 自建群 %u（已置 GROUP_REP 位自任首任代表），加入流程结束（回稳态）",
 			      decision->new_group_id);
 		break;
+	case MIDR_DECISION_REP_ELECT:
+		/*
+		 * doc/change.md A1：本节点当选群代表。CL 判定算法尚未实现（稳
+		 * 态优化待办），这里先接好 NDS 侧执行：幂等检查（已是代表则短
+		 * 路，避免重复置位/重复通告）→ 置 GROUP_REP 位 → 通告全网
+		 * （set_capability 内部发 Node NLRI）。能力位只改自己的，
+		 * ownership 无碍。
+		 */
+		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
+			MIDR_LOG("MIDR I-7：REP_ELECT 但本节点已是群代表，忽略");
+			break;
+		}
+		midr_nds_set_capability(bgp, mi->local_capabilities |
+					      MIDR_CAP_GROUP_REP);
+		MIDR_FLOW_LOG("MIDR I-7：REP_ELECT 群 %u，本节点当选代表",
+			      mi->local_group_id);
+		break;
+	case MIDR_DECISION_REP_RESIGN:
+		/*
+		 * doc/change.md A1：本节点卸任群代表。幂等检查（已不是代表则
+		 * 短路）→ 清 GROUP_REP 位 → 通告全网。
+		 */
+		if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP)) {
+			MIDR_LOG("MIDR I-7：REP_RESIGN 但本节点当前不是群代表，忽略");
+			break;
+		}
+		midr_nds_set_capability(bgp, mi->local_capabilities &
+					      ~MIDR_CAP_GROUP_REP);
+		MIDR_FLOW_LOG("MIDR I-7：REP_RESIGN 群 %u，本节点卸任代表",
+			      mi->local_group_id);
+		break;
 	}
 }
 
