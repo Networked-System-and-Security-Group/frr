@@ -17,6 +17,7 @@
 struct bgp;
 struct bgp_midr;
 struct midr_node_entry;
+struct peer;
 struct stream;
 
 /* ===========================================================================
@@ -38,7 +39,7 @@ struct stream;
 
 #define MIDR_CTRL_UDP_PORT    5859 /* control channel only (distinct from PM) */
 #define MIDR_CTRL_TCP_PORT    MIDR_CTRL_UDP_PORT /* 列表交换 TCP，与 UDP 同号并存 */
-#define MIDR_CTRL_MSG_VERSION 1
+#define MIDR_CTRL_MSG_VERSION 2 /* v2: REP_LIST_RESP 条目加 rep_rid 栏 (12B→16B) */
 
 enum midr_ctrl_msg_type {
 	MIDR_CTRL_PEER_REQUEST = 1,	  /* "please peer back with me" */
@@ -78,11 +79,14 @@ struct midr_ctrl_list_hdr {
 	uint16_t count; /* number of items that follow (network order) */
 };
 
-/* REP_LIST_RESP item, 12 bytes, network byte order. */
+/* REP_LIST_RESP item, 16 bytes, network byte order.
+ * rep_rid = 代表的 router-id（真名）；0 = 应答方不知道（收方退回
+ * "拿 transport 冒充 node_id"的旧占位路径，向后兼容）。 */
 struct midr_ctrl_rep_item {
 	uint32_t group_id;
 	struct in_addr rep_transport;
 	uint32_t rep_asn;
+	struct in_addr rep_rid;
 };
 
 /* MEMBER_LIST_RESP item, 16 bytes, network byte order. */
@@ -120,6 +124,23 @@ extern void midr_ctrl_finish(struct bgp *bgp);
  */
 extern void midr_ctrl_connect(struct bgp *bgp,
 			      const struct midr_node_entry *entry);
+
+/*
+ * 把一个刚建出的 peer 整形成 MIDR overlay 会话：multihop + update-source
+ * (本端 transport) + 激活 BGP-LS + 撤销 FRR 自动附送的 IPv4 单播（overlay
+ * 不得向 underlay 注入转发路由——否则递归下一跳环路，见函数实现头注释与
+ * docs/decisions/midr-overlay-underlay-layering.md）。自动建连
+ * (midr_ctrl_connect) 与手动命令 (midr neighbor) 共用。
+ */
+extern void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer);
+
+/*
+ * 会话归属判据（⑦，四处守卫共用）：peer 是不是 MIDR 自建的 overlay 会话。
+ * 双条件 = PEER_FLAG_MIDR_OVERLAY 标记（出身）∧ 除 BGP-LS 外无激活地址族（签名）。
+ * 用于让 no midr neighbor / midr neighbor / try_disconnect / connect 去重四处
+ * 一律"运维会话让路"：真是 MIDR 自己的才动，否则拒绝 + 告警。
+ */
+extern bool midr_nds_peer_is_overlay(struct peer *peer);
 
 /*
  * Called by bgp_midr.c (NDS) before a node entry is removed (withdraw or

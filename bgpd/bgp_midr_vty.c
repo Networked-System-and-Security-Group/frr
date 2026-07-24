@@ -4,8 +4,8 @@
  *
  * Provides CLI for MIDR configuration and diagnostics:
  *   midr group-id <N>
- *   midr neighbor <IP> remote-as <ASN>
- *   no midr neighbor <IP>
+ *   midr session <IP> remote-as <ASN>   （旧名 midr neighbor，隐藏别名过渡）
+ *   no midr session <IP>                （旧名 no midr neighbor，同上）
  *   midr help [plain]
  *   show midr nodes
  */
@@ -29,6 +29,23 @@
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_table.h"
 #include "monotime.h"
+
+/*
+ * 节点表里是否已学到任何远端节点。用于抑制"启动加载配置文件"阶段的误报：
+ * 那时 BGP 会话尚未建立、节点表必然为空，于是"目标群无已知成员"恒成立，
+ * 每个节点启动时都会无差别打出"将成为该群首个成员"（07-21 十节点实验现象）。
+ * 视图为空时我们其实无从判断该群有没有成员，沉默比给一个必然为真的断言好。
+ */
+static bool midr_view_has_remote_nodes(struct bgp *bgp)
+{
+	struct midr_node_entry *entry;
+
+	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry)
+		if (!entry->is_self)
+			return true;
+
+	return false;
+}
 
 /* ------------------------------------------------------------------ */
 /* midr group-id <N>                                                   */
@@ -59,7 +76,7 @@ DEFUN(midr_group_id,
 	 * 运维反馈：真正切了群且目标群当前无已知成员时，提示本节点将成为该群
 	 * 首个成员（强制切换语义下不阻断——群号是标签非注册制实体，允许开新群）。
 	 */
-	if (gid != old_gid && gid != 0) {
+	if (gid != old_gid && gid != 0 && midr_view_has_remote_nodes(bgp)) {
 		struct list *members = list_new();
 
 		midr_group_members(bgp, gid, members);
@@ -74,25 +91,59 @@ DEFUN(midr_group_id,
 }
 
 /* ------------------------------------------------------------------ */
-/* midr neighbor <IP> remote-as <ASN>                                  */
+/* midr session <IP> remote-as <ASN>（Q5 改名，原 midr neighbor：       */
+/* "neighbor"一词让人误当配邻接/加群命令，实际它只造会话不碰账）        */
 /* ------------------------------------------------------------------ */
 
-DEFUN(midr_neighbor,
-      midr_neighbor_cmd,
-      "midr neighbor A.B.C.D remote-as (1-4294967295)",
+DEFUN(midr_session,
+      midr_session_cmd,
+      "midr session A.B.C.D remote-as (1-4294967295)",
       "MIDR configuration\n"
-      "Add a MIDR neighbor\n"
-      "Neighbor IP address\n"
+      "Manually build a MIDR overlay session (escape hatch/debug; normal join uses midr group-id / midr bootstrap)\n"
+      "Session peer IP address\n"
       "Remote AS\n"
       "AS number\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	union sockunion su;
 	as_t asn = (as_t)atol(argv[4]->arg);
+	struct peer *peer;
 	int ret;
+
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
 
 	if (str2sockunion(argv[2]->arg, &su) < 0) {
 		vty_out(vty, "%% Invalid IP address: %s\n", argv[2]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	/*
+	 * S3 撞车守卫：必须拦在 peer_remote_as 之前——它对已存在 peer 会直接复用，
+	 * ASN 不同还静默改 AS（bgpd.c peer_as_change），随后整形把活的 underlay
+	 * 会话就地改造成 overlay（撤 IPv4、multihop），砸掉转发面（洞 #3）。
+	 */
+	peer = peer_lookup(bgp, &su);
+	if (peer) {
+		if (midr_nds_peer_is_overlay(peer)) {
+			/* 已是 MIDR 自建会话：幂等重整形（同值短路、不 reset），不改 AS。 */
+			midr_nds_ctrl_setup_overlay_peer(bgp, peer);
+			vty_out(vty,
+				"MIDR session %s 已存在（MIDR overlay 会话），已确保形态一致\n",
+				argv[2]->arg);
+			return CMD_SUCCESS;
+		}
+		/* 运维会话占用该地址：拒绝接管（运维优先，绝不动它）。 */
+		if (peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+			vty_out(vty,
+				"%% %s 已有运维会话且已激活 link-state，可直接承载 MIDR 拓扑，无需另建\n",
+				argv[2]->arg);
+		else
+			vty_out(vty,
+				"%% %s 已被运维会话占用；拒绝接管（避免砸转发面）。请在原生配置为该邻居激活 link-state 复用现有会话，或改用该节点其它地址\n",
+				argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
@@ -103,27 +154,37 @@ DEFUN(midr_neighbor,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	struct peer *peer = peer_lookup(bgp, &su);
-	if (peer) {
-		peer_ebgp_multihop_set(peer, MAXTTL);
-		peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
-	}
+	/* 与自动建连（midr_ctrl_connect）共用同一整形：multihop + update-source
+	 * + 只载 BGP-LS（撤 FRR 自动附送的 IPv4 单播——overlay 不得向 underlay
+	 * 注入转发路由）。定义与理由见 midr_nds_ctrl_setup_overlay_peer。 */
+	peer = peer_lookup(bgp, &su);
+	if (peer)
+		midr_nds_ctrl_setup_overlay_peer(bgp, peer);
 
-	vty_out(vty, "MIDR neighbor %s AS %u added\n", argv[2]->arg, asn);
+	vty_out(vty, "MIDR session %s AS %u created\n", argv[2]->arg, asn);
 	return CMD_SUCCESS;
 }
 
+/* 旧名弃用别名（Q5 过渡期保留：不出现在 ? 补全，但仍可执行；过渡期后删）。 */
+ALIAS_DEPRECATED(midr_session, midr_neighbor_cmd,
+      "midr neighbor A.B.C.D remote-as (1-4294967295)",
+      "MIDR configuration\n"
+      "Deprecated alias of `midr session` (kept for transition)\n"
+      "Session peer IP address\n"
+      "Remote AS\n"
+      "AS number\n")
+
 /* ------------------------------------------------------------------ */
-/* no midr neighbor <IP>                                               */
+/* no midr session <IP>（Q5 改名，原 no midr neighbor）                 */
 /* ------------------------------------------------------------------ */
 
-DEFUN(no_midr_neighbor,
-      no_midr_neighbor_cmd,
-      "no midr neighbor A.B.C.D",
+DEFUN(no_midr_session,
+      no_midr_session_cmd,
+      "no midr session A.B.C.D",
       NO_STR
       "MIDR configuration\n"
-      "Remove a MIDR neighbor\n"
-      "Neighbor IP address\n")
+      "Tear down a MIDR overlay session (guarded: operator sessions refused)\n"
+      "Session peer IP address\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	union sockunion su;
@@ -140,10 +201,35 @@ DEFUN(no_midr_neighbor,
 		return CMD_WARNING;
 	}
 
-	peer_delete(peer);
-	vty_out(vty, "MIDR neighbor %s removed\n", argv[3]->arg);
+	/*
+	 * S2 归属守卫：只拆 MIDR 自建的 overlay 会话，绝不误删运维 underlay 会话
+	 * （删了会砸转发面）。判据 = 标记 ∧ 只载 BGP-LS 签名。
+	 */
+	if (!midr_nds_peer_is_overlay(peer)) {
+		vty_out(vty,
+			"%% %s 是运维配置的会话（非 MIDR overlay），拒绝删除；如确需删除请用原生命令 no neighbor %s\n",
+			argv[3]->arg, argv[3]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	/*
+	 * S6 清账：按地址反查节点表条目，查到走 detach 全套（停探 + 删 link +
+	 * 清 is_adjacent + 拆会话）；查不到（该地址不对应已知节点）退化为只拆会话。
+	 */
+	if (!midr_nds_detach_by_locator(bgp, su.sin.sin_addr))
+		peer_delete(peer);
+
+	vty_out(vty, "MIDR session %s removed\n", argv[3]->arg);
 	return CMD_SUCCESS;
 }
+
+/* 旧名弃用别名（Q5 过渡期保留；过渡期后删）。 */
+ALIAS_DEPRECATED(no_midr_session, no_midr_neighbor_cmd,
+      "no midr neighbor A.B.C.D",
+      NO_STR
+      "MIDR configuration\n"
+      "Deprecated alias of `no midr session` (kept for transition)\n"
+      "Session peer IP address\n")
 
 /* ------------------------------------------------------------------ */
 /* midr role bootstrap / no midr role bootstrap                        */
@@ -266,7 +352,8 @@ DEFUN(midr_rep,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	midr_rep_dir_add(bgp, gid, rep_transport, asn);
+	midr_rep_dir_add(bgp, gid, rep_transport, asn,
+			 (struct in_addr){ .s_addr = INADDR_ANY });
 	vty_out(vty, "MIDR rep for group %u at %s AS %u added\n", gid,
 		argv[5]->arg, asn);
 	return CMD_SUCCESS;
@@ -335,6 +422,42 @@ DEFUN(midr_bootstrap,
 	vty_out(vty, "MIDR: joining via bootstrap %s AS %u ...\n", argv[2]->arg,
 		asn);
 	midr_join_via_bootstrap(bgp, &su, asn);
+	return CMD_SUCCESS;
+}
+
+/* no midr bootstrap [A.B.C.D]  (§8.32：删一条候选 / 清空候选并中止在途加入) */
+DEFUN(no_midr_bootstrap,
+      no_midr_bootstrap_cmd,
+      "no midr bootstrap [A.B.C.D]",
+      NO_STR
+      "MIDR configuration\n"
+      "Join the network via a bootstrap node\n"
+      "Bootstrap node IP address (omit to clear all candidates)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	union sockunion su;
+
+	if (!bgp->midr_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	/* 无地址参数：清空候选清单并作废在途加入意图（批注点 C）。 */
+	if (argc < 4) {
+		midr_bootstrap_clear(bgp);
+		vty_out(vty, "MIDR: cleared all bootstrap candidates\n");
+		return CMD_SUCCESS;
+	}
+
+	if (str2sockunion(argv[3]->arg, &su) < 0 || su.sa.sa_family != AF_INET) {
+		vty_out(vty, "%% Invalid IPv4 address: %s\n", argv[3]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	if (!midr_bootstrap_list_del(bgp, su.sin.sin_addr)) {
+		vty_out(vty, "%% No such bootstrap candidate: %s\n", argv[3]->arg);
+		return CMD_WARNING;
+	}
+	vty_out(vty, "MIDR: removed bootstrap candidate %s\n", argv[3]->arg);
 	return CMD_SUCCESS;
 }
 
@@ -564,10 +687,16 @@ DEFUN(show_midr_reps,
 	if (list_isempty(bgp->midr_info->rep_dir))
 		vty_out(vty, "  (none)\n");
 	else
-		for (ALL_LIST_ELEMENTS_RO(bgp->midr_info->rep_dir, node, r))
-			vty_out(vty, "  group %u -> %pI4 (AS %u)\n",
+		for (ALL_LIST_ELEMENTS_RO(bgp->midr_info->rep_dir, node, r)) {
+			char rid_buf[INET_ADDRSTRLEN] = "-";
+
+			if (r->rep_rid.s_addr != INADDR_ANY)
+				inet_ntop(AF_INET, &r->rep_rid, rid_buf,
+					  sizeof(rid_buf));
+			vty_out(vty, "  group %u -> %pI4 (AS %u, rid %s)\n",
 				r->group_id, &r->rep_transport,
-				(unsigned int)r->rep_asn);
+				(unsigned int)r->rep_asn, rid_buf);
+		}
 
 	return CMD_SUCCESS;
 }
@@ -781,19 +910,41 @@ DEFUN(show_midr_join,
 	}
 	mi = bgp->midr_info;
 
-	/* 未配 bootstrap 也继续输出：稳态的 PEER_REQUEST pending 与
+	/* §8.32：bootstrap 候选清单（手配在前、种子在后，当前尝试标 <- trying、
+	 * 已失败标 failed）。未配也继续输出：稳态的 PEER_REQUEST pending 与
 	 * bootstrap 无关，卡住的请求同样要在这里可见。 */
-	if (mi->bootstrap_set)
-		vty_out(vty, "Bootstrap node : %pSU AS %u\n",
-			&mi->bootstrap_su, mi->bootstrap_asn);
-	else
-		vty_out(vty, "Bootstrap node : (not configured)\n");
+	if (!mi->bootstrap_list || list_isempty(mi->bootstrap_list)) {
+		vty_out(vty, "Bootstrap candidates : (none configured)\n");
+	} else {
+		struct listnode *bn;
+		struct midr_bootstrap_entry *be;
+		unsigned int idx = 0;
+
+		vty_out(vty, "Bootstrap candidates :\n");
+		for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, bn, be)) {
+			idx++;
+			vty_out(vty, "  %u. %-15pI4 AS %-10u [%s]%s%s\n", idx,
+				&be->transport, be->asn,
+				be->source == MIDR_BOOTSTRAP_SEED ? "seed"
+								  : "manual",
+				(mi->bootstrap_cur == bn) ? "  <- trying" : "",
+				be->failed ? "  failed" : "");
+		}
+	}
 	vty_out(vty, "Join state     : %s\n",
 		mi->join_in_progress ? "in-progress" : "idle/done");
 	vty_out(vty, "Join phase     : %s\n",
 		midr_join_phase_str(mi->join_phase));
 	vty_out(vty, "Local group-id : %u\n", mi->local_group_id);
-	vty_out(vty, "Joined group   : %u\n", mi->join_group_id);
+	/*
+	 * join_group_id 记的是"正在评估/加入的候选群"（RECOMMEND 阶段选定），
+	 * 不是"已加入的群"——真身永远看 Local group-id。原名 "Joined group"
+	 * 会误导：CL 走 CREATE 分支自建群时二者不同（候选 2 / 实建 4）。
+	 * 流程结束后该字段已清零，此处只在真正在途时才显示。
+	 */
+	if (mi->join_group_id)
+		vty_out(vty, "Target group   : %u (加入中的候选群)\n",
+			mi->join_group_id);
 	vty_out(vty, "Members linked : %u\n", mi->join_members);
 
 	vty_out(vty, "Pending ctrl requests:\n");
@@ -846,11 +997,14 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "        设置本节点可达地址(TLV 1188,实际填 loopback)\n");
 	vty_out(vty, "    %sno midr transport-address [<IP>]%s\n", C_CMD, C_RST);
 	vty_out(vty, "        清除本节点的 transport-address\n");
-	vty_out(vty, "    %smidr neighbor <IP> remote-as <ASN>%s\n", C_CMD, C_RST);
+	vty_out(vty, "    %smidr session <IP> remote-as <ASN>%s\n", C_CMD, C_RST);
 	vty_out(vty,
-		"        手动添加 MIDR 邻居(eBGP multihop + 激活 BGP-LS 地址族)\n");
-	vty_out(vty, "    %sno midr neighbor <IP>%s\n", C_CMD, C_RST);
-	vty_out(vty, "        删除指定的 MIDR 邻居\n");
+		"        手动建一条 MIDR overlay 会话(逃生舱/调试用;正常加群走 midr group-id / midr bootstrap)\n");
+	vty_out(vty,
+		"        旧名 midr neighbor 过渡期仍可用(不再出现在补全里)\n");
+	vty_out(vty, "    %sno midr session <IP>%s\n", C_CMD, C_RST);
+	vty_out(vty,
+		"        拆一条 MIDR 会话并清账(带守卫:运维会话拒删;旧名 no midr neighbor 同上)\n");
 	vty_out(vty, "    %smidr role bootstrap%s\n", C_CMD, C_RST);
 	vty_out(vty, "        将本节点设为 bootstrap(引导)节点\n");
 	vty_out(vty, "    %sno midr role bootstrap%s\n", C_CMD, C_RST);
@@ -869,7 +1023,14 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "        从引导目录删除指定群代表\n");
 	vty_out(vty, "    %smidr bootstrap <IP> remote-as <ASN>%s\n", C_CMD,
 		C_RST);
-	vty_out(vty, "        作为新节点,经 bootstrap 节点入网(命令 O)\n");
+	vty_out(vty,
+		"        作为新节点,经 bootstrap 节点入网(命令 O;可多次配置多个候选,失败自动 failover)\n");
+	vty_out(vty, "    %sno midr bootstrap <IP>%s\n", C_CMD, C_RST);
+	vty_out(vty,
+		"        删除一个 bootstrap 候选(正在尝试的被删则顺移到下一候选)\n");
+	vty_out(vty, "    %sno midr bootstrap%s\n", C_CMD, C_RST);
+	vty_out(vty,
+		"        清空所有 bootstrap 候选并中止在途入网\n");
 	vty_out(vty, "    %smidr shutdown%s\n", C_CMD, C_RST);
 	vty_out(vty, "        优雅下线本节点(撤销自通告,抑制 keepalive)\n");
 	vty_out(vty, "    %sno midr shutdown%s\n", C_CMD, C_RST);
@@ -915,6 +1076,9 @@ DEFUN(midr_help,
 void bgp_midr_vty_init(void)
 {
 	install_element(BGP_NODE, &midr_group_id_cmd);
+	install_element(BGP_NODE, &midr_session_cmd);
+	install_element(BGP_NODE, &no_midr_session_cmd);
+	/* 旧名隐藏别名（Q5 过渡） */
 	install_element(BGP_NODE, &midr_neighbor_cmd);
 	install_element(BGP_NODE, &no_midr_neighbor_cmd);
 	install_element(BGP_NODE, &midr_role_bootstrap_cmd);
@@ -924,14 +1088,17 @@ void bgp_midr_vty_init(void)
 	install_element(BGP_NODE, &midr_rep_cmd);
 	install_element(BGP_NODE, &no_midr_rep_cmd);
 	install_element(BGP_NODE, &midr_bootstrap_cmd);
+	install_element(BGP_NODE, &no_midr_bootstrap_cmd);
 	install_element(BGP_NODE, &midr_transport_address_cmd);
 	install_element(BGP_NODE, &no_midr_transport_address_cmd);
 	install_element(BGP_NODE, &midr_shutdown_cmd);
 	install_element(BGP_NODE, &no_midr_shutdown_cmd);
 	install_element(BGP_NODE, &midr_help_cmd);
-	/* `midr help` 也在 vtysh 顶层可用(enable/view),无需进配置态 */
+	/* `midr help` 也在 vtysh 顶层可用(enable/view),无需进配置态。
+	 * 只装 VIEW_NODE 即可——lib/command.c 的 install_element 对 VIEW_NODE
+	 * 会自动连带装进 ENABLE_NODE；再显式装一次会触发启动期
+	 * "duplicate install_element call?" 告警。 */
 	install_element(VIEW_NODE, &midr_help_cmd);
-	install_element(ENABLE_NODE, &midr_help_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_reps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);

@@ -29,6 +29,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_ctrl.h"
+#include "bgpd/bgp_midr_pm.h" /* midr_pm_add_target（connect_group 启探测） */
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_PENDING, "MIDR ctrl pending peer-request");
 
@@ -266,6 +267,8 @@ static void midr_ctrl_retx_timer(struct event *t)
 	struct bgp_midr *mi = bgp->midr_info;
 	struct listnode *node, *nnode;
 	struct midr_ctrl_pending *p;
+	struct in_addr rep_failed = { 0 }; /* §8.32：本轮死心的 REP_LIST_REQ 目标 */
+	bool rep_gave_up = false;
 
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p)) {
 		if (p->type == MIDR_CTRL_PEER_REQUEST) {
@@ -295,6 +298,10 @@ static void midr_ctrl_retx_timer(struct event *t)
 				  midr_ctrl_msg_type_str(p->type),
 				  MIDR_CTRL_RETX_MAX, &p->target_transport,
 				  &p->target_transport);
+			if (p->type == MIDR_CTRL_REP_LIST_REQ) {
+				rep_failed = p->target_transport;
+				rep_gave_up = true;
+			}
 			list_delete_node(mi->ctrl_pending, node);
 			XFREE(MTYPE_MIDR_CTRL_PENDING, p);
 			continue;
@@ -302,6 +309,13 @@ static void midr_ctrl_retx_timer(struct event *t)
 		midr_ctrl_request_attempt(bgp, p->target_transport, p->type,
 					  p->target_group);
 	}
+
+	/* §8.32 failover：入网第一跳（REP_LIST_REQ）死心 → 回调 NDS 换下一候选。
+	 * 放循环外：回调会向新候选发请求、往 ctrl_pending 追加条目，循环内调用
+	 * = 边遍历边改表。NDS 侧守卫（意图仍在 + 地址==游标候选）保证过期/串话
+	 * 的回调被安全忽略；放在重挂判断之前，新请求的重试定时器才能被武装。 */
+	if (rep_gave_up)
+		midr_join_bootstrap_failed(bgp, rep_failed);
 
 	if (!list_isempty(mi->ctrl_pending))
 		event_add_timer(bm->master, midr_ctrl_retx_timer, bgp,
@@ -386,6 +400,13 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 		item.group_id = htonl(r->group_id);
 		item.rep_transport = r->rep_transport;
 		item.rep_asn = htonl((uint32_t)r->rep_asn);
+		/* v2 真名栏: 学来的条目自带 rid; 手配条目 (rid=0) 在应答时刻按
+		 * transport 反查节点表回填, 仍查不到就发 0 (收方走旧占位路径,
+		 * 行为与 v1 相同)。反查是每次应答现查现填, 视图收敛后自愈。 */
+		item.rep_rid = r->rep_rid.s_addr != INADDR_ANY
+				       ? r->rep_rid
+				       : midr_nds_rid_by_transport(
+						 bgp, r->rep_transport);
 		stream_put(s, &item, sizeof(item));
 		count++;
 		n_dir++;
@@ -407,6 +428,7 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 		item.group_id = htonl(ne->group_id);
 		item.rep_transport = ne->transport_addr;
 		item.rep_asn = htonl((uint32_t)ne->asn);
+		item.rep_rid = ne->node_id.u.prefix4; /* 节点表按真名为键, rid 现成 */
 		stream_put(s, &item, sizeof(item));
 		count++;
 		n_derived++;
@@ -524,7 +546,8 @@ static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
 	for (i = 0; i < count; i++)
 		midr_rep_dir_add(bgp, ntohl(items[i].group_id),
 				 items[i].rep_transport,
-				 (as_t)ntohl(items[i].rep_asn));
+				 (as_t)ntohl(items[i].rep_asn),
+				 items[i].rep_rid);
 
 	midr_ctrl_drop_pending(mi, MIDR_CTRL_REP_LIST_REQ);
 	MIDR_FLOW_LOG("midr_ctrl: REP_LIST_RESP with %u reps — starting join", count);
@@ -869,6 +892,84 @@ void midr_ctrl_finish(struct bgp *bgp)
 /* Peer lifecycle                                                       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 把一个刚由 peer_remote_as() 建出的 peer 整形成 MIDR overlay 会话。
+ * 自动建连（midr_ctrl_connect）与手动命令（midr neighbor）共用，保证
+ * "MIDR 会话长什么样"只有一个定义：
+ *
+ *   - multihop：MIDR 对等体多为非直连（transport 对 transport）；
+ *   - update-source：TCP 源地址绑本端 transport（loopback）。不绑则内核
+ *     用出口网卡地址做源，对端按源地址查邻居表对不上号，多跳会话卡 Active；
+ *   - 激活 BGP-LS：拓扑信息在 MIDR 对等体间直接流动，不必绕中继；
+ *   - 撤销 IPv4 单播：FRR 建 peer 时按 bgp->default_af 自动附送（bgpd.c
+ *     peer_create，在 peer_remote_as() 内部就已完成、无从阻止，只能建完
+ *     再撤）。不撤的后果：overlay 多跳会话把远端路由以更短 AS path 注入
+ *     underlay——本端向邻居通告"其实必须借道该邻居才走得通"的路径，形成
+ *     控制面无环、转发面成环的递归下一跳环路（07-21 十节点实测 g1b/g1c
+ *     互指、g2c 探测全丢；见 docs/decisions/midr-overlay-underlay-layering.md）。
+ *     MIDR 会话只承载 BGP-LS——谁提供转发可达性，谁才开 IPv4 单播。
+ *
+ * 此时会话尚未 Established，peer_deactivate 只清配置位、不触发 reset。
+ */
+void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+
+	/*
+	 * Stamp ownership FIRST: this is the single point both the auto-connect
+	 * path and the `midr neighbor` command pass through, so the flag
+	 * uniquely marks peers MIDR created.  The session-ownership guards
+	 * (midr_nds_peer_is_overlay) read it to avoid touching operator sessions.
+	 */
+	SET_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY);
+
+	peer_ebgp_multihop_set(peer, MAXTTL);
+	if (mi && mi->transport_addr_set) {
+		union sockunion local_su;
+
+		midr_su_from_in_addr(&local_su, mi->local_transport_addr);
+		peer_update_source_addr_set(peer, &local_su);
+	}
+	peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
+	peer_deactivate(peer, AFI_IP, SAFI_UNICAST);
+}
+
+/*
+ * 会话归属判据（⑦，四处守卫共用）：这条 peer 是不是 MIDR 自己建的 overlay 会话？
+ *
+ * 双条件——两条都过才算自己人：
+ *   1. 出身：带 PEER_FLAG_MIDR_OVERLAY 标记（只有上面的整形 helper 会设，
+ *      运维经 peer_remote_as 建的会话没有它）；
+ *   2. 长相（签名）：除 BGP-LS 外未激活任何地址族。⑥ 之后 MIDR 会话 = 只载
+ *      BGP-LS 是不变量；若运维事后手动给它开了 IPv4 等转发面地址族，签名不过、
+ *      保守当外人（宁可拒删也不误碰喂转发面的会话）。
+ *
+ * 判错方向刻意保守：把自己人误判成运维的 → 至多拒删（有原生 no neighbor 兜底）；
+ * 反过来误删运维会话不可接受（会砸转发面）。
+ */
+bool midr_nds_peer_is_overlay(struct peer *peer)
+{
+	afi_t afi;
+	safi_t safi;
+
+	if (!peer)
+		return false;
+
+	/* 出身。 */
+	if (!CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
+		return false;
+
+	/* 长相：任何非 BGP-LS 的已激活地址族都说明它在喂转发面，判外人。 */
+	FOREACH_AFI_SAFI (afi, safi) {
+		if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS)
+			continue;
+		if (peer->afc[afi][safi])
+			return false;
+	}
+
+	return true;
+}
+
 void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 {
 	union sockunion su;
@@ -889,24 +990,52 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	prefix2sockunion(&locator, &su);
 
 	/*
-	 * Dedup: a session toward this locator already exists.  This both
-	 * avoids duplicating a peer and terminates the A<->B notify handshake
-	 * — the side that receives the echoed PEER_REQUEST finds the peer it
-	 * already created here and stops, so it sends no further notify.
+	 * S5 第一道去重（⑦）：transport 地址上已有会话。地址被占 = 无法另建（BGP
+	 * 一地址一会话），只能复用或告警——终止 A<->B notify 握手也靠这条 return
+	 * （收到回响 PEER_REQUEST 的一端在此发现已建的 peer 便停发）。按归属分类：
+	 *   - MIDR 自己的：正常复用（重复 connect 很常见）；
+	 *   - 运维的、已激活 LS：借它当 LS 通道，可用，记 log；
+	 *   - 运维的、未激活 LS：拓扑无通道可走、邻接实际不可用，warn 出来——但绝不
+	 *     整形运维会话（那是洞 #3、违反运维优先）。
 	 */
-	if (peer_lookup(bgp, &su))
-		return;
+	{
+		struct peer *occupant = peer_lookup(bgp, &su);
+
+		if (occupant) {
+			if (midr_nds_peer_is_overlay(occupant)) {
+				/* MIDR 自己的会话，正常复用（沉默）。 */
+			} else if (occupant->afc[AFI_BGP_LS][SAFI_BGP_LS]) {
+				MIDR_LOG("midr_ctrl: %pFX transport 地址由已激活 LS 的运维会话占用，借用其为 LS 通道",
+					 &entry->node_id);
+			} else {
+				zlog_warn("midr_ctrl: %pFX 的 transport 地址被一条未激活 link-state 的运维会话占用，LS 邻接不可用；请在原生配置为该邻居激活 link-state",
+					  &entry->node_id);
+			}
+			return;
+		}
+	}
 
 	/*
-	 * 第二道去重：已存在任意一条到该节点（按对端 router-id 匹配）的 Established
-	 * 会话——典型是直连节点配置里手写的静态链路会话——就复用它（已激活 BGP-LS），
-	 * 不再叠一条多跳 transport 会话。上面的 peer_lookup 按地址查 connectionhash，
-	 * 漏掉以链路地址注册的静态会话，故这里按 router-id 补一道。
+	 * S5 第二道去重（⑦）：按对端 router-id 找一条现成 Established 会话——典型是
+	 * 直连节点的静态链路会话（键 = 链路地址，第一道按 transport 查不到它）。
+	 * 收紧：必须【已激活 BGP-LS】才算"已可达、可复用"；只 Established 不够——
+	 * 未激活 LS 的会话传不了拓扑、邻接实为坏（原注释"已激活 BGP-LS"是没查证的
+	 * 假设）。此时 transport 地址空闲（第一道已放行），照常另建自己的多跳会话。
+	 * 只在调用点加 LS 判定、不动 midr_node_established_peer 本身——PM 探测闸门
+	 * 与 E-1 origination 还在用它，对"会话"的语义要求不同（Established 即可）。
 	 */
-	if (midr_node_established_peer(bgp, &entry->node_id)) {
-		MIDR_LOG("midr_ctrl: %pFX already reachable via existing session (router-id match) — skip duplicate transport peering",
-			 &entry->node_id);
-		return;
+	{
+		struct peer *reachable =
+			midr_node_established_peer(bgp, &entry->node_id);
+
+		if (reachable && reachable->afc[AFI_BGP_LS][SAFI_BGP_LS]) {
+			MIDR_LOG("midr_ctrl: %pFX already reachable via existing LS session (router-id match) — skip duplicate transport peering",
+				 &entry->node_id);
+			return;
+		}
+		if (reachable)
+			MIDR_LOG("midr_ctrl: %pFX 有现成会话但未激活 LS，另建 transport overlay 会话以承载拓扑",
+				 &entry->node_id);
 	}
 
 	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
@@ -919,29 +1048,11 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	MIDR_FLOW_LOG("midr_ctrl: peering initiated with %pFX AS %u",
 		  &entry->node_id, asn);
 
-	/* MIDR peers may not be directly connected — allow multi-hop eBGP. */
+	/* 整形成 overlay 会话（multihop + update-source + 只载 BGP-LS），
+	 * 定义与理由见 midr_nds_ctrl_setup_overlay_peer 头注释。 */
 	peer = peer_lookup(bgp, &su);
-	if (peer) {
-		struct bgp_midr *mi = bgp->midr_info;
-
-		peer_ebgp_multihop_set(peer, MAXTTL);
-		/* Activate BGP-LS so topology info flows directly between
-		 * MIDR peers, not only via relay nodes. */
-		peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
-		/*
-		 * Source the TCP from our own transport-address (loopback) so
-		 * the far end sees a connection from the locator it configured
-		 * as the neighbor.  Without this the SYN is sourced from the
-		 * egress interface, the far end finds no matching neighbor, and
-		 * the multi-hop loopback session stays stuck in Active.
-		 */
-		if (mi->transport_addr_set) {
-			union sockunion local_su;
-
-			midr_su_from_in_addr(&local_su, mi->local_transport_addr);
-			peer_update_source_addr_set(peer, &local_su);
-		}
-	}
+	if (peer)
+		midr_nds_ctrl_setup_overlay_peer(bgp, peer);
 
 	/*
 	 * Bidirectional build-up: ask the target to peer back with us over the
@@ -966,13 +1077,18 @@ static void midr_try_disconnect(struct bgp *bgp,
 		return;
 
 	/*
-	 * Tear down the session unconditionally.  The old PEER_FLAG_CONFIG_NODE
-	 * guard could not distinguish MIDR-created peers from operator-config
-	 * ones (peer_remote_as sets that flag on both), so it never deleted
-	 * anything.  Statically configured neighbors generally key by a link
-	 * address, not the node locator, so peer_lookup() above won't match
-	 * them; if you need static neighbors back, redeploy the config.
+	 * S4 归属守卫（⑦）：只拆 MIDR 自建的 overlay 会话。键空间隔离（静态邻居按
+	 * 链路地址注册、这里按 locator 查）在 lab 下成立，但运维用 loopback（= 本
+	 * 节点 locator 键）配静态邻居是 iBGP 标准实践、完全合法，此时 peer_lookup
+	 * 会命中它——无守卫则误删运维会话、砸转发面。判据 = 标记 ∧ 只载 BGP-LS。
+	 * 旧 PEER_FLAG_CONFIG_NODE 守卫不可用：peer_remote_as 对谁都置它、区分不了。
 	 */
+	if (!midr_nds_peer_is_overlay(peer)) {
+		MIDR_LOG("midr_ctrl: %pFX locator 命中运维会话，拒拆（保护 underlay）",
+			 &entry->node_id);
+		return;
+	}
+
 	MIDR_LOG("midr_ctrl: removing peer %pFX (node gone)", &entry->node_id);
 	peer_delete(peer);
 }
@@ -1015,6 +1131,15 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id)
 		 * 判据的拆连（midr_group_reconverge 第 3 步）就找不到它们、造成会话泄漏。
 		 */
 		entry->is_adjacent = true;
+		/*
+		 * I-1 启动探测——同样与发现路径一致。少了这句，经 connect_group
+		 * 建连的成员（手动换组、I-7 JOIN）永远没有 probe_ctx：PM 每 10s 的
+		 * 兜底扫描只会灌零指标保活，E-1 导出的 TLV 1186 恒为 rtt=0/bw=0，
+		 * CL 后续拿这些假零做稳态判断即失真。JOIN 路径因成员表阶段已 add
+		 * 过而侥幸不显，手动换组则必现（07-21 十节点实验实证）。
+		 */
+		midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_GOSSIP,
+				   entry->capabilities);
 		midr_mark_topology(bgp, entry);
 		count++;
 	}

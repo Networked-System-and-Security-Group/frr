@@ -13,6 +13,8 @@
 
 #include <zebra.h>
 
+#include <math.h> /* fabs()：§8.21 去抖的丢包率绝对差比较 */
+
 #include "memory.h"
 #include "frrevent.h"
 #include "monotime.h"
@@ -28,13 +30,19 @@
 #include "bgpd/bgp_midr_cl.h"
 #include "bgpd/bgp_midr_pm.h"
 #include "bgpd/bgp_midr_tlv.h"
+#include "bgpd/bgp_midr_store.h"
 #include "bgpd/bgp_debug.h"
+
+/* §8.31 bootstrap 种子持久化参数 */
+#define MIDR_STORE_SEED_KEEP	  32 /* 种子库最多留几条（防膨胀，prune 上限） */
+#define MIDR_BOOTSTRAP_SELF_BOOT_SECS 10 /* 启动后延迟自举的等待秒数（等网络就绪） */
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_MIDR, "MIDR instance");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_GLOBAL_VIEW, "MIDR global view");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_ENTRY, "MIDR node entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_LINK_ENTRY, "MIDR link entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_ENTRY, "MIDR rep directory entry");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_BOOTSTRAP_ENTRY, "MIDR bootstrap candidate");
 
 /* ===========================================================================
  * Hash helpers (node table is keyed by node_id prefix)
@@ -81,6 +89,27 @@ void midr_node_get_locator(const struct midr_node_entry *e, struct prefix *out)
 		midr_prefix_from_in_addr(out, e->transport_addr);
 	else
 		prefix_copy(out, &e->node_id);
+}
+
+/*
+ * §8.31：若该节点是"可作种子的引导节点"（BOOTSTRAP 位 + transport + asn 齐备），
+ * 把它的 transport 地址写入种子库（有则刷 last_seen、无则插入）。非引导节点、
+ * self、字段不全者一律跳过。调用点：on_node_nlri 的变化分支（学到/变了才写，
+ * 不是每 5s keepalive）、periodic_sync 定时器（每 30s 顺路刷活性）。
+ */
+static void midr_maybe_save_bootstrap_seed(const struct midr_node_entry *entry)
+{
+	char buf[INET_ADDRSTRLEN];
+
+	if (entry->is_self)
+		return;
+	if (!(entry->capabilities & MIDR_CAP_BOOTSTRAP))
+		return;
+	if (!entry->has_transport_addr || entry->asn == 0)
+		return;
+
+	snprintfrr(buf, sizeof(buf), "%pI4", &entry->transport_addr);
+	midr_store_seed_save(buf, (uint32_t)entry->asn, monotime(NULL));
 }
 
 /* ===========================================================================
@@ -342,6 +371,11 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	 * (looped back) is skipped too.
 	 */
 	if (!entry->is_self) {
+		/* §8.31：学到/变更了引导节点就记一笔种子（keepalive 刷新不触发，
+		 * 因为下面两分支只在 is_new/changed 进入）。 */
+		if (is_new || changed)
+			midr_maybe_save_bootstrap_seed(entry);
+
 		if (is_new) {
 			midr_nds_on_node_discovered(bgp, entry);
 		} else if (changed) {
@@ -544,13 +578,19 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
  *      !should_peer 而非 ==old_gid，顺带清掉任何历史残留的错群邻接。detach 复用
  *      links 泄漏修复轮的统一清理（I-2 停探 + 双键删 link_entry + 复位 is_adjacent
  *      + 拆动态会话），不删 node 条目。PM 真实化后第 2 步的停探语义自动完整。
+ *   4. 停非本群群代表的评估期探测：join 第一段对 rep_dir 里【每个】群代表都起了
+ *      探测（midr_join_on_rep_list），落定后除本群代表外都不再需要。它们不带
+ *      is_adjacent（只探不纳入邻居），第 3 步扫不到，故按 rep_dir 单独收口——
+ *      否则每 join 一次就永久多养一批跨群探测。
  */
 static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 {
 	struct bgp_midr *mi = bgp->midr_info;
 	uint32_t old_gid = mi->local_group_id;
 	struct midr_node_entry *entry;
-	uint32_t connected = 0, detached = 0;
+	struct listnode *rn;
+	struct midr_rep_entry *r;
+	uint32_t connected = 0, detached = 0, reps_stopped = 0;
 
 	/* 1. 改群号 + 重通告（先于建连）。 */
 	midr_originate_group_update(bgp, new_gid, old_gid);
@@ -569,8 +609,39 @@ static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 		detached++;
 	}
 
-	MIDR_FLOW_LOG("MIDR 换组重收敛：群 %u -> %u（建连 %u 个新群成员，拆除 %u 个旧群邻接）",
-		      old_gid, new_gid, connected, detached);
+	/*
+	 * 4. 停非本群群代表的评估期探测。键的取法必须与 midr_join_on_rep_list
+	 *    起探时一致（有真名用真名、否则用 transport 建的占位条目），否则找不到
+	 *    条目、停不掉。两道守卫：
+	 *      - is_self：本节点自兼群代表时不能把自己停了；
+	 *      - is_adjacent：该代表若已是本群邻居（如它换群进了本群、而 rep_dir 里
+	 *        还是旧群号），它归第 3 步管，这里不碰——避免误伤正经邻接。
+	 *    不拆会话（teardown=false）：只探不连的代表本就没有会话；万一它另有会话，
+	 *    那也不是本步该管的账。
+	 */
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r)) {
+		struct midr_node_entry key = {};
+		struct midr_node_entry *rep_entry;
+
+		if (r->group_id == new_gid)
+			continue; /* 本群代表，留着继续探 */
+
+		if (r->rep_rid.s_addr != INADDR_ANY)
+			midr_prefix_from_in_addr(&key.node_id, r->rep_rid);
+		else
+			midr_prefix_from_in_addr(&key.node_id, r->rep_transport);
+
+		rep_entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent)
+			continue;
+
+		midr_nds_detach_node(bgp, rep_entry, MIDR_STOP_CLUSTER_CHANGE,
+				     false);
+		reps_stopped++;
+	}
+
+	MIDR_FLOW_LOG("MIDR 换组重收敛：群 %u -> %u（建连 %u 个新群成员，拆除 %u 个旧群邻接，停探 %u 个非本群代表）",
+		      old_gid, new_gid, connected, detached, reps_stopped);
 	return connected;
 }
 
@@ -599,6 +670,8 @@ void midr_nds_set_group_id(struct bgp *bgp, uint32_t new_gid)
 		mi->join_in_progress = false;
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_group_id = 0;
+		mi->bootstrap_cur = NULL; /* §8.32：收起 failover 游标，残留 pending
+					   * 死掉时守卫（intent+地址匹配）自然忽略 */
 		MIDR_LOG("MIDR 换组(手动)：作废在途加入意图");
 	}
 
@@ -743,8 +816,15 @@ static void midr_periodic_sync_timer(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	struct bgp_midr *mi = bgp->midr_info;
+	struct midr_node_entry *entry;
 
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_PERIODIC_SYNC);
+
+	/* §8.31：顺路把当前视图里的引导节点刷一遍种子库 last_seen（"我最近还
+	 * 见过它"），再 prune 到上限防膨胀。下线/过期不删库——种子跨活性留底。 */
+	frr_each (midr_node_hash, &mi->global_view->nodes, entry)
+		midr_maybe_save_bootstrap_seed(entry);
+	midr_store_seed_prune(MIDR_STORE_SEED_KEEP);
 
 	event_add_timer(bm->master, midr_periodic_sync_timer, bgp,
 			MIDR_PERIODIC_SYNC_INTERVAL, &mi->t_periodic_sync);
@@ -788,6 +868,100 @@ struct peer *midr_node_established_peer(struct bgp *bgp,
 	return NULL;
 }
 
+/*
+ * §8.21 去抖判断（"一处判断、两处消费"的那一处）：本次指标相对**上次发出的
+ * 快照**该不该发，以及——同样重要——是"真变化"还是"只是该刷一次了"。
+ *
+ * 返回原因而非布尔，是因为两个下游的口径不同：
+ *   - 下游②（对外发 Link NLRI）：任何非 NONE 都要发；
+ *   - 下游①（对内 notify CL）：**只有真变化才发**。周期兜底是为保传播/防静默
+ *     错误而重发，指标一动没动，此时通知 CL 等于喂假事件，会害它做无谓的重
+ *     评估（07-23 实测发现：不区分的话 notify 数完全跟随兜底节拍）。
+ *
+ * 四条必发条件：
+ *   1. FIRST     首次（还没发过）——邻居的第一条 1186 不能等；
+ *   2. STATUS    status 跳变——UP/DEGRADED/DOWN 变化永远是大事，DOWN 必须立刻广播；
+ *   3. THRESHOLD 任一指标超阈值（阈值与取值理由见 bgp_midr.h 的 MIDR_DEBOUNCE_*）；
+ *   4. PERIODIC  距上次发送 ≥ MIDR_DEBOUNCE_MAX_SILENCE 秒的兜底重发。不新增
+ *                定时器：I-5 每秒都进来，顺路查一下时间即可。
+ *
+ * 只读不写：快照的更新在调用方发出之后做（发出去了才算数）。
+ * 乒乓后手（暂不实装）：若实测值在阈值边界反复横跳导致发送偏多，可在此加
+ * "两次发送最小间隔"——last_sent_time 已经在手边，多一个 && 即可。
+ */
+enum midr_debounce_reason {
+	MIDR_DEBOUNCE_NONE = 0,	 /* 无显著变化且未到兜底期：两个下游都跳过 */
+	MIDR_DEBOUNCE_FIRST,	 /* 首条 */
+	MIDR_DEBOUNCE_STATUS,	 /* 状态跳变 */
+	MIDR_DEBOUNCE_THRESHOLD, /* 指标超阈值 */
+	MIDR_DEBOUNCE_PERIODIC,	 /* 周期兜底（发但不通知 CL） */
+};
+
+/* 是否属于"真变化"——决定要不要惊动 CL（兜底不算）。 */
+static bool midr_debounce_is_real_change(enum midr_debounce_reason r)
+{
+	return r == MIDR_DEBOUNCE_FIRST || r == MIDR_DEBOUNCE_STATUS ||
+	       r == MIDR_DEBOUNCE_THRESHOLD;
+}
+
+static enum midr_debounce_reason
+midr_nds_e1_should_send(const struct midr_link_entry *link,
+			enum midr_link_status new_status,
+			const struct midr_link_metrics *cur, time_t now)
+{
+	const struct midr_link_metrics *snap = &link->sent_metrics;
+	uint32_t rtt_delta;
+
+	/* 1. 首次必发。 */
+	if (!link->sent_once)
+		return MIDR_DEBOUNCE_FIRST;
+
+	/* 2. 状态跳变必发。 */
+	if (new_status != link->status)
+		return MIDR_DEBOUNCE_STATUS;
+
+	/*
+	 * 3. 逐指标超阈值判断。次序在兜底之前：同一秒里既超阈值又到兜底期时，
+	 *    要按"真变化"记（否则会被兜底吃掉、漏掉给 CL 的通知）。
+	 */
+
+	/* RTT：相对 + 绝对双条件同时满足才算变化（理由见头文件注释）。 */
+	rtt_delta = cur->rtt_us > snap->rtt_us ? cur->rtt_us - snap->rtt_us
+					       : snap->rtt_us - cur->rtt_us;
+	if (rtt_delta >= MIDR_DEBOUNCE_RTT_ABS_US) {
+		/* 快照为 0（还没测到过有效值）时任何非零值都算显著变化，
+		 * 同时避开除零。 */
+		if (snap->rtt_us == 0)
+			return MIDR_DEBOUNCE_THRESHOLD;
+		if ((uint64_t)rtt_delta * 100 >=
+		    (uint64_t)snap->rtt_us * MIDR_DEBOUNCE_RTT_REL_PCT)
+			return MIDR_DEBOUNCE_THRESHOLD;
+	}
+
+	/* 丢包率：绝对差。 */
+	if (fabs(cur->loss_rate - snap->loss_rate) >= MIDR_DEBOUNCE_LOSS_ABS)
+		return MIDR_DEBOUNCE_THRESHOLD;
+
+	/*
+	 * 带宽分数【刻意不作独立判据】——07-23 实测教训，非疏漏：
+	 * 现实现里 bw_score = sqrt(1.5)/(rtt × sqrt(loss))（bgp_midr_pm.c），
+	 * 是 rtt 与 loss 的确定性派生量、不含独立信息。若让它独立触发，就等于给
+	 * RTT 开了条绕过"绝对差 ≥1ms"免疫的旁路：内网 rtt 225→289us（+28%，绝对
+	 * 才 64us 本该被挡）经 1/x 放大成 bw −22%，稳态下累计漂移即穿透 25% 阈值
+	 * ——实测每几秒就假触发一次 NODE_CHANGE。而 bw 量纲跨 200 倍（跨群 271
+	 * vs 内网 55000），任何绝对门槛都套不住，靠调参解决不了。
+	 * 结论：rtt/loss 判无显著变化时，bw 的变化必是二者亚阈值抖动被放大的结果，
+	 * 不是新信息。⚠ 若将来 bw_score 改为独立测量（真实带宽探测而非 rtt 派生），
+	 * 必须回来恢复它的独立判据。
+	 */
+
+	/* 4. 指标无显著变化：距上次发送够久则兜底重发一次（只发、不通知 CL）。 */
+	if (now - link->last_sent_time >= MIDR_DEBOUNCE_MAX_SILENCE)
+		return MIDR_DEBOUNCE_PERIODIC;
+
+	return MIDR_DEBOUNCE_NONE;
+}
+
 static void midr_e1_write_to_bgpls(struct bgp *bgp, struct midr_link_entry *link)
 {
 	struct peer *peer;
@@ -828,6 +1002,8 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 {
 	struct bgp_midr *mi;
 	struct midr_link_entry *link;
+	time_t now = monotime(NULL);
+	enum midr_debounce_reason reason;
 
 	if (!bgp || !bgp->midr_info || !node_id)
 		return;
@@ -841,9 +1017,20 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 		listnode_add(mi->global_view->links, link);
 	}
 
+	/*
+	 * §8.21 去抖判断必须在覆盖 link->status / short_term **之前**做——判据要
+	 * 拿"本次值"跟"上次发出的快照"比，且 status 跳变判断要看新旧两个值。
+	 * 本地 link_entry 照常每秒更新（CL 的 60s 热身窗、pm-test 的指标判定都读
+	 * 它），去抖只门控两件对外的事：重发 Link NLRI、惊动 CL。
+	 */
+	reason = midr_nds_e1_should_send(link, status,
+					 short_term ? short_term
+						    : &link->short_term,
+					 now);
+
 	link->status = status;
 	link->consecutive_failures = consecutive_failures;
-	link->last_probe_time = monotime(NULL);
+	link->last_probe_time = now;
 	if (short_term)
 		link->short_term = *short_term;
 	if (long_term)
@@ -864,22 +1051,44 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 		key.node_id = *node_id;
 		node = midr_node_hash_find(&mi->global_view->nodes, &key);
 		if (node)
-			node->last_seen = monotime(NULL);
+			node->last_seen = now;
 	}
 
-	/* E-1: write short-term metrics into BGP-LS */
+	/*
+	 * 无显著变化：本地视图已更新完毕，对外两件事都跳过（既不重发 Link NLRI、
+	 * 也不惊动 CL）。绝大多数秒走这条路。
+	 */
+	if (reason == MIDR_DEBOUNCE_NONE)
+		return;
+
+	/* 下游②（对外）：E-1 把短期指标写进 BGP-LS Link NLRI（TLV 1186）。
+	 * seqno 在 E-1 内部自增，条件化之后它自然变成"真发出去才递增"的语义。 */
 	midr_e1_write_to_bgpls(bgp, link);
 
+	/* 发出即刻记快照：下次比较的基准，以及兜底周期的计时起点。 */
+	link->sent_metrics = link->short_term;
+	link->last_sent_time = now;
+	link->sent_once = true;
+
 	/*
-	 * 此处【不】notify CL。I-5 只负责更新 link_entry + E-1。把全局视图交给 CL
-	 * （I-3）的时机由编排层决定：
-	 *   - join 探群代表/成员：由 midr_join_on_rep_list / recv_member_list 在
-	 *     "探完一整批"后显式发 REP_PROBE_DONE / MEMBER_PROBE_DONE；
-	 *   - 稳态：节点表增删/能力变更发 NODE_CHANGE，周期定时器发 PERIODIC_SYNC。
-	 * 这样既不让 I-5 入口掺编排判断，又消除"每条探测各 notify 一次"。
-	 * TODO：① 稳态"性能显著变化才 notify(NODE_CHANGE)"的门控（落点 probe_timer，
-	 *       现 stub 假数据会乱触发故不实装）；② status==DOWN 的失效确认。
+	 * 下游①（对内）：链路质量真变化才值得让 CL 重新评估分群，发一条
+	 * NODE_CHANGE。两道闸：
+	 *   - **只在真变化时**（首条/状态跳变/超阈值）——周期兜底重发时指标一动
+	 *     没动，通知了就是喂假事件，CL 会被骗去做无谓重评估（07-23 实测：不加
+	 *     这道闸，notify 数完全跟随兜底节拍，60s 内 15 条全是假的）；
+	 *   - **只在稳态**——join 期（PROBING_REPS/PROBING_MEMBERS）指标正从 0 爬向
+	 *     真值，每一步都算"显著变化"，会连发一串无意义通知；而那段时间编排层
+	 *     本就有专门的 REP/MEMBER_PROBE_DONE 通知，CL 不缺消息。
+	 *
+	 * 注意：join 与稳态的分工没变——"探完一批"仍由编排层显式发 DONE，I-5 只在
+	 * 稳态补上原先完全缺失的"某条链路变天了"这一路事件（CL 侧 NODE_CHANGE 分支
+	 * 现为 stub，接上零风险；其稳态算法到货即可消费）。
 	 */
+	if (midr_debounce_is_real_change(reason) &&
+	    mi->join_phase == MIDR_JOIN_IDLE)
+		midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
+
+	/* TODO（未做）：status==DOWN 的失效确认（被动下线判定，见 §8）。 */
 }
 
 /* ===========================================================================
@@ -974,6 +1183,7 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_in_progress = false;
 		mi->join_intent = false;
+		mi->join_group_id = 0; /* 候选群字段回零：流程已结束，真身看 local_group_id */
 		MIDR_FLOW_LOG("MIDR I-7：JOIN 群 %u 完成（经重收敛编排建连 %u 个成员），加入流程结束（回稳态）",
 			      decision->new_group_id, mi->join_members);
 		break;
@@ -1000,19 +1210,44 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			MIDR_LOG("MIDR I-7：CREATE 但不在加入流程中，忽略");
 			break;
 		}
-		mi->local_group_id = decision->new_group_id;
-		midr_originate_group_update(bgp, decision->new_group_id, 0);
 		/*
-		 * TODO（CREATE 自建群待完善）：
-		 *   1. 自建群时没有任何现成节点可建连（与 JOIN 不同），后续需额外处理
-		 *      （如何引导其它节点加入本新群）。
-		 *   2. 需清空 global_view 的 nodes / link_entry —— 之前为评估候选群而
-		 *      探测/灌入的那些节点并不属于这个新群，应清掉以免污染稳态视图。
+		 * 自建群同样走重收敛编排（与 JOIN 共用），承担两件事：
+		 *   1. 改群号 + 重通告（原先手写的两行即此）；
+		 *   2. **清评估期残留**——为评估候选群而灌入并探测的那批节点
+		 *      （midr_nds_learn_member 置 is_adjacent=true + I-1 起探）并不属于
+		 *      这个新群，reconverge 第 3 步按"邻接却已不同群"判据把它们统一
+		 *      detach（I-2 停探 + 双键删 link_entry + 复位 is_adjacent），
+		 *      否则 CL 稳态会把别人群的节点当成本群邻接、PM 也继续白探。
+		 *      **detach 而非删除 node 条目**：p-1 全网互知下条目删了也会经泛洪
+		 *      重学（白删），且跨群视图本就该在；要断的只是"邻居化"关系。
+		 *      （原 TODO 措辞"清空 nodes"过度，2026-07-10 批注轮已修正为本语义。）
+		 * 第 2 步 connect_group 在新群里找不到成员，自然建连 0 个；评估期未建过
+		 * 会话（⑥ 先探后判），故 detach 的拆会话半边基本空转。
 		 */
+		midr_group_reconverge(bgp, decision->new_group_id);
+		/*
+		 * 创群者即首任群代表：置 GROUP_REP 位并重通告（set_capability 内部发
+		 * Node NLRI）。不置位则新群是**死群**——答 MEMBER_LIST 的闸门要这个位
+		 * （bgp_midr_ctrl.c）、进引导节点 rep 目录的推导也按这个位过滤
+		 * （midr_rep_candidates），后来者既问不到成员表也发现不了这个群。
+		 * ownership 无碍：能力位只能自己改，这里改的正是本节点自己的位。
+		 * 次序在 reconverge 之后——先落定新群号再宣称代表身份，避免中间态
+		 * 通告出"旧群号 + 我是代表"的错误组合。
+		 * TODO（仍缺）：如何主动引导其它节点加入本新群（现依赖它们各自 join 时
+		 * 经引导节点目录发现本群）。
+		 */
+		midr_nds_set_capability(bgp, mi->local_capabilities |
+					      MIDR_CAP_GROUP_REP);
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_in_progress = false;
 		mi->join_intent = false; /* join 落定，清意图与 JOIN 一致，堵迟到响应重启 */
-		MIDR_FLOW_LOG("MIDR I-7：CREATE 自建群 %u，加入流程结束（回稳态）",
+		/*
+		 * 候选群字段回零。CREATE 是二者唯一会不同的分支：候选群（RECOMMEND
+		 * 选中、探完发现链路不达标）与实建群号不是一个值，不清就会在
+		 * `show midr join` 里留下"Local group-id 4 / 候选群 2"的错位残留。
+		 */
+		mi->join_group_id = 0;
+		MIDR_FLOW_LOG("MIDR I-7：CREATE 自建群 %u（已置 GROUP_REP 位自任首任代表），加入流程结束（回稳态）",
 			      decision->new_group_id);
 		break;
 	}
@@ -1028,7 +1263,8 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
  * =========================================================================*/
 
 void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
-		      struct in_addr rep_transport, as_t rep_asn)
+		      struct in_addr rep_transport, as_t rep_asn,
+		      struct in_addr rep_rid)
 {
 	struct bgp_midr *mi;
 	struct listnode *node;
@@ -1038,11 +1274,14 @@ void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
 		return;
 	mi = bgp->midr_info;
 
-	/* Dedup on (group_id, rep_transport); refresh ASN if it already exists. */
+	/* Dedup on (group_id, rep_transport); refresh ASN if it already exists.
+	 * rid 只在非 0 时刷新——后到的无 rid 条目不得抹掉已知真名。 */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r))
 		if (r->group_id == group_id &&
 		    r->rep_transport.s_addr == rep_transport.s_addr) {
 			r->rep_asn = rep_asn;
+			if (rep_rid.s_addr != INADDR_ANY)
+				r->rep_rid = rep_rid;
 			return;
 		}
 
@@ -1050,6 +1289,7 @@ void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
 	r->group_id = group_id;
 	r->rep_transport = rep_transport;
 	r->rep_asn = rep_asn;
+	r->rep_rid = rep_rid;
 	listnode_add(mi->rep_dir, r);
 }
 
@@ -1148,7 +1388,7 @@ void midr_rep_candidates(struct bgp *bgp, struct list *out)
 		return;
 
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
-		if (!(entry->capabilities & MIDR_CAP_GROUP_REP))
+		if (!midr_node_is_group_rep(entry))
 			continue;
 		/* 活性兜底；主防线是 expire 定时器删表（≤5s 扫描周期） */
 		if (!entry->is_self &&
@@ -1201,6 +1441,62 @@ bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
 	return true;
 }
 
+/*
+ * 按 transport 地址反查节点真名（router-id）。给 build_rep_list 应答时刻回填
+ * 手配条目的 rid 用（护栏②）：手配 `midr rep group ...` 命令里没有 rid 栏，
+ * 借节点表补——含 self（引导节点手配自己当代表是标准姿势，self 条目启动即有，
+ * 反查必中）。查不到返回 0，wire 上 0 = 未知，收方走旧占位路径。
+ */
+struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
+					 struct in_addr transport)
+{
+	struct in_addr zero = { .s_addr = INADDR_ANY };
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_info)
+		return zero;
+
+	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
+		if (!entry->has_transport_addr)
+			continue;
+		if (entry->node_id.family != AF_INET)
+			continue;
+		if (entry->transport_addr.s_addr == transport.s_addr)
+			return entry->node_id.u.prefix4;
+	}
+	return zero;
+}
+
+/*
+ * ⑦ `no midr neighbor` 清账入口：按地址（会话对端 = 某节点 locator）反查节点表
+ * 条目，查到则走 midr_nds_detach_node 全套（I-2 停探 + 双键删 link + 清
+ * is_adjacent + 拆会话），返回 true；查不到返回 false（调用方退化为只拆会话）。
+ *
+ * 按 locator 比对而非仅 transport：节点无 transport 时 locator 回落 router-id，
+ * 两种键都能命中。detach 内部保持 static——只经此 wrapper 对 VTY 暴露一个动作，
+ * 不把停探/清账的原语散出去。
+ */
+bool midr_nds_detach_by_locator(struct bgp *bgp, struct in_addr addr)
+{
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_info)
+		return false;
+
+	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
+		struct prefix loc;
+
+		midr_node_get_locator(entry, &loc);
+		if (loc.family == AF_INET &&
+		    loc.u.prefix4.s_addr == addr.s_addr) {
+			midr_nds_detach_node(bgp, entry,
+					     MIDR_STOP_GRACEFUL_SHUTDOWN, true);
+			return true;
+		}
+	}
+	return false;
+}
+
 /* ===========================================================================
  * New-node join (bootstrap) — hierarchical discovery
  *
@@ -1213,10 +1509,153 @@ bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
  * No BGP-LS session is opened to the bootstrap, so there is no full-table dump.
  * =========================================================================*/
 
+/* ---------------------------------------------------------------------------
+ * §8.32 bootstrap 候选清单（多候选 + failover）
+ * 元素为 struct midr_bootstrap_entry；次序即尝试优先级：手配（MANUAL，按敲入
+ * 顺序）在前、种子（SEED，§8.31 重启读回）在后。游标 bootstrap_cur 指向本轮
+ * 正在尝试第一跳的候选；REP_LIST_REQ 重试耗尽时 ctrl 层回调
+ * midr_join_bootstrap_failed()，游标后移换下一候选，全部耗尽才放弃。
+ * ------------------------------------------------------------------------- */
+
+static struct midr_bootstrap_entry *
+midr_bootstrap_find(struct bgp_midr *mi, struct in_addr addr,
+		    struct listnode **node_out)
+{
+	struct listnode *node;
+	struct midr_bootstrap_entry *b;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b))
+		if (b->transport.s_addr == addr.s_addr) {
+			if (node_out)
+				*node_out = node;
+			return b;
+		}
+	return NULL;
+}
+
+/* 候选在清单中的 1 起序号（日志/展示用）。 */
+static unsigned int midr_bootstrap_index(struct bgp_midr *mi,
+					 const struct listnode *target)
+{
+	struct listnode *node;
+	unsigned int idx = 0;
+
+	for (node = listhead(mi->bootstrap_list); node;
+	     node = listnextnode(node)) {
+		idx++;
+		if (node == target)
+			return idx;
+	}
+	return 0;
+}
+
+/*
+ * 追加/刷新候选（去重键 = transport）。已存在只刷新 ASN/来源（MANUAL 覆盖
+ * SEED，位置不动——移动会使游标悬空，不值得）；新增时 MANUAL 插在首个 SEED
+ * 之前、SEED 追加到尾，维持"手配在前、种子在后"。
+ */
+static void midr_bootstrap_list_add(struct bgp_midr *mi, struct in_addr addr,
+				    as_t asn, enum midr_bootstrap_source source)
+{
+	struct midr_bootstrap_entry *b;
+	struct listnode *node;
+
+	b = midr_bootstrap_find(mi, addr, NULL);
+	if (b) {
+		b->asn = asn;
+		if (source == MIDR_BOOTSTRAP_MANUAL)
+			b->source = MIDR_BOOTSTRAP_MANUAL;
+		return;
+	}
+
+	b = XCALLOC(MTYPE_MIDR_BOOTSTRAP_ENTRY, sizeof(*b));
+	b->transport = addr;
+	b->asn = asn;
+	b->source = source;
+
+	if (source == MIDR_BOOTSTRAP_MANUAL) {
+		struct midr_bootstrap_entry *cur;
+
+		for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, cur))
+			if (cur->source == MIDR_BOOTSTRAP_SEED) {
+				listnode_add_before(mi->bootstrap_list, node, b);
+				return;
+			}
+	}
+	listnode_add(mi->bootstrap_list, b);
+}
+
+/* 向游标当前候选发第一跳请求（REP_LIST_REQ，经 TCP 列表交换 + pending 重试）。 */
+static void midr_bootstrap_start_attempt(struct bgp *bgp)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	struct midr_bootstrap_entry *b;
+
+	if (!mi->bootstrap_cur)
+		return;
+	b = listgetdata(mi->bootstrap_cur);
+	midr_ctrl_send_rep_request(bgp, b->transport);
+	MIDR_FLOW_LOG("MIDR JOIN: sent REP_LIST_REQ to bootstrap %pI4 [%s]（第 %u/%u 个候选）",
+		      &b->transport,
+		      b->source == MIDR_BOOTSTRAP_SEED ? "seed" : "manual",
+		      midr_bootstrap_index(mi, mi->bootstrap_cur),
+		      listcount(mi->bootstrap_list));
+}
+
+/* §8.31 种子读回回调：把库里一条种子（transport 字符串 + asn）追加进候选清单，
+ * 标 SEED 来源（排手配之后）。midr_store_seed_load 逐条调本函数。 */
+static void midr_bootstrap_seed_load_cb(const char *transport, uint32_t asn,
+					void *arg)
+{
+	struct bgp *bgp = arg;
+	union sockunion su;
+
+	if (str2sockunion(transport, &su) < 0 || su.sa.sa_family != AF_INET)
+		return;
+	midr_bootstrap_list_add(bgp->midr_info, su.sin.sin_addr, (as_t)asn,
+				MIDR_BOOTSTRAP_SEED);
+}
+
+/*
+ * §8.31 种子自举定时器（启动后延迟 MIDR_BOOTSTRAP_SELF_BOOT_SECS 触发一次）：
+ * 断电重启后 `midr bootstrap` 一次性命令已随进程消失、无人再敲，节点会永远闲
+ * 着。这里在启动初期用读回的种子自动发起一轮加入——三关全过才动（批注 B）：
+ *   ① 候选清单非空（全新机器无种子 → 不动，与现状一致）；
+ *   ② 本地无群号（local_group_id==0）——已手配 group-id 的节点是既有群成员，
+ *      不该自动跑去加入别的群；
+ *   ③ 无人已手动敲过 `midr bootstrap`（join_intent 未起）——人工优先。
+ * 三关全过后走与手动入网一样的流程（开新一轮、游标指表头、发第一跳），失败
+ * 同样按 §8.32 failover 换下一颗种子。
+ */
+static void midr_bootstrap_self_boot_cb(struct event *t)
+{
+	struct bgp *bgp = EVENT_ARG(t);
+	struct bgp_midr *mi = bgp->midr_info;
+	struct listnode *node;
+	struct midr_bootstrap_entry *b;
+
+	if (!mi->bootstrap_list || list_isempty(mi->bootstrap_list))
+		return;
+	if (mi->local_group_id != 0)
+		return;
+	if (mi->join_intent)
+		return;
+
+	mi->join_intent = true;
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b))
+		b->failed = false;
+	mi->bootstrap_cur = listhead(mi->bootstrap_list);
+	MIDR_FLOW_LOG("MIDR bootstrap：种子自举——重启后无群号且无人工命令，用 %u 个种子候选发起加入",
+		      listcount(mi->bootstrap_list));
+	midr_bootstrap_start_attempt(bgp);
+}
+
 void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 			     as_t asn)
 {
 	struct bgp_midr *mi;
+	struct listnode *node;
+	struct midr_bootstrap_entry *b;
 
 	if (!bgp || !bgp->midr_info || !su)
 		return;
@@ -1228,17 +1667,125 @@ void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 		return;
 	}
 
-	mi->bootstrap_su = *su;
-	mi->bootstrap_asn = asn;
-	mi->bootstrap_set = true;
+	/* §8.32：命令语义 = 追加候选（不再是覆盖单值）。 */
+	midr_bootstrap_list_add(mi, su->sin.sin_addr, asn,
+				MIDR_BOOTSTRAP_MANUAL);
+
+	/* 已有在途 join：只入列不打断——新候选排进清单，failover 轮得到它。 */
+	if (mi->join_intent) {
+		MIDR_FLOW_LOG("MIDR JOIN: 已有在途加入，候选 %pSU 仅入列（现共 %u 个候选）",
+			      su, listcount(mi->bootstrap_list));
+		return;
+	}
+
 	/* 表达一个尚未落定的加入意图：REP_LIST_RESP 到达时凭此放行进入 join。
 	 * 手动换组会作废它，届时迟到的响应被丢弃（见 midr_nds_set_group_id）。 */
 	mi->join_intent = true;
 
-	/* Ask the bootstrap for its representative directory (TCP list exchange). */
-	midr_ctrl_send_rep_request(bgp, su->sin.sin_addr);
-	MIDR_FLOW_LOG("MIDR JOIN: sent REP_LIST_REQ to bootstrap %pSU (TCP list exchange)",
-		  su);
+	/* 开新一轮：清 failed 标记，游标指向表头，向首个候选发第一跳。 */
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b))
+		b->failed = false;
+	mi->bootstrap_cur = listhead(mi->bootstrap_list);
+	midr_bootstrap_start_attempt(bgp);
+}
+
+/*
+ * §8.32 failover：REP_LIST_REQ 重试耗尽（"死心"）时由 ctrl 层回调（唯一调用点
+ * = midr_ctrl_retx_timer 的放弃分支）。守卫：意图仍在 + 失败地址就是游标当前
+ * 候选——被删候选/上一轮的残留 pending 死掉时地址对不上，静默忽略。
+ * 候选耗尽时 join_intent 保留：某慢候选的迟到 REP_LIST_RESP 仍可自愈进 join
+ * （与单候选旧行为一致）；手动换组照旧作废一切。
+ */
+void midr_join_bootstrap_failed(struct bgp *bgp, struct in_addr failed)
+{
+	struct bgp_midr *mi;
+	struct midr_bootstrap_entry *b;
+
+	if (!bgp || !bgp->midr_info)
+		return;
+	mi = bgp->midr_info;
+
+	if (!mi->join_intent || !mi->bootstrap_cur)
+		return;
+	b = listgetdata(mi->bootstrap_cur);
+	if (b->transport.s_addr != failed.s_addr)
+		return;
+
+	b->failed = true;
+	mi->bootstrap_cur = listnextnode(mi->bootstrap_cur);
+	if (mi->bootstrap_cur) {
+		struct midr_bootstrap_entry *next =
+			listgetdata(mi->bootstrap_cur);
+
+		zlog_warn("MIDR bootstrap failover：%pI4 无响应，改试 %pI4（第 %u/%u 个候选）",
+			  &failed, &next->transport,
+			  midr_bootstrap_index(mi, mi->bootstrap_cur),
+			  listcount(mi->bootstrap_list));
+		midr_bootstrap_start_attempt(bgp);
+	} else {
+		zlog_warn("MIDR bootstrap failover：全部 %u 个候选耗尽，放弃本轮加入（意图保留，迟到响应仍可自愈；可补候选后重敲 midr bootstrap）",
+			  listcount(mi->bootstrap_list));
+	}
+}
+
+bool midr_bootstrap_list_del(struct bgp *bgp, struct in_addr addr)
+{
+	struct bgp_midr *mi;
+	struct listnode *node = NULL;
+	struct midr_bootstrap_entry *b;
+	bool was_current = false;
+
+	if (!bgp || !bgp->midr_info)
+		return false;
+	mi = bgp->midr_info;
+
+	b = midr_bootstrap_find(mi, addr, &node);
+	if (!b)
+		return false;
+
+	/* 正在尝试的被删：游标先顺移（该候选的残留 pending 死掉时，failover
+	 * 守卫因地址对不上自然忽略，无需显式清 pending）。 */
+	if (mi->bootstrap_cur == node) {
+		mi->bootstrap_cur = listnextnode(node);
+		was_current = true;
+	}
+	list_delete_node(mi->bootstrap_list, node);
+	XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, b);
+
+	if (was_current && mi->join_intent) {
+		if (mi->bootstrap_cur)
+			midr_bootstrap_start_attempt(bgp);
+		else
+			zlog_warn("MIDR bootstrap：正在尝试的候选被删且已无其它候选，放弃本轮加入（意图保留）");
+	}
+	return true;
+}
+
+void midr_bootstrap_clear(struct bgp *bgp)
+{
+	struct bgp_midr *mi;
+	struct listnode *node, *nnode;
+	struct midr_bootstrap_entry *b;
+
+	if (!bgp || !bgp->midr_info)
+		return;
+	mi = bgp->midr_info;
+
+	mi->bootstrap_cur = NULL;
+	for (ALL_LIST_ELEMENTS(mi->bootstrap_list, node, nnode, b)) {
+		list_delete_node(mi->bootstrap_list, node);
+		XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, b);
+	}
+
+	/* 连带作废在途加入意图（与手动换组同款中止语义，批注点 C 已拍板）：
+	 * 清空候选 = 运维明确表态"别入网了"，迟到的 REP_LIST_RESP 也被丢弃。 */
+	if (mi->join_intent || mi->join_in_progress) {
+		mi->join_intent = false;
+		mi->join_in_progress = false;
+		mi->join_phase = MIDR_JOIN_IDLE;
+		mi->join_group_id = 0;
+		MIDR_LOG("MIDR bootstrap：清空候选清单并作废在途加入意图");
+	}
 }
 
 void midr_join_on_rep_list(struct bgp *bgp)
@@ -1274,6 +1821,9 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	 */
 	mi->join_in_progress = true;
 	mi->join_phase = MIDR_JOIN_PROBING_REPS;
+	/* §8.32：第一跳完成，收起 failover 游标；候选清单保留（供展示与
+	 * §8.31 种子写库）。此后目录已到手，无第一跳可 failover。 */
+	mi->bootstrap_cur = NULL;
 
 	/* I-1：对每个群代表启动探测（PM stub 同步把指标灌进 link_entry，不再 notify）。 */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
@@ -1281,16 +1831,25 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		struct midr_node_entry key = {};
 		struct midr_node_entry *entry;
 
-		midr_prefix_from_in_addr(&locator, r->rep_transport);
-
 		/*
 		 * 群代表此时尚未有 BGP-LS 会话（bootstrap 只是 UDP 通道），
 		 * global_view 里还没有它的条目，而 midr_pm_add_target() 要求
-		 * 探测目标已存在于 global_view 才会启动探测。这里以 transport
-		 * addr 本身作为 node_id 灌一条占位条目（与 cl_find_link_by_ipv4
-		 * 按 transport addr 查链路的假设一致），否则探测请求会被静默
-		 * 丢弃，REP_PROBE_DONE 永远拿不到数据。
+		 * 探测目标已存在于 global_view 才会启动探测，故先灌一条条目。
+		 * 键的取法（dual-ctx 根治，协议 v2 起目录条目带真名）：
+		 *   - rep_rid 非 0 → 以真名（router-id）为键。稍后该代表的
+		 *     Node NLRI / MEMBER_LIST 正式条目同键命中同一条，一台机器
+		 *     不再占两条表项、两个探测 ctx 抢同一地址的回复；
+		 *   - rep_rid 为 0（旧引导节点 / 应答方反查不到）→ 沿用旧法：拿
+		 *     transport addr 冒充 node_id 建占位条目（CL 侧兼容双查会按
+		 *     transport 回落命中，行为与 v1 相同）。
+		 * 守卫：rid 是自己时不按真名建（会撞 self 条目），走旧路。
 		 */
+		if (r->rep_rid.s_addr != INADDR_ANY &&
+		    !IPV4_ADDR_SAME(&r->rep_rid, &bgp->router_id))
+			midr_prefix_from_in_addr(&locator, r->rep_rid);
+		else
+			midr_prefix_from_in_addr(&locator, r->rep_transport);
+
 		key.node_id = locator;
 		entry = midr_node_hash_find(&mi->global_view->nodes, &key);
 		if (!entry) {
@@ -1350,6 +1909,7 @@ void bgp_midr_init(struct bgp *bgp)
 	mi->local_group_id = 0;
 	mi->local_capabilities = 0;
 	mi->rep_dir = list_new();
+	mi->bootstrap_list = list_new(); /* §8.32 候选引导节点清单 */
 	mi->perf_seqno = 0;
 	mi->cap_seqno = 0;
 
@@ -1372,6 +1932,15 @@ void bgp_midr_init(struct bgp *bgp)
 	event_add_timer(bm->master, midr_periodic_sync_timer, bgp,
 			MIDR_PERIODIC_SYNC_INTERVAL, &mi->t_periodic_sync);
 
+	/* §8.31：建种子表（失败仅 warn、种子功能静默降级，主链路照跑）；读回
+	 * 种子进候选清单，并挂一次性自举定时器（守卫见 self_boot_cb）。 */
+	if (midr_store_init() == 0) {
+		midr_store_seed_load(midr_bootstrap_seed_load_cb, bgp);
+		event_add_timer(bm->master, midr_bootstrap_self_boot_cb, bgp,
+				MIDR_BOOTSTRAP_SELF_BOOT_SECS,
+				&mi->t_bootstrap_boot);
+	}
+
 	MIDR_LOG("MIDR: module initialized for instance %s",
 		  bgp->name_pretty);
 }
@@ -1391,6 +1960,7 @@ void bgp_midr_finish(struct bgp *bgp)
 	event_cancel(&mi->t_probe_timeout);
 	event_cancel(&mi->t_rep_probe_done);
 	event_cancel(&mi->t_member_probe_done);
+	event_cancel(&mi->t_bootstrap_boot);
 
 	/* Stop PM periodic probe timer */
 	midr_pm_finish(bgp);
@@ -1402,6 +1972,15 @@ void bgp_midr_finish(struct bgp *bgp)
 	if (mi->rep_dir) {
 		midr_rep_dir_clear(bgp);
 		list_delete(&mi->rep_dir);
+	}
+	if (mi->bootstrap_list) { /* §8.32 候选清单（条目归本文件 MTYPE） */
+		struct listnode *node, *nnode;
+		struct midr_bootstrap_entry *b;
+
+		for (ALL_LIST_ELEMENTS(mi->bootstrap_list, node, nnode, b))
+			XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, b);
+		list_delete(&mi->bootstrap_list);
+		mi->bootstrap_cur = NULL;
 	}
 
 	XFREE(MTYPE_BGP_MIDR, mi);

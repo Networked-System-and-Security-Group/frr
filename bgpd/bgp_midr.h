@@ -58,6 +58,31 @@
  * and bad-link RTTs before CL evaluates. */
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
 
+/* ---------------------------------------------------------------------------
+ * §8.21 指标变化门控（去抖）阈值 —— ⚠ 全部为粗定值，待真实网络跑出数据后校准。
+ *
+ * 用途：PM 每秒回灌一次指标（I-5），若无门控则每秒每邻居重编码+泛洪一条 Link
+ * NLRI，绝大多数是原样重发。门控 = "显著变化才对外发/才惊动 CL"。
+ * 比较基准一律是 link->sent_metrics（上次发出的快照），公式：
+ *     相对变化 = |本次 − 快照| / 快照        （分母是快照，不是本次）
+ *
+ * RTT 用"相对 + 绝对"双条件，因为它跨数量级（内网百微秒 vs 跨群几十毫秒），
+ * 单一绝对值套不住两头：214us→260us 相对超 20% 但绝对才 46us（微值抖动，
+ * 不该发）；45ms→46ms 绝对差 1ms 但相对仅 2%（同样不该发）。两条都过才算变化。
+ * LOSS 只用绝对差：值域固定 0-1、不随链路基线缩放，且消费侧全是绝对阈值
+ * （CL 入群判 loss<5%），1 个百分点的分辨率正好匹配决策粒度，无需按链路分档。
+ * ------------------------------------------------------------------------- */
+#define MIDR_DEBOUNCE_RTT_REL_PCT   20	  /* RTT 相对变化门槛（%） */
+#define MIDR_DEBOUNCE_RTT_ABS_US    1000  /* RTT 绝对变化门槛（微秒，1ms） */
+#define MIDR_DEBOUNCE_LOSS_ABS	    0.01  /* 丢包率绝对变化门槛（1 个百分点） */
+#define MIDR_DEBOUNCE_BW_REL_PCT    25	  /* 带宽分数相对变化门槛（%）。⚠ 当前
+					   * 未启用：bw_score 是 rtt/loss 的派生量
+					   * （bgp_midr_pm.c 公式），独立判据会给
+					   * RTT 的绝对差免疫开旁路（07-23 实测假
+					   * 触发）。bw 改独立测量后再启用，理由
+					   * 见 bgp_midr.c 判断函数内注释。 */
+#define MIDR_DEBOUNCE_MAX_SILENCE   30	  /* 兜底：距上次发送满此秒数必发一次 */
+
 /* Forward declarations */
 struct bgp;
 struct peer;
@@ -91,6 +116,16 @@ struct midr_link_entry {
 	time_t last_probe_time;
 	struct midr_link_metrics short_term; /* second-level */
 	struct midr_link_metrics long_term;  /* day/week-level */
+
+	/*
+	 * §8.21 去抖状态（只此三项，无历史序列/滑窗）。基准是"上次**发出**的
+	 * 那组值"而非上一次测量值——逐次比会漏慢漂移（每秒 +1ms 永远不超阈值，
+	 * 累计漂 50ms 对外还是老值），与快照比则漂移积累到阈值必然触发。
+	 * 平滑不在这一层：进来的 short_term 已是 PM 侧 EWMA 的产物。
+	 */
+	struct midr_link_metrics sent_metrics; /* 上次发出的指标快照 */
+	time_t last_sent_time;		       /* 上次发出的时刻（兜底周期用） */
+	bool sent_once;			       /* 是否发过（首条必发） */
 };
 
 PREDECL_HASH(midr_node_hash);
@@ -123,11 +158,11 @@ struct midr_node_entry {
 	bool has_transport_addr;
 	time_t last_seen;	/* last keepalive timestamp (local clock) */
 	/*
-	 * 接口设计文档 §2.3 规格字段，现实现未接线（全树零读写）——判断群
-	 * 代表一律用 capabilities & MIDR_CAP_GROUP_REP（rep 目录推导/闸门
-	 * 均如此）。裁撤或接线待与 CL owner 的 cap 位核对对话一并定。
+	 * 接口设计文档 §2.3 原有一个 is_group_rep 布尔字段，2026-07-23 裁撤：
+	 * 它与 capabilities 的 GROUP_REP 位是同一事实的两个真值源，而全树只写
+	 * 不读（恒为 false），留着迟早被误用。判断群代表统一走下方的
+	 * midr_node_is_group_rep()——语义以访问函数形式保留。
 	 */
-	bool is_group_rep;
 	bool is_self;		/* this entry describes the local node */
 	/*
 	 * 是否为本节点的"邻居"：仅经 BGP-LS 泛洪收到（view-only）= false；
@@ -139,6 +174,16 @@ struct midr_node_entry {
 
 	struct midr_node_hash_item hash_item;
 };
+
+/*
+ * 角色判定的唯一入口（裁撤 is_group_rep 字段后的替代，见上方注释）。
+ * 真值源 = 节点自己经 TLV 1187 通告的能力位；rep 目录推导、MEMBER_LIST
+ * 应答闸门、show midr reps 过滤本就都按这个位判，这里只是给它一个名字。
+ */
+static inline bool midr_node_is_group_rep(const struct midr_node_entry *e)
+{
+	return e && (e->capabilities & MIDR_CAP_GROUP_REP);
+}
 
 extern unsigned int midr_node_hash_key(const struct midr_node_entry *e);
 extern int midr_node_hash_cmp(const struct midr_node_entry *a,
@@ -164,6 +209,25 @@ struct midr_rep_entry {
 	uint32_t group_id;
 	struct in_addr rep_transport; /* rep's reachable address (UDP + peering) */
 	as_t rep_asn;
+	struct in_addr rep_rid; /* rep's router-id (真名)；0 = 未知（探测退回
+				 * 占位路径，wire 上对应 v2 rep_rid 栏） */
+};
+
+/*
+ * §8.32 bootstrap 韧性：候选引导节点（多候选 + failover）。
+ * bootstrap_list 的元素；手配（MANUAL）排前、种子（SEED，§8.31 重启读回）排后，
+ * 次序即尝试优先级。去重键 = transport（同地址重复添加只更新，手配覆盖种子）。
+ */
+enum midr_bootstrap_source {
+	MIDR_BOOTSTRAP_MANUAL = 0, /* midr bootstrap 命令手配 */
+	MIDR_BOOTSTRAP_SEED,	   /* 持久化种子（重启读回） */
+};
+
+struct midr_bootstrap_entry {
+	struct in_addr transport; /* 引导节点可达地址 */
+	as_t asn;
+	enum midr_bootstrap_source source;
+	bool failed; /* 本轮第一跳已尝试失败（show 展示用；开新一轮时清零） */
 };
 
 /* §2.5 I-3 trigger event types */
@@ -249,11 +313,13 @@ struct bgp_midr {
 	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
 	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
 	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
+	struct event *t_bootstrap_boot;	  /* §8.31 一次性种子自举定时器 */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
-	union sockunion bootstrap_su; /* bootstrap node address */
-	as_t bootstrap_asn;	      /* bootstrap node ASN */
-	bool bootstrap_set;	      /* a bootstrap node is configured */
+	struct list *bootstrap_list;	/* 候选引导节点（struct midr_bootstrap_entry），
+					 * 手配在前、种子在后，次序即尝试优先级（§8.32） */
+	struct listnode *bootstrap_cur; /* 游标：当前正在尝试第一跳的候选；
+					 * NULL = 第一跳未在尝试（未开始或已完成） */
 	bool join_in_progress;	      /* guard：join 进行中，等价于 join_phase != IDLE，
 				       * 保留给 show midr join，由 join_phase 同步维护 */
 	bool join_intent;	      /* 存在一个尚未落定的加入意图：配 bootstrap 置起，
@@ -390,6 +456,22 @@ extern void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 				    as_t asn);
 
 /*
+ * §8.32 failover：ctrl 层 REP_LIST_REQ 重试耗尽（"死心"）时回调（唯一调用点
+ * midr_ctrl_retx_timer 的放弃分支）。守卫通过则游标后移、向下一候选重发第一跳
+ * 请求；候选耗尽则放弃本轮（join_intent 保留，迟到 RESP 仍可自愈——与单候选旧
+ * 行为一致）。
+ */
+extern void midr_join_bootstrap_failed(struct bgp *bgp, struct in_addr failed);
+
+/* `no midr bootstrap A.B.C.D`：删指定候选（true=找到并删除）；正在尝试的
+ * 被删则顺移到下一候选。 */
+extern bool midr_bootstrap_list_del(struct bgp *bgp, struct in_addr addr);
+
+/* `no midr bootstrap`（无参）：清空候选清单并作废在途加入意图（与手动换组
+ * 同款中止语义，批注点 C 已拍板）。 */
+extern void midr_bootstrap_clear(struct bgp *bgp);
+
+/*
  * Stage 1: the bootstrap's REP_LIST_RESP has been parsed into mi->rep_dir.
  * Probe the reps (I-1), pick a group, then query that group's representative
  * for its member list (MEMBER_LIST_REQ).  Called from the ctrl recv path.
@@ -411,9 +493,20 @@ extern void midr_group_members(struct bgp *bgp, uint32_t group_id,
  */
 extern void midr_rep_candidates(struct bgp *bgp, struct list *out);
 
-/* Group-representative directory (bootstrap config + learned). */
+/* Group-representative directory (bootstrap config + learned).
+ * rep_rid: 代表的 router-id；手配来源无从得知时传 0（wire 亦以 0 表未知）。 */
 extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
-			     struct in_addr rep_transport, as_t rep_asn);
+			     struct in_addr rep_transport, as_t rep_asn,
+			     struct in_addr rep_rid);
+
+/* 按 transport 地址在节点表反查 router-id（真名）；查不到返回 0。
+ * build_rep_list 应答时刻给手配条目回填 rid 用（护栏②，批注 55）。 */
+extern struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
+						struct in_addr transport);
+
+/* ⑦ `no midr neighbor` 清账：按地址反查节点表条目并 detach 全套（停探+删 link+
+ * 清 is_adjacent+拆会话）。查到返回 true，查不到 false（调用方退化为只拆会话）。 */
+extern bool midr_nds_detach_by_locator(struct bgp *bgp, struct in_addr addr);
 extern bool midr_rep_dir_del(struct bgp *bgp, uint32_t group_id,
 			     struct in_addr rep_transport);
 extern void midr_rep_dir_clear(struct bgp *bgp);
