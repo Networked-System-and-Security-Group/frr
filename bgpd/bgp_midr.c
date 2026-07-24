@@ -1405,6 +1405,18 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		MIDR_FLOW_LOG("MIDR I-7：REP_RESIGN 群 %u，本节点卸任代表",
 			      mi->local_group_id);
 		break;
+	case MIDR_DECISION_ANCHOR:
+		/*
+		 * B2/疑2（doc/change.md）：CL 选出的锚点候选（decision->evidence，
+		 * 至多 4 条 node_id+metrics）。NDS 侧的请求成员列表/限时探测/
+		 * 触发本决策那半套编排是 B2/疑2（下）的活；这里先接执行分支占位
+		 * （待办：对 evidence 里每条按 node_id 查 global_view 拿到完整
+		 * entry，逐条 midr_ctrl_connect()，与 connect_group 同一原语）。
+		 */
+		MIDR_LOG("MIDR I-7：ANCHOR 收到 %u 个锚点候选（stub，执行编排见 B2/疑2 下）",
+			 decision->evidence ? listcount(decision->evidence)
+					     : 0);
+		break;
 	}
 }
 

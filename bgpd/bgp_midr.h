@@ -237,6 +237,12 @@ enum midr_trigger_type {
 	MIDR_TRIGGER_CAPABILITY_UPDATE = 3, /* TLV 1187 capability update */
 	MIDR_TRIGGER_PERIODIC_SYNC = 4,	    /* periodic sync timer */
 	MIDR_TRIGGER_NODE_CHANGE = 5,	    /* node join/leave/expire */
+	/*
+	 * B2/疑2（doc/change.md）：两个次优群的候选成员限时探测完成。NDS 在
+	 * RECOMMEND 阶段向两个次优代表要来成员列表、探测 MIDR_JOIN_PROBE_WAIT_SECS
+	 * 秒后发出，交 CL 选锚点（cl_handle_anchor_probe_done → I-7 ANCHOR）。
+	 */
+	MIDR_TRIGGER_ANCHOR_PROBE_DONE = 6,
 };
 
 /* §2.6 I-7 clustering decision */
@@ -253,6 +259,13 @@ enum midr_decision_type {
 	 */
 	MIDR_DECISION_REP_ELECT = 6,
 	MIDR_DECISION_REP_RESIGN = 7,
+	/*
+	 * B2/疑2（doc/change.md，采纳方案）：群间锚点连接。不改变本节点的
+	 * group_id（old/new_group_id 均取 local_group_id，纯记录用）——真正
+	 * 的内容在 evidence：至多 4 个跨群锚点候选（node_id + 探测指标），NDS
+	 * 收到后对每条直接 midr_ctrl_connect()。
+	 */
+	MIDR_DECISION_ANCHOR = 8,
 };
 
 struct midr_node_evidence {
@@ -266,6 +279,13 @@ struct midr_cluster_decision {
 	uint32_t old_group_id;
 	struct prefix recommended_rep; /* only for RECOMMEND */
 	struct list *evidence;	       /* list of struct midr_node_evidence */
+	/*
+	 * B2/疑2：仅 RECOMMEND 有效，最多 2 个次优代表（探测中顺带得到，未被
+	 * 选中的第 2/3 名）。元素是借用指针，指向 mi->rep_dir 里的
+	 * struct midr_rep_entry，只在本次 I-7 同步调用期间有效——NDS 拿它去发
+	 * MEMBER_LIST_REQ，不得跨调用保存。候选不足 2 个时可能只有 0/1 个。
+	 */
+	struct list *anchor_reps;
 };
 
 /* §2.4 I-3 callback registered by the clustering (CL) module */
@@ -352,6 +372,14 @@ struct bgp_midr {
 	enum midr_join_phase join_phase; /* 加入流程阶段，决定 I-5 回灌发哪个 trigger */
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */
+
+	/*
+	 * B2/疑2（doc/change.md）：正在评估的两个次优群号（RECOMMEND 时从
+	 * CL 回灌的 anchor_reps 记下），0 = 该槽位无候选。NDS 向这两个群的
+	 * 代表发 MEMBER_LIST_REQ、限时探测后发 ANCHOR_PROBE_DONE，CL 据此
+	 * 重新从 gv->nodes 里按群号筛候选（见 cl_handle_anchor_probe_done）。
+	 */
+	uint32_t anchor_group_id[2];
 
 	/* === Control channel — independent of PM ===
 	 * 端口 5859 上并存两条传输 (内核 TCP/UDP 端口空间独立):

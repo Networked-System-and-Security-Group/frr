@@ -24,6 +24,7 @@
 #include <zebra.h>
 
 #include "log.h"
+#include "memory.h"
 #include "prefix.h"
 #include "linklist.h"
 #include "monotime.h"
@@ -31,6 +32,8 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_cl.h"
+
+DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
 
 /* ===========================================================================
  * CL 策略阈值
@@ -150,11 +153,36 @@ static uint32_t cl_max_group_id(const struct midr_global_view *gv)
  * =========================================================================*/
 
 /*
+ * 判断 cand（配其链路 cand_link）排名是否严格优于 best（配 best_link）：
+ *   长期 RTT 更低 → 丢包率更低 → 带宽分数更高 → group_id 更小（稳定排序）。
+ * best 为 NULL（尚无候选）时 cand 总是更优。抽成独立函数是因为 B2/疑2 的
+ * 前 3 名排序需要反复用它（不只是找单一最优）。
+ */
+static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
+			     const struct midr_link_entry *cand_link,
+			     const struct midr_rep_entry *best_r,
+			     const struct midr_link_entry *best_link)
+{
+	if (!best_r)
+		return true;
+	if (cl_metrics_is_better(&cand_link->long_term, &best_link->long_term))
+		return true;
+	return cand_link->long_term.rtt_us == best_link->long_term.rtt_us &&
+	       cand_link->long_term.loss_rate ==
+		       best_link->long_term.loss_rate &&
+	       cand_link->long_term.bw_score == best_link->long_term.bw_score &&
+	       cand_r->group_id < best_r->group_id;
+}
+
+/*
  * 从 mi->rep_dir（群代表目录）中，结合 gv->links 的长期探测指标，选出性能最优的
- * 群代表，经 I-7 RECOMMEND 回灌。
+ * 群代表，经 I-7 RECOMMEND 回灌；同时保留第 2、3 名（B2/疑2，doc/change.md：
+ * 群间锚点连接方案），随 RECOMMEND 一并回灌给 NDS 供其请求这两个次优群的成员
+ * 列表。REP_PROBE_DONE 本来就已对目录里每个代表探测过一轮，第 2/3 名不需要
+ * 任何额外探测代价，只是原先探完即弃。
  *
  * 候选筛选条件：链路状态 UP 且已有探测数据（rtt_us > 0）。
- * 排序规则：长期 RTT 更低 → 丢包率更低 → 带宽分数更高 → group_id 更小（稳定）。
+ * 排序规则见 cl_rep_is_better()。
  *
  * 无可用候选时输出 CREATE（new_group_id = 当前最大 group_id + 1）。
  */
@@ -164,9 +192,11 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 	struct bgp_midr *mi = bgp->midr_info;
 	struct listnode *n;
 	struct midr_rep_entry *r;
-	struct midr_rep_entry *best_rep = NULL;
-	struct midr_link_entry *best_link = NULL;
+	/* 前 3 名，插入排序维护；[0]=最优（RECOMMEND），[1]/[2]=次优（锚点候选）。 */
+	struct midr_rep_entry *top_rep[3] = { NULL, NULL, NULL };
+	struct midr_link_entry *top_link[3] = { NULL, NULL, NULL };
 	struct midr_cluster_decision d = {};
+	int i, j;
 
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
 		struct midr_link_entry *link;
@@ -182,21 +212,20 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		if (!cl_link_has_data(link))
 			continue;
 
-		if (!best_rep ||
-		    cl_metrics_is_better(&link->long_term,
-					 &best_link->long_term) ||
-		    (link->long_term.rtt_us == best_link->long_term.rtt_us &&
-		     link->long_term.loss_rate ==
-			     best_link->long_term.loss_rate &&
-		     link->long_term.bw_score ==
-			     best_link->long_term.bw_score &&
-		     r->group_id < best_rep->group_id)) {
-			best_rep = r;
-			best_link = link;
+		for (i = 0; i < 3; i++) {
+			if (!cl_rep_is_better(r, link, top_rep[i], top_link[i]))
+				continue;
+			for (j = 2; j > i; j--) {
+				top_rep[j] = top_rep[j - 1];
+				top_link[j] = top_link[j - 1];
+			}
+			top_rep[i] = r;
+			top_link[i] = link;
+			break;
 		}
 	}
 
-	if (!best_rep) {
+	if (!top_rep[0]) {
 		uint32_t new_gid = cl_max_group_id(gv) + 1;
 
 		d.decision_type = MIDR_DECISION_CREATE;
@@ -207,21 +236,33 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 			new_gid);
 	} else {
 		d.decision_type = MIDR_DECISION_RECOMMEND;
-		d.new_group_id = best_rep->group_id;
+		d.new_group_id = top_rep[0]->group_id;
 		d.old_group_id = mi->local_group_id;
 		d.recommended_rep.family = AF_INET;
 		d.recommended_rep.prefixlen = IPV4_MAX_BITLEN;
-		d.recommended_rep.u.prefix4 = best_rep->rep_transport;
+		d.recommended_rep.u.prefix4 = top_rep[0]->rep_transport;
+
+		/* B2/疑2：第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
+		d.anchor_reps = list_new();
+		if (top_rep[1])
+			listnode_add(d.anchor_reps, top_rep[1]);
+		if (top_rep[2])
+			listnode_add(d.anchor_reps, top_rep[2]);
+
 		MIDR_FLOW_LOG(
 			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pI4"
-			"（rtt=%u us, loss=%.4f, bw=%u）",
-			best_rep->group_id, &best_rep->rep_transport,
-			best_link->long_term.rtt_us,
-			best_link->long_term.loss_rate,
-			best_link->long_term.bw_score);
+			"（rtt=%u us, loss=%.4f, bw=%u），另有 %d 个次优群锚点候选",
+			top_rep[0]->group_id, &top_rep[0]->rep_transport,
+			top_link[0]->long_term.rtt_us,
+			top_link[0]->long_term.loss_rate,
+			top_link[0]->long_term.bw_score,
+			listcount(d.anchor_reps));
 	}
 
 	midr_nds_on_cluster_decision(bgp, &d);
+
+	if (d.anchor_reps)
+		list_delete(&d.anchor_reps); /* 元素是借用指针，只清链表节点 */
 }
 
 /* ===========================================================================
@@ -331,6 +372,108 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 }
 
 /* ===========================================================================
+ * ANCHOR_PROBE_DONE 处理（B2/疑2，doc/change.md：群间锚点连接）
+ * =========================================================================*/
+
+/*
+ * 在 target_group_id 群内按相对排名（cl_rep_is_better 同款比较、复用
+ * cl_metrics_is_better）选出连接质量最好的至多 2 个节点，各生成一条
+ * struct midr_node_evidence 追加进 out。
+ *
+ * 不设绝对及格线（不用 cl_link_is_good_for_join 的入群阈值）：跨群链路天然
+ * 比群内差，用入群阈值筛几乎总会把候选筛没、选不出锚点——这里要的是"这个群
+ * 里连得最好的两个"，不是"够不够格入群"。
+ *
+ * 不看 is_adjacent：锚点候选是 NDS 为评估而临时探测的非本群节点（只探不
+ * 连），不是本群邻居，语义上正相反于 cl_count_good_member_links 的过滤条件。
+ */
+static void cl_select_anchor_candidates(const struct midr_global_view *gv,
+					uint32_t target_group_id,
+					struct list *out)
+{
+	struct midr_node_entry *entry;
+	struct midr_node_entry *top1 = NULL, *top2 = NULL;
+	struct midr_link_metrics top1_m = {}, top2_m = {};
+
+	if (target_group_id == 0)
+		return;
+
+	frr_each (midr_node_hash, (struct midr_node_hash_head *)&gv->nodes,
+		  entry) {
+		struct midr_link_entry *link;
+
+		if (entry->is_self || entry->group_id != target_group_id)
+			continue;
+		link = cl_find_link_by_prefix(gv, &entry->node_id);
+		if (!cl_link_has_data(link))
+			continue;
+
+		if (!top1 || cl_metrics_is_better(&link->long_term, &top1_m)) {
+			top2 = top1;
+			top2_m = top1_m;
+			top1 = entry;
+			top1_m = link->long_term;
+		} else if (!top2 ||
+			   cl_metrics_is_better(&link->long_term, &top2_m)) {
+			top2 = entry;
+			top2_m = link->long_term;
+		}
+	}
+
+	if (top1) {
+		struct midr_node_evidence *ev =
+			XCALLOC(MTYPE_MIDR_NODE_EVIDENCE, sizeof(*ev));
+
+		ev->node_id = top1->node_id;
+		ev->metrics = top1_m;
+		listnode_add(out, ev);
+	}
+	if (top2) {
+		struct midr_node_evidence *ev =
+			XCALLOC(MTYPE_MIDR_NODE_EVIDENCE, sizeof(*ev));
+
+		ev->node_id = top2->node_id;
+		ev->metrics = top2_m;
+		listnode_add(out, ev);
+	}
+}
+
+/*
+ * 评估 mi->anchor_group_id[0]/[1]（NDS 在 RECOMMEND 阶段从次优代表拿到、限时
+ * 探测后回调的两个次优群号，0 = 该槽位无候选）：分别选出连接最好的至多 2 个
+ * 节点，合并进 evidence，输出 ANCHOR 决策。NDS 收到后对 evidence 里每条直接
+ * midr_ctrl_connect()，形成群间锚点连接（doc/change.md 疑2 采纳方案）。
+ * 不改变本节点的 group_id，new/old_group_id 均取 local_group_id 仅作记录。
+ */
+static void cl_handle_anchor_probe_done(struct bgp *bgp,
+					const struct midr_global_view *gv)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	struct midr_cluster_decision d = {};
+	struct listnode *node, *nnode;
+	struct midr_node_evidence *ev;
+
+	d.decision_type = MIDR_DECISION_ANCHOR;
+	d.old_group_id = mi->local_group_id;
+	d.new_group_id = mi->local_group_id;
+	d.evidence = list_new();
+
+	cl_select_anchor_candidates(gv, mi->anchor_group_id[0], d.evidence);
+	cl_select_anchor_candidates(gv, mi->anchor_group_id[1], d.evidence);
+
+	MIDR_FLOW_LOG(
+		"MIDR CL: ANCHOR_PROBE_DONE → 群 %u/%u 共选出 %d 个锚点候选，ANCHOR",
+		mi->anchor_group_id[0], mi->anchor_group_id[1],
+		listcount(d.evidence));
+
+	midr_nds_on_cluster_decision(bgp, &d);
+
+	for (ALL_LIST_ELEMENTS(d.evidence, node, nnode, ev))
+		XFREE(MTYPE_MIDR_NODE_EVIDENCE, ev);
+	list_delete(&d.evidence);
+}
+
+/* ===========================================================================
  * PERIODIC_SYNC 处理（B1，doc/change.md：稳态退群判定）
  * =========================================================================*/
 
@@ -435,6 +578,20 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 			break;
 		}
 		cl_handle_member_probe_done(bgp, gv);
+		break;
+
+	case MIDR_TRIGGER_ANCHOR_PROBE_DONE:
+		/*
+		 * B2/疑2：评估的是次优群，跟正在加入的候选群是两码事，不受
+		 * join_phase 状态机约束（不像 REP/MEMBER_PROBE_DONE 那样要求
+		 * 处在对应加入阶段）。仅当 NDS 确实起了一轮锚点探测（至少一个
+		 * 槽位非 0）时才处理。
+		 */
+		if (mi->anchor_group_id[0] == 0 && mi->anchor_group_id[1] == 0) {
+			MIDR_LOG("MIDR CL: ANCHOR_PROBE_DONE 但无锚点候选群，忽略");
+			break;
+		}
+		cl_handle_anchor_probe_done(bgp, gv);
 		break;
 
 	case MIDR_TRIGGER_CAPABILITY_UPDATE:
