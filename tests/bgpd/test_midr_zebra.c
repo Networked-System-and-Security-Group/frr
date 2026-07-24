@@ -171,7 +171,7 @@ static void test_add_flush_diff(void)
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "entry still exists after change");
 
 	/* delete */
-	midr_zebra_route_del(&bgp, &p);
+	midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	T(!installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "gone after delete");
 
@@ -197,14 +197,14 @@ static void test_add_then_delete(void)
 	result.paths = paths; result.path_count = 1;
 
 	midr_zebra_route_add(&bgp, &p, &result);
-	midr_zebra_route_del(&bgp, &p);
+	midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	T(pending_count(&bgp) == 2, "ADD+DEL queued");
 
 	midr_zebra_route_flush(&bgp);
 	T(pending_count(&bgp) == 0, "queue empty after flush");
 	T(!installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "not installed after ADD->DEL");
 
-	midr_zebra_route_del(&bgp, &p);
+	midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	T(1, "delete non-existent safe");
 
@@ -317,7 +317,7 @@ static void test_multiple_prefixes(void)
 	T(installed_has(&bgp, &p2, MIDR_INSTANCE_SPF), "p2");
 	T(installed_has(&bgp, &p3, MIDR_INSTANCE_SPF), "p3");
 
-	midr_zebra_route_del(&bgp, &p2);
+	midr_zebra_route_del(&bgp, &p2, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	T(installed_has(&bgp, &p1, MIDR_INSTANCE_SPF), "p1 still");
 	T(!installed_has(&bgp, &p2, MIDR_INSTANCE_SPF), "p2 gone");
@@ -436,10 +436,16 @@ static void test_dual_instance(void)
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "SPF still installed alongside TE");
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_TE), "TE installed at instance=1");
 
-	/* delete TE → SPF survives */
-	midr_zebra_route_del(&bgp, &p);
+	/* delete TE instance → TE entry gone, SPF survives */
+	midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_TE);
 	midr_zebra_route_flush(&bgp);
-	/* Note: route_del defaults to instance=SPF, so only SPF is deleted */
+	T(!installed_has(&bgp, &p, MIDR_INSTANCE_TE), "TE entry gone after delete");
+	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "SPF survives TE delete");
+
+	/* delete SPF instance too */
+	midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
+	midr_zebra_route_flush(&bgp);
+	T(!installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "SPF gone after delete");
 
 	midr_zebra_fini(&bgp);
 }

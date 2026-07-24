@@ -155,7 +155,7 @@ static int midr_delete_route(const char *pfx_str)
 	struct bgp bgp_dummy = {};
 
 	str2prefix(pfx_str, &p);
-	midr_zebra_route_del(&bgp_dummy, &p);
+	midr_zebra_route_del(&bgp_dummy, &p, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp_dummy);
 	drain_events();
 	return 0;

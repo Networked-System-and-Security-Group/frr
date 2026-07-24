@@ -799,7 +799,7 @@ void midr_zebra_route_add(struct bgp *bgp, struct prefix *p,
 	listnode_add(dp->pending_ops, op);
 }
 
-void midr_zebra_route_del(struct bgp *bgp, struct prefix *p)
+void midr_zebra_route_del(struct bgp *bgp, struct prefix *p, uint8_t instance)
 {
 	struct bgp_midr_dp *dp;
 	struct midr_pending_op *op;
@@ -812,7 +812,7 @@ void midr_zebra_route_del(struct bgp *bgp, struct prefix *p)
 
 	op = XCALLOC(MTYPE_TMP, sizeof(*op));
 	op->op = MIDR_OP_DEL;
-	op->instance = MIDR_INSTANCE_SPF;
+	op->instance = instance;
 	prefix_copy(&op->prefix, p);
 
 	listnode_add(dp->pending_ops, op);

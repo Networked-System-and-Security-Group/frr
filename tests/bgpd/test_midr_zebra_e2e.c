@@ -180,7 +180,7 @@ int main(int argc, char **argv)
 	}
 
 	printf("[A.4] Delete SPF route\n");
-	midr_zebra_route_del(&bgp, &p_spf);
+	midr_zebra_route_del(&bgp, &p_spf, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 
 	{
@@ -257,7 +257,7 @@ int main(int argc, char **argv)
 
 	/* B.3 Delete SRv6 route — nothing to verify besides no crash */
 	printf("[B.3] Delete TE SRv6\n");
-	midr_zebra_route_del(&bgp, &p_srv6);
+	midr_zebra_route_del(&bgp, &p_srv6, MIDR_INSTANCE_TE);
 	midr_zebra_route_flush(&bgp);
 
 	{
@@ -276,7 +276,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Final cleanup */
-	midr_zebra_route_del(&bgp, &p_spf);
+	midr_zebra_route_del(&bgp, &p_spf, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	{
 		struct event t;

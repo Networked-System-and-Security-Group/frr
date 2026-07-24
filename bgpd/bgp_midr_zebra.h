@@ -192,7 +192,8 @@ extern void midr_zebra_route_add(struct bgp *bgp, struct prefix *p,
  * @param bgp  BGP instance
  * @param p    prefix to be withdrawn
  */
-extern void midr_zebra_route_del(struct bgp *bgp, struct prefix *p);
+extern void midr_zebra_route_del(struct bgp *bgp, struct prefix *p,
+				 uint8_t instance);
 
 /*
  * Activate the 100 ms deferred-batch timer.

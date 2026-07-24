@@ -169,7 +169,7 @@ int main(int argc, char **argv)
 
 	/* ---- delete the blackhole ---- */
 	printf("[8] Delete blackhole route ...\n");
-	midr_zebra_route_del(&bgp, &p_bh);
+	midr_zebra_route_del(&bgp, &p_bh, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 
 	{

@@ -56,9 +56,9 @@ static void install_one(struct bgp *bgp, const char *pfx, const char *nh, uint32
 	midr_zebra_route_add(bgp, &p, &r);
 }
 
-static void delete_one(struct bgp *bgp, const char *pfx) {
+static void delete_one(struct bgp *bgp, const char *pfx, uint8_t instance) {
 	struct prefix p; str2prefix(pfx, &p);
-	midr_zebra_route_del(bgp, &p);
+	midr_zebra_route_del(bgp, &p, instance);
 }
 
 static int mode_blackhole(const char *sock, const char *pfx, const char *nh, int hold) {
@@ -112,7 +112,7 @@ static int mode_blackhole(const char *sock, const char *pfx, const char *nh, int
 
 	/* Delete */
 	printf("[6] Delete blackhole...\n");
-	delete_one(&bgp, pfx);
+	delete_one(&bgp, pfx, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	sleep(2);
 
@@ -162,7 +162,7 @@ static int mode_stress(const char *sock, const char *pfx, const char *nh, int it
 		midr_zebra_route_flush(&bgp);
 		usleep(300000);
 		if (fib_has(pfx)) add_ok++;
-		delete_one(&bgp, pfx);
+		delete_one(&bgp, pfx, MIDR_INSTANCE_SPF);
 		midr_zebra_route_flush(&bgp);
 		usleep(300000);
 		if (!fib_has(pfx)) del_ok++;

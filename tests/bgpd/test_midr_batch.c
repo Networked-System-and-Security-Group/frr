@@ -109,7 +109,7 @@ static void test_batch_install(void)
 		snprintf(buf, sizeof(buf), "10.%d.%d.0/24",
 			 (i / 256) % 256, i % 256);
 		str2prefix(buf, &p);
-		midr_zebra_route_del(&bgp, &p);
+		midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	}
 	midr_zebra_route_flush(&bgp);
 	T(1, "batch delete completed");
@@ -155,7 +155,7 @@ static void test_batch_ipv6_srv6(void)
 	for (i = 0; i < BATCH_SIZE; i++) {
 		snprintf(buf, sizeof(buf), "2001:db8:%x::/48", i);
 		str2prefix(buf, &p);
-		midr_zebra_route_del(&bgp, &p);
+		midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_TE);
 	}
 	midr_zebra_route_flush(&bgp);
 

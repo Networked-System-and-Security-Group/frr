@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
 	for (int i = 1; i <= BATCH_N; i++) {
 		char px[32]; snprintf(px, sizeof(px), "10.200.%d.0/24", i);
 		struct prefix p; str2prefix(px, &p);
-		midr_zebra_route_del(&bgp, &p);
+		midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	}
 	midr_zebra_route_flush(&bgp);
 	sleep(2);
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
 	for (int i = 1; i <= DUAL_N; i++) {
 		char px[32]; snprintf(px, sizeof(px), "10.210.%d.0/24", i);
 		struct prefix p; str2prefix(px, &p);
-		midr_zebra_route_del(&bgp, &p);
+		midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_TE);
 	}
 	midr_zebra_route_flush(&bgp);
 	sleep(2);
@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
 	for (int i = 1; i <= DUAL_N; i++) {
 		char px[32]; snprintf(px, sizeof(px), "10.210.%d.0/24", i);
 		struct prefix p; str2prefix(px, &p);
-		midr_zebra_route_del(&bgp, &p);
+		midr_zebra_route_del(&bgp, &p, MIDR_INSTANCE_SPF);
 	}
 	midr_zebra_route_flush(&bgp);
 	sleep(1);
