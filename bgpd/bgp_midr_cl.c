@@ -414,6 +414,12 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 		if (entry->is_self || entry->group_id != target_group_id)
 			continue;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
+		MIDR_LOG("MIDR CL: 锚点候选 %pFX group=%u link=%s status=%d rtt=%u loss=%.4f",
+			 &entry->node_id, entry->group_id,
+			 link ? "found" : "missing",
+			 link ? (int)link->status : -1,
+			 link ? link->long_term.rtt_us : 0,
+			 link ? link->long_term.loss_rate : 0.0);
 		if (!cl_link_has_data(link))
 			continue;
 
