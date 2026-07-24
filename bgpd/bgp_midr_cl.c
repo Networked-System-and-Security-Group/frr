@@ -26,6 +26,7 @@
 #include "log.h"
 #include "prefix.h"
 #include "linklist.h"
+#include "monotime.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
@@ -228,8 +229,13 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
  * =========================================================================*/
 
 /*
- * 统计目标群（mi->join_group_id）内满足入群条件的 is_adjacent 邻居数量，
- * 并收集用于日志的最差 RTT 和最差 loss_rate（便于排查未达标原因）。
+ * 统计 target_group_id 群内满足入群阈值条件的 is_adjacent 邻居数量，并收集
+ * 用于日志的最差 RTT 和最差 loss_rate（便于排查未达标原因）。
+ *
+ * 两处复用同一把尺子：MEMBER_PROBE_DONE 拿它评估候选群（target=join_group_id）
+ * 决定要不要 JOIN；PERIODIC_SYNC（B1，doc/change.md）拿它评估本节点当前所在
+ * 群（target=local_group_id）决定要不要 LEAVE——入群/留群用同一阈值，保持
+ * 对称。
  */
 static size_t cl_count_good_member_links(const struct bgp *bgp,
 					 const struct midr_global_view *gv,
@@ -325,6 +331,64 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 }
 
 /* ===========================================================================
+ * PERIODIC_SYNC 处理（B1，doc/change.md：稳态退群判定）
+ * =========================================================================*/
+
+/*
+ * 稳态退群判定：复用 cl_count_good_member_links() 对本节点当前所在群
+ * （而非候选群）计好链路数，跌破 MIDR_CL_MIN_GOOD_LINKS 时输出 LEAVE——与
+ * "入群"用同一把尺子，够格才留、不够格就走。
+ *
+ * 两个前置守卫：
+ *   - 本节点是群代表时不评估：代表退群目前没有"先卸任再走"的编排（A1 的
+ *     REP_ELECT/REP_RESIGN 判定算法还没做），贸然退群会让整群瞬间失去代表、
+ *     答不了 MEMBER_LIST，留给后续把 A1 接上后再一并处理。
+ *   - 群号刚变化不足 MIDR_JOIN_PROBE_WAIT_SECS 秒不评估：给 PM 长期 EWMA 留
+ *     够收敛时间，否则刚 JOIN/CREATE 完成时群内链路数据还不够，会被误判成
+ *     "好链路不够"立即又 LEAVE，形成抖动。
+ */
+static void cl_handle_periodic_sync(struct bgp *bgp,
+				    const struct midr_global_view *gv)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	uint32_t worst_rtt = 0;
+	double worst_loss = 0.0;
+	size_t good_links;
+	struct midr_cluster_decision d = {};
+
+	if (mi->local_group_id == 0) {
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点当前无群，跳过退群判定");
+		return;
+	}
+	if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点是群代表，跳过退群判定（待 A1 接上）");
+		return;
+	}
+	if (monotime(NULL) - mi->group_settled_at < MIDR_JOIN_PROBE_WAIT_SECS) {
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群号刚变化不足 %d 秒，跳过退群判定（等 EWMA 热身）",
+			 MIDR_JOIN_PROBE_WAIT_SECS);
+		return;
+	}
+
+	good_links = cl_count_good_member_links(bgp, gv, mi->local_group_id,
+						&worst_rtt, &worst_loss);
+	if (good_links >= MIDR_CL_MIN_GOOD_LINKS) {
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 仍有 %zu/%u 条好链路，留群",
+			 mi->local_group_id, good_links, MIDR_CL_MIN_GOOD_LINKS);
+		return;
+	}
+
+	d.decision_type = MIDR_DECISION_LEAVE;
+	d.old_group_id = mi->local_group_id;
+	d.new_group_id = 0;
+	MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC → 群 %u 仅 %zu/%u 条好链路"
+		      "（最差 rtt=%u us, loss=%.4f），LEAVE",
+		      mi->local_group_id, good_links, MIDR_CL_MIN_GOOD_LINKS,
+		      worst_rtt, worst_loss);
+	midr_nds_on_cluster_decision(bgp, &d);
+}
+
+/* ===========================================================================
  * I-3 主回调
  * =========================================================================*/
 
@@ -383,11 +447,12 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 
 	case MIDR_TRIGGER_PERIODIC_SYNC:
 		/*
-		 * 周期同步（每 MIDR_PERIODIC_SYNC_INTERVAL 秒）：
-		 * 稳态实现：检查留群条件（长期 RTT < 40ms，≥3 节点），
-		 * 不满足时触发换群或退群（stub）。
+		 * 周期同步（每 MIDR_PERIODIC_SYNC_INTERVAL 秒）：B1（doc/
+		 * change.md）稳态退群判定，见 cl_handle_periodic_sync()。
+		 * 换群（选到更优群后主动切换）仍是待办，退群判好之后 NDS 会
+		 * 自动重新走一遍加入流程，效果上覆盖了"退群+另择新群"的场景。
 		 */
-		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 稳态分群重评估（stub）");
+		cl_handle_periodic_sync(bgp, gv);
 		break;
 
 	case MIDR_TRIGGER_NODE_CHANGE:

@@ -1114,6 +1114,8 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 		return;
 
 	bgp->midr_info->local_group_id = new_group_id;
+	/* B1：唯一写手，见 struct bgp_midr.group_settled_at 处注释。 */
+	bgp->midr_info->group_settled_at = monotime(NULL);
 
 	/* Re-originate the local Node NLRI carrying the new TLV 1185 */
 	midr_propagate_self(bgp, MIDR_ORIGIN_GROUP_UPDATE);
@@ -1122,6 +1124,9 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 		zlog_debug("MIDR: group-id %u -> %u re-originated", old_group_id,
 			   new_group_id);
 }
+
+/* B1：LEAVE 分支重开加入轮，定义在本文件后段的 §8.32 bootstrap 韧性一节。 */
+static void midr_bootstrap_start_attempt(struct bgp *bgp); /* forward */
 
 void midr_nds_on_cluster_decision(struct bgp *bgp,
 				  const struct midr_cluster_decision *decision)
@@ -1188,8 +1193,55 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			      decision->new_group_id, mi->join_members);
 		break;
 	case MIDR_DECISION_LEAVE:
-		/* 待办 2：撤销 group-id 通告 + 经 I-2 停止相关探测（未实现）。 */
-		MIDR_LOG("MIDR I-7：LEAVE 群 %u（stub）", decision->old_group_id);
+		/*
+		 * doc/change.md B1-Q1，选项(a)：退群后清群号、自动重新走一遍
+		 * 加入流程——而不是停在"群号=0"等外部决策（(b)），也不是整体
+		 * 下线（那是 midr shutdown 的语义，(c)）。守卫：只在真正稳态
+		 * （join_phase==IDLE）时处理，避免跟其它在途加入/建群冲突；
+		 * 本节点已无群号时视为过期通知，忽略。
+		 */
+		if (mi->join_phase != MIDR_JOIN_IDLE) {
+			MIDR_LOG("MIDR I-7：LEAVE 但不在稳态（join_phase=%d），忽略",
+				 mi->join_phase);
+			break;
+		}
+		if (mi->local_group_id == 0) {
+			MIDR_LOG("MIDR I-7：LEAVE 但本节点当前无群，忽略");
+			break;
+		}
+		{
+			uint32_t left_gid = mi->local_group_id;
+
+			/* 清群号、拆本群邻接、停非本群代表探测、重通告（群号 0）。 */
+			midr_group_reconverge(bgp, 0);
+
+			/*
+			 * 自动重开一轮加入，复用 §8.32 候选引导清单——与
+			 * midr_bootstrap_self_boot_cb 相同的"开新一轮"手法：置
+			 * 意图、清 failed 标记、游标指表头、发第一跳。无候选
+			 * 可用时保持无群状态，等运维补 `midr bootstrap` 候选，
+			 * 或以后有别的触发路径。
+			 */
+			if (mi->bootstrap_list &&
+			    !list_isempty(mi->bootstrap_list)) {
+				struct listnode *bn;
+				struct midr_bootstrap_entry *b;
+
+				mi->join_intent = true;
+				for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list,
+							  bn, b))
+					b->failed = false;
+				mi->bootstrap_cur =
+					listhead(mi->bootstrap_list);
+				MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，自动重新加入（%u 个引导候选）",
+					      left_gid,
+					      listcount(mi->bootstrap_list));
+				midr_bootstrap_start_attempt(bgp);
+			} else {
+				MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，无引导候选可用，节点保持无群状态",
+					      left_gid);
+			}
+		}
 		break;
 	case MIDR_DECISION_SPLIT:
 		midr_originate_group_update(bgp, decision->new_group_id,

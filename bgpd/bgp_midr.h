@@ -302,6 +302,14 @@ struct bgp_midr {
 	uint32_t local_capabilities; /* local capability bitmap (TLV 1187) */
 	struct list *rep_dir;	     /* list of struct midr_rep_entry (rep directory) */
 	midr_global_view_cb cl_callback;
+	/*
+	 * B1（doc/change.md）：local_group_id 最近一次实际变化（含首次落定）
+	 * 的本地时钟时间戳，唯一写手是 midr_originate_group_update()。CL 的
+	 * PERIODIC_SYNC 退群判定拿它做热身闸门——群号刚变化不足
+	 * MIDR_JOIN_PROBE_WAIT_SECS 秒时跳过评估，否则会在长期 EWMA 还没收
+	 * 敛的链路上误判"好链路不够"，导致刚入群就抖动着又退群。
+	 */
+	time_t group_settled_at;
 
 	/* === Local transport address (TLV 1188) + graceful shutdown === */
 	struct in_addr local_transport_addr; /* our reachable locator */
