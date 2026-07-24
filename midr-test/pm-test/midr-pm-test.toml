@@ -27,7 +27,7 @@ delay = "20ms"
 
 [cells.up_loss]
 type = "Loss"
-pattern = [0.0]
+pattern = [0.05]
 
 # ── Downlink cells (ns-right → ns-left) ───────────────────────────────────────
 [cells.dn_bw]
@@ -45,7 +45,7 @@ delay = "20ms"
 
 [cells.dn_loss]
 type = "Loss"
-pattern = [0.0]
+pattern = [0.05]
 
 # ── Wiring: uplink left→right, downlink right→left ─────────────────────────────
 [links]

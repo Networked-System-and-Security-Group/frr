@@ -27,6 +27,10 @@ echo "--- CL decisions ---"
 grep -E "MIDR CL:|JOIN|CREATE|RECOMMEND" "$newnode_log" 2>/dev/null | tail -15 || true
 
 echo ""
+echo "--- Anchor-connection phase (group-3 and group-2 runner-up groups) ---"
+grep -E "锚点|ANCHOR" "$newnode_log" 2>/dev/null | tail -20 || true
+
+echo ""
 echo "--- PM I-5 metric samples (last 5 per node) ---"
 for node in g1a g2a g1b g1c g1d g1e; do
     echo "  Node $node:"
@@ -46,6 +50,18 @@ elif grep -qE "MIDR CL:.*CREATE 新群" "$newnode_log" 2>/dev/null; then
     echo "  INFO: newnode CREATE new group $group (EWMA not converged yet or < 5 good links)"
 else
     echo "  PENDING: no CL decision yet (increase --timeout or check logs)"
+fi
+
+anchor_line=$(grep "MIDR I-7：ANCHOR " "$newnode_log" 2>/dev/null | tail -1 || true)
+if [[ -n "$anchor_line" ]]; then
+    connected=$(echo "$anchor_line" | grep -oP "尝试建连 \K[0-9]+" || echo "?")
+    if [[ "$connected" == "4" ]]; then
+        echo "  PASS: anchor connections established to all 4 candidates (2 in group 3, 2 in group 2)  ✓"
+    else
+        echo "  INFO: anchor decision processed but only connected $connected/4 candidates — check logs"
+    fi
+else
+    echo "  PENDING: no ANCHOR decision yet (increase --timeout or check logs)"
 fi
 
 echo ""

@@ -2,7 +2,7 @@
 # teardown.sh — Kill bgpd processes and remove all test namespaces.
 set -e
 
-NODES=(g1a g1b g1c g1d g1e g2a g2b newnode)
+NODES=(g1a g1b g1c g1d g1e g2a g2b g3a g3b newnode)
 
 echo "[teardown] Killing bgpd instances..."
 for node in "${NODES[@]}"; do

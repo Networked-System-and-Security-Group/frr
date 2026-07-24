@@ -18,7 +18,7 @@ and g2a probed simultaneously, with g2a's RTT sitting well above the
 threshold; phase 2 (MEMBER probing) shows g1a-g1e probed simultaneously, all
 converging below the threshold, ending in JOIN.
 
-Node IDs differ between phases (this test's fixed 8-node topology,
+Node IDs differ between phases (this test's fixed 10-node topology,
 midr-test/cl-test/configs/*.conf): phase 1 probes a rep by its transport
 address (e.g. g1a=10.10.11.2, g2a=10.10.21.2); phase 2 probes members by
 their router-id (e.g. g1a=10.0.11.1, g1b=10.0.12.1, ...). Both IDs for the
@@ -66,6 +66,7 @@ RTT_THRESHOLD_MS = 20.0
 IP_TO_NAME = {
     "10.10.11.2": "g1a",  # group-1 rep, probed by transport addr (phase 1)
     "10.10.21.2": "g2a",  # group-2 rep, probed by transport addr (phase 1)
+    "10.10.31.2": "g3a",  # group-3 rep, probed by transport addr (phase 1)
     "10.0.11.1":  "g1a",  # group-1 member, probed by router-id (phase 2)
     "10.0.12.1":  "g1b",
     "10.0.13.1":  "g1c",
@@ -73,6 +74,8 @@ IP_TO_NAME = {
     "10.0.15.1":  "g1e",
     "10.0.21.1":  "g2a",
     "10.0.22.1":  "g2b",
+    "10.0.31.1":  "g3a",  # group-3 anchor candidate, probed by router-id (anchor phase)
+    "10.0.32.1":  "g3b",
 }
 
 TS_PAT = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)'
