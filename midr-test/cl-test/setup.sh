@@ -22,11 +22,19 @@ ip -n ns-hub link set lo up
 ip netns exec ns-hub sysctl -qw net.ipv4.ip_forward=1
 
 # /30 subnets: each node gets hub.x.1 (hub side) / hub.x.2 (node side)
-# Delay = one-way delay on hub→node egress interface (controls RTT from newnode)
-#   Group 1 (g1a-g1e): 3 ms  → RTT from newnode ≈  3 ms  (well below 20 ms threshold) — best, chosen by RECOMMEND
-#   Group 3 (g3a-g3b): 10 ms → RTT from newnode ≈ 10 ms  (below 20 ms threshold)      — 2nd best, 1st anchor group
-#   Group 2 (g2a-g2b): 50 ms → RTT from newnode ≈ 50 ms  (well above 20 ms threshold) — 3rd best, 2nd anchor group
-#   newnode:            0 ms  → no added delay
+# Delay = one-way delay on hub→node egress interface, applied on EVERY node's
+# own hub leg (including between two nodes of the same group — their mutual
+# RTT is the SUM of both their own delays, not just one newnode-facing leg).
+#   Group 1 (g1a-g1e): 3 ms → RTT from newnode ≈ 3 ms; intra-group (g1x<->g1y)
+#                             RTT ≈ 6 ms — both well below 20 ms.        — best, chosen by RECOMMEND
+#   Group 3 (g3a-g3b): 6 ms → RTT from newnode ≈ 6 ms; intra-group RTT ≈ 12 ms
+#                             — both below 20 ms with margin (NOT 10 ms: that
+#                             gives a 20 ms intra-group RTT, right on the
+#                             threshold boundary — g3a/g3b would flap their
+#                             own PERIODIC_SYNC stay judgement).          — 2nd best, 1st anchor group
+#   Group 2 (g2a-g2b): 50 ms → RTT from newnode ≈ 50 ms; intra-group RTT ≈
+#                             100 ms — deliberately bad both ways.        — 3rd best, 2nd anchor group
+#   newnode:            0 ms → no added delay
 # Groups 2 and 3 exist so REP_PROBE_DONE's top-3 ranking has two real runner-up
 # candidates to exercise the anchor-connection feature (doc/change-reply.md B2/疑2):
 # after RECOMMEND picks group 1, NDS also requests member lists from groups 3 and
@@ -47,7 +55,7 @@ NODEIP=( [g1a]=10.10.11.2  [g1b]=10.10.12.2  [g1c]=10.10.13.2
          [newnode]=10.10.99.2 )
 DELAY=( [g1a]=3ms [g1b]=3ms [g1c]=3ms [g1d]=3ms [g1e]=3ms
         [g2a]=50ms [g2b]=50ms
-        [g3a]=10ms [g3b]=10ms
+        [g3a]=6ms [g3b]=6ms
         [newnode]=0ms )
 
 for node in "${NODES[@]}"; do

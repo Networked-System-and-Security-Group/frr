@@ -1350,8 +1350,22 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			MIDR_LOG("MIDR I-7：LEAVE 但本节点当前无群，忽略");
 			break;
 		}
+		/*
+		 * 退群只有在"退完还能重新找群"时才划算——没有引导候选就没有回
+		 * 头路，reconverge(0) 会先拆掉当前（哪怕不完美但至少连通）的群
+		 * 内会话，然后卡在无群状态出不来，比留在原群更差。这里提前判
+		 * 断，没候选就直接放弃整个 LEAVE（不拆会话、不清群号），等运
+		 * 维补 `midr bootstrap` 候选或以后有别的触发路径再说。
+		 */
+		if (!mi->bootstrap_list || list_isempty(mi->bootstrap_list)) {
+			MIDR_LOG("MIDR I-7：LEAVE 群 %u 但无引导候选可回退，放弃退群（留在原群好过无群）",
+				 mi->local_group_id);
+			break;
+		}
 		{
 			uint32_t left_gid = mi->local_group_id;
+			struct listnode *bn;
+			struct midr_bootstrap_entry *b;
 
 			/* 清群号、拆本群邻接、停非本群代表探测、重通告（群号 0）。 */
 			midr_group_reconverge(bgp, 0);
@@ -1359,29 +1373,15 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			/*
 			 * 自动重开一轮加入，复用 §8.32 候选引导清单——与
 			 * midr_bootstrap_self_boot_cb 相同的"开新一轮"手法：置
-			 * 意图、清 failed 标记、游标指表头、发第一跳。无候选
-			 * 可用时保持无群状态，等运维补 `midr bootstrap` 候选，
-			 * 或以后有别的触发路径。
+			 * 意图、清 failed 标记、游标指表头、发第一跳。
 			 */
-			if (mi->bootstrap_list &&
-			    !list_isempty(mi->bootstrap_list)) {
-				struct listnode *bn;
-				struct midr_bootstrap_entry *b;
-
-				mi->join_intent = true;
-				for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list,
-							  bn, b))
-					b->failed = false;
-				mi->bootstrap_cur =
-					listhead(mi->bootstrap_list);
-				MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，自动重新加入（%u 个引导候选）",
-					      left_gid,
-					      listcount(mi->bootstrap_list));
-				midr_bootstrap_start_attempt(bgp);
-			} else {
-				MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，无引导候选可用，节点保持无群状态",
-					      left_gid);
-			}
+			mi->join_intent = true;
+			for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, bn, b))
+				b->failed = false;
+			mi->bootstrap_cur = listhead(mi->bootstrap_list);
+			MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，自动重新加入（%u 个引导候选）",
+				      left_gid, listcount(mi->bootstrap_list));
+			midr_bootstrap_start_attempt(bgp);
 		}
 		break;
 	case MIDR_DECISION_SPLIT:
