@@ -275,16 +275,23 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
  *
  * 两处复用同一把尺子：MEMBER_PROBE_DONE 拿它评估候选群（target=join_group_id）
  * 决定要不要 JOIN；PERIODIC_SYNC 拿它评估本节点当前所在群
- * （target=local_group_id）决定要不要 LEAVE——入群/留群用同一阈值，保持对称。
+ * （target=local_group_id）决定要不要 LEAVE——入群/留群用同一份"好链路"统计，
+ * 但两处拿这份统计去比的阈值并不对称，见 cl_handle_periodic_sync() 头注释。
+ *
+ * out_total（可选）：target_group_id 群内 is_adjacent 邻居总数（不论好坏）。
+ * PERIODIC_SYNC 拿它把留群阈值封顶到"群里实际认识的节点数"——群本身天然小
+ * （成员数 < MIDR_CL_MIN_GOOD_LINKS）时，入群用的绝对阈值永远够不着。
  */
 static size_t cl_count_good_member_links(const struct bgp *bgp,
 					 const struct midr_global_view *gv,
 					 uint32_t target_group_id,
 					 uint32_t *out_worst_rtt_us,
-					 double *out_worst_loss)
+					 double *out_worst_loss,
+					 size_t *out_total)
 {
 	struct midr_node_entry *entry;
 	size_t good = 0;
+	size_t total = 0;
 	uint32_t worst_rtt = 0;
 	double worst_loss = 0.0;
 
@@ -297,6 +304,7 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 		if (entry->group_id != target_group_id)
 			continue;
 
+		total++;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
 		if (cl_link_is_good_for_join(link)) {
 			good++;
@@ -319,6 +327,8 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 		*out_worst_rtt_us = worst_rtt;
 	if (out_worst_loss)
 		*out_worst_loss = worst_loss;
+	if (out_total)
+		*out_total = total;
 
 	return good;
 }
@@ -344,7 +354,7 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 	struct midr_cluster_decision d = {};
 
 	good_links = cl_count_good_member_links(bgp, gv, target_gid,
-						&worst_rtt, &worst_loss);
+						&worst_rtt, &worst_loss, NULL);
 
 	if (good_links >= MIDR_CL_MIN_GOOD_LINKS) {
 		d.decision_type = MIDR_DECISION_JOIN;
@@ -478,8 +488,15 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
 
 /*
  * 稳态退群判定：复用 cl_count_good_member_links() 对本节点当前所在群
- * （而非候选群）计好链路数，跌破 MIDR_CL_MIN_GOOD_LINKS 时输出 LEAVE——与
- * "入群"用同一把尺子，够格才留、不够格就走。
+ * （而非候选群）计好链路数，跌破留群阈值时输出 LEAVE。
+ *
+ * 留群阈值【不能】直接照抄 MIDR_CL_MIN_GOOD_LINKS（入群用的绝对阈值）：
+ * 入群评估的是"值不值得加入一个新群"，绝对阈值合理；但留群评估的是"已经
+ * 在群里的节点还要不要留下"，若群本身成员数就小于 MIDR_CL_MIN_GOOD_LINKS
+ * （现实里群大小 2、3、4 都合法），绝对阈值永远够不着——任何这么小的群会
+ * 在热身期一过就让全体成员集体判定"好链路不够"而 LEAVE，群越小越先散伙，
+ * 无法长期存在。留群阈值改为 min(MIDR_CL_MIN_GOOD_LINKS, 群内实际认识的
+ * 邻接节点总数)：小群只要"认识的都好"就留，大群仍然要求够格的绝对数量。
  *
  * 两个前置守卫：
  *   - 本节点是群代表时不评估：代表退群目前没有"先卸任再走"的编排
@@ -495,7 +512,7 @@ static void cl_handle_periodic_sync(struct bgp *bgp,
 	struct bgp_midr *mi = bgp->midr_info;
 	uint32_t worst_rtt = 0;
 	double worst_loss = 0.0;
-	size_t good_links;
+	size_t good_links, total_adjacent, stay_threshold;
 	struct midr_cluster_decision d = {};
 
 	if (mi->local_group_id == 0) {
@@ -513,20 +530,25 @@ static void cl_handle_periodic_sync(struct bgp *bgp,
 	}
 
 	good_links = cl_count_good_member_links(bgp, gv, mi->local_group_id,
-						&worst_rtt, &worst_loss);
-	if (good_links >= MIDR_CL_MIN_GOOD_LINKS) {
-		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 仍有 %zu/%u 条好链路，留群",
-			 mi->local_group_id, good_links, MIDR_CL_MIN_GOOD_LINKS);
+						&worst_rtt, &worst_loss,
+						&total_adjacent);
+	stay_threshold = total_adjacent < MIDR_CL_MIN_GOOD_LINKS
+				  ? total_adjacent
+				  : MIDR_CL_MIN_GOOD_LINKS;
+	if (good_links >= stay_threshold) {
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 仍有 %zu/%zu 条好链路（认识 %zu 个邻接节点），留群",
+			 mi->local_group_id, good_links, stay_threshold,
+			 total_adjacent);
 		return;
 	}
 
 	d.decision_type = MIDR_DECISION_LEAVE;
 	d.old_group_id = mi->local_group_id;
 	d.new_group_id = 0;
-	MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC → 群 %u 仅 %zu/%u 条好链路"
-		      "（最差 rtt=%u us, loss=%.4f），LEAVE",
-		      mi->local_group_id, good_links, MIDR_CL_MIN_GOOD_LINKS,
-		      worst_rtt, worst_loss);
+	MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC → 群 %u 仅 %zu/%zu 条好链路"
+		      "（认识 %zu 个邻接节点，最差 rtt=%u us, loss=%.4f），LEAVE",
+		      mi->local_group_id, good_links, stay_threshold,
+		      total_adjacent, worst_rtt, worst_loss);
 	midr_nds_on_cluster_decision(bgp, &d);
 }
 

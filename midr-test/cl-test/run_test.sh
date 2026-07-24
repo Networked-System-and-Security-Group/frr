@@ -48,6 +48,27 @@ done
 
 trap 'echo "[run_test] Interrupted."; exit 1' INT TERM
 
+# ---- 0. Reap any stale bgpd instances left running by a previous, ----------
+#         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
+# `ip netns del` does NOT kill processes still running inside a namespace —
+# the namespace just stays alive, invisible to `ip netns list`, for as long
+# as that orphan process holds it open. The orphan keeps its old
+# /tmp/bgpd-cl-<node>.pid locked, so this run's freshly started bgpd for that
+# same node silently fails at "Could not lock pid_file ... exiting" and the
+# node never comes up — with no obvious error at the run_test.sh level.
+echo "[run_test] Checking for stale bgpd instances from a previous run..."
+shopt -s nullglob
+for pidfile in /tmp/bgpd-cl-*.pid; do
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "  killing stale $(basename "$pidfile") (pid $pid)"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+done
+shopt -u nullglob
+sleep 1
+
 # ---- 1. Network setup -------------------------------------------------------
 if [[ "$DO_SETUP" -eq 1 ]]; then
     echo "[run_test] Setting up network namespaces..."
