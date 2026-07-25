@@ -21,6 +21,8 @@ SCENARIOS=(
 	invalid-link
 	peer-session
 	ted-not-ready
+	sync-status
+	router-id-restart
 )
 
 usage() {
@@ -36,7 +38,10 @@ Scenarios:
   ownership       reject non-local Node and Link ownership
   invalid-link    reject malformed Link measurements and addresses
   peer-session    basic peer session request/release wrapper
-  ted-not-ready   verify production TED remains NOT_READY in M1
+  ted-not-ready   verify production TED remains NOT_READY
+  sync-status     show bounded input and Provider synchronization state
+  router-id-restart
+                  clear old identity state and queue new input behind the barrier
   all             run every assertion-based scenario
   interactive     start bgpd terminal mode for manual VTY input
   list            list assertion-based scenarios

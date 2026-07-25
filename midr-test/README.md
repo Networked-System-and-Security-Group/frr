@@ -1,6 +1,6 @@
-# MIDR 接口与 TED 测试
+# MIDR 输入、Resync 与 TED 测试
 
-本目录用于测试 MIDR 第一组输入接口、Local Fact 版本处理、基础 session wrapper，以及路径计算使用的不可变 TED snapshot。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；TED fixture 只进入 test-only Mock Provider，不进入生产 `bgpd` 数据路径。
+本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper，以及路径计算使用的不可变 TED snapshot。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；测试 Provider 和 TED fixture 均不进入生产 `bgpd` 数据路径。
 
 ## 目录结构
 
@@ -8,12 +8,14 @@
 midr-test/
   bgpd.conf              # 测试用 bgpd 配置
   run.sh                 # 场景运行与断言脚本
+  run-resync-scenarios.sh
+                          # M2 Gherkin/组件测试映射入口
   run-ted-fixtures.sh    # TED Gherkin/fixture 断言入口
   ted-fixture-normalize.py
                           # 严格 YAML schema 到规范化 JSON
   expect/                # 固定字符串预期结果
   vty/                   # 场景输入的 VTY 命令
-  features/              # M1 Gherkin 场景及 ID 映射
+  features/              # M1/M2 Gherkin 场景及 ID 映射
   path-fixtures/         # 有效、非法及 expected TED fixture
   run/                   # pid、socket 和日志，不纳入 Git
 ```
@@ -27,6 +29,7 @@ cd ~/yhy/frr
 make -j$(nproc) \
   bgpd/bgpd \
   tests/bgpd/test_midr_input \
+  tests/bgpd/test_midr_resync \
   tests/bgpd/test_midr_ted \
   tests/bgpd/test_midr_ted_fixture
 ```
@@ -48,6 +51,7 @@ make -j$(nproc) \
 make -j$(nproc) \
   bgpd/bgpd \
   tests/bgpd/test_midr_input \
+  tests/bgpd/test_midr_resync \
   tests/bgpd/test_midr_ted \
   tests/bgpd/test_midr_ted_fixture
 ```
@@ -58,6 +62,19 @@ make -j$(nproc) \
 
 ```bash
 ./tests/bgpd/test_midr_input
+```
+
+运行 Local Fact、Snapshot/Resync 和 Router-ID 生命周期组件测试：
+
+```bash
+./tests/bgpd/test_midr_resync
+./midr-test/run-resync-scenarios.sh all
+```
+
+单个 M2 Gherkin 场景可按 ID 运行：
+
+```bash
+./midr-test/run-resync-scenarios.sh M2-INPUT-004
 ```
 
 运行不可变 snapshot、generation、consumer 和 builder 单元测试：
@@ -103,6 +120,9 @@ ownership      本地 Router-ID ownership 校验
 invalid-link   地址族、measurement 和 uint64 输入校验
 peer-session   基础 session request/release wrapper
 ted-not-ready  M1 生产 TED 保持 NOT_READY / generation 0
+sync-status    输入状态、队列上限和 Provider 状态
+router-id-restart
+               Router-ID 变化时清理旧 identity，并将新输入置于 Resync Barrier 后
 ```
 
 每个场景的完整输出保存在 `midr-test/run/<scenario>.log`。缺少必要输出、出现禁止输出、命令无法解析、进程崩溃或超时都会使脚本返回非零。普通用户运行时出现 `/var/lib/frr` 或 `/var/run/frr` permission warning 不作为失败。
@@ -122,8 +142,9 @@ midr topology link upsert 1.1.1.1 2.2.2.2 id 10 local-address 2001:db8::1 remote
 show midr topology nodes
 show midr topology links
 show midr topology tombstones
+show midr topology sync
 show midr events
 exit
 ```
 
-`show midr topology nodes/links` 只显示 active Local Fact，`show midr topology tombstones` 只显示已撤销对象的 key 和最后 input version。`show midr events` 中 `enqueued` 表示成功入队事件数，`processed` 表示已处理事件数，`ignored-old` 表示被版本规则忽略的事件数。
+`show midr topology nodes/links` 只显示 active Local Fact，`show midr topology tombstones` 只显示已撤销对象的 key 和最后 input version。`show midr topology sync` 显示输入状态、Provider、队列和 Resync 诊断；`show midr events` 显示事件接收、处理、拒绝和丢弃计数。
