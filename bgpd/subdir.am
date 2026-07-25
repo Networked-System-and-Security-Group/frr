@@ -55,6 +55,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_ls_nlri.c \
 	bgpd/bgp_ls_ted.c \
 	bgpd/bgp_midr.c \
+	bgpd/bgp_midr_input.c \
 	bgpd/bgp_midr_ted.c \
 	bgpd/bgp_midr_vty.c \
 	bgpd/bgp_mac.c \
