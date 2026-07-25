@@ -1,0 +1,18 @@
+{
+  "generation": 1,
+  "local_node_id": "1.1.1.1",
+  "local_group_id": 100,
+  "ready": true,
+  "sync_reason_flags": 0,
+  "nodes": [
+    {"node_id": "1.1.1.1", "group_id": 100, "cap_flags": 0, "policy_tags": 0}
+  ],
+  "intra_links": [],
+  "egress_links": [],
+  "node_prefixes": [],
+  "group_edges": [],
+  "prefix_groups": [
+    {"prefix": "192.0.2.0/24", "group_id": 200}
+  ],
+  "pending": {"links": 0, "node_prefixes": 0, "prefix_groups": 0}
+}

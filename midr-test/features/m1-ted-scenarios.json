@@ -1,0 +1,86 @@
+[
+  {
+    "id": "M1-TED-001",
+    "kind": "valid",
+    "description": "same-group directed router view",
+    "fixture": "same-group.yaml",
+    "expected": "same-group.json"
+  },
+  {
+    "id": "M1-TED-002",
+    "kind": "valid",
+    "description": "cross-group intra/egress classification",
+    "fixture": "cross-group.yaml",
+    "expected": "cross-group.json"
+  },
+  {
+    "id": "M1-TED-003",
+    "kind": "valid",
+    "description": "directed Link has no implicit reverse",
+    "fixture": "directed-link.yaml",
+    "expected": "directed-link.json"
+  },
+  {
+    "id": "M1-TED-004",
+    "kind": "valid",
+    "description": "multiple egress Links aggregate by minimum cost",
+    "fixture": "multiple-egress.yaml",
+    "expected": "multiple-egress.json"
+  },
+  {
+    "id": "M1-TED-005",
+    "kind": "valid",
+    "description": "one prefix maps to multiple target groups",
+    "fixture": "multiple-target-groups.yaml",
+    "expected": "multiple-target-groups.json"
+  },
+  {
+    "id": "M1-TED-006",
+    "kind": "valid",
+    "description": "unreachable target has no fabricated group edge",
+    "fixture": "unreachable.yaml",
+    "expected": "unreachable.json"
+  },
+  {
+    "id": "M1-TED-007",
+    "kind": "invalid",
+    "description": "unknown YAML key rejection",
+    "fixture": "unknown-key.yaml",
+    "error_contains": "unknown key"
+  },
+  {
+    "id": "M1-TED-008",
+    "kind": "invalid",
+    "description": "duplicate Link rejection",
+    "fixture": "duplicate-link.yaml",
+    "error_contains": "duplicates Link identity"
+  },
+  {
+    "id": "M1-TED-009",
+    "kind": "invalid",
+    "description": "invalid Link cost rejection",
+    "fixture": "invalid-cost.yaml",
+    "error_contains": "links[0].cost"
+  },
+  {
+    "id": "M1-TED-010",
+    "kind": "invalid",
+    "description": "unknown Link endpoint rejection",
+    "fixture": "unknown-node.yaml",
+    "error_contains": "references an unknown node"
+  },
+  {
+    "id": "M1-TED-011",
+    "kind": "invalid",
+    "description": "mixed Link endpoint family rejection",
+    "fixture": "address-family-mismatch.yaml",
+    "error_contains": "endpoint address families differ"
+  },
+  {
+    "id": "M1-TED-012",
+    "kind": "invalid",
+    "description": "duplicate YAML mapping key rejection",
+    "fixture": "duplicate-yaml-key.yaml",
+    "error_contains": "duplicate YAML key"
+  }
+]

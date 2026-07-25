@@ -1,0 +1,19 @@
+schema_version: 1
+local_node_id: 1.1.1.1
+local_group_id: 100
+
+nodes:
+  - {node_id: 1.1.1.1, group_id: 100}
+  - {node_id: 2.2.2.2, group_id: 100}
+
+links:
+  - local: 2.2.2.2
+    remote: 1.1.1.1
+    link_id: 7
+    local_address: 10.0.12.2
+    remote_address: 10.0.12.1
+    cost: 15
+    available_bandwidth_kbps: 50000
+
+node_prefixes: []
+prefix_groups: []
