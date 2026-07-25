@@ -16,6 +16,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_route.h"
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_MIDR, "BGP MIDR instance");
@@ -28,11 +29,6 @@ enum midr_event_type {
 	MIDR_EVENT_NODE_WITHDRAW,
 	MIDR_EVENT_LINK_UPSERT,
 	MIDR_EVENT_LINK_WITHDRAW,
-};
-
-struct midr_context {
-	struct bgp *bgp;
-	struct bgp_midr *midr;
 };
 
 struct midr_event {
@@ -762,6 +758,7 @@ static void midr_hooks_register_once(void)
 void bgp_midr_init(struct bgp *bgp)
 {
 	struct bgp_midr *midr;
+	int ret;
 
 	if (!bgp || bgp->midr_info)
 		return;
@@ -770,6 +767,11 @@ void bgp_midr_init(struct bgp *bgp)
 	midr->bgp = bgp;
 	midr->ctx.bgp = bgp;
 	midr->ctx.midr = midr;
+	ret = midr_ted_context_init(&midr->ctx);
+	if (ret) {
+		XFREE(MTYPE_BGP_MIDR, midr);
+		return;
+	}
 	midr->event_queue = list_new();
 	midr->event_queue->del = midr_event_free;
 	midr->node_table = hash_create(midr_node_hash_key, midr_node_hash_cmp, "MIDR node table");
@@ -788,6 +790,7 @@ void bgp_midr_finish(struct bgp *bgp)
 
 	midr = bgp->midr_info;
 	event_cancel(&midr->t_process);
+	midr_ted_context_finish(&midr->ctx);
 	list_delete(&midr->event_queue);
 	hash_clean_and_free(&midr->node_table, midr_node_entry_free);
 	hash_clean_and_free(&midr->link_table, midr_link_entry_free);

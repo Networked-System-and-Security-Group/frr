@@ -7,9 +7,16 @@
 #define _FRR_BGP_MIDR_PRIVATE_H
 
 #include "bgpd/bgp_midr.h"
-
 struct bgp;
+struct bgp_midr;
+struct midr_ted_store;
 struct vty;
+
+struct midr_context {
+	struct bgp *bgp;
+	struct bgp_midr *midr;
+	struct midr_ted_store *ted_store;
+};
 
 extern int midr_validate_node_update(uint32_t local_node_id, const struct midr_node_update *node);
 extern int midr_validate_node_withdraw(uint32_t local_node_id, uint32_t node_id);
