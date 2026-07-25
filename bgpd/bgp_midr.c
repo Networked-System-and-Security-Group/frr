@@ -175,6 +175,7 @@ static void midr_hooks_register_once(void)
 
 	hook_register(peer_status_changed, midr_peer_status_changed);
 	hook_register(bgp_route_update, midr_bgp_route_update);
+	hook_register(bgp_routerid_update, midr_input_router_id_update);
 	midr_hooks_registered = true;
 }
 
