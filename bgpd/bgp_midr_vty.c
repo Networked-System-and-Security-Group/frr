@@ -220,6 +220,22 @@ DEFUN(show_midr_topology_tombstones, show_midr_topology_tombstones_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN(show_midr_topology_sync, show_midr_topology_sync_cmd,
+      "show midr topology sync",
+      SHOW_STR
+      "MIDR information\n"
+      "Topology state\n"
+      "Provider synchronization state\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+
+	midr_show_topology_sync(vty, ctx);
+	return CMD_SUCCESS;
+}
+
 DEFUN(show_midr_events, show_midr_events_cmd,
       "show midr events",
       SHOW_STR
@@ -261,6 +277,7 @@ DEFUN(midr_cmd_topology_node_upsert, midr_topology_node_upsert_cmd,
 	}
 
 	node.policy_state = MIDR_POLICY_ALLOWED;
+	midr_input_test_resync_now(ctx);
 	ret = midr_topology_node_upsert(ctx, &node);
 	if (ret) {
 		vty_out(vty, "%% MIDR node upsert failed: %d\n", ret);
@@ -303,6 +320,7 @@ DEFUN(midr_cmd_topology_node_upsert_transport,
 
 	node.has_transport_address = true;
 	node.policy_state = MIDR_POLICY_ALLOWED;
+	midr_input_test_resync_now(ctx);
 	ret = midr_topology_node_upsert(ctx, &node);
 	if (ret) {
 		vty_out(vty, "%% MIDR node upsert failed: %d\n", ret);
@@ -336,6 +354,7 @@ DEFUN(midr_cmd_topology_node_withdraw, midr_topology_node_withdraw_cmd,
 		return CMD_WARNING;
 	}
 
+	midr_input_test_resync_now(ctx);
 	ret = midr_topology_node_withdraw(ctx, node_id, version);
 	if (ret) {
 		vty_out(vty, "%% MIDR node withdraw failed: %d\n", ret);
@@ -418,6 +437,7 @@ DEFUN(midr_cmd_topology_link_upsert, midr_topology_link_upsert_cmd,
 	link.metrics.has_available_bandwidth_kbps = true;
 	link.policy_state = MIDR_POLICY_ALLOWED;
 
+	midr_input_test_resync_now(ctx);
 	ret = midr_topology_link_upsert(ctx, &link);
 	if (ret) {
 		vty_out(vty, "%% MIDR link upsert failed: %d\n", ret);
@@ -456,6 +476,7 @@ DEFUN(midr_cmd_topology_link_withdraw, midr_topology_link_withdraw_cmd,
 		return CMD_WARNING;
 	}
 
+	midr_input_test_resync_now(ctx);
 	ret = midr_topology_link_withdraw(ctx, &key, version);
 	if (ret) {
 		vty_out(vty, "%% MIDR link withdraw failed: %d\n", ret);
@@ -537,6 +558,7 @@ void bgp_midr_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_links_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_tombstones_cmd);
+	install_element(VIEW_NODE, &show_midr_topology_sync_cmd);
 	install_element(VIEW_NODE, &show_midr_events_cmd);
 	install_element(ENABLE_NODE, &midr_topology_node_upsert_cmd);
 	install_element(ENABLE_NODE, &midr_topology_node_upsert_transport_cmd);

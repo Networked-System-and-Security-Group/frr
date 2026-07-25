@@ -658,7 +658,8 @@ int midr_input_init(struct midr_context *ctx)
 	ctx->input_store = store;
 
 	if (store->owner_node_id)
-		return 0;
+		return midr_input_begin_resync(store, MIDR_TOPOLOGY_RESYNC_STATE_INCONSISTENT,
+					       true);
 
 	store->state = MIDR_INPUT_IDENTITY_RESTART;
 	return 0;
@@ -787,7 +788,7 @@ int midr_topology_resync_begin(struct midr_context *ctx, enum midr_topology_resy
 	    reason != MIDR_TOPOLOGY_RESYNC_STATE_INCONSISTENT)
 		return -EINVAL;
 
-	return -EAGAIN;
+	return midr_input_begin_resync(ctx->input_store, reason, false);
 }
 
 int midr_input_router_id_update(struct bgp *bgp, bool withdraw)
