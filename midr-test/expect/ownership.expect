@@ -1,0 +1,7 @@
+% MIDR node upsert failed: -22
+% MIDR link upsert failed: -22
+  enqueued:       0
+  processed:      0
+  ignored-old:    0
+!1.1.1.1 group
+!9.9.9.9 group 100 policy

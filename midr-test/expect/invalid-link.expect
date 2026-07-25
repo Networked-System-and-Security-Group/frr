@@ -1,0 +1,9 @@
+% MIDR link upsert failed: -22
+% Malformed MIDR link input
+  enqueued:       0
+  processed:      0
+  ignored-old:    0
+!1.1.1.1 -> 2.2.2.2 id 1 local-address
+!1.1.1.1 -> 2.2.2.2 id 2 local-address
+!1.1.1.1 -> 2.2.2.2 id 3 local-address
+!1.1.1.1 -> 2.2.2.2 id 4 local-address

@@ -1,0 +1,8 @@
+MIDR topology nodes:
+MIDR topology tombstones:
+  nodes:
+    1.1.1.1 version 2
+  enqueued:       2
+  processed:      2
+  ignored-old:    0
+!1.1.1.1 group 100 policy

@@ -69,3 +69,12 @@ tests_bgpd_test_peer_attr_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_peer_attr_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_peer_attr_SOURCES = tests/bgpd/test_peer_attr.c
 EXTRA_DIST += tests/bgpd/test_peer_attr.py
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_input
+endif
+tests_bgpd_test_midr_input_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_input_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_input_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_input_SOURCES = tests/bgpd/test_midr_input.c

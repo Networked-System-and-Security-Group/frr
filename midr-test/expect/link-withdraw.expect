@@ -1,0 +1,8 @@
+MIDR topology links:
+MIDR topology tombstones:
+  links:
+    1.1.1.1 -> 2.2.2.2 id 99 version 5
+  enqueued:       2
+  processed:      2
+  ignored-old:    1
+!1.1.1.1 -> 2.2.2.2 id 99 local-address
