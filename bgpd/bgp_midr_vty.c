@@ -12,6 +12,7 @@
 
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_midr_vty.h"
 
 static int midr_parse_router_id(const char *str, uint32_t *out)
@@ -76,6 +77,99 @@ static struct midr_context *midr_vty_context(struct vty *vty)
 		vty_out(vty, "%% MIDR is not initialized\n");
 
 	return ctx;
+}
+
+static void midr_vty_show_sync_reasons(struct vty *vty, uint64_t reasons)
+{
+	bool separator = false;
+
+	if (!reasons) {
+		vty_out(vty, "none");
+		return;
+	}
+	if (reasons & MIDR_TED_SYNC_REASON_EOR_TIMEOUT) {
+		vty_out(vty, "EOR_TIMEOUT");
+		separator = true;
+	}
+	if (reasons & MIDR_TED_SYNC_REASON_RESYNC_FAILED)
+		vty_out(vty, "%sRESYNC_FAILED", separator ? "," : "");
+}
+
+DEFUN(show_midr_ted_summary, show_midr_ted_summary_cmd,
+      "show midr ted summary",
+      SHOW_STR
+      "MIDR information\n"
+      "Path-computation TED\n"
+      "TED readiness and object counts\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+	const struct midr_ted_snapshot *snapshot = NULL;
+	struct midr_ted_status status;
+	struct in_addr local_node;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_ted_status_get(ctx, &status);
+	if (ret) {
+		vty_out(vty, "%% MIDR TED status failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "MIDR TED summary:\n");
+	vty_out(vty, "  state:                 %s\n", status.ready ? "READY" : "NOT_READY");
+	vty_out(vty, "  generation:            %" PRIu64 "\n", status.generation);
+	vty_out(vty, "  sync reasons:          ");
+	midr_vty_show_sync_reasons(vty, status.sync_reason_flags);
+	vty_out(vty, "\n");
+	vty_out(vty, "  consumers:             %zu\n", status.consumer_count);
+	vty_out(vty, "  pending links:         %zu\n", status.pending_link_count);
+	vty_out(vty, "  pending node-prefixes: %zu\n", status.pending_node_prefix_count);
+	vty_out(vty, "  pending prefix-groups: %zu\n", status.pending_prefix_group_count);
+
+	if (!status.ready)
+		return CMD_SUCCESS;
+	ret = midr_ted_snapshot_get(ctx, &snapshot);
+	if (ret) {
+		vty_out(vty, "%% MIDR TED snapshot failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+
+	local_node.s_addr = snapshot->local_node_id;
+	vty_out(vty, "  local node:            %pI4\n", &local_node);
+	vty_out(vty, "  local group:           %u\n", snapshot->local_group_id);
+	vty_out(vty, "  nodes:                 %zu\n", snapshot->node_count);
+	vty_out(vty, "  intra links:           %zu\n", snapshot->intra_link_count);
+	vty_out(vty, "  egress links:          %zu\n", snapshot->egress_link_count);
+	vty_out(vty, "  node-prefixes:         %zu\n", snapshot->node_prefix_count);
+	vty_out(vty, "  group edges:           %zu\n", snapshot->group_edge_count);
+	vty_out(vty, "  prefix-groups:         %zu\n", snapshot->prefix_group_count);
+	midr_ted_snapshot_release(&snapshot);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_ted_generation, show_midr_ted_generation_cmd,
+      "show midr ted generation",
+      SHOW_STR
+      "MIDR information\n"
+      "Path-computation TED\n"
+      "Current immutable snapshot generation\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+	struct midr_ted_status status;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_ted_status_get(ctx, &status);
+	if (ret) {
+		vty_out(vty, "%% MIDR TED status failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "MIDR TED generation: %" PRIu64 " (%s)\n", status.generation,
+		status.ready ? "READY" : "NOT_READY");
+	return CMD_SUCCESS;
 }
 
 DEFUN(show_midr_topology_nodes, show_midr_topology_nodes_cmd,
@@ -438,6 +532,8 @@ DEFUN(midr_cmd_peer_session_release, midr_peer_session_release_cmd,
 
 void bgp_midr_vty_init(void)
 {
+	install_element(VIEW_NODE, &show_midr_ted_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_ted_generation_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_links_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_tombstones_cmd);

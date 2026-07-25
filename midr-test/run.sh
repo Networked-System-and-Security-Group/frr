@@ -20,6 +20,7 @@ SCENARIOS=(
 	ownership
 	invalid-link
 	peer-session
+	ted-not-ready
 )
 
 usage() {
@@ -35,6 +36,7 @@ Scenarios:
   ownership       reject non-local Node and Link ownership
   invalid-link    reject malformed Link measurements and addresses
   peer-session    basic peer session request/release wrapper
+  ted-not-ready   verify production TED remains NOT_READY in M1
   all             run every assertion-based scenario
   interactive     start bgpd terminal mode for manual VTY input
   list            list assertion-based scenarios

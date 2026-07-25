@@ -102,6 +102,7 @@ link-withdraw  未知 Link withdraw 后旧 upsert 不复活
 ownership      本地 Router-ID ownership 校验
 invalid-link   地址族、measurement 和 uint64 输入校验
 peer-session   基础 session request/release wrapper
+ted-not-ready  M1 生产 TED 保持 NOT_READY / generation 0
 ```
 
 每个场景的完整输出保存在 `midr-test/run/<scenario>.log`。缺少必要输出、出现禁止输出、命令无法解析、进程崩溃或超时都会使脚本返回非零。普通用户运行时出现 `/var/lib/frr` 或 `/var/run/frr` permission warning 不作为失败。
