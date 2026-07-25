@@ -82,6 +82,8 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_vty.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -3932,6 +3934,7 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
+		bgp_midr_init(bgp);
 	}
 
 	/*initialize global GR FSM */
@@ -4753,6 +4756,7 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
+	bgp_midr_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
@@ -9374,6 +9378,7 @@ void bgp_init(unsigned short instance)
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
+	bgp_midr_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
