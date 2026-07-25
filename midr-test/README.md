@@ -1,6 +1,6 @@
-# MIDR 接口骨架测试
+# MIDR 接口与 TED 测试
 
-本目录用于测试 MIDR 第一组输入接口、Local Fact 版本处理和基础 session wrapper。测试以 terminal VTY 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口。
+本目录用于测试 MIDR 第一组输入接口、Local Fact 版本处理、基础 session wrapper，以及路径计算使用的不可变 TED snapshot。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；TED fixture 只进入 test-only Mock Provider，不进入生产 `bgpd` 数据路径。
 
 ## 目录结构
 
@@ -8,8 +8,13 @@
 midr-test/
   bgpd.conf              # 测试用 bgpd 配置
   run.sh                 # 场景运行与断言脚本
+  run-ted-fixtures.sh    # TED Gherkin/fixture 断言入口
+  ted-fixture-normalize.py
+                          # 严格 YAML schema 到规范化 JSON
   expect/                # 固定字符串预期结果
   vty/                   # 场景输入的 VTY 命令
+  features/              # M1 Gherkin 场景及 ID 映射
+  path-fixtures/         # 有效、非法及 expected TED fixture
   run/                   # pid、socket 和日志，不纳入 Git
 ```
 
@@ -19,7 +24,11 @@ midr-test/
 
 ```bash
 cd ~/yhy/frr
-make -j$(nproc) bgpd/bgpd tests/bgpd/test_midr_input
+make -j$(nproc) \
+  bgpd/bgpd \
+  tests/bgpd/test_midr_input \
+  tests/bgpd/test_midr_ted \
+  tests/bgpd/test_midr_ted_fixture
 ```
 
 干净环境或构建清单发生变化时，先执行：
@@ -36,7 +45,11 @@ make -j$(nproc) bgpd/bgpd tests/bgpd/test_midr_input
   --enable-group=frr \
   --enable-vty-group=frrvty \
   --with-pkg-git-version
-make -j$(nproc) bgpd/bgpd tests/bgpd/test_midr_input
+make -j$(nproc) \
+  bgpd/bgpd \
+  tests/bgpd/test_midr_input \
+  tests/bgpd/test_midr_ted \
+  tests/bgpd/test_midr_ted_fixture
 ```
 
 ## 运行
@@ -45,6 +58,24 @@ make -j$(nproc) bgpd/bgpd tests/bgpd/test_midr_input
 
 ```bash
 ./tests/bgpd/test_midr_input
+```
+
+运行不可变 snapshot、generation、consumer 和 builder 单元测试：
+
+```bash
+./tests/bgpd/test_midr_ted
+```
+
+运行全部 M1 TED YAML/Gherkin 场景：
+
+```bash
+./midr-test/run-ted-fixtures.sh all
+```
+
+运行单个 M1 场景：
+
+```bash
+./midr-test/run-ted-fixtures.sh M1-TED-004
 ```
 
 运行全部 VTY 场景：
