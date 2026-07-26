@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "command.h"
 #include "privs.h"
@@ -15,6 +16,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_cost.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
@@ -22,6 +24,7 @@
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
+#include "tests/bgpd/midr_ted_mock_provider.h"
 
 struct zebra_privs_t bgpd_privs = {};
 struct event_loop *master;
@@ -274,6 +277,78 @@ static void install_remote(const struct midr_ls_object *object)
 	midr_propagation_path_fini(&path);
 }
 
+static void assert_mock_matches_real(
+	const struct midr_ted_snapshot *real,
+	const struct midr_ls_object *remote_link_object)
+{
+	char path[] = "/tmp/midr-m4-mock-XXXXXX";
+	char error[256];
+	struct midr_ls_metrics local_metrics = {
+		.present_flags = MIDR_METRIC_REQUIRED_MASK,
+		.rtt_us = 1000,
+		.loss_ppm = 100,
+		.available_bandwidth_kbps = 100000,
+	};
+	const struct midr_ted_snapshot *mock = NULL;
+	FILE *file;
+	uint32_t local_cost;
+	uint32_t remote_cost;
+	int fd;
+
+	assert(midr_cost_from_metrics(&local_metrics, &local_cost) == 0);
+	assert(midr_cost_from_metrics(
+		       &remote_link_object->payload.link.metrics,
+		       &remote_cost) == 0);
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	file = fdopen(fd, "w");
+	assert(file);
+	assert(fprintf(
+		       file,
+		       "{"
+		       "\"schema_version\":1,"
+		       "\"local_node_id\":\"10.0.0.1\","
+		       "\"local_group_id\":10,"
+		       "\"nodes\":["
+		       "{\"node_id\":\"10.0.0.1\",\"group_id\":10,"
+		       "\"cap_flags\":0,\"policy_tags\":0},"
+		       "{\"node_id\":\"10.0.0.2\",\"group_id\":20,"
+		       "\"cap_flags\":0,\"policy_tags\":0}],"
+		       "\"links\":["
+		       "{\"local\":\"10.0.0.1\",\"remote\":\"10.0.0.2\","
+		       "\"link_id\":1,\"local_address\":\"198.51.100.1\","
+		       "\"remote_address\":\"198.51.100.2\",\"cost\":%u,"
+		       "\"available_bandwidth_kbps\":100000,"
+		       "\"local_ifindex\":9,\"policy_tags\":0},"
+		       "{\"local\":\"10.0.0.2\",\"remote\":\"10.0.0.1\","
+		       "\"link_id\":2,\"local_address\":\"198.51.100.2\","
+		       "\"remote_address\":\"198.51.100.1\",\"cost\":%u,"
+		       "\"available_bandwidth_kbps\":90000,"
+		       "\"local_ifindex\":0,\"policy_tags\":0}],"
+		       "\"node_prefixes\":["
+		       "{\"prefix\":\"203.0.113.0/24\","
+		       "\"node_id\":\"10.0.0.2\"}],"
+		       "\"prefix_groups\":["
+		       "{\"prefix\":\"198.18.0.0/15\",\"group_id\":20}]"
+		       "}",
+		       local_cost, remote_cost) > 0);
+	assert(fclose(file) == 0);
+	assert(midr_ted_mock_provider_publish_file(
+		       ctx, path, error, sizeof(error)) == 0);
+	assert(unlink(path) == 0);
+	assert(midr_ted_snapshot_get(ctx, &mock) == 0);
+	assert(mock->generation == real->generation);
+	assert(mock->node_count == real->node_count);
+	assert(mock->intra_link_count == real->intra_link_count);
+	assert(mock->egress_link_count == real->egress_link_count);
+	assert(mock->group_edge_count == real->group_edge_count);
+	assert(mock->node_prefix_count == real->node_prefix_count);
+	assert(mock->prefix_group_count == real->prefix_group_count);
+	assert(mock->egress_links[0].canonical_cost ==
+	       real->egress_links[0].canonical_cost);
+	midr_ted_snapshot_release(&mock);
+}
+
 static void test_pending_activation_and_four_objects(void)
 {
 	const struct midr_ted_snapshot *held = NULL;
@@ -324,6 +399,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(held->prefix_group_count == 1);
 	assert(held->egress_links[0].local_ifindex == 9);
 	ready_generation = held->generation;
+	assert_mock_matches_real(held, &link);
 
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
 	assert(remote.node_count == 1);
