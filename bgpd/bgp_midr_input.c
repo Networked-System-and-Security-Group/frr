@@ -16,6 +16,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 
 #define MIDR_EVENT_QUEUE_LIMIT 4096U
@@ -280,8 +281,9 @@ int midr_validate_link_withdraw(uint32_t local_node_id, const struct midr_link_k
 	return 0;
 }
 
-static void midr_apply_node_upsert(struct midr_fact_table *table,
-				   const struct midr_node_update *node, uint64_t *ignored_old)
+static bool midr_apply_node_upsert(struct midr_fact_table *table,
+				   const struct midr_node_update *node,
+				   uint64_t *ignored_old)
 {
 	struct midr_node_entry lookup = { .data.node_id = node->node_id };
 	struct midr_node_entry *entry;
@@ -289,7 +291,7 @@ static void midr_apply_node_upsert(struct midr_fact_table *table,
 	entry = hash_lookup(table->nodes, &lookup);
 	if (entry && node->version <= entry->data.version) {
 		(*ignored_old)++;
-		return;
+		return false;
 	}
 
 	if (!entry) {
@@ -300,10 +302,12 @@ static void midr_apply_node_upsert(struct midr_fact_table *table,
 
 	entry->data = *node;
 	entry->active = true;
+	return true;
 }
 
-static void midr_apply_node_withdraw(struct midr_fact_table *table, uint32_t node_id,
-				     uint64_t version, uint64_t *ignored_old)
+static bool midr_apply_node_withdraw(struct midr_fact_table *table,
+				     uint32_t node_id, uint64_t version,
+				     uint64_t *ignored_old)
 {
 	struct midr_node_entry lookup = { .data.node_id = node_id };
 	struct midr_node_entry *entry;
@@ -311,7 +315,7 @@ static void midr_apply_node_withdraw(struct midr_fact_table *table, uint32_t nod
 	entry = hash_lookup(table->nodes, &lookup);
 	if (entry && version <= entry->data.version) {
 		(*ignored_old)++;
-		return;
+		return false;
 	}
 
 	if (!entry) {
@@ -324,10 +328,12 @@ static void midr_apply_node_withdraw(struct midr_fact_table *table, uint32_t nod
 	entry->data.node_id = node_id;
 	entry->data.version = version;
 	entry->active = false;
+	return true;
 }
 
-static void midr_apply_link_upsert(struct midr_fact_table *table,
-				   const struct midr_link_update *link, uint64_t *ignored_old)
+static bool midr_apply_link_upsert(struct midr_fact_table *table,
+				   const struct midr_link_update *link,
+				   uint64_t *ignored_old)
 {
 	struct midr_link_entry lookup = { .data.key = link->key };
 	struct midr_link_entry *entry;
@@ -335,7 +341,7 @@ static void midr_apply_link_upsert(struct midr_fact_table *table,
 	entry = hash_lookup(table->links, &lookup);
 	if (entry && link->version <= entry->data.version) {
 		(*ignored_old)++;
-		return;
+		return false;
 	}
 
 	if (!entry) {
@@ -346,9 +352,11 @@ static void midr_apply_link_upsert(struct midr_fact_table *table,
 
 	entry->data = *link;
 	entry->active = true;
+	return true;
 }
 
-static void midr_apply_link_withdraw(struct midr_fact_table *table, const struct midr_link_key *key,
+static bool midr_apply_link_withdraw(struct midr_fact_table *table,
+				     const struct midr_link_key *key,
 				     uint64_t version, uint64_t *ignored_old)
 {
 	struct midr_link_entry lookup = { .data.key = *key };
@@ -357,7 +365,7 @@ static void midr_apply_link_withdraw(struct midr_fact_table *table, const struct
 	entry = hash_lookup(table->links, &lookup);
 	if (entry && version <= entry->data.version) {
 		(*ignored_old)++;
-		return;
+		return false;
 	}
 
 	if (!entry) {
@@ -370,27 +378,30 @@ static void midr_apply_link_withdraw(struct midr_fact_table *table, const struct
 	entry->data.key = *key;
 	entry->data.version = version;
 	entry->active = false;
+	return true;
 }
 
-static void midr_apply_event(struct midr_fact_table *table, const struct midr_event *event,
+static bool midr_apply_event(struct midr_fact_table *table,
+			     const struct midr_event *event,
 			     uint64_t *ignored_old)
 {
 	switch (event->type) {
 	case MIDR_EVENT_NODE_UPSERT:
-		midr_apply_node_upsert(table, &event->u.node, ignored_old);
-		break;
+		return midr_apply_node_upsert(table, &event->u.node,
+					     ignored_old);
 	case MIDR_EVENT_NODE_WITHDRAW:
-		midr_apply_node_withdraw(table, event->u.node_withdraw.node_id,
-					 event->u.node_withdraw.version, ignored_old);
-		break;
+		return midr_apply_node_withdraw(
+			table, event->u.node_withdraw.node_id,
+			event->u.node_withdraw.version, ignored_old);
 	case MIDR_EVENT_LINK_UPSERT:
-		midr_apply_link_upsert(table, &event->u.link, ignored_old);
-		break;
+		return midr_apply_link_upsert(table, &event->u.link,
+					     ignored_old);
 	case MIDR_EVENT_LINK_WITHDRAW:
-		midr_apply_link_withdraw(table, &event->u.link_withdraw.key,
-					 event->u.link_withdraw.version, ignored_old);
-		break;
+		return midr_apply_link_withdraw(
+			table, &event->u.link_withdraw.key,
+			event->u.link_withdraw.version, ignored_old);
 	}
+	return false;
 }
 
 static size_t midr_queue_discard(struct list *queue)
@@ -405,17 +416,21 @@ static size_t midr_queue_discard(struct list *queue)
 	return count;
 }
 
-static void midr_process_queue(struct midr_input_store *store, struct list *queue,
+static bool midr_process_queue(struct midr_input_store *store,
+			       struct list *queue,
 			       struct midr_fact_table *table)
 {
 	struct midr_event *event;
+	bool changed = false;
 
 	while ((event = listnode_head(queue)) != NULL) {
 		listnode_delete(queue, event);
-		midr_apply_event(table, event, &store->event_ignored_old);
+		changed |= midr_apply_event(table, event,
+					    &store->event_ignored_old);
 		store->event_processed++;
 		midr_event_free(event);
 	}
+	return changed;
 }
 
 static void midr_input_schedule_resync(struct midr_input_store *store, unsigned int delay_msec);
@@ -428,6 +443,7 @@ static void midr_input_enter_out_of_sync(struct midr_input_store *store)
 	store->event_dropped_resync += midr_queue_discard(store->resync_queue);
 	store->state = MIDR_INPUT_OUT_OF_SYNC;
 	store->startup_probe = false;
+	midr_owned_input_state_changed(store->ctx);
 }
 
 static int midr_snapshot_to_fact_table(struct midr_input_store *store,
@@ -482,7 +498,8 @@ static void midr_input_resync_step(struct midr_input_store *store)
 		return;
 
 	store->resync_attempts++;
-	midr_process_queue(store, store->normal_queue, store->active);
+	if (midr_process_queue(store, store->normal_queue, store->active))
+		midr_owned_reconcile(store->ctx);
 
 	ret = midr_topology_snapshot_get(store->ctx, &snapshot);
 	if (store->state != MIDR_INPUT_RESYNCING) {
@@ -493,7 +510,9 @@ static void midr_input_resync_step(struct midr_input_store *store)
 	if (ret == -ENOSYS) {
 		store->provider_state = MIDR_PROVIDER_UNAVAILABLE;
 		if (store->startup_probe && !store->identity_restart_pending) {
-			midr_process_queue(store, store->resync_queue, store->active);
+				if (midr_process_queue(store, store->resync_queue,
+						       store->active))
+					midr_owned_reconcile(store->ctx);
 			store->state = MIDR_INPUT_NORMAL;
 			store->startup_probe = false;
 			return;
@@ -515,7 +534,7 @@ static void midr_input_resync_step(struct midr_input_store *store)
 	snapshot_version = snapshot.snapshot_version;
 	ret = midr_snapshot_to_fact_table(store, &snapshot, &staging);
 	if (!ret)
-		midr_process_queue(store, store->resync_queue, staging);
+		(void)midr_process_queue(store, store->resync_queue, staging);
 	midr_topology_snapshot_release(store->ctx, &snapshot);
 	if (ret) {
 		store->resync_failures++;
@@ -532,6 +551,8 @@ static void midr_input_resync_step(struct midr_input_store *store)
 	store->identity_restart_pending = false;
 	store->resync_commits++;
 	midr_fact_table_free(&old);
+	midr_owned_reconcile(store->ctx);
+	midr_owned_input_state_changed(store->ctx);
 }
 
 static void midr_resync_event_cb(struct event *event)
@@ -584,8 +605,9 @@ static void midr_process_event_cb(struct event *event)
 		return;
 
 	store->t_process = NULL;
-	if (store->state == MIDR_INPUT_NORMAL)
-		midr_process_queue(store, store->normal_queue, store->active);
+	if (store->state == MIDR_INPUT_NORMAL &&
+	    midr_process_queue(store, store->normal_queue, store->active))
+		midr_owned_reconcile(store->ctx);
 }
 
 static void midr_schedule_process(struct midr_input_store *store)
@@ -690,10 +712,10 @@ void midr_topology_process_pending(struct midr_context *ctx)
 		return;
 
 	store = ctx->input_store;
-	if (store->state == MIDR_INPUT_NORMAL)
-		midr_process_queue(store, store->normal_queue, store->active);
-	else if (store->state == MIDR_INPUT_RESYNCING)
-		midr_process_queue(store, store->normal_queue, store->active);
+	if ((store->state == MIDR_INPUT_NORMAL ||
+	     store->state == MIDR_INPUT_RESYNCING) &&
+	    midr_process_queue(store, store->normal_queue, store->active))
+		midr_owned_reconcile(ctx);
 }
 
 int midr_topology_node_upsert(struct midr_context *ctx, const struct midr_node_update *node)
@@ -808,6 +830,7 @@ int midr_input_router_id_update(struct bgp *bgp, bool withdraw)
 
 	if (withdraw) {
 		had_identity = store->owner_node_id != 0;
+		midr_owned_identity_withdraw(ctx);
 		event_cancel(&store->t_process);
 		event_cancel(&store->t_resync);
 		store->event_dropped_resync += midr_queue_discard(store->normal_queue);
@@ -826,6 +849,7 @@ int midr_input_router_id_update(struct bgp *bgp, bool withdraw)
 	}
 
 	store->owner_node_id = bgp->router_id.s_addr;
+	midr_owned_identity_start(ctx, store->owner_node_id);
 	if (!store->owner_node_id) {
 		store->state = MIDR_INPUT_IDENTITY_RESTART;
 		return 0;
@@ -882,6 +906,55 @@ int midr_local_fact_link_get(struct midr_context *ctx, const struct midr_link_ke
 	*link = entry->data;
 	*active = entry->active;
 	return 0;
+}
+
+struct midr_local_fact_foreach_state {
+	midr_local_fact_node_cb node_cb;
+	midr_local_fact_link_cb link_cb;
+	void *arg;
+	int result;
+};
+
+static void midr_local_fact_node_iter(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_local_fact_foreach_state *state = arg;
+	struct midr_node_entry *entry = bucket->data;
+
+	if (state->result || !entry->active || !state->node_cb)
+		return;
+	state->result = state->node_cb(&entry->data, state->arg);
+}
+
+static void midr_local_fact_link_iter(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_local_fact_foreach_state *state = arg;
+	struct midr_link_entry *entry = bucket->data;
+
+	if (state->result || !entry->active || !state->link_cb)
+		return;
+	state->result = state->link_cb(&entry->data, state->arg);
+}
+
+int midr_local_fact_foreach(struct midr_context *ctx,
+			    midr_local_fact_node_cb node_cb,
+			    midr_local_fact_link_cb link_cb, void *arg)
+{
+	struct midr_local_fact_foreach_state state = {
+		.node_cb = node_cb,
+		.link_cb = link_cb,
+		.arg = arg,
+	};
+
+	if (!ctx || !ctx->input_store)
+		return -ENOENT;
+	if (!node_cb && !link_cb)
+		return -EINVAL;
+
+	hash_iterate(ctx->input_store->active->nodes,
+		     midr_local_fact_node_iter, &state);
+	hash_iterate(ctx->input_store->active->links,
+		     midr_local_fact_link_iter, &state);
+	return state.result;
 }
 
 struct midr_fact_count {

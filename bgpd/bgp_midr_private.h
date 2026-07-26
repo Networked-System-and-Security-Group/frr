@@ -10,6 +10,8 @@
 struct bgp;
 struct bgp_midr;
 struct midr_input_store;
+struct midr_lsdb_store;
+struct midr_owned_store;
 struct midr_rib_store;
 struct midr_ted_store;
 struct vty;
@@ -18,7 +20,9 @@ struct midr_context {
 	struct bgp *bgp;
 	struct bgp_midr *midr;
 	struct midr_input_store *input_store;
+	struct midr_owned_store *owned_store;
 	struct midr_rib_store *rib_store;
+	struct midr_lsdb_store *lsdb_store;
 	struct midr_ted_store *ted_store;
 };
 
@@ -78,6 +82,13 @@ extern int midr_local_fact_node_get(struct midr_context *ctx, uint32_t node_id,
 				    struct midr_node_update *node, bool *active);
 extern int midr_local_fact_link_get(struct midr_context *ctx, const struct midr_link_key *key,
 				    struct midr_link_update *link, bool *active);
+typedef int (*midr_local_fact_node_cb)(const struct midr_node_update *node,
+				      void *arg);
+typedef int (*midr_local_fact_link_cb)(const struct midr_link_update *link,
+				      void *arg);
+extern int midr_local_fact_foreach(struct midr_context *ctx,
+				   midr_local_fact_node_cb node_cb,
+				   midr_local_fact_link_cb link_cb, void *arg);
 extern int midr_input_test_set_queue_limits(struct midr_context *ctx, size_t normal_limit,
 					    size_t resync_limit);
 extern void midr_input_test_resync_now(struct midr_context *ctx);

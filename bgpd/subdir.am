@@ -60,6 +60,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_cost.c \
 	bgpd/bgp_midr_input.c \
 	bgpd/bgp_midr_ls.c \
+	bgpd/bgp_midr_owned.c \
 	bgpd/bgp_midr_rib.c \
 	bgpd/bgp_midr_sequence.c \
 	bgpd/bgp_midr_ted.c \
@@ -157,6 +158,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_codec.h \
 	bgpd/bgp_midr_cost.h \
 	bgpd/bgp_midr_ls.h \
+	bgpd/bgp_midr_owned.h \
 	bgpd/bgp_midr_private.h \
 	bgpd/bgp_midr_rib.h \
 	bgpd/bgp_midr_sequence.h \

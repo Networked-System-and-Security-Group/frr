@@ -146,6 +146,15 @@ tests_bgpd_test_midr_rib_SOURCES = tests/bgpd/test_midr_rib.c
 
 
 if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_owned
+endif
+tests_bgpd_test_midr_owned_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_owned_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_owned_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_owned_SOURCES = tests/bgpd/test_midr_owned.c
+
+
+if BGPD
 check_PROGRAMS += tests/bgpd/test_midr_resync
 endif
 tests_bgpd_test_midr_resync_CFLAGS = $(TESTS_CFLAGS)

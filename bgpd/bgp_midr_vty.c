@@ -11,6 +11,7 @@
 #include "sockunion.h"
 
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_midr_vty.h"
@@ -77,6 +78,20 @@ static struct midr_context *midr_vty_context(struct vty *vty)
 		vty_out(vty, "%% MIDR is not initialized\n");
 
 	return ctx;
+}
+
+DEFUN(show_midr_owned, show_midr_owned_cmd,
+      "show midr owned",
+      SHOW_STR
+      "MIDR information\n"
+      "Locally originated objects\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_owned(vty, ctx);
+	return CMD_SUCCESS;
 }
 
 static void midr_vty_show_sync_reasons(struct vty *vty, uint64_t reasons)
@@ -555,6 +570,7 @@ void bgp_midr_vty_init(void)
 {
 	install_element(VIEW_NODE, &show_midr_ted_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_ted_generation_cmd);
+	install_element(VIEW_NODE, &show_midr_owned_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_links_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_tombstones_cmd);
