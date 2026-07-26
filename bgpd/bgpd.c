@@ -990,6 +990,8 @@ int bgp_map_afi_safi_iana2int(iana_afi_t pkt_afi, iana_safi_t pkt_safi,
 	*safi = safi_iana2int(pkt_safi);
 	if (*afi == AFI_MAX || *safi == SAFI_MAX)
 		return -1;
+	if (*safi == SAFI_MIDR_LS && *afi != AFI_BGP_LS)
+		return -1;
 
 	return 0;
 }
@@ -1000,7 +1002,8 @@ int bgp_map_afi_safi_int2iana(afi_t afi, safi_t safi, iana_afi_t *pkt_afi,
 	/* Map from internal values to IANA values, return error if
 	 * internal values are bad (unexpected).
 	 */
-	if (afi == AFI_MAX || safi == SAFI_MAX)
+	if (afi == AFI_MAX || safi == SAFI_MAX
+	    || (safi == SAFI_MIDR_LS && afi != AFI_BGP_LS))
 		return -1;
 	*pkt_afi = afi_int2iana(afi);
 	*pkt_safi = safi_int2iana(safi);

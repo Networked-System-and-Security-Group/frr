@@ -5,6 +5,7 @@
  * Donald Sharp
  */
 #ifndef __IANA_AFI_H__
+#define __IANA_AFI_H__
 
 #include <prefix.h>
 
@@ -104,8 +105,7 @@ static inline safi_t safi_iana2int(iana_safi_t safi)
 	case IANA_SAFI_BGP_LS:
 		return SAFI_BGP_LS;
 	case IANA_SAFI_MIDR_LS:
-		/* The internal SAFI and RIB integration are added in M4. */
-		return SAFI_MAX;
+		return SAFI_MIDR_LS;
 	case IANA_SAFI_RESERVED:
 		return SAFI_MAX;
 	}
@@ -132,6 +132,8 @@ static inline iana_safi_t safi_int2iana(safi_t safi)
 		return IANA_SAFI_FLOWSPEC;
 	case SAFI_BGP_LS:
 		return IANA_SAFI_BGP_LS;
+	case SAFI_MIDR_LS:
+		return IANA_SAFI_MIDR_LS;
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		return IANA_SAFI_RESERVED;

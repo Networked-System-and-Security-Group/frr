@@ -50,6 +50,8 @@ int midr_peer_session_request(struct midr_context *ctx,
 	if (!req->remote_as || req->afi <= AFI_UNSPEC || req->afi >= AFI_MAX ||
 	    req->safi <= SAFI_UNSPEC || req->safi >= SAFI_MAX)
 		return -EINVAL;
+	if (req->afi == AFI_BGP_LS && req->safi == SAFI_MIDR_LS)
+		return -EAGAIN;
 	if (req->has_update_source || req->ebgp_multihop || (req->password && req->password[0]) ||
 	    req->policy_tags)
 		return -ENOTSUP;
