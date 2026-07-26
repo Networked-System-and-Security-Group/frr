@@ -234,11 +234,11 @@ static void midr_lsdb_state_free(struct midr_lsdb_state **statep)
 	if (!statep || !*statep)
 		return;
 	state = *statep;
-	hash_free(state->memberships);
+	hash_clean_and_free(&state->memberships, NULL);
 	hash_clean_and_free(&state->link_endpoints, midr_lsdb_index_free);
-	hash_free(state->group_members);
+	hash_clean_and_free(&state->group_members, NULL);
 	hash_clean_and_free(&state->groups, midr_lsdb_index_free);
-	hash_free(state->pending_links);
+	hash_clean_and_free(&state->pending_links, NULL);
 	hash_clean_and_free(&state->identities, midr_lsdb_entry_free);
 	XFREE(MTYPE_MIDR_LSDB_STATE, state);
 	*statep = NULL;
