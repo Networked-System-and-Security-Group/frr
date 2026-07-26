@@ -19,6 +19,9 @@ struct mock_membership {
 };
 
 static int mock_error(char *error, size_t error_size, const char *format, ...)
+	__attribute__((format(printf, 3, 4)));
+
+static int mock_error(char *error, size_t error_size, const char *format, ...)
 {
 	va_list args;
 

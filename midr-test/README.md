@@ -1,6 +1,6 @@
-# MIDR 输入、Resync 与 TED 测试
+# MIDR 输入、TED 与协议对象测试
 
-本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper，以及路径计算使用的不可变 TED snapshot。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；测试 Provider 和 TED fixture 均不进入生产 `bgpd` 数据路径。
+本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper、不可变 TED snapshot，以及 LS Object、sequence、cost 和 wire codec。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；测试 Provider、TED fixture 和 fuzz corpus 均不进入生产 `bgpd` 数据路径。
 
 ## 目录结构
 
@@ -11,11 +11,15 @@ midr-test/
   run-resync-scenarios.sh
                           # M2 Gherkin/组件测试映射入口
   run-ted-fixtures.sh    # TED Gherkin/fixture 断言入口
+  run-codec-fuzz.sh      # M3 codec libFuzzer 入口
+  run-m3-mutation.sh     # M3 关键规则定向变异测试
+  run-m3-coverage.sh     # M3 核心文件覆盖率门禁
   ted-fixture-normalize.py
                           # 严格 YAML schema 到规范化 JSON
   expect/                # 固定字符串预期结果
   vty/                   # 场景输入的 VTY 命令
   features/              # M1/M2 Gherkin 场景及 ID 映射
+  fuzz/corpus/           # M3 golden 和 malformed 十六进制种子
   path-fixtures/         # 有效、非法及 expected TED fixture
   run/                   # pid、socket 和日志，不纳入 Git
 ```
@@ -31,7 +35,11 @@ make -j$(nproc) \
   tests/bgpd/test_midr_input \
   tests/bgpd/test_midr_resync \
   tests/bgpd/test_midr_ted \
-  tests/bgpd/test_midr_ted_fixture
+  tests/bgpd/test_midr_ted_fixture \
+  tests/bgpd/test_midr_ls_object \
+  tests/bgpd/test_midr_sequence \
+  tests/bgpd/test_midr_cost \
+  tests/bgpd/test_midr_codec
 ```
 
 干净环境或构建清单发生变化时，先执行：
@@ -53,7 +61,11 @@ make -j$(nproc) \
   tests/bgpd/test_midr_input \
   tests/bgpd/test_midr_resync \
   tests/bgpd/test_midr_ted \
-  tests/bgpd/test_midr_ted_fixture
+  tests/bgpd/test_midr_ted_fixture \
+  tests/bgpd/test_midr_ls_object \
+  tests/bgpd/test_midr_sequence \
+  tests/bgpd/test_midr_cost \
+  tests/bgpd/test_midr_codec
 ```
 
 ## 运行
@@ -82,6 +94,25 @@ make -j$(nproc) \
 ```bash
 ./tests/bgpd/test_midr_ted
 ```
+
+运行 M3 协议对象核心单元测试：
+
+```bash
+./tests/bgpd/test_midr_ls_object
+./tests/bgpd/test_midr_sequence
+./tests/bgpd/test_midr_cost
+./tests/bgpd/test_midr_codec
+```
+
+运行 M3 codec fuzz、定向变异和覆盖率门禁：
+
+```bash
+MIDR_FUZZ_TIME=60 ./midr-test/run-codec-fuzz.sh
+./midr-test/run-m3-mutation.sh
+./midr-test/run-m3-coverage.sh
+```
+
+Fuzzer 使用 Clang 的 ASAN/UBSAN 和 LeakSanitizer；变异测试要求 10 个定向 mutant 全部被现有单元测试杀死；覆盖率只统计 `bgp_midr_ls.c`、`bgp_midr_sequence.c`、`bgp_midr_cost.c` 和 `bgp_midr_codec.c`，门禁为 line 90%、branch 80%。覆盖率脚本需要 `gcovr`。
 
 运行全部 M1 TED YAML/Gherkin 场景：
 
