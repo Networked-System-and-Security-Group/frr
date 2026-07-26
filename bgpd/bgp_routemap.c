@@ -36,6 +36,7 @@
 #include "bgpd/bgp_clist.h"
 #include "bgpd/bgp_filter.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_ecommunity.h"
 #include "bgpd/bgp_lcommunity.h"
 #include "bgpd/bgp_vty.h"
@@ -5058,10 +5059,13 @@ static void bgp_route_map_mark_update(const char *rmap_name)
 		/* Signal the groups that a route-map update event has
 		 * started */
 		for (ALL_LIST_ELEMENTS(bm->bgp, node, nnode, bgp))
+			midr_prefix_route_map_changed(bgp, rmap_name);
+		for (ALL_LIST_ELEMENTS(bm->bgp, node, nnode, bgp))
 			update_group_policy_update(bgp, BGP_POLICY_ROUTE_MAP,
 						   rmap_name, true, 1);
 	} else {
 		for (ALL_LIST_ELEMENTS(bm->bgp, node, nnode, bgp)) {
+			midr_prefix_route_map_changed(bgp, rmap_name);
 			bgp_route_map_process_update(bgp, rmap_name, false);
 #ifdef ENABLE_BGP_VNC
 			vnc_routemap_update(bgp, __func__);

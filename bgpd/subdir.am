@@ -63,6 +63,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_lsdb.c \
 	bgpd/bgp_midr_owned.c \
 	bgpd/bgp_midr_packet.c \
+	bgpd/bgp_midr_prefix.c \
 	bgpd/bgp_midr_rib.c \
 	bgpd/bgp_midr_sequence.c \
 	bgpd/bgp_midr_sync.c \
@@ -164,6 +165,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_lsdb.h \
 	bgpd/bgp_midr_owned.h \
 	bgpd/bgp_midr_packet.h \
+	bgpd/bgp_midr_prefix.h \
 	bgpd/bgp_midr_private.h \
 	bgpd/bgp_midr_rib.h \
 	bgpd/bgp_midr_sequence.h \

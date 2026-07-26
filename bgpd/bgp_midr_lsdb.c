@@ -18,6 +18,7 @@
 #include "bgpd/bgp_midr_cost.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
@@ -55,7 +56,14 @@ struct midr_lsdb_endpoint_index {
 
 struct midr_lsdb_group_index {
 	uint32_t group_id;
+	uint32_t representative_node_id;
 	size_t member_count;
+};
+
+struct midr_lsdb_contributor_index {
+	uint32_t group_id;
+	struct midr_ls_prefix_key prefix;
+	size_t contributor_count;
 };
 
 struct midr_lsdb_state {
@@ -64,6 +72,7 @@ struct midr_lsdb_state {
 	struct hash *link_endpoints;
 	struct hash *group_members;
 	struct hash *groups;
+	struct hash *contributors;
 	struct hash *pending_links;
 	uint64_t generation;
 	uint64_t sync_reason_flags;
@@ -165,6 +174,38 @@ static bool midr_lsdb_group_hash_cmp(const void *a, const void *b)
 	return left->group_id == right->group_id;
 }
 
+static unsigned int midr_lsdb_contributor_hash_key(const void *arg)
+{
+	const struct midr_lsdb_contributor_index *index = arg;
+	uint32_t words[3] = {
+		index->group_id,
+		((uint32_t)index->prefix.afi << 16) | index->prefix.safi,
+		prefix_hash_key(&index->prefix.prefix),
+	};
+
+	return jhash2(words, array_size(words), 0);
+}
+
+static bool midr_lsdb_contributor_hash_cmp(const void *a, const void *b)
+{
+	const struct midr_lsdb_contributor_index *left = a;
+	const struct midr_lsdb_contributor_index *right = b;
+
+	return left->group_id == right->group_id && left->prefix.afi == right->prefix.afi &&
+	       left->prefix.safi == right->prefix.safi &&
+	       prefix_same(&left->prefix.prefix, &right->prefix.prefix);
+}
+
+static void *midr_lsdb_contributor_hash_alloc(void *arg)
+{
+	const struct midr_lsdb_contributor_index *source = arg;
+	struct midr_lsdb_contributor_index *index;
+
+	index = XCALLOC(MTYPE_MIDR_LSDB_INDEX, sizeof(*index));
+	*index = *source;
+	return index;
+}
+
 static void *midr_lsdb_group_hash_alloc(void *arg)
 {
 	const struct midr_lsdb_group_index *source = arg;
@@ -228,6 +269,9 @@ static struct midr_lsdb_state *midr_lsdb_state_new(void)
 	state->groups = hash_create(midr_lsdb_group_hash_key,
 				    midr_lsdb_group_hash_cmp,
 				    "MIDR LSDB groups");
+	state->contributors = hash_create(midr_lsdb_contributor_hash_key,
+					  midr_lsdb_contributor_hash_cmp,
+					  "MIDR LSDB prefix contributors");
 	state->pending_links = hash_create(midr_lsdb_identity_hash_key,
 					   midr_lsdb_identity_hash_cmp,
 					   "MIDR LSDB pending links");
@@ -245,6 +289,7 @@ static void midr_lsdb_state_free(struct midr_lsdb_state **statep)
 	hash_clean_and_free(&state->link_endpoints, midr_lsdb_index_free);
 	hash_clean_and_free(&state->group_members, NULL);
 	hash_clean_and_free(&state->groups, midr_lsdb_index_free);
+	hash_clean_and_free(&state->contributors, midr_lsdb_index_free);
 	hash_clean_and_free(&state->pending_links, NULL);
 	hash_clean_and_free(&state->identities, midr_lsdb_entry_free);
 	XFREE(MTYPE_MIDR_LSDB_STATE, state);
@@ -262,14 +307,14 @@ midr_lsdb_membership_lookup(struct midr_lsdb_state *state,
 	return hash_lookup(state->memberships, &lookup);
 }
 
-static bool midr_lsdb_group_exists(struct midr_lsdb_state *state,
-				   uint32_t group_id)
+static struct midr_lsdb_group_index *
+midr_lsdb_group_lookup(struct midr_lsdb_state *state, uint32_t group_id)
 {
 	struct midr_lsdb_group_index lookup = {
 		.group_id = group_id,
 	};
 
-	return hash_lookup(state->groups, &lookup) != NULL;
+	return hash_lookup(state->groups, &lookup);
 }
 
 static int midr_lsdb_capture_selected(
@@ -330,6 +375,22 @@ static void midr_lsdb_index_membership(struct hash_bucket *bucket,
 	group = hash_get(state->groups, &candidate,
 			 midr_lsdb_group_hash_alloc);
 	group->member_count++;
+	if (!group->representative_node_id ||
+	    ntohl(entry->object.key.originator_node_id) < ntohl(group->representative_node_id))
+		group->representative_node_id = entry->object.key.originator_node_id;
+}
+
+static void midr_lsdb_contributor_add(struct midr_lsdb_state *state, uint32_t group_id,
+				      const struct midr_ls_prefix_key *prefix)
+{
+	struct midr_lsdb_contributor_index candidate = {
+		.group_id = group_id,
+		.prefix = *prefix,
+	};
+	struct midr_lsdb_contributor_index *index;
+
+	index = hash_get(state->contributors, &candidate, midr_lsdb_contributor_hash_alloc);
+	index->contributor_count++;
 }
 
 static int midr_lsdb_endpoint_add(struct midr_lsdb_state *state,
@@ -418,19 +479,27 @@ static void midr_lsdb_derive_entry(struct hash_bucket *bucket, void *arg)
 			entry->usable = state->local_group_id == entry->scope_group_id;
 			if (!entry->usable)
 				entry->pending_reason = MIDR_LSDB_PENDING_SCOPE_INELIGIBLE;
+			else
+				midr_lsdb_contributor_add(state, entry->scope_group_id,
+							  &entry->object.key.u.node_prefix);
 		}
 		break;
-	case MIDR_NLRI_TYPE_GROUP_PREFIX:
-		if (!midr_lsdb_group_exists(
-			    state,
-			    entry->object.key.u.group_prefix.group_id))
-			entry->pending_reason =
-				MIDR_LSDB_PENDING_GROUP_MEMBERSHIP;
+	case MIDR_NLRI_TYPE_GROUP_PREFIX: {
+		struct midr_lsdb_group_index *group =
+			midr_lsdb_group_lookup(
+				state,
+				entry->object.key.u.group_prefix.group_id);
+
+		if (!group)
+			entry->pending_reason = MIDR_LSDB_PENDING_GROUP_MEMBERSHIP;
+		else if (entry->object.key.originator_node_id !=
+			 group->representative_node_id)
+			entry->pending_reason = MIDR_LSDB_PENDING_SCOPE_INELIGIBLE;
 		else {
 			entry->usable = true;
 			entry->scope = MIDR_LSDB_SCOPE_GLOBAL;
 		}
-		break;
+	} break;
 	case MIDR_NLRI_TYPE_RESERVED:
 	case MIDR_NLRI_TYPE_MEMBERSHIP:
 		break;
@@ -599,6 +668,8 @@ static int midr_lsdb_prepare_ted(
 	(void)midr_input_status_get(ctx, &input);
 	if (input.state == MIDR_INPUT_OUT_OF_SYNC)
 		reasons |= MIDR_TED_SYNC_REASON_RESYNC_FAILED;
+	if (!midr_prefix_is_ready(ctx))
+		reasons |= MIDR_TED_SYNC_REASON_RESYNC_FAILED;
 	state->sync_reason_flags = reasons;
 
 	local = hash_lookup(state->identities, &lookup);
@@ -608,6 +679,11 @@ static int midr_lsdb_prepare_ted(
 		state->ready = false;
 		return midr_ted_prepare_not_ready(
 			ctx, ctx->bgp->router_id.s_addr, reasons, prepared);
+	}
+	if (!midr_prefix_is_ready(ctx)) {
+		state->ready = false;
+		return midr_ted_prepare_not_ready(ctx, ctx->bgp->router_id.s_addr, reasons,
+						  prepared);
 	}
 	if (!midr_sync_view_ready(ctx, true, &reasons)) {
 		state->sync_reason_flags = reasons;
@@ -984,6 +1060,8 @@ static int midr_lsdb_process(struct midr_lsdb_store *store)
 		midr_lsdb_state_free(&old);
 	else
 		midr_lsdb_state_free(&staging);
+	if (changed)
+		midr_owned_group_reconcile(store->ctx);
 	store->last_error = 0;
 	return 0;
 
@@ -1284,6 +1362,79 @@ int midr_lsdb_summary_get(struct midr_context *ctx,
 	summary->node_prefix_count = state->node_prefix_count;
 	summary->group_prefix_count = state->group_prefix_count;
 	return 0;
+}
+
+int midr_lsdb_local_group_get(struct midr_context *ctx, uint32_t *group_id,
+			      uint32_t *representative_node_id)
+{
+	struct midr_lsdb_group_index *group;
+	struct midr_lsdb_state *state;
+
+	if (!group_id || !representative_node_id)
+		return -EINVAL;
+	*group_id = 0;
+	*representative_node_id = 0;
+	if (!ctx || !ctx->lsdb_store)
+		return -ENOENT;
+	state = ctx->lsdb_store->current;
+	if (!state || !state->local_group_id)
+		return -EAGAIN;
+	group = midr_lsdb_group_lookup(state, state->local_group_id);
+	if (!group || !group->representative_node_id)
+		return -EAGAIN;
+	*group_id = group->group_id;
+	*representative_node_id = group->representative_node_id;
+	return 0;
+}
+
+struct midr_lsdb_group_prefix_foreach_state {
+	struct midr_lsdb_state *state;
+	midr_lsdb_group_prefix_cb cb;
+	void *arg;
+	int result;
+};
+
+static void midr_lsdb_group_prefix_foreach_iter(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_lsdb_group_prefix_foreach_state *walk = arg;
+	struct midr_lsdb_contributor_index *index = bucket->data;
+	struct midr_lsdb_group_index *group;
+	struct midr_lsdb_group_prefix_candidate candidate;
+
+	if (walk->result || index->group_id != walk->state->local_group_id)
+		return;
+	group = midr_lsdb_group_lookup(walk->state, index->group_id);
+	if (!group || !group->representative_node_id)
+		return;
+	candidate = (struct midr_lsdb_group_prefix_candidate){
+		.group_id = index->group_id,
+		.representative_node_id = group->representative_node_id,
+		.prefix = index->prefix,
+		.contributor_count = index->contributor_count,
+	};
+	walk->result = walk->cb(&candidate, walk->arg);
+}
+
+int midr_lsdb_local_group_prefix_foreach(struct midr_context *ctx, midr_lsdb_group_prefix_cb cb,
+					 void *arg)
+{
+	struct midr_lsdb_group_prefix_foreach_state walk;
+	struct midr_lsdb_state *state;
+
+	if (!ctx || !ctx->lsdb_store)
+		return -ENOENT;
+	if (!cb)
+		return -EINVAL;
+	state = ctx->lsdb_store->current;
+	if (!state || !state->local_group_id)
+		return -EAGAIN;
+	walk = (struct midr_lsdb_group_prefix_foreach_state){
+		.state = state,
+		.cb = cb,
+		.arg = arg,
+	};
+	hash_iterate(state->contributors, midr_lsdb_group_prefix_foreach_iter, &walk);
+	return walk.result;
 }
 
 void midr_show_lsdb(struct vty *vty, struct midr_context *ctx)

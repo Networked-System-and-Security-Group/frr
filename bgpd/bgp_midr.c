@@ -13,6 +13,7 @@
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
@@ -157,6 +158,8 @@ static int midr_bgp_route_update(struct bgp *bgp, afi_t afi, safi_t safi, struct
 		ctx->midr->route_hook_events++;
 		if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
 			midr_lsdb_route_changed(ctx, bn, old_route, new_route);
+		else if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_UNICAST)
+			midr_prefix_route_changed(ctx, afi, safi, bn, old_route, new_route);
 	}
 
 	return 0;
@@ -180,6 +183,7 @@ void bgp_midr_init(struct bgp *bgp)
 
 	if (!bgp || bgp->midr_info)
 		return;
+	midr_hooks_register_once();
 
 	midr = XCALLOC(MTYPE_BGP_MIDR, sizeof(*midr));
 	midr->bgp = bgp;
@@ -230,9 +234,19 @@ void bgp_midr_init(struct bgp *bgp)
 		XFREE(MTYPE_BGP_MIDR, midr);
 		return;
 	}
-
 	bgp->midr_info = midr;
-	midr_hooks_register_once();
+	ret = midr_prefix_init(&midr->ctx);
+	if (ret) {
+		bgp->midr_info = NULL;
+		midr_input_finish(&midr->ctx);
+		midr_owned_finish(&midr->ctx);
+		midr_lsdb_finish(&midr->ctx);
+		midr_sync_finish(&midr->ctx);
+		midr_ted_context_finish(&midr->ctx);
+		midr_rib_finish(&midr->ctx);
+		XFREE(MTYPE_BGP_MIDR, midr);
+		return;
+	}
 }
 
 void bgp_midr_finish(struct bgp *bgp)
@@ -243,6 +257,7 @@ void bgp_midr_finish(struct bgp *bgp)
 		return;
 
 	midr = bgp->midr_info;
+	midr_prefix_finish(&midr->ctx);
 	midr_input_finish(&midr->ctx);
 	midr_owned_finish(&midr->ctx);
 	midr_lsdb_finish(&midr->ctx);

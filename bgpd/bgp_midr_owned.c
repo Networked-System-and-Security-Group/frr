@@ -17,14 +17,24 @@
 #include "bgpd/bgp_midr_cost.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 
 #define MIDR_LINK_ADVERTISEMENT_INTERVAL_MSEC 1000U
 #define MIDR_SEQUENCE_RETRY_MSEC 1000U
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_OWNED_STORE, "MIDR owned object store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_OWNED_ENTRY, "MIDR owned object entry");
+
+enum midr_owned_domain {
+	MIDR_OWNED_DOMAIN_TOPOLOGY = (1U << 0),
+	MIDR_OWNED_DOMAIN_NODE_PREFIX = (1U << 1),
+	MIDR_OWNED_DOMAIN_GROUP_PREFIX = (1U << 2),
+	MIDR_OWNED_DOMAIN_ALL = MIDR_OWNED_DOMAIN_TOPOLOGY | MIDR_OWNED_DOMAIN_NODE_PREFIX |
+				MIDR_OWNED_DOMAIN_GROUP_PREFIX,
+};
 
 struct midr_owned_entry {
 	struct midr_owned_store *store;
@@ -35,10 +45,27 @@ struct midr_owned_entry {
 	ifindex_t local_ifindex;
 	time_t last_advertised;
 	struct event *timer;
+	uint32_t domain;
 	bool advertised_present;
 	bool seen;
 	bool suppressed;
 };
+
+static uint32_t midr_owned_key_domain(const struct midr_ls_object_key *key)
+{
+	switch (key->type) {
+	case MIDR_NLRI_TYPE_MEMBERSHIP:
+	case MIDR_NLRI_TYPE_LINK:
+		return MIDR_OWNED_DOMAIN_TOPOLOGY;
+	case MIDR_NLRI_TYPE_NODE_PREFIX:
+		return MIDR_OWNED_DOMAIN_NODE_PREFIX;
+	case MIDR_NLRI_TYPE_GROUP_PREFIX:
+		return MIDR_OWNED_DOMAIN_GROUP_PREFIX;
+	case MIDR_NLRI_TYPE_RESERVED:
+		break;
+	}
+	return 0;
+}
 
 struct midr_owned_store {
 	struct midr_context *ctx;
@@ -47,10 +74,16 @@ struct midr_owned_store {
 	const struct midr_sequence_store_ops *sequence_ops;
 	void *sequence_arg;
 	struct event *sequence_retry;
+	struct event *takeover_timer;
 	uint32_t owner_node_id;
+	uint32_t representative_group_id;
+	uint32_t representative_candidate;
+	uint32_t takeover_delay_msec;
 	bool ready;
 	bool reconciling;
-	bool reconcile_again;
+	bool representative_committed;
+	bool takeover_delay_elapsed;
+	uint32_t pending_domains;
 	uint64_t sequence_failures;
 	uint64_t fightbacks;
 };
@@ -92,6 +125,7 @@ midr_owned_entry_get(struct midr_owned_store *store,
 
 	entry = hash_get(store->entries, &lookup, midr_owned_hash_alloc);
 	entry->store = store;
+	entry->domain = midr_owned_key_domain(key);
 	return entry;
 }
 
@@ -419,55 +453,220 @@ static int midr_owned_link_fact(const struct midr_link_update *link, void *arg)
 
 struct midr_owned_sweep {
 	struct midr_owned_store *store;
+	uint32_t domains;
 };
 
 static void midr_owned_mark_unseen(struct hash_bucket *bucket, void *arg)
 {
+	const struct midr_owned_sweep *sweep = arg;
 	struct midr_owned_entry *entry = bucket->data;
 
-	(void)arg;
-	entry->seen = false;
+	if (CHECK_FLAG(sweep->domains, entry->domain))
+		entry->seen = false;
 }
 
 static void midr_owned_sweep_unseen(struct hash_bucket *bucket, void *arg)
 {
-	struct midr_owned_store *store = arg;
+	struct midr_owned_sweep *sweep = arg;
 	struct midr_owned_entry *entry = bucket->data;
 
-	if (entry->seen)
+	if (!CHECK_FLAG(sweep->domains, entry->domain) || entry->seen)
 		return;
 	event_cancel(&entry->timer);
-	midr_owned_path_withdraw(store, entry);
+	midr_owned_path_withdraw(sweep->store, entry);
 }
 
-void midr_owned_reconcile(struct midr_context *ctx)
+static int midr_owned_node_prefix(const struct prefix *prefix, void *arg)
+{
+	struct midr_owned_store *store = arg;
+	struct midr_ls_object object = {
+		.key =
+			{
+				.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+				.originator_node_id = store->owner_node_id,
+				.u.node_prefix =
+					{
+						.afi =
+							family2afi(
+								prefix
+									->family),
+						.safi = SAFI_UNICAST,
+					},
+			},
+	};
+	struct midr_owned_entry *entry;
+
+	prefix_copy(&object.key.u.node_prefix.prefix, prefix);
+	apply_mask(&object.key.u.node_prefix.prefix);
+	entry = midr_owned_entry_get(store, &object.key);
+	entry->seen = true;
+	return midr_owned_publish(store, entry, &object, 0);
+}
+
+static int midr_owned_group_prefix(const struct midr_lsdb_group_prefix_candidate *candidate,
+				   void *arg)
+{
+	struct midr_owned_store *store = arg;
+	struct midr_ls_object object = {
+		.key =
+			{
+				.type = MIDR_NLRI_TYPE_GROUP_PREFIX,
+				.originator_node_id = store->owner_node_id,
+				.u.group_prefix =
+					{
+						.group_id =
+							candidate->group_id,
+						.prefix =
+							candidate->prefix,
+					},
+			},
+	};
+	struct midr_owned_entry *entry;
+
+	if (!candidate->contributor_count ||
+	    candidate->representative_node_id != store->owner_node_id)
+		return 0;
+	entry = midr_owned_entry_get(store, &object.key);
+	entry->seen = true;
+	return midr_owned_publish(store, entry, &object, 0);
+}
+
+static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t domains)
 {
 	struct midr_owned_store *store;
+	struct midr_owned_sweep sweep;
 
 	if (!ctx || !ctx->owned_store)
 		return;
 	store = ctx->owned_store;
 	if (store->reconciling) {
-		store->reconcile_again = true;
+		SET_FLAG(store->pending_domains, domains);
 		return;
 	}
 
 	store->reconciling = true;
+	SET_FLAG(store->pending_domains, domains);
 	do {
-		store->reconcile_again = false;
-		hash_iterate(store->entries, midr_owned_mark_unseen, NULL);
-		if (store->owner_node_id != ctx->bgp->router_id.s_addr)
+		domains = store->pending_domains;
+		store->pending_domains = 0;
+		sweep.store = store;
+		sweep.domains = domains;
+		hash_iterate(store->entries, midr_owned_mark_unseen, &sweep);
+		if (CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_TOPOLOGY) &&
+		    store->owner_node_id != ctx->bgp->router_id.s_addr)
 			midr_owned_identity_start(ctx,
 						  ctx->bgp->router_id.s_addr);
-		if (store->ready) {
+		if (store->ready &&
+		    CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_TOPOLOGY)) {
 			(void)midr_local_fact_foreach(ctx, midr_owned_node_fact,
 						     midr_owned_link_fact,
 						     store);
 		}
-		hash_iterate(store->entries, midr_owned_sweep_unseen, store);
-	} while (store->reconcile_again);
+		if (store->ready && CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_NODE_PREFIX))
+			(void)midr_prefix_contributor_foreach(ctx, midr_owned_node_prefix, store);
+		if (store->ready && store->representative_committed &&
+		    CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_GROUP_PREFIX))
+			(void)midr_lsdb_local_group_prefix_foreach(ctx, midr_owned_group_prefix,
+								   store);
+		hash_iterate(store->entries, midr_owned_sweep_unseen, &sweep);
+	} while (store->pending_domains);
 	store->reconciling = false;
 	midr_lsdb_local_metadata_changed(ctx);
+}
+
+void midr_owned_reconcile(struct midr_context *ctx)
+{
+	midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_TOPOLOGY);
+}
+
+void midr_owned_prefix_reconcile(struct midr_context *ctx)
+{
+	midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_NODE_PREFIX);
+}
+
+static bool midr_owned_group_prefix_gate_ready(struct midr_owned_store *store)
+{
+	struct midr_sync_status sync;
+
+	if (!store->ready || !midr_prefix_is_ready(store->ctx))
+		return false;
+	if (midr_sync_status_get(store->ctx, &sync) != 0)
+		return false;
+	return sync.state == MIDR_SYNC_READY;
+}
+
+static void midr_owned_takeover_timer_cb(struct event *event)
+{
+	struct midr_owned_store *store = EVENT_ARG(event);
+
+	if (!store)
+		return;
+	store->takeover_timer = NULL;
+	store->takeover_delay_elapsed = true;
+	midr_owned_group_reconcile(store->ctx);
+}
+
+static void midr_owned_takeover_schedule(struct midr_owned_store *store)
+{
+	if (store->takeover_timer || store->takeover_delay_elapsed)
+		return;
+	if (!store->takeover_delay_msec) {
+		store->takeover_delay_elapsed = true;
+		return;
+	}
+	if (bm && bm->master)
+		event_add_timer_msec(bm->master, midr_owned_takeover_timer_cb, store,
+				     store->takeover_delay_msec, &store->takeover_timer);
+}
+
+void midr_owned_group_reconcile(struct midr_context *ctx)
+{
+	struct midr_owned_store *store;
+	uint32_t representative = 0;
+	uint32_t group_id = 0;
+	bool candidate_changed;
+
+	if (!ctx || !ctx->owned_store)
+		return;
+	store = ctx->owned_store;
+	(void)midr_lsdb_local_group_get(ctx, &group_id, &representative);
+	candidate_changed = group_id != store->representative_group_id ||
+			    representative != store->representative_candidate;
+	if (candidate_changed) {
+		event_cancel(&store->takeover_timer);
+		store->representative_group_id = group_id;
+		store->representative_candidate = representative;
+		store->representative_committed = false;
+		store->takeover_delay_elapsed = false;
+		midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_GROUP_PREFIX);
+	}
+
+	if (!group_id || representative != store->owner_node_id) {
+		event_cancel(&store->takeover_timer);
+		store->representative_committed = false;
+		store->takeover_delay_elapsed = false;
+		midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_GROUP_PREFIX);
+		return;
+	}
+
+	if (!midr_owned_group_prefix_gate_ready(store)) {
+		if (store->representative_committed) {
+			store->representative_committed = false;
+			store->takeover_delay_elapsed = false;
+		}
+		midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_GROUP_PREFIX);
+		return;
+	}
+
+	if (!store->representative_committed) {
+		midr_owned_takeover_schedule(store);
+		if (!store->takeover_delay_elapsed) {
+			midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_GROUP_PREFIX);
+			return;
+		}
+		store->representative_committed = true;
+	}
+	midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_GROUP_PREFIX);
 }
 
 static void midr_owned_reconcile_event(struct event *event)
@@ -480,7 +679,7 @@ static void midr_owned_reconcile_event(struct event *event)
 	if (!store->ready)
 		(void)midr_owned_allocator_start(
 			store, store->ctx->bgp->router_id.s_addr);
-	midr_owned_reconcile(store->ctx);
+	midr_owned_reconcile_domains(store->ctx, MIDR_OWNED_DOMAIN_ALL);
 }
 
 void midr_owned_input_state_changed(struct midr_context *ctx)
@@ -496,9 +695,14 @@ void midr_owned_identity_withdraw(struct midr_context *ctx)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
 	store->ready = false;
 	store->owner_node_id = 0;
+	store->representative_group_id = 0;
+	store->representative_candidate = 0;
+	store->representative_committed = false;
+	store->takeover_delay_elapsed = false;
 	memset(&store->allocator, 0, sizeof(store->allocator));
 	midr_owned_input_state_changed(ctx);
 }
@@ -511,7 +715,12 @@ void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
+	store->representative_group_id = 0;
+	store->representative_candidate = 0;
+	store->representative_committed = false;
+	store->takeover_delay_elapsed = false;
 	(void)midr_owned_allocator_start(store, node_id);
 	if (node_id && !store->ready)
 		midr_owned_schedule_sequence_retry(store);
@@ -533,6 +742,7 @@ int midr_owned_init(struct midr_context *ctx)
 				     midr_owned_hash_cmp,
 				     "MIDR owned objects");
 	store->sequence_ops = &midr_sequence_frr_store_ops;
+	store->takeover_delay_msec = MIDR_GROUP_PREFIX_TAKEOVER_DELAY_DEFAULT_MSEC;
 	ctx->owned_store = store;
 	if (ctx->bgp->router_id.s_addr)
 		(void)midr_owned_allocator_start(store,
@@ -548,6 +758,7 @@ void midr_owned_finish(struct midr_context *ctx)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
 	hash_clean_and_free(&store->entries, midr_owned_entry_free);
 	ctx->owned_store = NULL;
@@ -616,6 +827,10 @@ static void midr_owned_count_iter(struct hash_bucket *bucket, void *arg)
 			state->summary->membership_count++;
 		else if (entry->key.type == MIDR_NLRI_TYPE_LINK)
 			state->summary->link_count++;
+		else if (entry->key.type == MIDR_NLRI_TYPE_NODE_PREFIX)
+			state->summary->node_prefix_count++;
+		else if (entry->key.type == MIDR_NLRI_TYPE_GROUP_PREFIX)
+			state->summary->group_prefix_count++;
 	}
 	if (entry->suppressed)
 		state->summary->suppressed_link_count++;
@@ -641,6 +856,11 @@ int midr_owned_summary_get(struct midr_context *ctx,
 	summary->owner_node_id = store->owner_node_id;
 	summary->sequence_failures = store->sequence_failures;
 	summary->fightbacks = store->fightbacks;
+	summary->representative_group_id = store->representative_group_id;
+	summary->representative_candidate = store->representative_candidate;
+	summary->representative_committed = store->representative_committed;
+	summary->takeover_delay_msec = store->takeover_delay_msec;
+	summary->takeover_timer_pending = store->takeover_timer != NULL;
 	hash_iterate(store->entries, midr_owned_count_iter, &state);
 	return 0;
 }
@@ -661,19 +881,58 @@ void midr_show_owned(struct vty *vty, struct midr_context *ctx)
 	vty_out(vty, "  memberships:        %zu\n",
 		summary.membership_count);
 	vty_out(vty, "  links:              %zu\n", summary.link_count);
-	vty_out(vty, "  suppressed links:   %zu\n",
-		summary.suppressed_link_count);
-	vty_out(vty, "  pending timers:     %zu\n",
-		summary.pending_timer_count);
-	vty_out(vty, "  sequence failures:  %" PRIu64 "\n",
-		summary.sequence_failures);
-	vty_out(vty, "  fightbacks:         %" PRIu64 "\n",
-		summary.fightbacks);
+	vty_out(vty, "  node prefixes:      %zu\n", summary.node_prefix_count);
+	vty_out(vty, "  group prefixes:     %zu\n", summary.group_prefix_count);
+	vty_out(vty, "  suppressed links:   %zu\n", summary.suppressed_link_count);
+	vty_out(vty, "  pending timers:     %zu\n", summary.pending_timer_count);
+	vty_out(vty, "  representative group: %u\n", summary.representative_group_id);
+	if (summary.representative_candidate) {
+		struct in_addr representative = {
+			.s_addr = summary.representative_candidate,
+		};
+
+		vty_out(vty, "  representative:     %pI4 (%s)\n", &representative,
+			summary.representative_committed ? "COMMITTED" : "PENDING");
+	}
+	vty_out(vty, "  takeover delay:     %u ms%s\n", summary.takeover_delay_msec,
+		summary.takeover_timer_pending ? " (timer pending)" : "");
+	vty_out(vty, "  sequence failures:  %" PRIu64 "\n", summary.sequence_failures);
+	vty_out(vty, "  fightbacks:         %" PRIu64 "\n", summary.fightbacks);
 }
 
-int midr_owned_test_set_sequence_store(
-	struct midr_context *ctx, const struct midr_sequence_store_ops *ops,
-	void *arg)
+int midr_owned_takeover_delay_set(struct midr_context *ctx, uint32_t delay_msec)
+{
+	struct midr_owned_store *store;
+
+	if (!ctx || !ctx->owned_store)
+		return -ENOENT;
+	if (delay_msec > MIDR_GROUP_PREFIX_TAKEOVER_DELAY_MAX_MSEC)
+		return -EINVAL;
+	store = ctx->owned_store;
+	if (store->takeover_delay_msec == delay_msec)
+		return 0;
+	store->takeover_delay_msec = delay_msec;
+	if (!store->representative_committed &&
+	    store->representative_candidate == store->owner_node_id) {
+		event_cancel(&store->takeover_timer);
+		store->takeover_delay_elapsed = delay_msec == 0;
+		midr_owned_group_reconcile(ctx);
+	}
+	return 0;
+}
+
+int midr_owned_takeover_delay_get(struct midr_context *ctx, uint32_t *delay_msec)
+{
+	if (!delay_msec)
+		return -EINVAL;
+	if (!ctx || !ctx->owned_store)
+		return -ENOENT;
+	*delay_msec = ctx->owned_store->takeover_delay_msec;
+	return 0;
+}
+
+int midr_owned_test_set_sequence_store(struct midr_context *ctx,
+				       const struct midr_sequence_store_ops *ops, void *arg)
 {
 	struct midr_owned_store *store;
 
@@ -706,4 +965,18 @@ void midr_owned_test_fire_timers(struct midr_context *ctx)
 		return;
 	hash_iterate(ctx->owned_store->entries, midr_owned_fire_timer_iter,
 		     ctx->owned_store);
+}
+
+void midr_owned_test_fire_takeover(struct midr_context *ctx)
+{
+	struct midr_owned_store *store;
+
+	if (!ctx || !ctx->owned_store)
+		return;
+	store = ctx->owned_store;
+	if (!store->takeover_timer)
+		return;
+	event_cancel(&store->takeover_timer);
+	store->takeover_delay_elapsed = true;
+	midr_owned_group_reconcile(ctx);
 }

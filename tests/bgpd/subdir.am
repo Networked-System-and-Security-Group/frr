@@ -173,6 +173,15 @@ tests_bgpd_test_midr_owned_SOURCES = tests/bgpd/test_midr_owned.c
 
 
 if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_prefix
+endif
+tests_bgpd_test_midr_prefix_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_prefix_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_prefix_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_prefix_SOURCES = tests/bgpd/test_midr_prefix.c
+
+
+if BGPD
 check_PROGRAMS += tests/bgpd/test_midr_lsdb
 endif
 tests_bgpd_test_midr_lsdb_CFLAGS = $(TESTS_CFLAGS)

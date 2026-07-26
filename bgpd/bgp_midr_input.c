@@ -17,6 +17,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 
 #define MIDR_EVENT_QUEUE_LIMIT 4096U
@@ -831,6 +832,7 @@ int midr_input_router_id_update(struct bgp *bgp, bool withdraw)
 	if (withdraw) {
 		had_identity = store->owner_node_id != 0;
 		midr_owned_identity_withdraw(ctx);
+		midr_prefix_identity_withdraw(ctx);
 		event_cancel(&store->t_process);
 		event_cancel(&store->t_resync);
 		store->event_dropped_resync += midr_queue_discard(store->normal_queue);
@@ -850,6 +852,7 @@ int midr_input_router_id_update(struct bgp *bgp, bool withdraw)
 
 	store->owner_node_id = bgp->router_id.s_addr;
 	midr_owned_identity_start(ctx, store->owner_node_id);
+	midr_prefix_identity_start(ctx);
 	if (!store->owner_node_id) {
 		store->state = MIDR_INPUT_IDENTITY_RESTART;
 		return 0;

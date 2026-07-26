@@ -12,6 +12,7 @@ struct bgp_midr;
 struct midr_input_store;
 struct midr_lsdb_store;
 struct midr_owned_store;
+struct midr_prefix_store;
 struct midr_rib_store;
 struct midr_sync_store;
 struct midr_ted_store;
@@ -22,6 +23,7 @@ struct midr_context {
 	struct bgp_midr *midr;
 	struct midr_input_store *input_store;
 	struct midr_owned_store *owned_store;
+	struct midr_prefix_store *prefix_store;
 	struct midr_rib_store *rib_store;
 	struct midr_sync_store *sync_store;
 	struct midr_lsdb_store *lsdb_store;

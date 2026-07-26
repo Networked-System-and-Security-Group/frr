@@ -9,6 +9,7 @@
 #include <zebra.h>
 
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_ls.h"
 
 struct bgp_dest;
 struct bgp_path_info;
@@ -45,6 +46,16 @@ struct midr_lsdb_summary {
 	int last_error;
 };
 
+struct midr_lsdb_group_prefix_candidate {
+	uint32_t group_id;
+	uint32_t representative_node_id;
+	struct midr_ls_prefix_key prefix;
+	size_t contributor_count;
+};
+
+typedef int (*midr_lsdb_group_prefix_cb)(const struct midr_lsdb_group_prefix_candidate *candidate,
+					 void *arg);
+
 extern int midr_lsdb_init(struct midr_context *ctx);
 extern void midr_lsdb_finish(struct midr_context *ctx);
 extern void midr_lsdb_route_changed(struct midr_context *ctx,
@@ -64,6 +75,10 @@ extern void midr_lsdb_remote_snapshot_release(
 extern int midr_lsdb_summary_get(struct midr_context *ctx,
 				 struct midr_lsdb_summary *summary);
 extern void midr_show_lsdb(struct vty *vty, struct midr_context *ctx);
+extern int midr_lsdb_local_group_get(struct midr_context *ctx, uint32_t *group_id,
+				     uint32_t *representative_node_id);
+extern int midr_lsdb_local_group_prefix_foreach(struct midr_context *ctx,
+						midr_lsdb_group_prefix_cb cb, void *arg);
 
 extern int midr_lsdb_test_process(struct midr_context *ctx);
 extern void midr_lsdb_test_fail_next_prepare(struct midr_context *ctx);
