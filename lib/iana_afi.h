@@ -38,7 +38,8 @@ typedef enum {
 	IANA_SAFI_EVPN = 70,
 	IANA_SAFI_BGP_LS = 71, /* BGP-LS per RFC 9552 */
 	IANA_SAFI_MPLS_VPN = 128,
-	IANA_SAFI_FLOWSPEC = 133
+	IANA_SAFI_FLOWSPEC = 133,
+	IANA_SAFI_MIDR_LS = 241 /* Development-only value. */
 } iana_safi_t;
 
 static inline afi_t afi_iana2int(iana_afi_t afi)
@@ -102,6 +103,9 @@ static inline safi_t safi_iana2int(iana_safi_t safi)
 		return SAFI_FLOWSPEC;
 	case IANA_SAFI_BGP_LS:
 		return SAFI_BGP_LS;
+	case IANA_SAFI_MIDR_LS:
+		/* The internal SAFI and RIB integration are added in M4. */
+		return SAFI_MAX;
 	case IANA_SAFI_RESERVED:
 		return SAFI_MAX;
 	}
