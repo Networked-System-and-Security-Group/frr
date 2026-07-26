@@ -1,0 +1,20 @@
+[
+  {
+    "id": "M7-TED-001",
+    "command": ["tests/bgpd/test_midr_lsdb"],
+    "expect": "MIDR LSDB and production TED tests passed",
+    "description": "real and mock TED parity"
+  },
+  {
+    "id": "M7-TED-002",
+    "command": ["tests/bgpd/test_midr_lsdb"],
+    "expect": "MIDR LSDB and production TED tests passed",
+    "description": "public TED consumer lifecycle"
+  },
+  {
+    "id": "M7-TED-003",
+    "command": ["midr-test/run-m5-multinode.sh", "prefix"],
+    "expect": "PASS: MIDR M5 rootless prefix",
+    "description": "remote prefix-to-group delivery"
+  }
+]
