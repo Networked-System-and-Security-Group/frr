@@ -14,6 +14,9 @@ SCENARIOS=(
 	triangle
 	eor-timeout
 	route-refresh
+	prefix
+	prefix-withdraw
+	prefix-takeover
 )
 
 usage()
@@ -229,6 +232,35 @@ inject_link()
 		"midr topology link upsert ${NODE_IP[$node]} ${NODE_IP[$remote]} id $link_id local-address 198.51.100.$link_id remote-address 198.51.101.$link_id rtt-us 1000 loss-ppm 100 available-bandwidth-kbps 100000 version 1"
 }
 
+configure_prefix()
+{
+	local node="$1"
+	local prefix="$2"
+
+	vty "$node" -c "configure terminal" \
+		-c "route-map EXPORT-MIDR permit 10" \
+		-c "exit"
+	vty "$node" -c "configure terminal" \
+		-c "router bgp 65000" \
+		-c "no bgp network import-check" \
+		-c "midr group-prefix takeover-delay-ms 500" \
+		-c "address-family ipv4 unicast" \
+		-c "midr prefix-export route-map EXPORT-MIDR" \
+		-c "midr prefix-export local-source network" \
+		-c "network $prefix"
+}
+
+withdraw_prefix()
+{
+	local node="$1"
+	local prefix="$2"
+
+	vty "$node" -c "configure terminal" \
+		-c "router bgp 65000" \
+		-c "address-family ipv4 unicast" \
+		-c "no network $prefix"
+}
+
 wait_field()
 {
 	local node="$1"
@@ -332,6 +364,39 @@ case "$scenario" in
 		inject_membership r2 10
 		wait_field r1 "show midr sync" "timed-out peers:    0"
 		wait_field r2 "show midr sync" "state:              READY"
+		;;
+	prefix|prefix-withdraw|prefix-takeover)
+		for node in "${NODES[@]}"; do
+			inject_membership "$node" 10
+		done
+		for node in "${NODES[@]}"; do
+			wait_field "$node" "show midr sync" \
+				"state:              READY"
+		done
+		configure_prefix r1 203.0.113.0/24
+		if [[ "$scenario" == "prefix-takeover" ]]; then
+			configure_prefix r2 203.0.113.0/24
+		fi
+		wait_field r1 "show midr prefix summary" \
+			"contributors:      1"
+		wait_field r3 "show midr ted summary" \
+			"prefix-groups:         1"
+		if [[ "$scenario" == "prefix-withdraw" ]]; then
+			withdraw_prefix r1 203.0.113.0/24
+			wait_field r1 "show midr prefix summary" \
+				"contributors:      0"
+			wait_field r3 "show midr ted summary" \
+				"prefix-groups:         0"
+		elif [[ "$scenario" == "prefix-takeover" ]]; then
+			kill "$(cat "$RUN_DIR/r1/r1.pid")"
+			rm -f "$RUN_DIR/r1/r1.pid"
+			wait_field r2 "show midr owned" \
+				"group prefixes:     1"
+			wait_field r2 "show midr owned" \
+				"10.0.0.2 (COMMITTED)"
+			wait_field r3 "show midr ted summary" \
+				"prefix-groups:         1"
+		fi
 		;;
 esac
 
