@@ -46,6 +46,7 @@
 #include "bgp_flowspec_private.h"
 #include "bgp_mac.h"
 #include "bgpd/bgp_ls_nlri.h"
+#include "bgpd/bgp_midr_attr.h"
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -75,6 +76,8 @@ static const struct message attr_str[] = {
 	{BGP_ATTR_IPV6_EXT_COMMUNITIES, "IPV6_EXT_COMMUNITIES"},
 	{BGP_ATTR_AIGP, "AIGP"},
 	{BGP_ATTR_NHC, "Next Hop Dependent Characteristics"},
+	{BGP_ATTR_MIDR_LS, "MIDR_LINK_STATE"},
+	{BGP_ATTR_MIDR_PROPAGATION_PATH, "MIDR_PROPAGATION_PATH"},
 	{0}};
 
 static const struct message attr_flag_str[] = {
@@ -1057,6 +1060,11 @@ unsigned int attrhash_key_make(const void *p)
 		MIX(bgp_nhc_hash_key_make(bgp_attr_get_nhc(attr)));
 	if (bgp_attr_get_ls_attr(attr))
 		MIX(bgp_ls_attr_hash_key(bgp_attr_get_ls_attr(attr)));
+	if (attr->midr_ls)
+		MIX(bgp_midr_ls_attr_hash_key(attr->midr_ls));
+	if (attr->midr_propagation_path)
+		MIX(bgp_midr_propagation_path_attr_hash_key(
+			attr->midr_propagation_path));
 
 	return key;
 }
@@ -1108,6 +1116,9 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    !memcmp(&attr1->rmac, &attr2->rmac, sizeof(struct ethaddr)) &&
 		    bgp_nhc_same(bgp_attr_get_nhc(attr1), bgp_attr_get_nhc(attr2)) &&
 		    bgp_ls_attr_same(attr1->ls_attr, attr2->ls_attr) &&
+		    attr1->midr_ls == attr2->midr_ls &&
+		    attr1->midr_propagation_path ==
+			    attr2->midr_propagation_path &&
 		    (attr1->pmsi_tnl_type == attr2->pmsi_tnl_type) &&
 		    IPV6_ADDR_SAME(&attr1->tunn_id, &attr2->tunn_id))
 			return true;
@@ -1368,6 +1379,12 @@ struct attr *bgp_attr_intern(struct attr *attr)
 			bgp_attr_get_ls_attr(attr)->refcnt++;
 	}
 
+	if (attr->midr_ls)
+		bgp_midr_ls_attr_lock(attr->midr_ls);
+	if (attr->midr_propagation_path)
+		bgp_midr_propagation_path_attr_lock(
+			attr->midr_propagation_path);
+
 	/* At this point, attr only contains intern'd pointers.  that means
 	 * if we find it in attrhash, it has all the same pointers and we
 	 * correctly updated the refcounts on these.
@@ -1606,6 +1623,10 @@ void bgp_attr_unintern_sub(struct attr *attr)
 	ls_attr = bgp_attr_get_ls_attr(attr);
 	bgp_ls_attr_unintern(&ls_attr);
 	bgp_attr_set_ls_attr(attr, NULL);
+
+	bgp_midr_ls_attr_unintern(&attr->midr_ls);
+	bgp_midr_propagation_path_attr_unintern(
+		&attr->midr_propagation_path);
 }
 
 /* Clear cached intern_attr if it points to the attr that is being uninterned */
@@ -1721,6 +1742,10 @@ void bgp_attr_flush(struct attr *attr)
 		bgp_ls_attr_free(ls_attr);
 		bgp_attr_set_ls_attr(attr, NULL);
 	}
+
+	bgp_midr_ls_attr_unintern(&attr->midr_ls);
+	bgp_midr_propagation_path_attr_unintern(
+		&attr->midr_propagation_path);
 
 	nhc = bgp_attr_get_nhc(attr);
 	if (nhc && !nhc->refcnt) {
@@ -4262,6 +4287,15 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 				       bgp_size_t size, struct bgp_nlri *mp_update,
 				       struct bgp_nlri *mp_withdraw)
 {
+	struct {
+		struct {
+			const uint8_t *value;
+			size_t length;
+			uint8_t flags;
+			bool present;
+			bool duplicate;
+		} ls, propagation_path;
+	} midr_pending = {};
 	struct peer *peer = connection->peer;
 	enum bgp_attr_parse_ret ret;
 	uint8_t flag = 0;
@@ -4385,6 +4419,20 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 		 */
 
 		if (CHECK_BITMAP(seen, type)) {
+			if (type == BGP_ATTR_MIDR_LS ||
+			    type == BGP_ATTR_MIDR_PROPAGATION_PATH) {
+				if (type == BGP_ATTR_MIDR_LS)
+					midr_pending.ls.duplicate = true;
+				else
+					midr_pending.propagation_path
+						.duplicate = true;
+				stream_set_getp(
+					BGP_INPUT(connection),
+					attr_endp -
+						STREAM_DATA(BGP_INPUT(
+							connection)));
+				continue;
+			}
 			/* Only relax error handling for eBGP peers */
 			if (peer->sort != BGP_PEER_EBGP ||
 					type == BGP_ATTR_MP_REACH_NLRI || type == BGP_ATTR_MP_UNREACH_NLRI) {
@@ -4523,6 +4571,23 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 		case BGP_ATTR_LINK_STATE:
 			ret = bgp_attr_ls(&attr_args);
 			break;
+		case BGP_ATTR_MIDR_LS:
+			midr_pending.ls.value = BGP_INPUT_PNT(connection);
+			midr_pending.ls.length = length;
+			midr_pending.ls.flags = flag;
+			midr_pending.ls.present = true;
+			stream_forward_getp(BGP_INPUT(connection), length);
+			ret = BGP_ATTR_PARSE_PROCEED;
+			break;
+		case BGP_ATTR_MIDR_PROPAGATION_PATH:
+			midr_pending.propagation_path.value =
+				BGP_INPUT_PNT(connection);
+			midr_pending.propagation_path.length = length;
+			midr_pending.propagation_path.flags = flag;
+			midr_pending.propagation_path.present = true;
+			stream_forward_getp(BGP_INPUT(connection), length);
+			ret = BGP_ATTR_PARSE_PROCEED;
+			break;
 		default:
 			ret = bgp_attr_unknown(&attr_args);
 			break;
@@ -4560,6 +4625,35 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 					BGP_NOTIFY_UPDATE_ATTR_LENG_ERR);
 			ret = BGP_ATTR_PARSE_ERROR;
 			goto done;
+		}
+	}
+
+	if (bgp_midr_attr_family_is_midr(
+		    bgp_attr_exists(attr, BGP_ATTR_MP_REACH_NLRI),
+		    mp_update->afi, mp_update->safi)) {
+		if (midr_pending.ls.duplicate ||
+		    midr_pending.propagation_path.duplicate) {
+			ret = BGP_ATTR_PARSE_WITHDRAW;
+			goto done;
+		}
+		if (midr_pending.ls.present) {
+			ret = bgp_midr_attr_decode(
+				attr, BGP_ATTR_MIDR_LS,
+				midr_pending.ls.flags,
+				midr_pending.ls.value,
+				midr_pending.ls.length);
+			if (ret != BGP_ATTR_PARSE_PROCEED)
+				goto done;
+		}
+		if (midr_pending.propagation_path.present) {
+			ret = bgp_midr_attr_decode(
+				attr,
+				BGP_ATTR_MIDR_PROPAGATION_PATH,
+				midr_pending.propagation_path.flags,
+				midr_pending.propagation_path.value,
+				midr_pending.propagation_path.length);
+			if (ret != BGP_ATTR_PARSE_PROCEED)
+				goto done;
 		}
 	}
 
@@ -5859,6 +5953,7 @@ void bgp_attr_init(void)
 {
 	aspath_init();
 	attrhash_init();
+	bgp_midr_attr_init();
 	community_init();
 	ecommunity_init();
 	lcommunity_init();
@@ -5874,6 +5969,7 @@ void bgp_attr_finish(void)
 {
 	aspath_finish();
 	attrhash_finish();
+	bgp_midr_attr_finish();
 	community_finish();
 	ecommunity_finish();
 	lcommunity_finish();
