@@ -10,6 +10,7 @@
 struct bgp;
 struct bgp_midr;
 struct midr_input_store;
+struct midr_rib_store;
 struct midr_ted_store;
 struct vty;
 
@@ -17,6 +18,7 @@ struct midr_context {
 	struct bgp *bgp;
 	struct bgp_midr *midr;
 	struct midr_input_store *input_store;
+	struct midr_rib_store *rib_store;
 	struct midr_ted_store *ted_store;
 };
 
