@@ -99,6 +99,15 @@ tests_bgpd_test_midr_sequence_SOURCES = tests/bgpd/test_midr_sequence.c
 
 
 if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_cost
+endif
+tests_bgpd_test_midr_cost_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_cost_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_cost_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_cost_SOURCES = tests/bgpd/test_midr_cost.c
+
+
+if BGPD
 check_PROGRAMS += tests/bgpd/test_midr_resync
 endif
 tests_bgpd_test_midr_resync_CFLAGS = $(TESTS_CFLAGS)
