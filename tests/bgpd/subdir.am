@@ -189,7 +189,8 @@ tests_bgpd_test_midr_lsdb_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_midr_lsdb_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_midr_lsdb_SOURCES = \
 	tests/bgpd/test_midr_lsdb.c \
-	tests/bgpd/midr_ted_mock_provider.c
+	tests/bgpd/midr_ted_mock_provider.c \
+	tests/bgpd/test_midr_ted_consumer.c
 
 
 if BGPD
