@@ -1,6 +1,6 @@
 # MIDR 输入、TED 与协议对象测试
 
-本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper、不可变 TED snapshot、LS Object、sequence、cost、wire codec、MIDR SAFI RIB、owned object、LSDB、生产 TED，以及 M5 的多节点传播、scope、withdraw、EoR 和 Route Refresh。单节点 VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；M5 多节点测试使用 rootless user/network namespace 建立真实 BGP session。测试 Provider、TED fixture 和 fuzz corpus 均不进入生产 `bgpd` 数据路径。
+本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper、不可变 TED snapshot、LS Object、sequence、cost、wire codec、MIDR SAFI RIB、owned object、LSDB、生产 TED，以及多节点传播、Prefix Reachability、scope、withdraw、代表接管、EoR 和 Route Refresh。单节点 VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；多节点测试使用 rootless user/network namespace 建立真实 BGP session。测试 Provider、TED fixture 和 fuzz corpus均不进入生产 `bgpd` 数据路径。
 
 ## 目录结构
 
@@ -17,6 +17,9 @@ midr-test/
   run-m4-scenarios.sh    # M4 RIB/LSDB Gherkin 组件测试
   run-m5-multinode.sh    # M5 rootless 多节点传播测试
   run-m5-scenarios.py    # M5 Gherkin ID 与自动断言映射
+  run-m6-m7-scenarios.py # M6/M7 Gherkin ID 与自动断言映射
+  check-command-reference.py
+                          # 配置手册与实际 VTY 语法一致性检查
   ted-fixture-normalize.py
                           # 严格 YAML schema 到规范化 JSON
   expect/                # 固定字符串预期结果
@@ -48,6 +51,7 @@ make -j$(nproc) \
   tests/bgpd/test_midr_rib \
   tests/bgpd/test_midr_owned \
   tests/bgpd/test_midr_lsdb \
+  tests/bgpd/test_midr_prefix \
   tests/bgpd/test_midr_packet \
   tests/bgpd/test_midr_scope \
   tests/bgpd/test_midr_sync
@@ -82,6 +86,7 @@ make -j$(nproc) \
   tests/bgpd/test_midr_rib \
   tests/bgpd/test_midr_owned \
   tests/bgpd/test_midr_lsdb \
+  tests/bgpd/test_midr_prefix \
   tests/bgpd/test_midr_packet \
   tests/bgpd/test_midr_scope \
   tests/bgpd/test_midr_sync
@@ -163,6 +168,23 @@ python3 ./midr-test/run-m5-scenarios.py
 
 固定场景覆盖三节点线形传播、逐跳 `MP_UNREACH`、intra-group/global scope、三角拓扑 alternate path 与防环、EoR timeout/迟到恢复，以及 Route Refresh。M5 的阶段门禁以这些协议行为、完整 M0-M5 回归、Clang、ASAN/UBSAN/LeakSanitizer 和 codec fuzz 为主；覆盖率只用于定位明显缺失的关键分支，不设置为了达到单一百分比而反复补测的关闭门槛。
 
+运行 M6 Prefix Contributor、Node/Group Prefix、代表接管，以及 M7 TED parity/Consumer 场景：
+
+```bash
+./tests/bgpd/test_midr_prefix
+python3 ./midr-test/run-m6-m7-scenarios.py
+python3 ./midr-test/check-command-reference.py
+```
+
+单个 Gherkin 场景可按 ID 运行：
+
+```bash
+python3 ./midr-test/run-m6-m7-scenarios.py M6-PFX-004
+python3 ./midr-test/run-m6-m7-scenarios.py M7-TED-002
+```
+
+M6/M7 的 Gherkin 只映射跨模块和外部可观察行为。PFX-01 的字段级 eligibility、sequence 和异常输入由 `test_midr_prefix` 直接断言；真实 Node Prefix、Group Prefix、逐跳撤销和代表接管由 rootless 多节点场景断言；Real/Mock parity 和 public Consumer 生命周期由 `test_midr_lsdb` 断言。
+
 运行全部 M1 TED YAML/Gherkin 场景：
 
 ```bash
@@ -204,6 +226,7 @@ sync-status    输入状态、队列上限和 Provider 状态
 eor-config     EoR timeout 配置、持久化输出和默认值恢复
 router-id-restart
                Router-ID 变化时清理旧 identity，并将新输入置于 Resync Barrier 后
+prefix-config  Prefix policy、external source 和代表接管延迟配置
 ```
 
 每个场景的完整输出保存在 `midr-test/run/<scenario>.log`。缺少必要输出、出现禁止输出、命令无法解析、进程崩溃或超时都会使脚本返回非零。普通用户运行时出现 `/var/lib/frr` 或 `/var/run/frr` permission warning 不作为失败。
