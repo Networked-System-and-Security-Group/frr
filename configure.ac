@@ -231,6 +231,17 @@ AC_ARG_WITH([vici-socket], [AS_HELP_STRING([--with-vici-socket=PATH], [vici-sock
 ])
 AC_DEFINE_UNQUOTED([VICI_SOCKET], ["$vici_socket"], [StrongSWAN vici socket path])
 
+AC_ARG_WITH([midr-traceroute],
+	[AS_HELP_STRING([--with-midr-traceroute=PATH],
+		[absolute traceroute executable path used by MIDR; executable and parent directories must be root-owned and not group/world writable (/usr/bin/traceroute)])],
+	[midr_traceroute_path="$withval"],
+	[midr_traceroute_path="/usr/bin/traceroute"])
+AS_CASE([$midr_traceroute_path],
+	[/*], [],
+	[AC_MSG_ERROR([--with-midr-traceroute must be an absolute path])])
+AC_DEFINE_UNQUOTED([MIDR_TRACEROUTE_PATH], ["$midr_traceroute_path"],
+	[Absolute path of the controlled traceroute executable used by MIDR])
+
 AC_ARG_ENABLE(tcmalloc,
 	AS_HELP_STRING([--enable-tcmalloc], [Turn on tcmalloc]),
 [case "${enableval}" in
@@ -1169,7 +1180,7 @@ dnl -------------------------
 dnl Check other header files.
 dnl -------------------------
 AC_CHECK_HEADERS([ \
-	asm/types.h sys/endian.h])
+	asm/types.h spawn.h sys/endian.h])
 
 AC_CHECK_HEADER([endian.h], [], [
   AC_MSG_ERROR([missing endian.h])
@@ -1396,6 +1407,9 @@ AC_CHECK_FUNCS([ \
 	getgrouplist \
 	getloadavg \
 	openat \
+	pipe2 \
+	posix_spawn \
+	posix_spawn_file_actions_addclosefrom_np \
 	unlinkat \
 	posix_fallocate \
 	sendmmsg \

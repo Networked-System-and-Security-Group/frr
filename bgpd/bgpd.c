@@ -82,6 +82,7 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -9368,6 +9369,10 @@ void bgp_init(unsigned short instance)
 	/* Init zebra. */
 	bgp_zebra_init(bm->master, instance);
 
+	if (midr_trace_scheduler_init(bm->master) != 0)
+		zlog_warn(
+			"MIDR traceroute scheduler is unavailable; traceroute requests will be rejected");
+
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
 #endif
@@ -9426,6 +9431,14 @@ void bgp_terminate(void)
 	struct peer *peer;
 	struct listnode *node, *nnode;
 	struct listnode *mnode, *mnnode;
+
+	/*
+	 * No further event-loop iteration is guaranteed after this function.
+	 * First settle callbacks while their consumers are alive, then perform
+	 * the executor's synchronous child/fd teardown.
+	 */
+	midr_trace_scheduler_quiesce();
+	midr_trace_scheduler_fini();
 
 	QOBJ_UNREG(bm);
 

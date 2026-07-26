@@ -64,7 +64,9 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/midr_ip2asn.c \
 	bgpd/midr_tier1.c \
 	bgpd/midr_tier1_vty.c \
+	bgpd/midr_trace_exec.c \
 	bgpd/midr_trace_observer.c \
+	bgpd/midr_trace_scheduler.c \
 	bgpd/bgp_open.c \
 	bgpd/bgp_packet.c \
 	bgpd/bgp_pbr.c \
@@ -173,6 +175,12 @@ noinst_HEADERS += \
 	bgpd/bgp_zebra.h \
 	bgpd/bgpd.h \
 	bgpd/bgp_trace.h \
+	bgpd/midr_ip2asn.h \
+	bgpd/midr_tier1.h \
+	bgpd/midr_tier1_vty.h \
+	bgpd/midr_trace_exec.h \
+	bgpd/midr_trace_observer.h \
+	bgpd/midr_trace_scheduler.h \
 	bgpd/bgp_nhg.h \
 	bgpd/bgp_attr_srv6.h \
 	bgpd/bgp_srv6.h \

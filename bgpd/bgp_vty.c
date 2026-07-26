@@ -69,6 +69,7 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/midr_ip2asn.h"
 #include "bgpd/midr_tier1_vty.h"
+#include "bgpd/midr_trace_scheduler.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
@@ -21905,6 +21906,8 @@ int bgp_config_write(struct vty *vty)
 
 	vty_out(vty, "!\n");
 	if (midr_ip2asn_config_write(vty))
+		vty_out(vty, "!\n");
+	if (midr_trace_scheduler_config_write(vty))
 		vty_out(vty, "!\n");
 
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
