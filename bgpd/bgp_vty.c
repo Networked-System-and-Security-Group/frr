@@ -51,6 +51,7 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
@@ -21822,6 +21823,7 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 	bgp_config_write_network(vty, bgp, afi, safi);
 
 	bgp_config_write_redistribute(vty, bgp, afi, safi);
+	midr_prefix_config_write_family(vty, bgp, afi, safi);
 
 	bgp_config_write_ipv6_nexthop_prefer_global(vty, bgp, afi, safi);
 

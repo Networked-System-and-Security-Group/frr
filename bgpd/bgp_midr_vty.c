@@ -15,6 +15,7 @@
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
@@ -83,6 +84,175 @@ static struct midr_context *midr_vty_context(struct vty *vty)
 		vty_out(vty, "%% MIDR is not initialized\n");
 
 	return ctx;
+}
+
+static bool midr_vty_prefix_family(struct vty *vty, afi_t *afi)
+{
+	*afi = bgp_node_afi(vty);
+	return (*afi == AFI_IP || *afi == AFI_IP6) && bgp_node_safi(vty) == SAFI_UNICAST;
+}
+
+DEFUN(show_midr_prefix_summary, show_midr_prefix_summary_cmd,
+      "show midr prefix summary",
+      SHOW_STR
+      "MIDR information\n"
+      "Prefix input and origination\n"
+      "Prefix input status and counters\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_prefix_summary(vty, ctx);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_prefix_contributors, show_midr_prefix_contributors_cmd,
+      "show midr prefix contributors",
+      SHOW_STR
+      "MIDR information\n"
+      "Prefix input and origination\n"
+      "Active local contributor prefixes\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_prefix_contributors(vty, ctx);
+	return CMD_SUCCESS;
+}
+
+DEFUN(midr_external_prefix_source, midr_external_prefix_source_cmd,
+      "neighbor <A.B.C.D|X:X::X:X|WORD> midr external-prefix-source",
+      NEIGHBOR_STR
+      "Neighbor address or interface\n"
+      "Neighbor address or interface\n"
+      "Neighbor address or interface\n"
+      "MIDR configuration\n"
+      "Classify this peer as an external Prefix source\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct peer *peer;
+	afi_t afi;
+
+	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi))
+		return CMD_WARNING_CONFIG_FAILED;
+	peer = peer_and_group_lookup_vty(vty, argv[1]->arg);
+	if (!peer)
+		return CMD_WARNING_CONFIG_FAILED;
+	if (midr_prefix_external_peer_set(&bgp->midr_info->ctx, peer, afi, true) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_external_prefix_source, no_midr_external_prefix_source_cmd,
+      "no neighbor <A.B.C.D|X:X::X:X|WORD> midr external-prefix-source",
+      NO_STR
+      NEIGHBOR_STR
+      "Neighbor address or interface\n"
+      "Neighbor address or interface\n"
+      "Neighbor address or interface\n"
+      "MIDR configuration\n"
+      "Classify this peer as an external Prefix source\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct peer *peer;
+	afi_t afi;
+
+	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi))
+		return CMD_WARNING_CONFIG_FAILED;
+	peer = peer_and_group_lookup_vty(vty, argv[2]->arg);
+	if (!peer)
+		return CMD_WARNING_CONFIG_FAILED;
+	if (midr_prefix_external_peer_set(&bgp->midr_info->ctx, peer, afi, false) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+DEFUN(midr_prefix_export_route_map, midr_prefix_export_route_map_cmd,
+      "midr prefix-export route-map WORD",
+      "MIDR configuration\n"
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Apply a route-map; permit is required\n"
+      "Route-map name\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi;
+
+	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi) ||
+	    midr_prefix_route_map_set(&bgp->midr_info->ctx, afi, argv[3]->arg) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_prefix_export_route_map, no_midr_prefix_export_route_map_cmd,
+      "no midr prefix-export route-map [WORD]",
+      NO_STR
+      "MIDR configuration\n"
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Apply a route-map; permit is required\n"
+      "Route-map name\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi;
+
+	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi) ||
+	    midr_prefix_route_map_unset(&bgp->midr_info->ctx, afi) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+static uint32_t midr_vty_local_source(const char *name)
+{
+	if (strcmp(name, "network") == 0)
+		return MIDR_PREFIX_SOURCE_NETWORK;
+	if (strcmp(name, "connected") == 0)
+		return MIDR_PREFIX_SOURCE_CONNECTED;
+	if (strcmp(name, "static") == 0)
+		return MIDR_PREFIX_SOURCE_STATIC;
+	return 0;
+}
+
+DEFUN(midr_prefix_export_local_source, midr_prefix_export_local_source_cmd,
+      "midr prefix-export local-source <network|connected|static>",
+      "MIDR configuration\n"
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Allow an explicit local route source\n"
+      "BGP network statement\n"
+      "Redistributed connected route\n"
+      "Redistributed static route\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	uint32_t source;
+	afi_t afi;
+
+	source = midr_vty_local_source(argv[3]->arg);
+	if (!bgp || !bgp->midr_info || !source || !midr_vty_prefix_family(vty, &afi) ||
+	    midr_prefix_local_source_set(&bgp->midr_info->ctx, afi, source, true) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_prefix_export_local_source,
+      no_midr_prefix_export_local_source_cmd,
+      "no midr prefix-export local-source <network|connected|static>",
+      NO_STR
+      "MIDR configuration\n"
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Allow an explicit local route source\n"
+      "BGP network statement\n"
+      "Redistributed connected route\n"
+      "Redistributed static route\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	uint32_t source;
+	afi_t afi;
+
+	source = midr_vty_local_source(argv[4]->arg);
+	if (!bgp || !bgp->midr_info || !source || !midr_vty_prefix_family(vty, &afi) ||
+	    midr_prefix_local_source_set(&bgp->midr_info->ctx, afi, source, false) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
 }
 
 DEFUN(show_midr_owned, show_midr_owned_cmd,
@@ -299,15 +469,54 @@ DEFUN(no_midr_eor_timeout, no_midr_eor_timeout_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN(midr_group_prefix_takeover_delay,
+      midr_group_prefix_takeover_delay_cmd,
+      "midr group-prefix takeover-delay-ms (0-600000)",
+      "MIDR configuration\n"
+      "Representative-originated Group Prefixes\n"
+      "Delay before a new representative originates Group Prefixes\n"
+      "Delay in milliseconds; zero disables the delay\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	uint32_t delay_msec;
+
+	if (!bgp || !bgp->midr_info || midr_parse_u32(argv[3]->arg, &delay_msec) != 0 ||
+	    midr_owned_takeover_delay_set(&bgp->midr_info->ctx, delay_msec) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_group_prefix_takeover_delay,
+      no_midr_group_prefix_takeover_delay_cmd,
+      "no midr group-prefix takeover-delay-ms [(0-600000)]",
+      NO_STR
+      "MIDR configuration\n"
+      "Representative-originated Group Prefixes\n"
+      "Delay before a new representative originates Group Prefixes\n"
+      "Delay in milliseconds\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	if (!bgp || !bgp->midr_info ||
+	    midr_owned_takeover_delay_set(&bgp->midr_info->ctx,
+					  MIDR_GROUP_PREFIX_TAKEOVER_DELAY_DEFAULT_MSEC) != 0)
+		return CMD_WARNING_CONFIG_FAILED;
+	return CMD_SUCCESS;
+}
+
 static int midr_config_write(struct bgp *bgp, struct vty *vty)
 {
 	struct midr_sync_status status;
+	uint32_t takeover_delay_msec;
 
 	if (!bgp || !bgp->midr_info ||
 	    midr_sync_status_get(&bgp->midr_info->ctx, &status) != 0)
 		return 0;
 	if (status.timeout_seconds != MIDR_EOR_TIMEOUT_DEFAULT)
 		vty_out(vty, " midr eor-timeout %u\n", status.timeout_seconds);
+	if (midr_owned_takeover_delay_get(&bgp->midr_info->ctx, &takeover_delay_msec) == 0 &&
+	    takeover_delay_msec != MIDR_GROUP_PREFIX_TAKEOVER_DELAY_DEFAULT_MSEC)
+		vty_out(vty, " midr group-prefix takeover-delay-ms %u\n", takeover_delay_msec);
 	return 0;
 }
 
@@ -716,6 +925,8 @@ void bgp_midr_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_owned_cmd);
 	install_element(VIEW_NODE, &show_midr_lsdb_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_rib_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_prefix_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_prefix_contributors_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_links_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_tombstones_cmd);
@@ -730,5 +941,19 @@ void bgp_midr_vty_init(void)
 	install_element(ENABLE_NODE, &midr_peer_session_release_cmd);
 	install_element(BGP_NODE, &midr_eor_timeout_cmd);
 	install_element(BGP_NODE, &no_midr_eor_timeout_cmd);
+	install_element(BGP_NODE, &midr_group_prefix_takeover_delay_cmd);
+	install_element(BGP_NODE, &no_midr_group_prefix_takeover_delay_cmd);
+	install_element(BGP_IPV4_NODE, &midr_external_prefix_source_cmd);
+	install_element(BGP_IPV4_NODE, &no_midr_external_prefix_source_cmd);
+	install_element(BGP_IPV6_NODE, &midr_external_prefix_source_cmd);
+	install_element(BGP_IPV6_NODE, &no_midr_external_prefix_source_cmd);
+	install_element(BGP_IPV4_NODE, &midr_prefix_export_route_map_cmd);
+	install_element(BGP_IPV4_NODE, &no_midr_prefix_export_route_map_cmd);
+	install_element(BGP_IPV6_NODE, &midr_prefix_export_route_map_cmd);
+	install_element(BGP_IPV6_NODE, &no_midr_prefix_export_route_map_cmd);
+	install_element(BGP_IPV4_NODE, &midr_prefix_export_local_source_cmd);
+	install_element(BGP_IPV4_NODE, &no_midr_prefix_export_local_source_cmd);
+	install_element(BGP_IPV6_NODE, &midr_prefix_export_local_source_cmd);
+	install_element(BGP_IPV6_NODE, &no_midr_prefix_export_local_source_cmd);
 	hook_register(bgp_inst_config_write, midr_config_write);
 }

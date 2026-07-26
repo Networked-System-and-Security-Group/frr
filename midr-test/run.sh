@@ -24,6 +24,7 @@ SCENARIOS=(
 	sync-status
 	eor-config
 	router-id-restart
+	prefix-config
 )
 
 usage() {
@@ -44,6 +45,7 @@ Scenarios:
   eor-config      configure, persist and reset the MIDR EoR timeout
   router-id-restart
                   clear old identity state and queue new input behind the barrier
+  prefix-config   configure and persist MIDR Prefix policy and takeover delay
   all             run every assertion-based scenario
   interactive     start bgpd terminal mode for manual VTY input
   list            list assertion-based scenarios
