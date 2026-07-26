@@ -41,7 +41,11 @@ struct midr_rib_summary {
 typedef int (*midr_rib_selected_cb)(
 	const struct midr_ls_object *object,
 	const struct midr_propagation_path *path, struct peer *peer,
-	void *arg);
+		void *arg);
+typedef int (*midr_rib_selected_entry_cb)(
+	const struct midr_ls_object *object,
+	const struct midr_propagation_path *path, struct peer *peer,
+	struct bgp_dest *dest, struct bgp_path_info *selected, void *arg);
 
 extern int midr_rib_init(struct midr_context *ctx);
 extern void midr_rib_finish(struct midr_context *ctx);
@@ -75,6 +79,9 @@ extern int midr_rib_selected_get(
 extern int midr_rib_selected_foreach(struct midr_context *ctx,
 				     midr_rib_selected_cb callback,
 				     void *arg);
+extern int midr_rib_selected_entry_foreach(
+	struct midr_context *ctx, midr_rib_selected_entry_cb callback,
+	void *arg);
 extern int midr_rib_summary_get(struct midr_context *ctx,
 				struct midr_rib_summary *summary);
 

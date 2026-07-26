@@ -11,8 +11,10 @@
 #include "sockunion.h"
 
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_midr_vty.h"
 
@@ -91,6 +93,54 @@ DEFUN(show_midr_owned, show_midr_owned_cmd,
 	if (!ctx)
 		return CMD_WARNING;
 	midr_show_owned(vty, ctx);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_lsdb_summary, show_midr_lsdb_summary_cmd,
+      "show midr lsdb summary",
+      SHOW_STR
+      "MIDR information\n"
+      "Selected-object database\n"
+      "LSDB readiness and object counts\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_lsdb(vty, ctx);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
+      "show midr rib summary",
+      SHOW_STR
+      "MIDR information\n"
+      "MIDR SAFI RIB\n"
+      "RIB identity and path counts\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+	struct midr_rib_summary summary;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_rib_summary_get(ctx, &summary);
+	if (ret) {
+		vty_out(vty, "%% MIDR RIB summary failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+	vty_out(vty, "MIDR RIB summary:\n");
+	vty_out(vty, "  identities:        %zu/%zu\n",
+		summary.identity_count, summary.identity_limit);
+	vty_out(vty, "  paths:             %zu\n", summary.path_count);
+	vty_out(vty, "  selected:          %zu\n",
+		summary.selected_count);
+	vty_out(vty, "  conflicts:         %zu\n",
+		summary.conflict_count);
+	vty_out(vty, "  rejected limit:    %" PRIu64 "\n",
+		summary.rejected_limit);
+	vty_out(vty, "  payload conflicts: %" PRIu64 "\n",
+		summary.rejected_payload_conflict);
 	return CMD_SUCCESS;
 }
 
@@ -571,6 +621,8 @@ void bgp_midr_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_ted_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_ted_generation_cmd);
 	install_element(VIEW_NODE, &show_midr_owned_cmd);
+	install_element(VIEW_NODE, &show_midr_lsdb_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_rib_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_links_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_tombstones_cmd);

@@ -500,6 +500,16 @@ void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
 		store->path_count--;
 		assert(bgp_path_info_reap(dest, path));
 	}
+	if (!identity->path_count) {
+		assert(!identity->selected);
+		assert(identity->state == MIDR_RIB_IDENTITY_NO_PATH);
+		dest->midr_identity = NULL;
+		identity->dest = NULL;
+		assert(hash_release(store->identities, identity) ==
+		       identity);
+		idalloc_free(store->allocator, identity->synthetic_id);
+		XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
+	}
 	UNSET_FLAG(dest->flags, BGP_NODE_PROCESS_SCHEDULED);
 }
 
@@ -701,6 +711,55 @@ int midr_rib_selected_foreach(struct midr_context *ctx,
 		return -EINVAL;
 	hash_iterate(ctx->rib_store->identities,
 		     midr_rib_selected_iter, &state);
+	return state.result;
+}
+
+struct midr_rib_entry_foreach_state {
+	midr_rib_selected_entry_cb callback;
+	void *arg;
+	int result;
+};
+
+static void midr_rib_selected_entry_iter(struct hash_bucket *bucket,
+					 void *arg)
+{
+	struct midr_rib_entry_foreach_state *state = arg;
+	struct midr_rib_identity *identity = bucket->data;
+	const struct midr_propagation_path *propagation;
+	struct midr_ls_object object;
+
+	if (state->result || !identity->selected)
+		return;
+	if (midr_rib_path_object(identity->dest, identity->selected,
+				 &object) != 0) {
+		state->result = -EINVAL;
+		return;
+	}
+	propagation = midr_rib_path_propagation(identity->selected);
+	if (!propagation) {
+		state->result = -EINVAL;
+		return;
+	}
+	state->result = state->callback(
+		&object, propagation, identity->selected->peer,
+		identity->dest, identity->selected, state->arg);
+}
+
+int midr_rib_selected_entry_foreach(
+	struct midr_context *ctx, midr_rib_selected_entry_cb callback,
+	void *arg)
+{
+	struct midr_rib_entry_foreach_state state = {
+		.callback = callback,
+		.arg = arg,
+	};
+
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	if (!callback)
+		return -EINVAL;
+	hash_iterate(ctx->rib_store->identities,
+		     midr_rib_selected_entry_iter, &state);
 	return state.result;
 }
 

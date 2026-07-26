@@ -10,6 +10,7 @@
 #include "bgpd/bgp_midr_ted.h"
 
 struct midr_ted_builder;
+struct midr_ted_prepared;
 
 struct midr_ted_link_input {
 	uint32_t local_node_id;
@@ -50,6 +51,16 @@ extern int midr_ted_builder_add_prefix_group(struct midr_ted_builder *builder,
 extern int midr_ted_builder_publish(struct midr_context *ctx,
 				    const struct midr_ted_builder *builder,
 				    uint64_t sync_reason_flags);
+extern int midr_ted_prepare_ready(struct midr_context *ctx,
+				  const struct midr_ted_builder *builder,
+				  uint64_t sync_reason_flags,
+				  struct midr_ted_prepared **out);
+extern int midr_ted_prepare_not_ready(struct midr_context *ctx,
+				      uint32_t local_node_id,
+				      uint64_t sync_reason_flags,
+				      struct midr_ted_prepared **out);
+extern void midr_ted_prepared_commit(struct midr_ted_prepared **prepared);
+extern void midr_ted_prepared_abort(struct midr_ted_prepared **prepared);
 
 extern int midr_ted_status_get(struct midr_context *ctx, struct midr_ted_status *status);
 

@@ -11,6 +11,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
@@ -109,23 +110,14 @@ int midr_peer_session_release(struct midr_context *ctx, const union sockunion *r
 int midr_remote_view_snapshot_get(struct midr_context *ctx,
 				  struct midr_remote_view_snapshot *snapshot)
 {
-	if (!snapshot)
-		return -EINVAL;
-
-	memset(snapshot, 0, sizeof(*snapshot));
-	if (!ctx || !ctx->bgp || !ctx->midr)
-		return -ENOENT;
-
-	return -EAGAIN;
+	return midr_lsdb_remote_snapshot_get(ctx, snapshot);
 }
 
 void midr_remote_view_snapshot_release(struct midr_context *ctx,
 				       struct midr_remote_view_snapshot *snapshot)
 {
 	(void)ctx;
-
-	if (snapshot)
-		memset(snapshot, 0, sizeof(*snapshot));
+	midr_lsdb_remote_snapshot_release(snapshot);
 }
 
 int midr_remote_view_callbacks_register(struct midr_context *ctx,
@@ -160,14 +152,11 @@ static int midr_bgp_route_update(struct bgp *bgp, afi_t afi, safi_t safi, struct
 {
 	struct midr_context *ctx = midr_context_from_bgp(bgp);
 
-	(void)afi;
-	(void)safi;
-	(void)bn;
-	(void)old_route;
-	(void)new_route;
-
-	if (ctx && ctx->midr)
+	if (ctx && ctx->midr) {
 		ctx->midr->route_hook_events++;
+		if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
+			midr_lsdb_route_changed(ctx, bn, old_route, new_route);
+	}
 
 	return 0;
 }
@@ -206,8 +195,16 @@ void bgp_midr_init(struct bgp *bgp)
 		XFREE(MTYPE_BGP_MIDR, midr);
 		return;
 	}
+	ret = midr_lsdb_init(&midr->ctx);
+	if (ret) {
+		midr_ted_context_finish(&midr->ctx);
+		midr_rib_finish(&midr->ctx);
+		XFREE(MTYPE_BGP_MIDR, midr);
+		return;
+	}
 	ret = midr_owned_init(&midr->ctx);
 	if (ret) {
+		midr_lsdb_finish(&midr->ctx);
 		midr_ted_context_finish(&midr->ctx);
 		midr_rib_finish(&midr->ctx);
 		XFREE(MTYPE_BGP_MIDR, midr);
@@ -216,6 +213,7 @@ void bgp_midr_init(struct bgp *bgp)
 	ret = midr_input_init(&midr->ctx);
 	if (ret) {
 		midr_owned_finish(&midr->ctx);
+		midr_lsdb_finish(&midr->ctx);
 		midr_ted_context_finish(&midr->ctx);
 		midr_rib_finish(&midr->ctx);
 		XFREE(MTYPE_BGP_MIDR, midr);
@@ -236,6 +234,7 @@ void bgp_midr_finish(struct bgp *bgp)
 	midr = bgp->midr_info;
 	midr_input_finish(&midr->ctx);
 	midr_owned_finish(&midr->ctx);
+	midr_lsdb_finish(&midr->ctx);
 	midr_ted_context_finish(&midr->ctx);
 	midr_rib_finish(&midr->ctx);
 	bgp->midr_info = NULL;

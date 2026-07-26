@@ -15,6 +15,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_cost.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
@@ -466,6 +467,7 @@ void midr_owned_reconcile(struct midr_context *ctx)
 		hash_iterate(store->entries, midr_owned_sweep_unseen, store);
 	} while (store->reconcile_again);
 	store->reconciling = false;
+	midr_lsdb_local_metadata_changed(ctx);
 }
 
 static void midr_owned_reconcile_event(struct event *event)
@@ -483,7 +485,7 @@ static void midr_owned_reconcile_event(struct event *event)
 
 void midr_owned_input_state_changed(struct midr_context *ctx)
 {
-	(void)ctx;
+	midr_lsdb_input_state_changed(ctx);
 }
 
 void midr_owned_identity_withdraw(struct midr_context *ctx)
