@@ -136,6 +136,8 @@ Fuzzer 使用 Clang 的 ASAN/UBSAN 和 LeakSanitizer；变异测试要求 10 个
 ./midr-test/run-m4-scenarios.sh all
 ```
 
+M4 的 selection、LSDB 事务和 owned-object 生命周期属于核心逻辑。阶段结束时先验证需求场景、故障回滚、定向 mutation 和 Sanitizer，再进行一次覆盖缺口分析。核心新增代码聚合覆盖率硬门禁为 line 85%、branch 70%，单个核心文件最低为 line 75%、branch 60%；line 90%、branch 80% 保留为目标值，不为纯防御性短路、不可注入的 FRR glue 或重复语义分支反复补充低价值测试。未达到目标值但达到硬门禁时，必须同时满足关键需求场景均有自动断言、关键算法 mutation 或等价故障注入通过、Sanitizer 无报告且审查无未解决 P0/P1。
+
 运行全部 M1 TED YAML/Gherkin 场景：
 
 ```bash

@@ -71,8 +71,7 @@ static struct prefix ipv4_prefix(const char *text)
 	return prefix;
 }
 
-static int sequence_load(void *arg, uint32_t node_id, uint32_t *epoch,
-			 bool *found)
+static int sequence_load(void *arg, uint32_t node_id, uint32_t *epoch, bool *found)
 {
 	struct memory_sequence_store *store = arg;
 
@@ -97,8 +96,7 @@ static const struct midr_sequence_store_ops sequence_ops = {
 	.save_epoch = sequence_save,
 };
 
-static struct midr_node_update local_node(uint64_t version,
-					  uint32_t group_id)
+static struct midr_node_update local_node(uint64_t version, uint32_t group_id)
 {
 	return (struct midr_node_update){
 		.node_id = bgp->router_id.s_addr,
@@ -136,8 +134,7 @@ static struct midr_link_update local_link(uint64_t version)
 	};
 }
 
-static struct midr_ls_object remote_membership(uint64_t sequence,
-						uint32_t group_id)
+static struct midr_ls_object remote_membership(uint64_t sequence, uint32_t group_id)
 {
 	return (struct midr_ls_object){
 		.key =
@@ -213,8 +210,7 @@ static struct midr_ls_object remote_node_prefix(uint64_t sequence)
 	};
 }
 
-static struct midr_ls_object remote_group_prefix(uint64_t sequence,
-						 uint32_t group_id)
+static struct midr_ls_object remote_group_prefix(uint64_t sequence, uint32_t group_id)
 {
 	return (struct midr_ls_object){
 		.key =
@@ -259,8 +255,7 @@ static void remote_link_update(const struct midr_remote_link_info *link)
 	callbacks.link_updates++;
 }
 
-static void remote_link_withdraw(const struct midr_link_key *key,
-				 uint64_t sequence)
+static void remote_link_withdraw(const struct midr_link_key *key, uint64_t sequence)
 {
 	assert(key->local_node_id == remote_peer->remote_id.s_addr);
 	assert(sequence);
@@ -271,15 +266,13 @@ static void install_remote(const struct midr_ls_object *object)
 {
 	struct midr_propagation_path path = {};
 
-	assert(midr_propagation_path_init(
-		       &path, remote_peer->remote_id.s_addr) == 0);
+	assert(midr_propagation_path_init(&path, remote_peer->remote_id.s_addr) == 0);
 	assert(midr_rib_path_upsert(ctx, remote_peer, object, &path) == 0);
 	midr_propagation_path_fini(&path);
 }
 
-static void assert_mock_matches_real(
-	const struct midr_ted_snapshot *real,
-	const struct midr_ls_object *remote_link_object)
+static void assert_mock_matches_real(const struct midr_ted_snapshot *real,
+				     const struct midr_ls_object *remote_link_object)
 {
 	char path[] = "/tmp/midr-m4-mock-XXXXXX";
 	char error[256];
@@ -296,15 +289,13 @@ static void assert_mock_matches_real(
 	int fd;
 
 	assert(midr_cost_from_metrics(&local_metrics, &local_cost) == 0);
-	assert(midr_cost_from_metrics(
-		       &remote_link_object->payload.link.metrics,
-		       &remote_cost) == 0);
+	assert(midr_cost_from_metrics(&remote_link_object->payload.link.metrics, &remote_cost) ==
+	       0);
 	fd = mkstemp(path);
 	assert(fd >= 0);
 	file = fdopen(fd, "w");
 	assert(file);
-	assert(fprintf(
-		       file,
+	assert(fprintf(file,
 		       "{"
 		       "\"schema_version\":1,"
 		       "\"local_node_id\":\"10.0.0.1\","
@@ -333,8 +324,7 @@ static void assert_mock_matches_real(
 		       "}",
 		       local_cost, remote_cost) > 0);
 	assert(fclose(file) == 0);
-	assert(midr_ted_mock_provider_publish_file(
-		       ctx, path, error, sizeof(error)) == 0);
+	assert(midr_ted_mock_provider_publish_file(ctx, path, error, sizeof(error)) == 0);
 	assert(unlink(path) == 0);
 	assert(midr_ted_snapshot_get(ctx, &mock) == 0);
 	assert(mock->generation == real->generation);
@@ -344,25 +334,86 @@ static void assert_mock_matches_real(
 	assert(mock->group_edge_count == real->group_edge_count);
 	assert(mock->node_prefix_count == real->node_prefix_count);
 	assert(mock->prefix_group_count == real->prefix_group_count);
-	assert(mock->egress_links[0].canonical_cost ==
-	       real->egress_links[0].canonical_cost);
+	assert(mock->egress_links[0].canonical_cost == real->egress_links[0].canonical_cost);
 	midr_ted_snapshot_release(&mock);
+}
+
+static void test_initial_state_and_api_validation(void)
+{
+	struct midr_remote_view_snapshot remote = {};
+	struct midr_lsdb_summary summary;
+	struct midr_ted_status status;
+	struct bgp empty_bgp = {};
+	struct midr_context no_ted = {
+		.bgp = &empty_bgp,
+	};
+	struct midr_context standalone = {
+		.bgp = &empty_bgp,
+		.ted_store = (void *)1,
+	};
+
+	assert(midr_lsdb_init(NULL) == -EINVAL);
+	assert(midr_lsdb_init(&(struct midr_context){}) == -EINVAL);
+	assert(midr_lsdb_init(&no_ted) == -EINVAL);
+	assert(midr_lsdb_init(&standalone) == 0);
+	assert(midr_lsdb_init(&standalone) == -EALREADY);
+	assert(midr_lsdb_summary_get(&standalone, &summary) == 0);
+	assert(summary.object_count == 0);
+	assert(midr_lsdb_test_process(&standalone) == 0);
+	midr_lsdb_finish(&standalone);
+	midr_lsdb_finish(&standalone);
+	assert(midr_lsdb_init(ctx) == -EALREADY);
+	midr_lsdb_finish(NULL);
+	midr_lsdb_route_changed(NULL, NULL, NULL, NULL);
+	midr_lsdb_route_changed(&standalone, NULL, NULL, NULL);
+	midr_lsdb_route_changed(ctx, NULL, NULL, NULL);
+	midr_lsdb_local_metadata_changed(NULL);
+	midr_lsdb_local_metadata_changed(&standalone);
+	midr_lsdb_input_state_changed(NULL);
+	midr_lsdb_input_state_changed(&standalone);
+	assert(midr_lsdb_summary_get(NULL, &summary) == -ENOENT);
+	assert(midr_lsdb_summary_get(ctx, NULL) == -EINVAL);
+	assert(midr_lsdb_summary_get(ctx, &summary) == 0);
+	assert(summary.generation == 0);
+	assert(summary.object_count == 0);
+	assert(midr_lsdb_remote_snapshot_get(NULL, &remote) == -ENOENT);
+	assert(midr_lsdb_remote_snapshot_get(&standalone, &remote) == -ENOENT);
+	assert(midr_lsdb_remote_snapshot_get(ctx, NULL) == -EINVAL);
+	assert(midr_lsdb_remote_snapshot_get(ctx, &remote) == -EAGAIN);
+	assert(remote.node_count == 0);
+	assert(remote.link_count == 0);
+	assert(midr_lsdb_test_process(NULL) == -ENOENT);
+	midr_lsdb_test_fail_next_prepare(NULL);
+	midr_lsdb_remote_snapshot_release(NULL);
+	midr_lsdb_remote_snapshot_release(&remote);
+	midr_lsdb_remote_snapshot_release(&remote);
+
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_summary_get(ctx, &summary) == 0);
+	assert(summary.object_count == 0);
+	assert(summary.commit_count == 1);
+	assert(midr_ted_status_get(ctx, &status) == 0);
+	assert(!status.ready);
+	assert(status.generation == 1);
+	assert(midr_lsdb_remote_snapshot_get(ctx, &remote) == -EAGAIN);
 }
 
 static void test_pending_activation_and_four_objects(void)
 {
+	const struct midr_remote_view_callbacks empty_callbacks = {};
 	const struct midr_ted_snapshot *held = NULL;
 	const struct midr_ted_snapshot *snapshot = NULL;
 	struct midr_remote_view_snapshot remote = {};
 	struct midr_ls_object membership = remote_membership(1, 20);
 	struct midr_ls_object link = remote_link(1);
 	struct midr_ls_object node_prefix = remote_node_prefix(1);
-	struct midr_ls_object group_prefix =
-		remote_group_prefix(1, 20);
+	struct midr_ls_object group_prefix = remote_group_prefix(1, 20);
 	struct midr_lsdb_summary lsdb;
 	struct midr_ted_status status;
 	struct midr_node_update node = local_node(1, 10);
 	struct midr_link_update local = local_link(1);
+	uint64_t held_generation;
 	uint64_t ready_generation;
 
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
@@ -399,6 +450,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(held->prefix_group_count == 1);
 	assert(held->egress_links[0].local_ifindex == 9);
 	ready_generation = held->generation;
+	held_generation = held->generation;
 	assert_mock_matches_real(held, &link);
 
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
@@ -408,6 +460,28 @@ static void test_pending_activation_and_four_objects(void)
 	midr_remote_view_snapshot_release(ctx, &remote);
 	assert(callbacks.node_updates == 1);
 	assert(callbacks.link_updates == 1);
+
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	ready_generation = lsdb.generation;
+	midr_lsdb_local_metadata_changed(ctx);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.generation == ready_generation);
+	assert(callbacks.node_updates == 1);
+	assert(callbacks.link_updates == 1);
+
+	local.version = 2;
+	local.local_ifindex = 19;
+	assert(midr_topology_link_upsert(ctx, &local) == 0);
+	midr_topology_process_pending(ctx);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.generation > ready_generation);
+	ready_generation = lsdb.generation;
+	assert(midr_ted_snapshot_get(ctx, &snapshot) == 0);
+	assert(snapshot->egress_links[0].local_ifindex == 19);
+	midr_ted_snapshot_release(&snapshot);
+	assert(held->egress_links[0].local_ifindex == 9);
 
 	membership = remote_membership(2, 30);
 	install_remote(&membership);
@@ -425,8 +499,42 @@ static void test_pending_activation_and_four_objects(void)
 	midr_remote_view_snapshot_release(ctx, &remote);
 	assert(callbacks.node_updates == 2);
 
-	assert(midr_rib_path_withdraw(ctx, remote_peer,
-				      &membership.key) == 0);
+	ctx->midr->remote_callbacks_registered = false;
+	membership = remote_membership(3, 31);
+	install_remote(&membership);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(callbacks.node_updates == 2);
+	ctx->midr->remote_callbacks_registered = true;
+	membership = remote_membership(4, 32);
+	install_remote(&membership);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(callbacks.node_updates == 3);
+
+	assert(midr_remote_view_callbacks_register(ctx, &empty_callbacks) == 0);
+	membership = remote_membership(5, 33);
+	install_remote(&membership);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(callbacks.node_updates == 3);
+	assert(callbacks.node_withdraws == 0);
+	assert(callbacks.link_withdraws == 0);
+	assert(midr_remote_view_callbacks_register(ctx,
+						   &(const struct midr_remote_view_callbacks){
+							   .remote_node_update = remote_node_update,
+							   .remote_node_withdraw =
+								   remote_node_withdraw,
+							   .remote_link_update = remote_link_update,
+							   .remote_link_withdraw =
+								   remote_link_withdraw,
+						   }) == 0);
+	membership = remote_membership(6, 34);
+	install_remote(&membership);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(callbacks.node_updates == 4);
+	assert(callbacks.link_updates == 2);
+
+	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	assert(lsdb.usable_count == 1);
@@ -446,7 +554,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(!status.ready);
 	assert(status.generation > ready_generation);
 	assert(midr_ted_snapshot_get(ctx, &snapshot) == -EAGAIN);
-	assert(held->generation == ready_generation);
+	assert(held->generation == held_generation);
 	assert(held->egress_link_count == 1);
 	midr_ted_snapshot_release(&held);
 }
@@ -473,8 +581,7 @@ static void test_out_of_sync_reason(void)
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_ted_status_get(ctx, &status) == 0);
 	assert(status.ready);
-	assert(status.sync_reason_flags ==
-	       MIDR_TED_SYNC_REASON_RESYNC_FAILED);
+	assert(status.sync_reason_flags == MIDR_TED_SYNC_REASON_RESYNC_FAILED);
 }
 
 int main(void)
@@ -495,22 +602,22 @@ int main(void)
 	vrf_init(NULL, NULL, NULL, NULL);
 	bgp_option_set(BGP_OPT_NO_LISTEN);
 	bgp_attr_init();
-	assert(bgp_get(&bgp, &asn, NULL, BGP_INSTANCE_TYPE_DEFAULT, NULL,
-		       ASNOTATION_PLAIN) >= 0);
+	assert(bgp_get(&bgp, &asn, NULL, BGP_INSTANCE_TYPE_DEFAULT, NULL, ASNOTATION_PLAIN) >= 0);
 	ctx = &bgp->midr_info->ctx;
-	assert(midr_owned_test_set_sequence_store(ctx, &sequence_ops,
-						  &sequence_store) == 0);
+	assert(midr_owned_test_set_sequence_store(ctx, &sequence_ops, &sequence_store) == 0);
 	bgp->router_id.s_addr = router_id("10.0.0.1");
 	assert(midr_input_router_id_update(bgp, false) == 0);
 	midr_input_test_resync_now(ctx);
 	remote_peer = peer_create_accept(bgp, NULL);
 	assert(remote_peer);
 	remote_peer->remote_id.s_addr = router_id("10.0.0.2");
-	assert(midr_remote_view_callbacks_register(
-		       ctx, &remote_callbacks) == 0);
+	assert(midr_remote_view_callbacks_register(ctx, &remote_callbacks) == 0);
 
+	test_initial_state_and_api_validation();
 	test_pending_activation_and_four_objects();
 	test_out_of_sync_reason();
+	midr_lsdb_finish(ctx);
+	assert(midr_lsdb_summary_get(ctx, &(struct midr_lsdb_summary){}) == -ENOENT);
 	puts("MIDR LSDB and production TED tests passed");
 	return 0;
 }
