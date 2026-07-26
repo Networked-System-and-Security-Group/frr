@@ -47,6 +47,7 @@
 #include "bgp_mac.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_midr_attr.h"
+#include "bgpd/bgp_midr_packet.h"
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -1379,11 +1380,8 @@ struct attr *bgp_attr_intern(struct attr *attr)
 			bgp_attr_get_ls_attr(attr)->refcnt++;
 	}
 
-	if (attr->midr_ls)
-		bgp_midr_ls_attr_lock(attr->midr_ls);
-	if (attr->midr_propagation_path)
-		bgp_midr_propagation_path_attr_lock(
-			attr->midr_propagation_path);
+	bgp_midr_ls_attr_intern_ref(&attr->midr_ls);
+	bgp_midr_propagation_path_attr_intern_ref(&attr->midr_propagation_path);
 
 	/* At this point, attr only contains intern'd pointers.  that means
 	 * if we find it in attrhash, it has all the same pointers and we
@@ -1743,8 +1741,8 @@ void bgp_attr_flush(struct attr *attr)
 		bgp_attr_set_ls_attr(attr, NULL);
 	}
 
-	bgp_midr_ls_attr_unintern(&attr->midr_ls);
-	bgp_midr_propagation_path_attr_unintern(
+	bgp_midr_ls_attr_flush(&attr->midr_ls);
+	bgp_midr_propagation_path_attr_flush(
 		&attr->midr_propagation_path);
 
 	nhc = bgp_attr_get_nhc(attr);
@@ -4636,6 +4634,11 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 			ret = BGP_ATTR_PARSE_WITHDRAW;
 			goto done;
 		}
+		if (!midr_pending.ls.present ||
+		    !midr_pending.propagation_path.present) {
+			ret = BGP_ATTR_PARSE_WITHDRAW;
+			goto done;
+		}
 		if (midr_pending.ls.present) {
 			ret = bgp_midr_attr_decode(
 				attr, BGP_ATTR_MIDR_LS,
@@ -4857,6 +4860,13 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 	stream_putw(s, pkt_afi);  /* AFI */
 	stream_putc(s, pkt_safi); /* SAFI */
 
+	if (safi == SAFI_MIDR_LS) {
+		stream_putc(s, IPV4_MAX_BYTELEN);
+		stream_put_ipv4(s, attr->mp_nexthop_global_in.s_addr);
+		stream_putc(s, 0);
+		return sizep;
+	}
+
 	/* Nexthop AFI */
 	if (afi == AFI_IP
 	    && (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST
@@ -4906,7 +4916,6 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			stream_put_ipv4(s, attr->mp_nexthop_global_in.s_addr);
 			break;
 		case SAFI_MIDR_LS:
-			assert(!"MIDR MP_REACH encoding is implemented in M5");
 			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -4969,7 +4978,6 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 				stream_put(s, &attr->mp_nexthop_local, IPV6_MAX_BYTELEN);
 			break;
 		case SAFI_MIDR_LS:
-			assert(!"MIDR MP_REACH encoding is implemented in M5");
 			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -5155,7 +5163,7 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 		bgp_ls_encode_nlri(s, ls_nlri);
 		break;
 	case SAFI_MIDR_LS:
-		assert(!"MIDR NLRI encoding is implemented in M5");
+		/* MIDR uses its semantic object key instead of an IP prefix. */
 		break;
 	case SAFI_LABELED_UNICAST:
 		/* Prefix write with label. */
@@ -5219,7 +5227,6 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 		size = 0;
 		break;
 	case SAFI_MIDR_LS:
-		assert(!"MIDR NLRI sizing is implemented in M5");
 		size = 0;
 		break;
 	}
@@ -5884,6 +5891,12 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 	/* BGP-LS Attribute (Type 29) - RFC 9552 Section 4 */
 	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS && bgp_attr_get_ls_attr(attr))
 		bgp_packet_ls_attribute(s, bgp, attr, bpi);
+
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS &&
+	    bgp_midr_packet_attributes(s, bgp, bpi) < 0) {
+		stream_set_endp(s, cp);
+		return 0;
+	}
 
 	/* draft-ietf-idr-entropy-label */
 	if (peergroup_flag_check(peer, PEER_FLAG_SEND_NHC_ATTRIBUTE))

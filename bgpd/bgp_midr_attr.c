@@ -117,6 +117,18 @@ static void *midr_ls_attr_hash_alloc(void *arg)
 }
 
 struct bgp_midr_ls_attr *
+bgp_midr_ls_attr_new(const struct midr_ls_attributes *attributes)
+{
+	struct bgp_midr_ls_attr *attr;
+
+	if (!attributes)
+		return NULL;
+	attr = XCALLOC(MTYPE_MIDR_LS_ATTR, sizeof(*attr));
+	attr->attributes = *attributes;
+	return attr;
+}
+
+struct bgp_midr_ls_attr *
 bgp_midr_ls_attr_intern(const struct midr_ls_attributes *attributes)
 {
 	struct bgp_midr_ls_attr lookup = {};
@@ -129,6 +141,25 @@ bgp_midr_ls_attr_intern(const struct midr_ls_attributes *attributes)
 			midr_ls_attr_hash_alloc);
 	attr->refcnt++;
 	return attr;
+}
+
+void bgp_midr_ls_attr_intern_ref(struct bgp_midr_ls_attr **attrp)
+{
+	struct bgp_midr_ls_attr *attr;
+	struct bgp_midr_ls_attr *interned;
+
+	if (!attrp || !*attrp)
+		return;
+	attr = *attrp;
+	if (attr->refcnt) {
+		bgp_midr_ls_attr_lock(attr);
+		return;
+	}
+	interned =
+		hash_get(midr_ls_attr_hash, attr, midr_ls_attr_hash_alloc);
+	interned->refcnt++;
+	XFREE(MTYPE_MIDR_LS_ATTR, attr);
+	*attrp = interned;
 }
 
 void bgp_midr_ls_attr_lock(struct bgp_midr_ls_attr *attr)
@@ -150,6 +181,18 @@ void bgp_midr_ls_attr_unintern(struct bgp_midr_ls_attr **attrp)
 		assert(hash_release(midr_ls_attr_hash, attr) == attr);
 		XFREE(MTYPE_MIDR_LS_ATTR, attr);
 	}
+	*attrp = NULL;
+}
+
+void bgp_midr_ls_attr_flush(struct bgp_midr_ls_attr **attrp)
+{
+	struct bgp_midr_ls_attr *attr;
+
+	if (!attrp || !*attrp)
+		return;
+	attr = *attrp;
+	if (!attr->refcnt)
+		XFREE(MTYPE_MIDR_LS_ATTR, attr);
 	*attrp = NULL;
 }
 
@@ -209,6 +252,17 @@ static void *midr_propagation_path_attr_hash_alloc(void *arg)
 }
 
 struct bgp_midr_propagation_path_attr *
+bgp_midr_propagation_path_attr_new(const struct midr_propagation_path *path)
+{
+	struct bgp_midr_propagation_path_attr source = {};
+
+	if (!path || !path->nodes || !path->node_count)
+		return NULL;
+	source.path = *path;
+	return midr_propagation_path_attr_hash_alloc(&source);
+}
+
+struct bgp_midr_propagation_path_attr *
 bgp_midr_propagation_path_attr_intern(
 	const struct midr_propagation_path *path)
 {
@@ -223,6 +277,27 @@ bgp_midr_propagation_path_attr_intern(
 			midr_propagation_path_attr_hash_alloc);
 	attr->refcnt++;
 	return attr;
+}
+
+void bgp_midr_propagation_path_attr_intern_ref(
+	struct bgp_midr_propagation_path_attr **attrp)
+{
+	struct bgp_midr_propagation_path_attr *attr;
+	struct bgp_midr_propagation_path_attr *interned;
+
+	if (!attrp || !*attrp)
+		return;
+	attr = *attrp;
+	if (attr->refcnt) {
+		bgp_midr_propagation_path_attr_lock(attr);
+		return;
+	}
+	interned = hash_get(midr_propagation_path_attr_hash, attr,
+			    midr_propagation_path_attr_hash_alloc);
+	interned->refcnt++;
+	XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr->path.nodes);
+	XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr);
+	*attrp = interned;
 }
 
 void bgp_midr_propagation_path_attr_lock(
@@ -245,6 +320,21 @@ void bgp_midr_propagation_path_attr_unintern(
 	if (!attr->refcnt) {
 		assert(hash_release(midr_propagation_path_attr_hash, attr)
 		       == attr);
+		XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr->path.nodes);
+		XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr);
+	}
+	*attrp = NULL;
+}
+
+void bgp_midr_propagation_path_attr_flush(
+	struct bgp_midr_propagation_path_attr **attrp)
+{
+	struct bgp_midr_propagation_path_attr *attr;
+
+	if (!attrp || !*attrp)
+		return;
+	attr = *attrp;
+	if (!attr->refcnt) {
 		XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr->path.nodes);
 		XFREE(MTYPE_MIDR_PROPAGATION_PATH_ATTR, attr);
 	}

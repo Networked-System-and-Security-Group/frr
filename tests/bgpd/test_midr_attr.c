@@ -99,7 +99,7 @@ static void test_ls_attr_decode_and_intern(void)
 	assert(first == attr.midr_ls);
 	bgp_midr_ls_attr_unintern(&first);
 	bgp_midr_ls_attr_unintern(&second);
-	bgp_attr_flush(&attr);
+	bgp_attr_unintern_sub(&attr);
 	assert(!attr.midr_ls);
 	stream_free(stream);
 }
@@ -127,7 +127,7 @@ static void test_propagation_path_decode_and_intern(void)
 	second = bgp_midr_propagation_path_attr_intern(value);
 	assert(second == attr.midr_propagation_path);
 	bgp_midr_propagation_path_attr_unintern(&second);
-	bgp_attr_flush(&attr);
+	bgp_attr_unintern_sub(&attr);
 	midr_propagation_path_fini(&path);
 	stream_free(stream);
 }
@@ -143,16 +143,20 @@ static void test_outer_attr_lifecycle(void)
 	struct attr *interned;
 
 	assert(midr_propagation_path_init(&path, router_id("1.1.1.1")) == 0);
-	parsed.midr_ls = bgp_midr_ls_attr_intern(&attributes);
-	parsed.midr_propagation_path = bgp_midr_propagation_path_attr_intern(&path);
+	parsed.midr_ls = bgp_midr_ls_attr_new(&attributes);
+	parsed.midr_propagation_path = bgp_midr_propagation_path_attr_new(&path);
 	assert(parsed.midr_ls && parsed.midr_propagation_path);
 
 	interned = bgp_attr_intern(&parsed);
 	assert(interned);
 	assert(interned->midr_ls == parsed.midr_ls);
 	assert(interned->midr_propagation_path == parsed.midr_propagation_path);
-	bgp_attr_unintern_sub(&parsed);
+	bgp_attr_flush(&parsed);
 	assert(!parsed.midr_ls && !parsed.midr_propagation_path);
+	assert(bgp_midr_ls_attr_value(interned->midr_ls)->ls_sequence == 5);
+	assert(bgp_midr_propagation_path_attr_value(
+		       interned->midr_propagation_path)
+		       ->nodes[0] == router_id("1.1.1.1"));
 	bgp_attr_unintern(&interned);
 	assert(!interned);
 	midr_propagation_path_fini(&path);

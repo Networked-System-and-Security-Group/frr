@@ -15,6 +15,7 @@
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_route.h"
 
@@ -53,8 +54,6 @@ int midr_peer_session_request(struct midr_context *ctx,
 	if (!req->remote_as || req->afi <= AFI_UNSPEC || req->afi >= AFI_MAX ||
 	    req->safi <= SAFI_UNSPEC || req->safi >= SAFI_MAX)
 		return -EINVAL;
-	if (req->afi == AFI_BGP_LS && req->safi == SAFI_MIDR_LS)
-		return -EAGAIN;
 	if (req->has_update_source || req->ebgp_multihop || (req->password && req->password[0]) ||
 	    req->policy_tags)
 		return -ENOTSUP;
@@ -141,8 +140,10 @@ static int midr_peer_status_changed(struct peer *peer)
 		return 0;
 
 	ctx = midr_context_from_bgp(peer->bgp);
-	if (ctx && ctx->midr)
+	if (ctx && ctx->midr) {
 		ctx->midr->peer_hook_events++;
+		midr_sync_peer_status_changed(ctx, peer);
+	}
 
 	return 0;
 }
@@ -195,8 +196,16 @@ void bgp_midr_init(struct bgp *bgp)
 		XFREE(MTYPE_BGP_MIDR, midr);
 		return;
 	}
+	ret = midr_sync_init(&midr->ctx);
+	if (ret) {
+		midr_ted_context_finish(&midr->ctx);
+		midr_rib_finish(&midr->ctx);
+		XFREE(MTYPE_BGP_MIDR, midr);
+		return;
+	}
 	ret = midr_lsdb_init(&midr->ctx);
 	if (ret) {
+		midr_sync_finish(&midr->ctx);
 		midr_ted_context_finish(&midr->ctx);
 		midr_rib_finish(&midr->ctx);
 		XFREE(MTYPE_BGP_MIDR, midr);
@@ -205,6 +214,7 @@ void bgp_midr_init(struct bgp *bgp)
 	ret = midr_owned_init(&midr->ctx);
 	if (ret) {
 		midr_lsdb_finish(&midr->ctx);
+		midr_sync_finish(&midr->ctx);
 		midr_ted_context_finish(&midr->ctx);
 		midr_rib_finish(&midr->ctx);
 		XFREE(MTYPE_BGP_MIDR, midr);
@@ -214,6 +224,7 @@ void bgp_midr_init(struct bgp *bgp)
 	if (ret) {
 		midr_owned_finish(&midr->ctx);
 		midr_lsdb_finish(&midr->ctx);
+		midr_sync_finish(&midr->ctx);
 		midr_ted_context_finish(&midr->ctx);
 		midr_rib_finish(&midr->ctx);
 		XFREE(MTYPE_BGP_MIDR, midr);
@@ -235,6 +246,7 @@ void bgp_midr_finish(struct bgp *bgp)
 	midr_input_finish(&midr->ctx);
 	midr_owned_finish(&midr->ctx);
 	midr_lsdb_finish(&midr->ctx);
+	midr_sync_finish(&midr->ctx);
 	midr_ted_context_finish(&midr->ctx);
 	midr_rib_finish(&midr->ctx);
 	bgp->midr_info = NULL;

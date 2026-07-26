@@ -15,6 +15,7 @@
 #include "memory.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_attr.h"
 #include "bgpd/bgp_midr_private.h"
@@ -39,6 +40,7 @@ struct midr_rib_store {
 	struct hash *identities;
 	struct id_alloc *allocator;
 	size_t identity_limit;
+	size_t active_identity_count;
 	size_t path_count;
 	size_t selected_count;
 	size_t conflict_count;
@@ -204,23 +206,27 @@ midr_rib_attributes_from_object(const struct midr_ls_object *object,
 }
 
 static struct attr *
-midr_rib_attr_intern(const struct midr_ls_object *object,
+midr_rib_attr_intern(struct bgp *bgp, const struct midr_ls_object *object,
 		     const struct midr_propagation_path *path)
 {
 	struct midr_ls_attributes attributes;
-	struct attr parsed = {};
+	struct attr parsed;
 	struct attr *interned;
 
+	bgp_attr_default_set(&parsed, bgp, BGP_ORIGIN_IGP);
+	parsed.mp_nexthop_len = IPV4_MAX_BYTELEN;
+	parsed.mp_nexthop_global_in = bgp->router_id;
+
 	midr_rib_attributes_from_object(object, &attributes);
-	parsed.midr_ls = bgp_midr_ls_attr_intern(&attributes);
-	parsed.midr_propagation_path =
-		bgp_midr_propagation_path_attr_intern(path);
+	parsed.midr_ls = bgp_midr_ls_attr_new(&attributes);
+	parsed.midr_propagation_path = bgp_midr_propagation_path_attr_new(path);
 	if (!parsed.midr_ls || !parsed.midr_propagation_path) {
+		aspath_unintern(&parsed.aspath);
 		bgp_attr_flush(&parsed);
 		return NULL;
 	}
 	interned = bgp_attr_intern(&parsed);
-	bgp_attr_unintern_sub(&parsed);
+	aspath_unintern(&parsed.aspath);
 	return interned;
 }
 
@@ -503,12 +509,8 @@ void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
 	if (!identity->path_count) {
 		assert(!identity->selected);
 		assert(identity->state == MIDR_RIB_IDENTITY_NO_PATH);
-		dest->midr_identity = NULL;
-		identity->dest = NULL;
-		assert(hash_release(store->identities, identity) ==
-		       identity);
-		idalloc_free(store->allocator, identity->synthetic_id);
-		XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
+		assert(store->active_identity_count);
+		store->active_identity_count--;
 	}
 	UNSET_FLAG(dest->flags, BGP_NODE_PROCESS_SCHEDULED);
 }
@@ -548,7 +550,7 @@ int midr_rib_path_upsert(struct midr_context *ctx, struct peer *peer,
 		return -EINVAL;
 	}
 
-	new_attr = midr_rib_attr_intern(object, path);
+	new_attr = midr_rib_attr_intern(ctx->bgp, object, path);
 	if (!new_attr) {
 		bgp_dest_unlock_node(dest);
 		return -ENOMEM;
@@ -577,6 +579,8 @@ int midr_rib_path_upsert(struct midr_context *ctx, struct peer *peer,
 	SET_FLAG(new_path->flags, BGP_PATH_VALID);
 	new_path->from = peer;
 	bgp_path_info_add(dest, new_path);
+	if (!identity->path_count)
+		store->active_identity_count++;
 	identity->path_count++;
 	store->path_count++;
 	bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
@@ -774,7 +778,7 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		return -EINVAL;
 	store = ctx->rib_store;
 	*summary = (struct midr_rib_summary){
-		.identity_count = store->identities->count,
+		.identity_count = store->active_identity_count,
 		.path_count = store->path_count,
 		.selected_count = store->selected_count,
 		.conflict_count = store->conflict_count,

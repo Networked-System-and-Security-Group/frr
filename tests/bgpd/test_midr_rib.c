@@ -15,6 +15,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_network.h"
@@ -148,6 +149,7 @@ static void assert_empty(void)
 	assert(summary.path_count == 0);
 	assert(summary.selected_count == 0);
 	assert(summary.conflict_count == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
 }
 
 static int selected_callback(const struct midr_ls_object *object,
@@ -413,9 +415,12 @@ static void test_identity_limit(void)
 	first.ls_sequence = 2;
 	assert(midr_rib_path_upsert(ctx, peer_two, &first, &first_path) == 0);
 	assert(midr_rib_path_withdraw(ctx, peer_two, &first.key) == 0);
+	assert(midr_rib_path_upsert(ctx, peer_two, &second, &second_path) ==
+	       -ENOSPC);
+	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_rib_path_upsert(ctx, peer_two, &second, &second_path) == 0);
 	assert(midr_rib_summary_get(ctx, &summary) == 0);
-	assert(summary.rejected_limit == 1);
+	assert(summary.rejected_limit == 2);
 	assert(midr_rib_path_withdraw(ctx, peer_two, &second.key) == 0);
 	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
 	assert_empty();

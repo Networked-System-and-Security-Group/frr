@@ -51,6 +51,9 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_midr_packet.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 
 DEFINE_HOOK(bgp_packet_dump,
 		(struct peer *peer, uint8_t type, bgp_size_t size,
@@ -330,6 +333,8 @@ int bgp_nlri_parse(struct peer *peer, struct attr *attr,
 		return bgp_nlri_parse_flowspec(peer, attr, packet, mp_withdraw);
 	case SAFI_BGP_LS:
 		return bgp_nlri_parse_ls(peer, mp_withdraw ? NULL : attr, packet);
+	case SAFI_MIDR_LS:
+		return bgp_nlri_parse_midr(peer, mp_withdraw ? NULL : attr, packet);
 	}
 	return BGP_NLRI_PARSE_ERROR;
 }
@@ -588,6 +593,10 @@ void bgp_generate_updgrp_packets(struct event *event)
 					 * not sent.
 					 */
 					if (!BGP_SEND_EOR(peer->bgp, afi, safi))
+						continue;
+					if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS &&
+					    peer->bgp->midr_info &&
+					    !midr_sync_local_ready(&peer->bgp->midr_info->ctx))
 						continue;
 
 					SET_FLAG(peer->af_sflags[afi][safi],
@@ -2309,6 +2318,8 @@ static void bgp_update_receive_eor(struct peer_connection *connection, afi_t afi
 	/* NSF delete stale route */
 	if (peer->nsf[afi][safi])
 		bgp_clear_stale_route(peer, afi, safi);
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS && bgp->midr_info)
+		midr_sync_peer_eor(&bgp->midr_info->ctx, peer);
 }
 
 /**

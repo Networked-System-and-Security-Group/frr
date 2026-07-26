@@ -10,11 +10,14 @@
 #include "command.h"
 #include "sockunion.h"
 
+#include "bgpd/bgpd.h"
+#include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_midr_vty.h"
 
@@ -235,6 +238,77 @@ DEFUN(show_midr_ted_generation, show_midr_ted_generation_cmd,
 	vty_out(vty, "MIDR TED generation: %" PRIu64 " (%s)\n", status.generation,
 		status.ready ? "READY" : "NOT_READY");
 	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_sync, show_midr_sync_cmd,
+      "show midr sync",
+      SHOW_STR
+      "MIDR information\n"
+      "Peer End-of-RIB synchronization\n")
+{
+	static const char *const state_names[] = {
+		[MIDR_SYNC_LOCAL_WAIT] = "LOCAL_WAIT",
+		[MIDR_SYNC_REMOTE_WAIT] = "REMOTE_WAIT",
+		[MIDR_SYNC_READY] = "READY",
+	};
+	struct midr_context *ctx = midr_vty_context(vty);
+	struct midr_sync_status status;
+
+	if (!ctx || midr_sync_status_get(ctx, &status) != 0)
+		return CMD_WARNING;
+	vty_out(vty, "MIDR synchronization:\n");
+	vty_out(vty, "  state:              %s\n", state_names[status.state]);
+	vty_out(vty, "  EoR timeout:        %u seconds\n", status.timeout_seconds);
+	vty_out(vty, "  initial peers:      %zu\n", status.initial_peer_count);
+	vty_out(vty, "  waiting peers:      %zu\n", status.waiting_peer_count);
+	vty_out(vty, "  timed-out peers:    %zu\n", status.timed_out_peer_count);
+	vty_out(vty, "  barriers/timeouts:  %" PRIu64 "/%" PRIu64 "\n",
+		status.barrier_count, status.timeout_count);
+	return CMD_SUCCESS;
+}
+
+DEFUN(midr_eor_timeout, midr_eor_timeout_cmd,
+      "midr eor-timeout (1-3600)",
+      "MIDR configuration\n"
+      "Initial peer End-of-RIB timeout\n"
+      "Timeout in seconds\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	uint32_t seconds;
+
+	if (!bgp || !bgp->midr_info ||
+	    midr_parse_u32(argv[2]->arg, &seconds) != 0 ||
+	    midr_sync_timeout_set(&bgp->midr_info->ctx, seconds) != 0)
+		return CMD_WARNING;
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_eor_timeout, no_midr_eor_timeout_cmd,
+      "no midr eor-timeout [(1-3600)]",
+      NO_STR
+      "MIDR configuration\n"
+      "Initial peer End-of-RIB timeout\n"
+      "Timeout in seconds\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+
+	if (!bgp || !bgp->midr_info ||
+	    midr_sync_timeout_set(&bgp->midr_info->ctx,
+				  MIDR_EOR_TIMEOUT_DEFAULT) != 0)
+		return CMD_WARNING;
+	return CMD_SUCCESS;
+}
+
+static int midr_config_write(struct bgp *bgp, struct vty *vty)
+{
+	struct midr_sync_status status;
+
+	if (!bgp || !bgp->midr_info ||
+	    midr_sync_status_get(&bgp->midr_info->ctx, &status) != 0)
+		return 0;
+	if (status.timeout_seconds != MIDR_EOR_TIMEOUT_DEFAULT)
+		vty_out(vty, " midr eor-timeout %u\n", status.timeout_seconds);
+	return 0;
 }
 
 DEFUN(show_midr_topology_nodes, show_midr_topology_nodes_cmd,
@@ -553,17 +627,19 @@ DEFUN(midr_cmd_topology_link_withdraw, midr_topology_link_withdraw_cmd,
 }
 
 DEFUN(midr_cmd_peer_session, midr_peer_session_cmd,
-      "midr peer session A.B.C.D remote-as (1-4294967295) ipv4-unicast",
+      "midr peer session A.B.C.D remote-as (1-4294967295) <ipv4-unicast|midr-link-state>",
       "MIDR commands\n"
       "Peer helper\n"
       "Request BGP session\n"
       "Remote peer address\n"
       "Remote AS\n"
       "Remote AS number\n"
-      "Activate IPv4 unicast\n")
+      "Activate IPv4 unicast\n"
+      "Activate MIDR link-state\n")
 {
 	struct midr_context *ctx = midr_vty_context(vty);
 	struct midr_peer_session_request_info req = {};
+	int idx = 0;
 	int ret;
 
 	if (!ctx)
@@ -574,8 +650,13 @@ DEFUN(midr_cmd_peer_session, midr_peer_session_cmd,
 	}
 
 	req.remote_as = strtoul(argv[5]->arg, NULL, 10);
-	req.afi = AFI_IP;
-	req.safi = SAFI_UNICAST;
+	if (argv_find(argv, argc, "midr-link-state", &idx)) {
+		req.afi = AFI_BGP_LS;
+		req.safi = SAFI_MIDR_LS;
+	} else {
+		req.afi = AFI_IP;
+		req.safi = SAFI_UNICAST;
+	}
 
 	ret = midr_peer_session_request(ctx, &req);
 	if (ret) {
@@ -587,16 +668,20 @@ DEFUN(midr_cmd_peer_session, midr_peer_session_cmd,
 }
 
 DEFUN(midr_cmd_peer_session_release, midr_peer_session_release_cmd,
-      "midr peer session A.B.C.D release ipv4-unicast",
+      "midr peer session A.B.C.D release <ipv4-unicast|midr-link-state>",
       "MIDR commands\n"
       "Peer helper\n"
       "Request BGP session\n"
       "Remote peer address\n"
       "Release peer AFI/SAFI\n"
-      "Deactivate IPv4 unicast\n")
+      "Deactivate IPv4 unicast\n"
+      "Deactivate MIDR link-state\n")
 {
 	struct midr_context *ctx = midr_vty_context(vty);
 	union sockunion remote_address;
+	afi_t afi;
+	safi_t safi;
+	int idx = 0;
 	int ret;
 
 	if (!ctx)
@@ -606,7 +691,14 @@ DEFUN(midr_cmd_peer_session_release, midr_peer_session_release_cmd,
 		return CMD_WARNING;
 	}
 
-	ret = midr_peer_session_release(ctx, &remote_address, AFI_IP, SAFI_UNICAST,
+	if (argv_find(argv, argc, "midr-link-state", &idx)) {
+		afi = AFI_BGP_LS;
+		safi = SAFI_MIDR_LS;
+	} else {
+		afi = AFI_IP;
+		safi = SAFI_UNICAST;
+	}
+	ret = midr_peer_session_release(ctx, &remote_address, afi, safi,
 					MIDR_PEER_RELEASE_ADMIN);
 	if (ret) {
 		vty_out(vty, "%% MIDR peer session release failed: %d\n", ret);
@@ -620,6 +712,7 @@ void bgp_midr_vty_init(void)
 {
 	install_element(VIEW_NODE, &show_midr_ted_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_ted_generation_cmd);
+	install_element(VIEW_NODE, &show_midr_sync_cmd);
 	install_element(VIEW_NODE, &show_midr_owned_cmd);
 	install_element(VIEW_NODE, &show_midr_lsdb_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_rib_summary_cmd);
@@ -635,4 +728,7 @@ void bgp_midr_vty_init(void)
 	install_element(ENABLE_NODE, &midr_topology_link_withdraw_cmd);
 	install_element(ENABLE_NODE, &midr_peer_session_cmd);
 	install_element(ENABLE_NODE, &midr_peer_session_release_cmd);
+	install_element(BGP_NODE, &midr_eor_timeout_cmd);
+	install_element(BGP_NODE, &no_midr_eor_timeout_cmd);
+	hook_register(bgp_inst_config_write, midr_config_write);
 }

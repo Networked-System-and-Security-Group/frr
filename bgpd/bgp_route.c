@@ -70,6 +70,8 @@
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_lsdb.h"
+#include "bgpd/bgp_midr_private.h"
 
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/rfapi_backend.h"
@@ -2460,6 +2462,18 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	if (!CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
 		if (!bgp_addpath_capable(pi, peer, afi, safi))
 			return false;
+
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+		struct peer *target = SUBGRP_PFIRST(subgrp)->peer;
+		bool eligible;
+
+		eligible = bgp && bgp->midr_info &&
+			   midr_lsdb_export_eligible(&bgp->midr_info->ctx, dest,
+						     pi, target);
+		if (eligible)
+			*attr = *piattr;
+		return eligible;
+	}
 
 	/* Aggregate-address suppress check. */
 	if (bgp_path_suppressed(pi) && !UNSUPPRESS_MAP_NAME(filter))

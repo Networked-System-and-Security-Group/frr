@@ -22,6 +22,7 @@ SCENARIOS=(
 	peer-session
 	ted-not-ready
 	sync-status
+	eor-config
 	router-id-restart
 )
 
@@ -40,6 +41,7 @@ Scenarios:
   peer-session    basic peer session request/release wrapper
   ted-not-ready   verify production TED remains NOT_READY
   sync-status     show bounded input and Provider synchronization state
+  eor-config      configure, persist and reset the MIDR EoR timeout
   router-id-restart
                   clear old identity state and queue new input behind the barrier
   all             run every assertion-based scenario

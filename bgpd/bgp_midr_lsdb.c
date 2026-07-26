@@ -14,13 +14,16 @@
 #include "memory.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_midr_attr.h"
 #include "bgpd/bgp_midr_cost.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_route.h"
+#include "bgpd/bgp_updgrp.h"
 
 #define MIDR_LSDB_RETRY_MSEC 1000U
 
@@ -36,6 +39,7 @@ struct midr_lsdb_entry {
 	struct peer *peer;
 	struct bgp_dest *dest;
 	struct bgp_path_info *selected;
+	enum midr_lsdb_scope scope;
 	uint32_t scope_group_id;
 	uint32_t canonical_cost;
 	ifindex_t local_ifindex;
@@ -63,6 +67,7 @@ struct midr_lsdb_state {
 	struct hash *pending_links;
 	uint64_t generation;
 	uint64_t sync_reason_flags;
+	uint32_t local_group_id;
 	bool ready;
 	size_t usable_count;
 	size_t pending_count;
@@ -84,9 +89,11 @@ struct midr_lsdb_store {
 	struct list *dirty;
 	struct event *t_commit;
 	bool force_rebuild;
+	bool scope_rebuild;
 	bool fail_next_prepare;
 	uint64_t commit_count;
 	uint64_t failure_count;
+	int last_error;
 };
 
 static unsigned int midr_lsdb_identity_hash_key(const void *arg)
@@ -315,12 +322,11 @@ static void midr_lsdb_index_membership(struct hash_bucket *bucket,
 	    !entry->object.payload.membership.group_id)
 		return;
 	entry->usable = true;
-	entry->scope_group_id =
-		entry->object.payload.membership.group_id;
+	entry->scope = MIDR_LSDB_SCOPE_GLOBAL;
 	state->usable_count++;
 	(void)hash_get(state->memberships, entry, hash_alloc_intern);
 	(void)hash_get(state->group_members, entry, hash_alloc_intern);
-	candidate.group_id = entry->scope_group_id;
+	candidate.group_id = entry->object.payload.membership.group_id;
 	group = hash_get(state->groups, &candidate,
 			 midr_lsdb_group_hash_alloc);
 	group->member_count++;
@@ -378,9 +384,22 @@ static void midr_lsdb_derive_entry(struct hash_bucket *bucket, void *arg)
 			entry->pending_reason =
 				MIDR_LSDB_PENDING_REMOTE_MEMBERSHIP;
 		else {
-			entry->usable = true;
-			entry->scope_group_id =
-				local_membership->scope_group_id;
+			uint32_t local_group =
+				local_membership->object.payload.membership.group_id;
+			uint32_t remote_group =
+				remote_membership->object.payload.membership.group_id;
+
+			if (local_group == remote_group) {
+				entry->scope = MIDR_LSDB_SCOPE_INTRA_GROUP;
+				entry->scope_group_id = local_group;
+				entry->usable = state->local_group_id == local_group;
+				if (!entry->usable)
+					entry->pending_reason =
+						MIDR_LSDB_PENDING_SCOPE_INELIGIBLE;
+			} else {
+				entry->scope = MIDR_LSDB_SCOPE_GLOBAL;
+				entry->usable = true;
+			}
 		}
 		if (!entry->usable)
 			(void)hash_get(state->pending_links, entry,
@@ -393,9 +412,12 @@ static void midr_lsdb_derive_entry(struct hash_bucket *bucket, void *arg)
 			entry->pending_reason =
 				MIDR_LSDB_PENDING_LOCAL_MEMBERSHIP;
 		else {
-			entry->usable = true;
+			entry->scope = MIDR_LSDB_SCOPE_INTRA_GROUP;
 			entry->scope_group_id =
-				local_membership->scope_group_id;
+				local_membership->object.payload.membership.group_id;
+			entry->usable = state->local_group_id == entry->scope_group_id;
+			if (!entry->usable)
+				entry->pending_reason = MIDR_LSDB_PENDING_SCOPE_INELIGIBLE;
 		}
 		break;
 	case MIDR_NLRI_TYPE_GROUP_PREFIX:
@@ -406,8 +428,7 @@ static void midr_lsdb_derive_entry(struct hash_bucket *bucket, void *arg)
 				MIDR_LSDB_PENDING_GROUP_MEMBERSHIP;
 		else {
 			entry->usable = true;
-			entry->scope_group_id =
-				entry->object.key.u.group_prefix.group_id;
+			entry->scope = MIDR_LSDB_SCOPE_GLOBAL;
 		}
 		break;
 	case MIDR_NLRI_TYPE_RESERVED:
@@ -437,6 +458,7 @@ static void midr_lsdb_local_metadata(struct hash_bucket *bucket, void *arg)
 static int midr_lsdb_build_state(struct midr_context *ctx,
 				 struct midr_lsdb_state **out)
 {
+	struct midr_lsdb_entry *local_membership;
 	struct midr_lsdb_state *state;
 	int ret;
 
@@ -449,6 +471,12 @@ static int midr_lsdb_build_state(struct midr_context *ctx,
 		goto fail;
 	hash_iterate(state->identities, midr_lsdb_index_membership,
 		     state);
+	local_membership = midr_lsdb_membership_lookup(
+		state, ctx->bgp->router_id.s_addr);
+
+	if (local_membership)
+		state->local_group_id =
+			local_membership->object.payload.membership.group_id;
 	hash_iterate(state->identities, midr_lsdb_derive_entry, state);
 	hash_iterate(state->identities, midr_lsdb_local_metadata, ctx);
 	*out = state;
@@ -576,10 +604,18 @@ static int midr_lsdb_prepare_ted(
 	local = hash_lookup(state->identities, &lookup);
 	if (input.state == MIDR_INPUT_IDENTITY_RESTART || !local ||
 	    !local->usable || local->peer != ctx->bgp->peer_self) {
+		(void)midr_sync_view_ready(ctx, false, &reasons);
 		state->ready = false;
 		return midr_ted_prepare_not_ready(
 			ctx, ctx->bgp->router_id.s_addr, reasons, prepared);
 	}
+	if (!midr_sync_view_ready(ctx, true, &reasons)) {
+		state->sync_reason_flags = reasons;
+		state->ready = false;
+		return midr_ted_prepare_not_ready(
+			ctx, ctx->bgp->router_id.s_addr, reasons, prepared);
+	}
+	state->sync_reason_flags = reasons;
 
 	ret = midr_ted_builder_create(
 		ctx->bgp->router_id.s_addr,
@@ -604,10 +640,98 @@ static bool midr_lsdb_entry_same(const struct midr_lsdb_entry *left,
 	return midr_ls_object_same(&left->object, &right->object) &&
 	       left->usable == right->usable &&
 	       left->pending_reason == right->pending_reason &&
+	       left->scope == right->scope &&
 	       left->scope_group_id == right->scope_group_id &&
 	       left->canonical_cost == right->canonical_cost &&
 	       left->local_ifindex == right->local_ifindex &&
 	       left->peer == right->peer;
+}
+
+static struct midr_lsdb_entry *
+midr_lsdb_state_entry(struct midr_lsdb_state *state,
+		      const struct midr_ls_object_key *key);
+
+bool midr_lsdb_export_eligible(struct midr_context *ctx,
+			      const struct bgp_dest *dest,
+			      const struct bgp_path_info *path,
+			      const struct peer *target)
+{
+	const struct midr_propagation_path *propagation;
+	const struct midr_ls_object_key *key;
+	struct midr_lsdb_entry *target_membership;
+	struct midr_lsdb_entry *entry;
+	struct midr_lsdb_state *state;
+
+	if (!ctx || !ctx->lsdb_store || !dest || !path || !target ||
+	    target->bgp != ctx->bgp || target == ctx->bgp->peer_self ||
+	    !target->remote_id.s_addr ||
+	    target->remote_id.s_addr == ctx->bgp->router_id.s_addr)
+		return false;
+	state = ctx->lsdb_store->current;
+	key = midr_rib_dest_key(dest);
+	if (!state || !key)
+		return false;
+	entry = midr_lsdb_state_entry(state, key);
+	if (!entry || !entry->usable || entry->selected != path ||
+	    entry->scope == MIDR_LSDB_SCOPE_LOCAL_ONLY)
+		return false;
+
+	propagation = bgp_midr_propagation_path_attr_value(
+		path->attr->midr_propagation_path);
+	if (!propagation ||
+	    midr_propagation_path_contains(propagation,
+					   target->remote_id.s_addr))
+		return false;
+	if (entry->scope == MIDR_LSDB_SCOPE_GLOBAL)
+		return true;
+
+	target_membership = midr_lsdb_membership_lookup(state, target->remote_id.s_addr);
+	return target_membership &&
+	       target_membership->object.payload.membership.group_id == entry->scope_group_id;
+}
+
+static void midr_lsdb_announce_dirty(struct midr_lsdb_store *store)
+{
+	struct listnode *node;
+	struct midr_lsdb_dirty *dirty;
+
+	for (ALL_LIST_ELEMENTS_RO(store->dirty, node, dirty)) {
+		struct bgp_path_info *selected = NULL;
+		struct bgp_path_info *path;
+
+		for (path = bgp_dest_get_bgp_path_info(dirty->dest); path;
+		     path = path->next)
+			if (CHECK_FLAG(path->flags, BGP_PATH_SELECTED)) {
+				selected = path;
+				break;
+			}
+		group_announce_route(store->ctx->bgp, AFI_BGP_LS,
+				     SAFI_MIDR_LS, dirty->dest, selected);
+	}
+}
+
+static int midr_lsdb_announce_selected(
+	const struct midr_ls_object *object,
+	const struct midr_propagation_path *path, struct peer *peer,
+	struct bgp_dest *dest, struct bgp_path_info *selected, void *arg)
+{
+	struct midr_lsdb_store *store = arg;
+
+	(void)object;
+	(void)path;
+	(void)peer;
+	group_announce_route(store->ctx->bgp, AFI_BGP_LS, SAFI_MIDR_LS,
+			     dest, selected);
+	return 0;
+}
+
+static void midr_lsdb_announce_committed(struct midr_lsdb_store *store)
+{
+	if (store->scope_rebuild)
+		(void)midr_rib_selected_entry_foreach(
+			store->ctx, midr_lsdb_announce_selected, store);
+	midr_lsdb_announce_dirty(store);
+	store->scope_rebuild = false;
 }
 
 struct midr_lsdb_compare {
@@ -842,8 +966,9 @@ static int midr_lsdb_process(struct midr_lsdb_store *store)
 		staging = NULL;
 		store->commit_count++;
 	}
-	midr_lsdb_dirty_clear(store);
 	midr_ted_prepared_commit(&prepared);
+	midr_lsdb_announce_committed(store);
+	midr_lsdb_dirty_clear(store);
 	if (changed) {
 		notify.store = store;
 		notify.other = store->current;
@@ -859,10 +984,12 @@ static int midr_lsdb_process(struct midr_lsdb_store *store)
 		midr_lsdb_state_free(&old);
 	else
 		midr_lsdb_state_free(&staging);
+	store->last_error = 0;
 	return 0;
 
 fail:
 	store->failure_count++;
+	store->last_error = ret;
 	midr_ted_prepared_abort(&prepared);
 	midr_lsdb_state_free(&staging);
 	return ret;
@@ -924,6 +1051,7 @@ void midr_lsdb_route_changed(struct midr_context *ctx,
 			     struct bgp_path_info *old_selected,
 			     struct bgp_path_info *new_selected)
 {
+	const struct midr_ls_object_key *key;
 	struct midr_lsdb_dirty *dirty;
 	struct midr_lsdb_store *store;
 
@@ -937,6 +1065,10 @@ void midr_lsdb_route_changed(struct midr_context *ctx,
 	if (new_selected)
 		dirty->new_selected = bgp_path_info_lock(new_selected);
 	listnode_add(store->dirty, dirty);
+	key = midr_rib_dest_key(dest);
+
+	if (key && key->type == MIDR_NLRI_TYPE_MEMBERSHIP)
+		store->scope_rebuild = true;
 	midr_lsdb_schedule(store);
 }
 
@@ -951,6 +1083,15 @@ void midr_lsdb_local_metadata_changed(struct midr_context *ctx)
 void midr_lsdb_input_state_changed(struct midr_context *ctx)
 {
 	midr_lsdb_local_metadata_changed(ctx);
+}
+
+void midr_lsdb_sync_changed(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->lsdb_store)
+		return;
+	ctx->lsdb_store->force_rebuild = true;
+	ctx->lsdb_store->scope_rebuild = true;
+	midr_lsdb_schedule(ctx->lsdb_store);
 }
 
 struct midr_lsdb_remote_count {
@@ -1131,6 +1272,7 @@ int midr_lsdb_summary_get(struct midr_context *ctx,
 	summary->dirty_count = listcount(store->dirty);
 	summary->commit_count = store->commit_count;
 	summary->failure_count = store->failure_count;
+	summary->last_error = store->last_error;
 	if (!state)
 		return 0;
 	summary->generation = state->generation;
@@ -1168,6 +1310,7 @@ void midr_show_lsdb(struct vty *vty, struct midr_context *ctx)
 	vty_out(vty, "  dirty entries:    %zu\n", summary.dirty_count);
 	vty_out(vty, "  commits/failures: %" PRIu64 "/%" PRIu64 "\n",
 		summary.commit_count, summary.failure_count);
+	vty_out(vty, "  last error:       %d\n", summary.last_error);
 }
 
 int midr_lsdb_test_process(struct midr_context *ctx)

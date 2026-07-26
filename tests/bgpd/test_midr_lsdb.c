@@ -436,8 +436,8 @@ static void test_pending_activation_and_four_objects(void)
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	assert(lsdb.object_count == 6);
-	assert(lsdb.usable_count == 6);
-	assert(lsdb.pending_count == 0);
+	assert(lsdb.usable_count == 5);
+	assert(lsdb.pending_count == 1);
 	assert(lsdb.membership_count == 2);
 	assert(lsdb.link_count == 2);
 	assert(lsdb.node_prefix_count == 1);

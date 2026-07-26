@@ -19,8 +19,13 @@ extern void bgp_midr_attr_finish(void);
 
 extern struct bgp_midr_ls_attr *
 bgp_midr_ls_attr_intern(const struct midr_ls_attributes *attributes);
+extern struct bgp_midr_ls_attr *
+bgp_midr_ls_attr_new(const struct midr_ls_attributes *attributes);
+extern void
+bgp_midr_ls_attr_intern_ref(struct bgp_midr_ls_attr **attr);
 extern void bgp_midr_ls_attr_lock(struct bgp_midr_ls_attr *attr);
 extern void bgp_midr_ls_attr_unintern(struct bgp_midr_ls_attr **attr);
+extern void bgp_midr_ls_attr_flush(struct bgp_midr_ls_attr **attr);
 extern const struct midr_ls_attributes *
 bgp_midr_ls_attr_value(const struct bgp_midr_ls_attr *attr);
 extern unsigned int
@@ -31,9 +36,15 @@ extern bool bgp_midr_ls_attr_same(const struct bgp_midr_ls_attr *a,
 extern struct bgp_midr_propagation_path_attr *
 bgp_midr_propagation_path_attr_intern(
 	const struct midr_propagation_path *path);
+extern struct bgp_midr_propagation_path_attr *
+bgp_midr_propagation_path_attr_new(const struct midr_propagation_path *path);
+extern void bgp_midr_propagation_path_attr_intern_ref(
+	struct bgp_midr_propagation_path_attr **attr);
 extern void bgp_midr_propagation_path_attr_lock(
 	struct bgp_midr_propagation_path_attr *attr);
 extern void bgp_midr_propagation_path_attr_unintern(
+	struct bgp_midr_propagation_path_attr **attr);
+extern void bgp_midr_propagation_path_attr_flush(
 	struct bgp_midr_propagation_path_attr **attr);
 extern const struct midr_propagation_path *
 bgp_midr_propagation_path_attr_value(
