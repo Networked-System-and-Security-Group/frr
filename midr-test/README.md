@@ -1,6 +1,6 @@
 # MIDR 输入、TED 与协议对象测试
 
-本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper、不可变 TED snapshot、LS Object、sequence、cost、wire codec，以及 MIDR SAFI RIB、owned object、LSDB 和生产 TED。VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；测试 Provider、TED fixture 和 fuzz corpus 均不进入生产 `bgpd` 数据路径。
+本目录用于测试 MIDR 第一组输入接口、Local Fact、Snapshot/Resync、基础 session wrapper、不可变 TED snapshot、LS Object、sequence、cost、wire codec、MIDR SAFI RIB、owned object、LSDB、生产 TED，以及 M5 的多节点传播、scope、withdraw、EoR 和 Route Refresh。单节点 VTY 测试以 terminal 模式启动 `bgpd`，不连接 zebra，也不监听真实 BGP 端口；M5 多节点测试使用 rootless user/network namespace 建立真实 BGP session。测试 Provider、TED fixture 和 fuzz corpus 均不进入生产 `bgpd` 数据路径。
 
 ## 目录结构
 
@@ -15,6 +15,8 @@ midr-test/
   run-m3-mutation.sh     # M3 关键规则定向变异测试
   run-m3-coverage.sh     # M3 核心文件覆盖率门禁
   run-m4-scenarios.sh    # M4 RIB/LSDB Gherkin 组件测试
+  run-m5-multinode.sh    # M5 rootless 多节点传播测试
+  run-m5-scenarios.py    # M5 Gherkin ID 与自动断言映射
   ted-fixture-normalize.py
                           # 严格 YAML schema 到规范化 JSON
   expect/                # 固定字符串预期结果
@@ -45,7 +47,10 @@ make -j$(nproc) \
   tests/bgpd/test_midr_attr \
   tests/bgpd/test_midr_rib \
   tests/bgpd/test_midr_owned \
-  tests/bgpd/test_midr_lsdb
+  tests/bgpd/test_midr_lsdb \
+  tests/bgpd/test_midr_packet \
+  tests/bgpd/test_midr_scope \
+  tests/bgpd/test_midr_sync
 ```
 
 干净环境或构建清单发生变化时，先执行：
@@ -76,7 +81,10 @@ make -j$(nproc) \
   tests/bgpd/test_midr_attr \
   tests/bgpd/test_midr_rib \
   tests/bgpd/test_midr_owned \
-  tests/bgpd/test_midr_lsdb
+  tests/bgpd/test_midr_lsdb \
+  tests/bgpd/test_midr_packet \
+  tests/bgpd/test_midr_scope \
+  tests/bgpd/test_midr_sync
 ```
 
 ## 运行
@@ -138,6 +146,23 @@ Fuzzer 使用 Clang 的 ASAN/UBSAN 和 LeakSanitizer；变异测试要求 10 个
 
 M4 的 selection、LSDB 事务和 owned-object 生命周期属于核心逻辑。阶段结束时先验证需求场景、故障回滚、定向 mutation 和 Sanitizer，再进行一次覆盖缺口分析。核心新增代码聚合覆盖率硬门禁为 line 85%、branch 70%，单个核心文件最低为 line 75%、branch 60%；line 90%、branch 80% 保留为目标值，不为纯防御性短路、不可注入的 FRR glue 或重复语义分支反复补充低价值测试。未达到目标值但达到硬门禁时，必须同时满足关键需求场景均有自动断言、关键算法 mutation 或等价故障注入通过、Sanitizer 无报告且审查无未解决 P0/P1。
 
+运行 M5 wire、scope 和 EoR 组件测试：
+
+```bash
+./tests/bgpd/test_midr_packet
+./tests/bgpd/test_midr_scope
+./tests/bgpd/test_midr_sync
+```
+
+运行全部 M5 rootless 多节点传播场景：
+
+```bash
+./midr-test/run-m5-multinode.sh all
+python3 ./midr-test/run-m5-scenarios.py
+```
+
+固定场景覆盖三节点线形传播、逐跳 `MP_UNREACH`、intra-group/global scope、三角拓扑 alternate path 与防环、EoR timeout/迟到恢复，以及 Route Refresh。M5 的阶段门禁以这些协议行为、完整 M0-M5 回归、Clang、ASAN/UBSAN/LeakSanitizer 和 codec fuzz 为主；覆盖率只用于定位明显缺失的关键分支，不设置为了达到单一百分比而反复补测的关闭门槛。
+
 运行全部 M1 TED YAML/Gherkin 场景：
 
 ```bash
@@ -176,6 +201,7 @@ invalid-link   地址族、measurement 和 uint64 输入校验
 peer-session   基础 session request/release wrapper
 ted-not-ready  M1 生产 TED 保持 NOT_READY / generation 0
 sync-status    输入状态、队列上限和 Provider 状态
+eor-config     EoR timeout 配置、持久化输出和默认值恢复
 router-id-restart
                Router-ID 变化时清理旧 identity，并将新输入置于 Resync Barrier 后
 ```
