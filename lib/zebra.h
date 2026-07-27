@@ -184,7 +184,8 @@ typedef enum {
 	SAFI_LABELED_UNICAST = 6,
 	SAFI_FLOWSPEC = 7,
 	SAFI_BGP_LS = 8, /* BGP-LS (RFC 9552) */
-	SAFI_MAX = 9
+	SAFI_MIDR_LS = 9, /* MIDR link-state (development) */
+	SAFI_MAX = 10
 } safi_t;
 
 #define FOREACH_AFI_SAFI(afi, safi)                                            \

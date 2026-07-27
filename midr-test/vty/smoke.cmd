@@ -5,4 +5,8 @@ midr topology link upsert 1.1.1.1 2.2.2.2 id 4294967296 local-address 10.0.0.1 r
 show midr topology nodes
 show midr topology links
 show midr events
+show midr rib summary
+show midr owned
+show midr lsdb summary
+show midr ted summary
 exit

@@ -1,0 +1,13 @@
+MIDR topology synchronization:
+state:             RESYNCING
+reason:            PROVIDER_RESTART
+owner:             1.1.1.1
+provider:          unavailable
+snapshot version:  0
+normal queue:      0/4096
+resync queue:      0/4096
+active facts:      0 nodes, 0 links
+tombstones:        0 nodes, 0 links
+rejected-full:  0
+rejected-sync:  0
+MIDR TED generation: 0 (NOT_READY)

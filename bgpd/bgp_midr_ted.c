@@ -20,6 +20,7 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_SNAPSHOT, "MIDR TED snapshot");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_ARRAY, "MIDR TED array");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_BUILDER, "MIDR TED builder");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_CONSUMER, "MIDR TED consumer");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_PREPARED, "MIDR prepared TED");
 
 struct midr_ted_snapshot_internal {
 	struct midr_ted_snapshot public;
@@ -52,6 +53,12 @@ struct midr_ted_store {
 	size_t pending_node_prefix_count;
 	size_t pending_prefix_group_count;
 	bool notifying;
+};
+
+struct midr_ted_prepared {
+	struct midr_ted_store *store;
+	struct midr_ted_snapshot_internal *candidate;
+	uint32_t changes;
 };
 
 struct midr_ted_builder {
@@ -483,6 +490,24 @@ fail:
 	return ret;
 }
 
+static int midr_ted_snapshot_not_ready(uint32_t local_node_id,
+				       uint64_t sync_reason_flags,
+				       struct midr_ted_snapshot_internal **out)
+{
+	const uint64_t valid_reasons = MIDR_TED_SYNC_REASON_EOR_TIMEOUT |
+				       MIDR_TED_SYNC_REASON_RESYNC_FAILED;
+	struct midr_ted_snapshot_internal *snapshot;
+
+	if (!out || *out || (sync_reason_flags & ~valid_reasons))
+		return -EINVAL;
+	snapshot = XCALLOC(MTYPE_MIDR_TED_SNAPSHOT, sizeof(*snapshot));
+	snapshot->refcount = 1;
+	snapshot->public.local_node_id = local_node_id;
+	snapshot->public.sync_reason_flags = sync_reason_flags;
+	*out = snapshot;
+	return 0;
+}
+
 static bool midr_ted_nodes_same(const struct midr_ted_snapshot *a,
 				const struct midr_ted_snapshot *b)
 {
@@ -793,44 +818,136 @@ int midr_ted_builder_add_prefix_group(struct midr_ted_builder *builder,
 	return 0;
 }
 
-int midr_ted_builder_publish(struct midr_context *ctx, const struct midr_ted_builder *builder,
-			     uint64_t sync_reason_flags)
+static int midr_ted_prepare_candidate(
+	struct midr_context *ctx,
+	struct midr_ted_snapshot_internal *candidate,
+	struct midr_ted_prepared **out)
 {
-	struct midr_ted_snapshot_internal *candidate = NULL;
 	struct midr_ted_snapshot_internal *old;
+	struct midr_ted_prepared *prepared;
 	struct midr_ted_store *store;
 	uint32_t changes;
-	int ret;
 
-	if (!ctx || !ctx->ted_store)
+	if (!out || *out || !candidate)
+		return -EINVAL;
+	if (!ctx || !ctx->ted_store) {
+		midr_ted_snapshot_put(candidate);
 		return -ENOENT;
-
-	ret = midr_ted_snapshot_build(builder, sync_reason_flags, &candidate);
-	if (ret)
-		return ret;
+	}
 
 	store = ctx->ted_store;
 	old = store->current;
 	changes = midr_ted_snapshot_changes(old ? &old->public : NULL, &candidate->public);
-	if (!changes) {
-		store->pending_link_count = candidate->pending_link_count;
-		store->pending_node_prefix_count = candidate->pending_node_prefix_count;
-		store->pending_prefix_group_count = candidate->pending_prefix_group_count;
-		midr_ted_snapshot_put(candidate);
-		return 0;
-	}
-	if (old && old->public.generation == UINT64_MAX) {
+	if (changes && old && old->public.generation == UINT64_MAX) {
 		midr_ted_snapshot_put(candidate);
 		return -EOVERFLOW;
 	}
+	if (changes)
+		candidate->public.generation =
+			old ? old->public.generation + 1 : 1;
+	else if (old)
+		candidate->public.generation = old->public.generation;
 
-	candidate->public.generation = old ? old->public.generation + 1 : 1;
-	store->current = candidate;
+	prepared = XCALLOC(MTYPE_MIDR_TED_PREPARED, sizeof(*prepared));
+	prepared->store = store;
+	prepared->candidate = candidate;
+	prepared->changes = changes;
+	*out = prepared;
+	return 0;
+}
+
+int midr_ted_prepare_ready(struct midr_context *ctx,
+			   const struct midr_ted_builder *builder,
+			   uint64_t sync_reason_flags,
+			   struct midr_ted_prepared **out)
+{
+	struct midr_ted_snapshot_internal *candidate = NULL;
+	int ret;
+
+	if (!out || *out)
+		return -EINVAL;
+	if (!ctx || !ctx->ted_store)
+		return -ENOENT;
+	ret = midr_ted_snapshot_build(builder, sync_reason_flags, &candidate);
+	if (ret)
+		return ret;
+	return midr_ted_prepare_candidate(ctx, candidate, out);
+}
+
+int midr_ted_prepare_not_ready(struct midr_context *ctx,
+			       uint32_t local_node_id,
+			       uint64_t sync_reason_flags,
+			       struct midr_ted_prepared **out)
+{
+	struct midr_ted_snapshot_internal *candidate = NULL;
+	int ret;
+
+	if (!out || *out)
+		return -EINVAL;
+	if (!ctx || !ctx->ted_store)
+		return -ENOENT;
+	ret = midr_ted_snapshot_not_ready(local_node_id, sync_reason_flags,
+					  &candidate);
+	if (ret)
+		return ret;
+	return midr_ted_prepare_candidate(ctx, candidate, out);
+}
+
+void midr_ted_prepared_commit(struct midr_ted_prepared **preparedp)
+{
+	struct midr_ted_snapshot_internal *candidate;
+	struct midr_ted_snapshot_internal *old;
+	struct midr_ted_prepared *prepared;
+	struct midr_ted_store *store;
+
+	if (!preparedp || !*preparedp)
+		return;
+	prepared = *preparedp;
+	*preparedp = NULL;
+	store = prepared->store;
+	candidate = prepared->candidate;
+	old = store->current;
 	store->pending_link_count = candidate->pending_link_count;
-	store->pending_node_prefix_count = candidate->pending_node_prefix_count;
-	store->pending_prefix_group_count = candidate->pending_prefix_group_count;
-	midr_ted_notify(store, candidate->public.generation, changes);
+	store->pending_node_prefix_count =
+		candidate->pending_node_prefix_count;
+	store->pending_prefix_group_count =
+		candidate->pending_prefix_group_count;
+	if (!prepared->changes) {
+		midr_ted_snapshot_put(candidate);
+		XFREE(MTYPE_MIDR_TED_PREPARED, prepared);
+		return;
+	}
+
+	store->current = candidate;
+	midr_ted_notify(store, candidate->public.generation,
+			prepared->changes);
 	midr_ted_snapshot_put(old);
+	XFREE(MTYPE_MIDR_TED_PREPARED, prepared);
+}
+
+void midr_ted_prepared_abort(struct midr_ted_prepared **preparedp)
+{
+	struct midr_ted_prepared *prepared;
+
+	if (!preparedp || !*preparedp)
+		return;
+	prepared = *preparedp;
+	*preparedp = NULL;
+	midr_ted_snapshot_put(prepared->candidate);
+	XFREE(MTYPE_MIDR_TED_PREPARED, prepared);
+}
+
+int midr_ted_builder_publish(struct midr_context *ctx, const struct midr_ted_builder *builder,
+			     uint64_t sync_reason_flags)
+{
+	struct midr_ted_prepared *prepared = NULL;
+	int ret;
+
+	ret = midr_ted_prepare_ready(ctx, builder, sync_reason_flags,
+				     &prepared);
+	if (ret)
+		return ret;
+	midr_ted_prepared_commit(&prepared);
 	return 0;
 }
 

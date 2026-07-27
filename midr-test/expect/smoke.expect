@@ -5,5 +5,9 @@ MIDR topology links:
   enqueued:       2
   processed:      2
   ignored-old:    0
+MIDR RIB summary:
+MIDR owned objects:
+MIDR LSDB summary:
+MIDR TED summary:
 !% MIDR node upsert failed
 !% MIDR link upsert failed

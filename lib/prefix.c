@@ -182,6 +182,8 @@ const char *safi2str(safi_t safi)
 		return "flowspec";
 	case SAFI_BGP_LS:
 		return "bgp-ls";
+	case SAFI_MIDR_LS:
+		return "midr-ls";
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		return "unknown";

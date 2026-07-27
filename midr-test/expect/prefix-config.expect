@@ -1,0 +1,12 @@
+MIDR prefix input:
+  state:             READY
+ midr group-prefix takeover-delay-ms 2500
+  neighbor 192.0.2.2 midr external-prefix-source
+  midr prefix-export route-map EXPORT-MIDR-V4
+  midr prefix-export local-source network
+  midr prefix-export local-source connected
+  midr prefix-export local-source static
+  neighbor 2001:db8::2 midr external-prefix-source
+  midr prefix-export route-map EXPORT-MIDR-V6
+!% Unknown command
+!% Ambiguous command
