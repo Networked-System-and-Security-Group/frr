@@ -50,14 +50,28 @@ static void midr_ctrl_drop_pending(struct bgp_midr *mi, uint8_t type);
 static void midr_ctrl_retx_timer(struct event *t);
 static void midr_ctrl_udp_recv(struct event *t);
 
+static void midr_ctrl_prefix_from_in_addr(struct prefix *p, struct in_addr a)
+{
+	memset(p, 0, sizeof(*p));
+	p->family = AF_INET;
+	p->prefixlen = IPV4_MAX_BITLEN;
+	p->u.prefix4 = a;
+}
+
+static bool midr_ctrl_endpoint_usable(struct bgp *bgp, struct in_addr address)
+{
+	struct prefix endpoint;
+
+	midr_ctrl_prefix_from_in_addr(&endpoint, address);
+	return midr_liveness_endpoint_usable(bgp, &endpoint);
+}
+
 /* Build a union sockunion (AF_INET) from a bare in_addr. */
 static void midr_su_from_in_addr(union sockunion *su, struct in_addr a)
 {
-	struct prefix p = {};
+	struct prefix p;
 
-	p.family = AF_INET;
-	p.prefixlen = IPV4_MAX_BITLEN;
-	p.u.prefix4 = a;
+	midr_ctrl_prefix_from_in_addr(&p, a);
 	prefix2sockunion(&p, su);
 }
 
@@ -189,7 +203,7 @@ static bool midr_ctrl_enqueue_request(struct bgp *bgp, struct in_addr dst,
 			  type);
 		return false;
 	}
-	if (!midr_liveness_transport_usable(bgp, dst)) {
+	if (!midr_ctrl_endpoint_usable(bgp, dst)) {
 		MIDR_LOG("midr_ctrl: refusing %s to quarantined transport %pI4",
 			 midr_ctrl_msg_type_str(type), &dst);
 		return false;
@@ -290,8 +304,7 @@ static void midr_ctrl_retx_timer(struct event *t)
 	struct midr_ctrl_pending *p;
 
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p)) {
-		if (!midr_liveness_transport_usable(bgp,
-						      p->target_transport)) {
+		if (!midr_ctrl_endpoint_usable(bgp, p->target_transport)) {
 			MIDR_LOG("midr_ctrl: cancel pending %s to SUSPECT transport %pI4",
 				 midr_ctrl_msg_type_str(p->type),
 				 &p->target_transport);
@@ -367,9 +380,9 @@ static bool midr_ctrl_rep_list_contains(const struct stream *s, uint32_t count,
  * 告警截断——消灭原 UDP 版的静默截断)。dst 仅用于日志。
  *
  * 条目两来源 (任务甲, 2026-07-10):
- *   1) mi->rep_dir (手配/学来) 全量排前——CL 现为"取首条"占位策略, 应答条目序
- *      = 客户端目录序, 排前即"人工覆盖/应急兜底"的实际生效机制; 真 CL 按链路
- *      质量选优后自动退化为并列候选, 无需再改。
+ *   1) mi->rep_dir (手配/学来) 的当前可用视图排前——原始目录不删除，
+ *      SUSPECT/近期删除项恢复后可重新进入；应答条目序 = 客户端目录序，
+ *      排前即"人工覆盖/应急兜底"的实际生效机制。
  *   2) midr_rep_candidates() 从 global_view 按 GROUP_REP 位推导的候选, 与已写
  *      条目 (group_id, transport) 重合的跳过。
  * 合并后 0 条则返回 NULL = 不回包 (沉默同闸门): 回空表会让客户端清目录+销重
@@ -384,7 +397,7 @@ static bool midr_ctrl_rep_list_contains(const struct stream *s, uint32_t count,
 static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 					       struct in_addr dst)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct list *directory = list_new();
 	struct list *derived = list_new();
 	struct stream *s;
 	struct listnode *node;
@@ -394,8 +407,9 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 	uint32_t count = 0, n_dir = 0, n_derived = 0, n_dedup = 0;
 	size_t count_pos;
 
+	midr_rep_directory_usable(bgp, directory);
 	midr_rep_candidates(bgp, derived);
-	maxn = listcount(mi->rep_dir) + listcount(derived);
+	maxn = listcount(directory) + listcount(derived);
 	if (maxn > 65535)
 		maxn = 65535;
 	s = stream_new(sizeof(struct midr_ctrl_list_hdr) +
@@ -406,19 +420,14 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 	count_pos = stream_get_endp(s);
 	stream_putw(s, 0); /* count 占位, 末尾回填 */
 
-	/* 来源一: rep_dir 全量, 排前 (覆盖生效机制, 见函数头) */
-	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
+	/* 来源一: rep_dir 的可用借用视图，原始目录保持不变。 */
+	for (ALL_LIST_ELEMENTS_RO(directory, node, r)) {
 		struct midr_ctrl_rep_item item;
 
 		if (count >= 65535) {
 			zlog_warn("midr_ctrl: rep directory exceeds 65535 — REP_LIST_RESP truncated");
 			break;
 		}
-		/* Preserve unknown/manual bootstrap entries, but quarantine a
-		 * directory locator that maps to a known SUSPECT node.
-		 */
-		if (!midr_liveness_transport_usable(bgp, r->rep_transport))
-			continue;
 		item.group_id = htonl(r->group_id);
 		item.rep_transport = r->rep_transport;
 		item.rep_asn = htonl((uint32_t)r->rep_asn);
@@ -435,6 +444,8 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 			zlog_warn("midr_ctrl: rep directory exceeds 65535 — REP_LIST_RESP truncated");
 			break;
 		}
+		if (!midr_ctrl_endpoint_usable(bgp, ne->transport_addr))
+			continue;
 		if (midr_ctrl_rep_list_contains(s, count, ne->group_id,
 						ne->transport_addr)) {
 			n_dedup++;
@@ -447,6 +458,7 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 		count++;
 		n_derived++;
 	}
+	list_delete(&directory);
 	list_delete(&derived);
 
 	if (count == 0) {
@@ -517,7 +529,8 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 			break;
 		}
 		midr_node_get_locator(entry, &locator);
-		if (locator.family != AF_INET)
+		if (locator.family != AF_INET ||
+		    !midr_liveness_endpoint_usable(bgp, &locator))
 			continue;
 		item.rid = entry->node_id.u.prefix4;
 		item.transport = locator.u.prefix4;
@@ -598,8 +611,17 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	 * midr_nds_on_cluster_decision 的 JOIN 分支调 connect_group。
 	 */
 	for (i = 0; i < count; i++) {
+		struct prefix node_id;
+
 		if (IPV4_ADDR_SAME(&items[i].rid, &bgp->router_id))
 			continue; /* 跳过描述自己的条目 */
+		midr_ctrl_prefix_from_in_addr(&node_id, items[i].rid);
+		if (!midr_liveness_indirect_endpoint_usable(
+			    bgp, &node_id, &items[i].transport)) {
+			MIDR_LOG("MIDR 加入：忽略隔离成员 %pFX",
+				 &node_id);
+			continue;
+		}
 
 		midr_nds_learn_member(bgp, items[i].rid, ntohl(items[i].asn),
 				      items[i].transport,
@@ -636,7 +658,6 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 	struct bgp_midr *mi = bgp->midr_info;
 	struct midr_ctrl_msg msg;
 	struct midr_node_entry key = {};
-	struct midr_node_entry *known;
 
 	if (!mi)
 		return NULL;
@@ -652,15 +673,16 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 	memcpy(&msg, payload, sizeof(msg));
 	if (msg.version != MIDR_CTRL_MSG_VERSION)
 		return NULL;
+	if (!midr_ctrl_endpoint_usable(bgp, remote)) {
+		MIDR_LOG("midr_ctrl: ignoring list request from quarantined transport %pI4",
+			 &remote);
+		return NULL;
+	}
 	key.node_id.family = AF_INET;
 	key.node_id.prefixlen = IPV4_MAX_BITLEN;
 	key.node_id.u.prefix4 = msg.requester_rid;
-	known = midr_node_hash_find(&mi->global_view->nodes, &key);
-	if ((known && !midr_liveness_node_usable(known)) ||
-	    (!known &&
-	     (!midr_liveness_indirect_discovery_allowed(bgp, &key.node_id) ||
-	      !midr_liveness_transport_usable(bgp,
-						msg.requester_transport)))) {
+	if (!midr_liveness_indirect_endpoint_usable(
+		    bgp, &key.node_id, &msg.requester_transport)) {
 		MIDR_LOG("midr_ctrl: ignoring list request from quarantined node %pFX",
 			 &key.node_id);
 		return NULL;
@@ -711,7 +733,7 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 {
 	const struct midr_ctrl_list_hdr *hdr;
 
-	if (!midr_liveness_transport_usable(bgp, remote)) {
+	if (!midr_ctrl_endpoint_usable(bgp, remote)) {
 		MIDR_LOG("midr_ctrl: ignoring TCP response from quarantined transport %pI4",
 			 &remote);
 		return;
@@ -817,6 +839,14 @@ static void midr_ctrl_udp_recv(struct event *t)
 		req.transport_addr = msg.requester_transport;
 		req.has_transport_addr = true;
 
+		if (!midr_ctrl_endpoint_usable(bgp, from.sin_addr) ||
+		    !midr_liveness_indirect_endpoint_usable(
+			    bgp, &req.node_id, &req.transport_addr)) {
+			MIDR_LOG("midr_ctrl: ignoring PEER_REQUEST from quarantined node %pFX",
+				 &req.node_id);
+			return;
+		}
+
 		MIDR_FLOW_LOG("midr_ctrl: PEER_REQUEST rid %pI4 transport %pI4 AS %u group %u",
 			  &msg.requester_rid, &msg.requester_transport,
 			  (unsigned int)req.asn, target_group);
@@ -919,8 +949,6 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 {
 	union sockunion su;
 	struct prefix locator;
-	struct midr_node_entry key = {};
-	struct midr_node_entry *known;
 	struct peer *peer;
 	as_t asn;
 	int ret;
@@ -930,22 +958,14 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry)
 	asn = entry->asn;
 	midr_node_get_locator(entry, &locator);
 
-	/* A transient PEER_REQUEST entry may bypass the node table.  Allow an
-	 * unknown joiner unless a recent DEAD/LEAVE quarantines its identity or
-	 * locator; never recreate a session for a known SUSPECT.
+	/* A transient PEER_REQUEST entry may bypass the node table.  The
+	 * combined identity+transport gate handles both known SUSPECT/REMOVING
+	 * nodes and recently removed unknown endpoints.
 	 */
-	prefix_copy(&key.node_id, &entry->node_id);
-	known = midr_node_hash_find(&bgp->midr_info->global_view->nodes, &key);
-	if (known && !midr_liveness_node_usable(known)) {
-		MIDR_LOG("midr_ctrl: skip peering with SUSPECT node %pFX",
-			 &entry->node_id);
-		return;
-	}
-	if (!known &&
-	    (!midr_liveness_indirect_discovery_allowed(bgp, &entry->node_id) ||
-	     locator.family != AF_INET ||
-	     !midr_liveness_transport_usable(bgp, locator.u.prefix4))) {
-		MIDR_LOG("midr_ctrl: skip recently removed unknown node %pFX",
+	if (locator.family != AF_INET ||
+	    !midr_liveness_indirect_endpoint_usable(
+		    bgp, &entry->node_id, &locator.u.prefix4)) {
+		MIDR_LOG("midr_ctrl: skip quarantined endpoint %pFX",
 			 &entry->node_id);
 		return;
 	}
@@ -1093,11 +1113,16 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id)
 		return 0;
 
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
+		struct prefix locator;
+
 		if (entry->is_self)
 			continue;
-		if (!midr_liveness_node_usable(entry))
-			continue;
 		if (entry->group_id != group_id)
+			continue;
+		midr_node_get_locator(entry, &locator);
+		if (locator.family != AF_INET ||
+		    !midr_liveness_indirect_endpoint_usable(
+			    bgp, &entry->node_id, &locator.u.prefix4))
 			continue;
 		midr_ctrl_connect(bgp, entry);
 		midr_mark_topology(bgp, entry);

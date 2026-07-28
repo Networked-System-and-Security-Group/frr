@@ -130,7 +130,14 @@ struct midr_node_entry {
 	 */
 	struct in_addr transport_addr;
 	bool has_transport_addr;
-	time_t last_seen;	/* last keepalive timestamp (local clock) */
+	/*
+	 * Only receipt of the node's BGP-LS Node NLRI may update last_seen.
+	 * Weak MEMBER_LIST discovery and indirect ALIVE responses instead set
+	 * a local, non-transitive lease.  That lease may keep this instance's
+	 * entry ACTIVE, but can never be used to vote ALIVE for a third party.
+	 */
+	time_t last_seen;
+	time_t nontransitive_alive_until;
 	/*
 	 * 接口设计文档 §2.3 规格字段，现实现未接线（全树零读写）——判断群
 	 * 代表一律用 capabilities & MIDR_CAP_GROUP_REP（rep 目录推导/闸门
@@ -421,6 +428,12 @@ extern void midr_group_members(struct bgp *bgp, uint32_t group_id,
  * self.  Single source of truth for the derived directory view (任务甲).
  */
 extern void midr_rep_candidates(struct bgp *bgp, struct list *out);
+
+/* Collect borrowed pointers to currently usable entries in the configured or
+ * learned representative directory.  The raw directory remains intact so a
+ * recovered representative can become usable again.
+ */
+extern void midr_rep_directory_usable(struct bgp *bgp, struct list *out);
 
 /* Group-representative directory (bootstrap config + learned). */
 extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,

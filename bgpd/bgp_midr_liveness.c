@@ -27,10 +27,17 @@
 #include "bgpd/bgp_debug.h"
 
 #define MIDR_LIVENESS_TICK_INTERVAL 1
+#define MIDR_LIVENESS_AGE_UNKNOWN UINT32_MAX
+#define MIDR_LIVENESS_AGE_MAX (UINT32_MAX - 1)
+#define MIDR_LIVENESS_DEFAULT_MAX_INFLIGHT_ROUNDS 32
+#define MIDR_LIVENESS_LEAVE_RETX_COUNT 2
+#define MIDR_LIVENESS_LEAVE_RETX_INTERVAL_MS 500
+#define MIDR_LIVENESS_LEAVE_RETX_PENDING_MAX 64
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_MIDR_LIVENESS, "MIDR liveness context");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_LIVENESS_ROUND, "MIDR liveness round");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_LIVENESS_SEEN, "MIDR liveness seen rumor");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_LIVENESS_RETX, "MIDR liveness retransmit");
 
 struct midr_liveness_wire_hdr {
 	uint8_t version;
@@ -90,14 +97,30 @@ struct midr_liveness_voter {
 	enum midr_liveness_probe_result result;
 };
 
+enum midr_liveness_round_state {
+	MIDR_LIVENESS_ROUND_DELAYED,
+	MIDR_LIVENESS_ROUND_WAITING,
+	MIDR_LIVENESS_ROUND_BACKOFF,
+};
+
+enum midr_liveness_detector_tier {
+	MIDR_LIVENESS_DETECTOR_DIRECT,
+	MIDR_LIVENESS_DETECTOR_SAME_GROUP,
+	MIDR_LIVENESS_DETECTOR_REMOTE,
+};
+
 struct midr_liveness_round {
 	struct prefix subject;
 	uint32_t round_id;
 	uint32_t required_quorum;
+	uint32_t requester_age;
 	struct midr_liveness_voter voters[MIDR_LIVENESS_MAX_VOTERS];
 	size_t voter_count;
+	time_t started_at;
 	time_t deadline;
-	bool waiting;
+	enum midr_liveness_round_state state;
+	enum midr_liveness_detector_tier tier;
+	bool counted_inflight;
 };
 
 struct midr_liveness_seen {
@@ -116,14 +139,29 @@ enum midr_liveness_seen_result {
 	MIDR_LIVENESS_SEEN_DUPLICATE,
 	MIDR_LIVENESS_SEEN_FIRST,
 	MIDR_LIVENESS_SEEN_FORWARD_ONLY,
+	MIDR_LIVENESS_SEEN_SUBJECT_SUPPRESSED,
+};
+
+struct midr_liveness_retx {
+	struct bgp *bgp;
+	struct event *timer;
+	uint8_t payload[MIDR_LIVENESS_MAX_WIRE_SIZE];
+	size_t length;
+	struct sockaddr_in source;
+	struct in_addr subject;
+	bool has_source;
+	uint8_t retries_left;
 };
 
 struct midr_liveness {
 	struct midr_liveness_config config;
 	struct list *rounds;
 	struct list *seen;
+	struct list *leave_retx;
 	struct event *t_self_advertise;
 	uint32_t tx_counter;
+	uint32_t inflight_rounds;
+	uint32_t max_inflight_rounds;
 	time_t next_node_scan;
 };
 
@@ -135,6 +173,16 @@ static void midr_liveness_round_begin(struct bgp *bgp,
 				      time_t now);
 static bool midr_liveness_recent_transport_blocked(
 	struct midr_liveness *ctx, struct in_addr transport);
+static void midr_liveness_recover(struct bgp *bgp,
+				  struct midr_node_entry *entry, bool direct);
+static void midr_liveness_leave_retx_cancel_subject(
+	struct midr_liveness *ctx, struct in_addr subject);
+static uint32_t midr_liveness_initial_delay(
+	const struct bgp *bgp, const struct midr_liveness *ctx,
+	const struct midr_liveness_round *round);
+static void midr_liveness_round_schedule(
+	struct midr_liveness *ctx, struct midr_liveness_round *round,
+	enum midr_liveness_round_state state, time_t deadline);
 
 static void midr_liveness_rearm_keepalive(struct bgp *bgp)
 {
@@ -189,12 +237,35 @@ static uint32_t midr_liveness_age(time_t now, time_t last_seen)
 {
 	time_t age;
 
-	if (last_seen <= 0 || now <= last_seen)
+	if (last_seen <= 0)
+		return MIDR_LIVENESS_AGE_UNKNOWN;
+	if (now <= last_seen)
 		return 0;
 	age = now - last_seen;
-	if ((uint64_t)age > UINT32_MAX)
-		return UINT32_MAX;
+	if ((uint64_t)age > MIDR_LIVENESS_AGE_MAX)
+		return MIDR_LIVENESS_AGE_MAX;
 	return (uint32_t)age;
+}
+
+static bool midr_liveness_direct_evidence_fresh(
+	const struct midr_liveness *ctx, const struct midr_node_entry *entry,
+	time_t now)
+{
+	uint32_t age;
+
+	if (!ctx || !entry)
+		return false;
+	age = midr_liveness_age(now, entry->last_seen);
+	return age != MIDR_LIVENESS_AGE_UNKNOWN &&
+	       age <= ctx->config.suspect_timeout;
+}
+
+static bool midr_liveness_any_evidence_fresh(
+	const struct midr_liveness *ctx, const struct midr_node_entry *entry,
+	time_t now)
+{
+	return midr_liveness_direct_evidence_fresh(ctx, entry, now) ||
+	       entry->nontransitive_alive_until > now;
 }
 
 void
@@ -289,6 +360,20 @@ bool midr_liveness_set_config(struct bgp *bgp,
 		ctx->next_node_scan = now + ctx->config.scan_interval;
 	if (keepalive_changed)
 		midr_liveness_rearm_keepalive(bgp);
+	/*
+	 * A weak-evidence lease is never extended by a configuration change.
+	 * When the timeout is reduced, cap outstanding leases to the new upper
+	 * bound so old policy cannot keep a node ACTIVE for longer than the new
+	 * policy allows.
+	 */
+	if (ctx->config.suspect_timeout < old_suspect_timeout)
+		frr_each (midr_node_hash,
+			  &bgp->midr_info->global_view->nodes, entry) {
+			time_t cap = now + ctx->config.suspect_timeout;
+
+			if (entry->nontransitive_alive_until > cap)
+				entry->nontransitive_alive_until = cap;
+		}
 	/* Only a timeout-only suspicion can become invalid merely because the
 	 * operator raised the timeout.  A WITHDRAW remains independent evidence.
 	 */
@@ -297,17 +382,33 @@ bool midr_liveness_set_config(struct bgp *bgp,
 			       &bgp->midr_info->global_view->nodes, entry) {
 			if (entry->liveness_state == MIDR_NODE_SUSPECT &&
 			    entry->liveness_suspect_causes ==
-				    MIDR_NODE_SUSPECT_TIMEOUT &&
-			    midr_liveness_age(now, entry->last_seen) <=
-				    ctx->config.suspect_timeout)
-				midr_liveness_on_alive(bgp, entry);
+				    MIDR_NODE_SUSPECT_TIMEOUT) {
+				if (midr_liveness_direct_evidence_fresh(
+					    ctx, entry, now))
+					midr_liveness_recover(bgp, entry, true);
+				else if (entry->nontransitive_alive_until >
+					 now)
+					midr_liveness_recover(bgp, entry, false);
+			}
 		}
 	/* Re-snapshot voters and issue a new round-id so responses to the old
 	 * runtime configuration cannot commit under a newly displayed policy.
 	 */
 	if (round_changed)
-		for (ALL_LIST_ELEMENTS_RO(ctx->rounds, node, round))
-			midr_liveness_round_begin(bgp, round, now);
+		for (ALL_LIST_ELEMENTS_RO(ctx->rounds, node, round)) {
+			if (round->state == MIDR_LIVENESS_ROUND_WAITING)
+				midr_liveness_round_begin(bgp, round, now);
+			else if (round->state ==
+				 MIDR_LIVENESS_ROUND_DELAYED)
+				round->deadline =
+					now + midr_liveness_initial_delay(
+						      bgp, ctx, round);
+			else
+				midr_liveness_round_schedule(
+					ctx, round,
+					MIDR_LIVENESS_ROUND_BACKOFF,
+					now + ctx->config.retry_backoff);
+		}
 	if (cache_changed)
 		for (ALL_LIST_ELEMENTS_RO(ctx->seen, node, seen))
 			seen->expires_at += (time_t)ctx->config.cache_ttl -
@@ -352,6 +453,45 @@ bool midr_liveness_transport_usable(struct bgp *bgp,
 		midr_liveness_ctx(bgp), transport);
 }
 
+bool midr_liveness_endpoint_usable(struct bgp *bgp,
+				   const struct prefix *endpoint)
+{
+	struct midr_node_entry *entry;
+
+	if (!bgp || !endpoint || endpoint->family != AF_INET)
+		return false;
+	if (!midr_liveness_indirect_discovery_allowed(bgp, endpoint))
+		return false;
+	entry = midr_liveness_find_node(bgp, endpoint);
+	if (entry && !midr_liveness_node_usable(entry))
+		return false;
+	return midr_liveness_transport_usable(bgp, endpoint->u.prefix4);
+}
+
+bool midr_liveness_indirect_endpoint_usable(
+	struct bgp *bgp, const struct prefix *node_id,
+	const struct in_addr *transport)
+{
+	struct midr_node_entry *entry;
+
+	if (!bgp)
+		return false;
+	if (node_id) {
+		if (node_id->family != AF_INET ||
+		    !midr_liveness_indirect_discovery_allowed(bgp, node_id))
+			return false;
+		entry = midr_liveness_find_node(bgp, node_id);
+		if (entry && !midr_liveness_node_usable(entry))
+			return false;
+	}
+	if (transport)
+		return midr_liveness_transport_usable(bgp, *transport);
+	if (node_id)
+		return midr_liveness_transport_usable(
+			bgp, node_id->u.prefix4);
+	return true;
+}
+
 static uint32_t midr_liveness_next_id(struct midr_liveness *ctx)
 {
 	ctx->tx_counter++;
@@ -385,15 +525,30 @@ static bool midr_liveness_udp_send(struct bgp *bgp, struct in_addr address,
 }
 
 static bool
-midr_liveness_neighbor_eligible(struct bgp *bgp,
-				const struct midr_node_entry *entry,
-				const struct prefix *subject)
+midr_liveness_voter_eligible(struct bgp *bgp,
+			     const struct midr_node_entry *entry,
+			     const struct prefix *subject)
 {
 	if (!entry || entry->is_self || !entry->is_adjacent ||
 	    !entry->has_transport_addr || !midr_liveness_node_usable(entry))
 		return false;
 	if (subject && prefix_same(&entry->node_id, subject))
 		return false;
+	return midr_node_established_peer(bgp, &entry->node_id) != NULL;
+}
+
+static bool
+midr_liveness_gossip_peer_eligible(struct bgp *bgp,
+				   const struct midr_node_entry *entry)
+{
+	if (!entry || entry->is_self || !entry->has_transport_addr ||
+	    !midr_liveness_node_usable(entry))
+		return false;
+	/*
+	 * Gossip may use every active Established MIDR session, including a
+	 * statically configured or cross-group peer.  Voting remains limited
+	 * to semantic adjacencies by midr_liveness_voter_eligible().
+	 */
 	return midr_node_established_peer(bgp, &entry->node_id) != NULL;
 }
 
@@ -406,13 +561,127 @@ static void midr_liveness_gossip_raw(struct bgp *bgp, const uint8_t *payload,
 	if (!bgp || !bgp->midr_info)
 		return;
 	frr_each (midr_node_hash, &bgp->midr_info->global_view->nodes, entry) {
-		if (!midr_liveness_neighbor_eligible(bgp, entry, NULL))
+		if (!midr_liveness_gossip_peer_eligible(bgp, entry))
 			continue;
 		if (source && IPV4_ADDR_SAME(&source->sin_addr,
 					  &entry->transport_addr))
 			continue;
 		midr_liveness_udp_send(bgp, entry->transport_addr, payload,
 					   length);
+	}
+}
+
+static void
+midr_liveness_leave_retx_delete(struct midr_liveness *ctx,
+				struct midr_liveness_retx *retry)
+{
+	struct listnode *node, *next;
+	struct midr_liveness_retx *candidate;
+
+	if (!ctx || !retry)
+		return;
+	for (ALL_LIST_ELEMENTS(ctx->leave_retx, node, next, candidate)) {
+		if (candidate != retry)
+			continue;
+		event_cancel(&candidate->timer);
+		list_delete_node(ctx->leave_retx, node);
+		XFREE(MTYPE_MIDR_LIVENESS_RETX, candidate);
+		return;
+	}
+}
+
+static void midr_liveness_leave_retx_timer(struct event *event)
+{
+	struct midr_liveness_retx *retry = EVENT_ARG(event);
+	struct midr_liveness *ctx;
+
+	if (!retry)
+		return;
+	retry->timer = NULL;
+	ctx = midr_liveness_ctx(retry->bgp);
+	if (!ctx) {
+		XFREE(MTYPE_MIDR_LIVENESS_RETX, retry);
+		return;
+	}
+	midr_liveness_gossip_raw(
+		retry->bgp, retry->payload, retry->length,
+		retry->has_source ? &retry->source : NULL);
+	if (--retry->retries_left == 0) {
+		midr_liveness_leave_retx_delete(ctx, retry);
+		return;
+	}
+	event_add_timer_msec(bm->master, midr_liveness_leave_retx_timer,
+			     retry, MIDR_LIVENESS_LEAVE_RETX_INTERVAL_MS,
+			     &retry->timer);
+}
+
+static void midr_liveness_leave_retx_schedule(
+	struct bgp *bgp, const uint8_t *payload, size_t length,
+	const struct sockaddr_in *source)
+{
+	struct midr_liveness_leave_wire leave;
+	struct midr_liveness_leave_wire pending;
+	struct midr_liveness *ctx = midr_liveness_ctx(bgp);
+	struct midr_liveness_retx *retry;
+	struct listnode *node;
+
+	if (!ctx || !payload || length != sizeof(leave))
+		return;
+	memcpy(&leave, payload, sizeof(leave));
+	for (ALL_LIST_ELEMENTS_RO(ctx->leave_retx, node, retry)) {
+		memcpy(&pending, retry->payload, sizeof(pending));
+		if (pending.hdr.message_id != leave.hdr.message_id ||
+		    !IPV4_ADDR_SAME(&pending.hdr.origin,
+				    &leave.hdr.origin))
+			continue;
+		/*
+		 * A later copy with more remaining reach replaces the pending
+		 * payload; it does not create a second retransmission burst.
+		 */
+		if (leave.hop_limit > pending.hop_limit) {
+			memcpy(retry->payload, payload, length);
+			retry->length = length;
+			if (source) {
+				retry->source = *source;
+				retry->has_source = true;
+			} else
+				retry->has_source = false;
+		}
+		return;
+	}
+	if (listcount(ctx->leave_retx) >=
+	    MIDR_LIVENESS_LEAVE_RETX_PENDING_MAX)
+		return;
+	retry = XCALLOC(MTYPE_MIDR_LIVENESS_RETX, sizeof(*retry));
+	retry->bgp = bgp;
+	memcpy(retry->payload, payload, length);
+	retry->length = length;
+	retry->subject = leave.subject;
+	retry->retries_left = MIDR_LIVENESS_LEAVE_RETX_COUNT;
+	if (source) {
+		retry->source = *source;
+		retry->has_source = true;
+	}
+	listnode_add(ctx->leave_retx, retry);
+	event_add_timer_msec(bm->master, midr_liveness_leave_retx_timer,
+			     retry, MIDR_LIVENESS_LEAVE_RETX_INTERVAL_MS,
+			     &retry->timer);
+}
+
+static void midr_liveness_leave_retx_cancel_subject(
+	struct midr_liveness *ctx, struct in_addr subject)
+{
+	struct listnode *node, *next;
+	struct midr_liveness_retx *retry;
+
+	if (!ctx)
+		return;
+	for (ALL_LIST_ELEMENTS(ctx->leave_retx, node, next, retry)) {
+		if (!IPV4_ADDR_SAME(&retry->subject, &subject))
+			continue;
+		event_cancel(&retry->timer);
+		list_delete_node(ctx->leave_retx, node);
+		XFREE(MTYPE_MIDR_LIVENESS_RETX, retry);
 	}
 }
 
@@ -473,19 +742,58 @@ static enum midr_liveness_seen_result midr_liveness_seen_accept(
 {
 	struct listnode *node;
 	struct midr_liveness_seen *seen;
+	struct midr_liveness_seen *exact = NULL;
+	struct midr_liveness_seen *subject_seen = NULL;
 	struct midr_node_entry *entry;
 	struct prefix locator;
+	uint8_t subject_max_hop = 0;
 
 	midr_liveness_seen_gc(ctx, now);
 	for (ALL_LIST_ELEMENTS_RO(ctx->seen, node, seen))
 		if (seen->type == type && seen->message_id == message_id &&
 		    IPV4_ADDR_SAME(&seen->origin, &origin)) {
-			if (!IPV4_ADDR_SAME(&seen->subject, &subject) ||
+			/*
+			 * A direct rejoin clears the quarantine bit but retains
+			 * the dedup record.  Never let a delayed higher-hop copy
+			 * of that resolved event restart propagation.
+			 */
+			if (!seen->blocks_indirect_discovery ||
+			    !IPV4_ADDR_SAME(&seen->subject, &subject) ||
 			    hop_limit <= seen->max_hop_limit)
 				return MIDR_LIVENESS_SEEN_DUPLICATE;
-			seen->max_hop_limit = hop_limit;
-			return MIDR_LIVENESS_SEEN_FORWARD_ONLY;
+			exact = seen;
+			break;
 		}
+
+	/*
+	 * Independent detectors may create different message IDs for the same
+	 * DEAD subject.  Merge their waves by subject while still allowing a
+	 * later copy with a larger remaining radius to progress.
+	 */
+	if (type == MIDR_LIVENESS_DEAD)
+		for (ALL_LIST_ELEMENTS_RO(ctx->seen, node, seen)) {
+			if (seen->type != MIDR_LIVENESS_DEAD ||
+			    !seen->blocks_indirect_discovery ||
+			    !IPV4_ADDR_SAME(&seen->subject, &subject))
+				continue;
+			if (!subject_seen ||
+			    seen->max_hop_limit > subject_max_hop) {
+				subject_seen = seen;
+				subject_max_hop = seen->max_hop_limit;
+			}
+		}
+	if (subject_seen) {
+		if (hop_limit <= subject_max_hop)
+			return MIDR_LIVENESS_SEEN_SUBJECT_SUPPRESSED;
+		subject_seen->max_hop_limit = hop_limit;
+		if (exact)
+			exact->max_hop_limit = hop_limit;
+		return MIDR_LIVENESS_SEEN_FORWARD_ONLY;
+	}
+	if (exact) {
+		exact->max_hop_limit = hop_limit;
+		return MIDR_LIVENESS_SEEN_FORWARD_ONLY;
+	}
 
 	seen = XCALLOC(MTYPE_MIDR_LIVENESS_SEEN, sizeof(*seen));
 	seen->type = type;
@@ -511,6 +819,93 @@ static enum midr_liveness_seen_result midr_liveness_seen_accept(
 	return MIDR_LIVENESS_SEEN_FIRST;
 }
 
+static uint32_t midr_liveness_mix32(uint32_t value)
+{
+	value ^= value >> 16;
+	value *= 0x7feb352dU;
+	value ^= value >> 15;
+	value *= 0x846ca68bU;
+	value ^= value >> 16;
+	return value;
+}
+
+static uint32_t midr_liveness_round_jitter(
+	const struct bgp *bgp, const struct midr_liveness_round *round,
+	uint32_t span)
+{
+	uint32_t seed;
+
+	if (span == 0)
+		return 0;
+	seed = ntohl(bgp->router_id.s_addr) ^
+	       (ntohl(round->subject.u.prefix4.s_addr) * 0x9e3779b9U);
+	return midr_liveness_mix32(seed) % span;
+}
+
+static enum midr_liveness_detector_tier
+midr_liveness_detector_tier(const struct bgp *bgp,
+			    const struct midr_node_entry *entry)
+{
+	if (entry->is_adjacent)
+		return MIDR_LIVENESS_DETECTOR_DIRECT;
+	if (entry->group_id != 0 &&
+	    entry->group_id == bgp->midr_info->local_group_id)
+		return MIDR_LIVENESS_DETECTOR_SAME_GROUP;
+	return MIDR_LIVENESS_DETECTOR_REMOTE;
+}
+
+static uint32_t midr_liveness_initial_delay(
+	const struct bgp *bgp, const struct midr_liveness *ctx,
+	const struct midr_liveness_round *round)
+{
+	switch (round->tier) {
+	case MIDR_LIVENESS_DETECTOR_DIRECT:
+		return midr_liveness_round_jitter(bgp, round, 2);
+	case MIDR_LIVENESS_DETECTOR_SAME_GROUP:
+		return ctx->config.confirm_timeout +
+		       midr_liveness_round_jitter(
+			       bgp, round, ctx->config.scan_interval + 1);
+	case MIDR_LIVENESS_DETECTOR_REMOTE:
+		return 2 * ctx->config.confirm_timeout +
+		       midr_liveness_round_jitter(
+			       bgp, round, ctx->config.retry_backoff + 1);
+	}
+	return 0;
+}
+
+static void midr_liveness_round_leave_waiting(
+	struct midr_liveness *ctx, struct midr_liveness_round *round)
+{
+	if (!round->counted_inflight)
+		return;
+	if (ctx->inflight_rounds > 0)
+		ctx->inflight_rounds--;
+	round->counted_inflight = false;
+}
+
+static void midr_liveness_round_schedule(
+	struct midr_liveness *ctx, struct midr_liveness_round *round,
+	enum midr_liveness_round_state state, time_t deadline)
+{
+	midr_liveness_round_leave_waiting(ctx, round);
+	round->state = state;
+	round->deadline = deadline;
+}
+
+static const char *midr_liveness_round_state_name(
+	const struct midr_liveness_round *round)
+{
+	switch (round->state) {
+	case MIDR_LIVENESS_ROUND_DELAYED:
+		return "delayed";
+	case MIDR_LIVENESS_ROUND_WAITING:
+		return "waiting";
+	case MIDR_LIVENESS_ROUND_BACKOFF:
+		return "backoff";
+	}
+	return "unknown";
+}
+
 static struct midr_liveness_round *
 midr_liveness_round_find(struct midr_liveness *ctx,
 			 const struct prefix *subject)
@@ -533,6 +928,7 @@ static void midr_liveness_round_delete(struct midr_liveness *ctx,
 	for (ALL_LIST_ELEMENTS(ctx->rounds, node, next, candidate)) {
 		if (candidate != round)
 			continue;
+		midr_liveness_round_leave_waiting(ctx, candidate);
 		list_delete_node(ctx->rounds, node);
 		XFREE(MTYPE_MIDR_LIVENESS_ROUND, candidate);
 		return;
@@ -570,7 +966,7 @@ midr_liveness_select_voters(struct bgp *bgp,
 		uint32_t candidate_id;
 		size_t position = 0;
 
-		if (!midr_liveness_neighbor_eligible(bgp, entry, subject))
+		if (!midr_liveness_voter_eligible(bgp, entry, subject))
 			continue;
 		candidate.node_id = entry->node_id.u.prefix4;
 		candidate.transport = entry->transport_addr;
@@ -602,6 +998,19 @@ static void midr_liveness_round_begin(struct bgp *bgp,
 	struct midr_node_entry *entry;
 	size_t i;
 
+	if (!ctx || !round)
+		return;
+	midr_liveness_round_leave_waiting(ctx, round);
+	if (ctx->inflight_rounds >= ctx->max_inflight_rounds) {
+		midr_liveness_round_schedule(
+			ctx, round, MIDR_LIVENESS_ROUND_BACKOFF,
+			now + 1 + midr_liveness_round_jitter(bgp, round, 2));
+		MIDR_LOG("MIDR liveness: defer %pFX; %u/%u rounds in flight",
+			 &round->subject, ctx->inflight_rounds,
+			 ctx->max_inflight_rounds);
+		return;
+	}
+
 	memset(round->voters, 0, sizeof(round->voters));
 	round->voter_count = midr_liveness_select_voters(
 		bgp, &round->subject, round->voters,
@@ -613,8 +1022,9 @@ static void midr_liveness_round_begin(struct bgp *bgp,
 
 	/* One voter can never constitute a majority confirmation. */
 	if (round->voter_count < 2 || round->required_quorum < 2) {
-		round->waiting = false;
-		round->deadline = now + ctx->config.retry_backoff;
+		midr_liveness_round_schedule(
+			ctx, round, MIDR_LIVENESS_ROUND_BACKOFF,
+			now + ctx->config.retry_backoff);
 		MIDR_LOG("MIDR liveness: %pFX remains SUSPECT; only %zu eligible voter(s)",
 			 &round->subject, round->voter_count);
 		return;
@@ -625,15 +1035,19 @@ static void midr_liveness_round_begin(struct bgp *bgp,
 				 bgp->router_id);
 	request.subject = round->subject.u.prefix4;
 	entry = midr_liveness_find_node(bgp, &round->subject);
-	if (entry)
-		request.requester_age = htonl(midr_liveness_age(
-			now, entry->last_seen));
+	round->requester_age =
+		entry ? midr_liveness_age(now, entry->last_seen)
+		      : MIDR_LIVENESS_AGE_UNKNOWN;
+	round->started_at = now;
+	request.requester_age = htonl(round->requester_age);
+	round->state = MIDR_LIVENESS_ROUND_WAITING;
+	round->deadline = now + ctx->config.confirm_timeout;
+	round->counted_inflight = true;
+	ctx->inflight_rounds++;
 	for (i = 0; i < round->voter_count; i++)
 		midr_liveness_udp_send(bgp, round->voters[i].transport,
 					   &request, sizeof(request));
 
-	round->waiting = true;
-	round->deadline = now + ctx->config.confirm_timeout;
 	MIDR_LOG("MIDR liveness: probing %pFX round %u via %zu voters (quorum %u)",
 		 &round->subject, round->round_id, round->voter_count,
 		 round->required_quorum);
@@ -666,11 +1080,15 @@ static void midr_liveness_mark_suspect(struct bgp *bgp,
 		return;
 	round = XCALLOC(MTYPE_MIDR_LIVENESS_ROUND, sizeof(*round));
 	prefix_copy(&round->subject, &entry->node_id);
+	round->tier = midr_liveness_detector_tier(bgp, entry);
+	round->state = MIDR_LIVENESS_ROUND_DELAYED;
+	round->deadline =
+		now + midr_liveness_initial_delay(bgp, ctx, round);
 	listnode_add(ctx->rounds, round);
-	midr_liveness_round_begin(bgp, round, now);
 }
 
-void midr_liveness_on_alive(struct bgp *bgp, struct midr_node_entry *entry)
+static void midr_liveness_recover(struct bgp *bgp,
+				  struct midr_node_entry *entry, bool direct)
 {
 	struct midr_liveness *ctx = midr_liveness_ctx(bgp);
 	struct midr_liveness_round *round;
@@ -684,21 +1102,33 @@ void midr_liveness_on_alive(struct bgp *bgp, struct midr_node_entry *entry)
 	entry->liveness_state = MIDR_NODE_ACTIVE;
 	entry->liveness_suspect_causes = MIDR_NODE_SUSPECT_NONE;
 	entry->suspect_since = 0;
-	/* Accepted ALIVE evidence is allowed to supersede the lightweight
-	 * indirect-discovery quarantine without discarding rumor dedup state.
+	/*
+	 * Only a real Node NLRI (or the local self source) supersedes a DEAD or
+	 * LEAVE quarantine.  An indirect ALIVE lease is deliberately local and
+	 * non-transitive: it cannot erase the rumor or be relayed as evidence.
 	 */
-	for (ALL_LIST_ELEMENTS_RO(ctx->seen, node, seen))
-		if (IPV4_ADDR_SAME(&seen->subject,
-				   &entry->node_id.u.prefix4))
-			seen->blocks_indirect_discovery = false;
+	if (direct) {
+		entry->nontransitive_alive_until = 0;
+		for (ALL_LIST_ELEMENTS_RO(ctx->seen, node, seen))
+			if (IPV4_ADDR_SAME(&seen->subject,
+					   &entry->node_id.u.prefix4))
+				seen->blocks_indirect_discovery = false;
+		midr_liveness_leave_retx_cancel_subject(
+			ctx, entry->node_id.u.prefix4);
+	}
 	round = midr_liveness_round_find(ctx, &entry->node_id);
 	if (round)
 		midr_liveness_round_delete(ctx, round);
 	if (recovered) {
-		MIDR_LOG("MIDR liveness: node %pFX recovered to ACTIVE",
-			 &entry->node_id);
+		MIDR_LOG("MIDR liveness: node %pFX recovered to ACTIVE (%s evidence)",
+			 &entry->node_id, direct ? "direct" : "indirect");
 		midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
 	}
+}
+
+void midr_liveness_on_alive(struct bgp *bgp, struct midr_node_entry *entry)
+{
+	midr_liveness_recover(bgp, entry, true);
 }
 
 void midr_liveness_on_withdraw(struct bgp *bgp, const struct prefix *node_id)
@@ -736,6 +1166,7 @@ midr_liveness_commit_dead(struct bgp *bgp,
 	struct midr_node_entry *entry;
 	struct prefix locator;
 	uint32_t message_id;
+	enum midr_liveness_seen_result seen_result;
 	size_t voter_count = 0;
 	size_t length;
 	size_t i;
@@ -773,15 +1204,19 @@ midr_liveness_commit_dead(struct bgp *bgp,
 	       voter_count * sizeof(voters[0]));
 
 	/* Mark before publication so a reflected rumor is idempotent. */
-	midr_liveness_seen_accept(bgp, ctx, MIDR_LIVENESS_DEAD,
-				  bgp->router_id, message_id,
-				  subject.u.prefix4, dead.subject_transport,
-				  dead.hop_limit, now);
-	if (!midr_nds_commit_node_remove(bgp, &subject,
-					 MIDR_NODE_REMOVE_QUORUM_DEAD))
+	seen_result = midr_liveness_seen_accept(
+		bgp, ctx, MIDR_LIVENESS_DEAD, bgp->router_id, message_id,
+		subject.u.prefix4, dead.subject_transport, dead.hop_limit, now);
+	if (seen_result == MIDR_LIVENESS_SEEN_DUPLICATE ||
+	    seen_result == MIDR_LIVENESS_SEEN_SUBJECT_SUPPRESSED)
 		return;
-	MIDR_LOG("MIDR liveness: committed DEAD for %pFX with %zu STALE votes",
-		 &subject, voter_count);
+	if (seen_result == MIDR_LIVENESS_SEEN_FIRST) {
+		if (!midr_nds_commit_node_remove(
+			    bgp, &subject, MIDR_NODE_REMOVE_QUORUM_DEAD))
+			return;
+		MIDR_LOG("MIDR liveness: committed DEAD for %pFX with %zu STALE votes",
+			 &subject, voter_count);
+	}
 	midr_liveness_gossip_raw(bgp, payload, length, NULL);
 }
 
@@ -810,6 +1245,8 @@ void midr_liveness_publish_leave(struct bgp *bgp)
 				  leave.subject_transport, leave.hop_limit, now);
 	midr_liveness_gossip_raw(bgp, (const uint8_t *)&leave, sizeof(leave),
 				 NULL);
+	midr_liveness_leave_retx_schedule(
+		bgp, (const uint8_t *)&leave, sizeof(leave), NULL);
 	MIDR_LOG("MIDR liveness: published graceful leave for %pI4",
 		 &bgp->router_id);
 }
@@ -832,7 +1269,7 @@ static bool midr_liveness_parse_hdr(const uint8_t *buf, size_t len,
 
 static enum midr_liveness_probe_result
 midr_liveness_local_result(struct bgp *bgp, struct in_addr subject,
-			   uint32_t *age_out)
+			   uint32_t requester_age, uint32_t *age_out)
 {
 	struct midr_liveness *ctx = midr_liveness_ctx(bgp);
 	struct midr_node_entry *entry;
@@ -841,15 +1278,24 @@ midr_liveness_local_result(struct bgp *bgp, struct in_addr subject,
 
 	entry = midr_liveness_find_node_addr(bgp, subject);
 	if (!entry) {
-		*age_out = 0;
+		*age_out = MIDR_LIVENESS_AGE_UNKNOWN;
 		return MIDR_LIVENESS_RESULT_UNKNOWN;
 	}
 	age = midr_liveness_age(now, entry->last_seen);
 	*age_out = age;
+	/*
+	 * MEMBER_LIST discovery and an indirect ALIVE may keep our local entry
+	 * ACTIVE, but neither is transferable evidence for another requester.
+	 */
+	if (age == MIDR_LIVENESS_AGE_UNKNOWN)
+		return MIDR_LIVENESS_RESULT_UNKNOWN;
 	if ((entry->is_self && bgp->midr_info->shutdown) ||
 	    !midr_liveness_node_usable(entry) ||
 	    age > ctx->config.suspect_timeout)
 		return MIDR_LIVENESS_RESULT_STALE;
+	if (requester_age != MIDR_LIVENESS_AGE_UNKNOWN &&
+	    age >= requester_age)
+		return MIDR_LIVENESS_RESULT_UNKNOWN;
 	return MIDR_LIVENESS_RESULT_ALIVE;
 }
 
@@ -873,8 +1319,8 @@ static void midr_liveness_handle_probe_req(
 				 sizeof(response),
 				 ntohl(parsed_hdr->message_id), bgp->router_id);
 	response.subject = request.subject;
-	response.result =
-		midr_liveness_local_result(bgp, request.subject, &age);
+	response.result = midr_liveness_local_result(
+		bgp, request.subject, ntohl(request.requester_age), &age);
 	response.age = htonl(age);
 	midr_ctrl_udp_send(bgp, source, &response, sizeof(response));
 }
@@ -888,10 +1334,16 @@ static void midr_liveness_handle_probe_resp(
 	struct midr_liveness_round *round;
 	struct prefix subject;
 	struct midr_node_entry *entry;
+	struct midr_node_entry *voter_entry;
 	size_t i;
 	size_t responses = 0;
 	size_t stale_votes = 0;
+	uint32_t response_age;
+	uint32_t effective_age;
+	uint64_t elapsed;
+	enum midr_liveness_probe_result result;
 	uint32_t round_id = ntohl(parsed_hdr->message_id);
+	time_t now = monotime(NULL);
 
 	if (len != sizeof(response))
 		return;
@@ -901,8 +1353,8 @@ static void midr_liveness_handle_probe_resp(
 		return;
 	midr_liveness_prefix_from_addr(&subject, response.subject);
 	round = midr_liveness_round_find(ctx, &subject);
-	if (!round || !round->waiting || round->round_id != round_id ||
-	    monotime(NULL) >= round->deadline)
+	if (!round || round->state != MIDR_LIVENESS_ROUND_WAITING ||
+	    round->round_id != round_id || now >= round->deadline)
 		return;
 
 	for (i = 0; i < round->voter_count; i++)
@@ -911,16 +1363,54 @@ static void midr_liveness_handle_probe_resp(
 			break;
 	if (i == round->voter_count || round->voters[i].responded)
 		return;
+	/*
+	 * The round snapshot proves this Router-ID was selected, but a delayed
+	 * datagram must not retain voting authority after the voter becomes
+	 * SUSPECT, loses adjacency/session, or is removed.
+	 */
+	voter_entry = midr_liveness_find_node_addr(bgp,
+						   response.hdr.origin);
+	result = midr_liveness_voter_eligible(bgp, voter_entry,
+					      &round->subject)
+			 ? response.result
+			 : MIDR_LIVENESS_RESULT_UNKNOWN;
+	response_age = ntohl(response.age);
+	entry = midr_liveness_find_node(bgp, &round->subject);
+
+	/*
+	 * ALIVE is accepted only when the voter has fresher direct Node-NLRI
+	 * evidence.  Account conservatively for the whole round elapsed time;
+	 * the resulting local lease can therefore never outlive that evidence.
+	 */
+	if (result == MIDR_LIVENESS_RESULT_ALIVE) {
+		elapsed = now > round->started_at
+				  ? (uint64_t)(now - round->started_at)
+				  : 0;
+		if (response_age == MIDR_LIVENESS_AGE_UNKNOWN ||
+		    (round->requester_age != MIDR_LIVENESS_AGE_UNKNOWN &&
+		     response_age >= round->requester_age) ||
+		    elapsed > MIDR_LIVENESS_AGE_MAX ||
+		    response_age >
+			    MIDR_LIVENESS_AGE_MAX - (uint32_t)elapsed)
+			result = MIDR_LIVENESS_RESULT_UNKNOWN;
+		else {
+			effective_age = response_age + (uint32_t)elapsed;
+			if (effective_age >= ctx->config.suspect_timeout ||
+			    !entry)
+				result = MIDR_LIVENESS_RESULT_UNKNOWN;
+		}
+	}
 	round->voters[i].responded = true;
-	round->voters[i].result = response.result;
+	round->voters[i].result = result;
 
 	/* In the trusted prototype, one indirect ALIVE is sufficient proof. */
-	if (response.result == MIDR_LIVENESS_RESULT_ALIVE) {
-		entry = midr_liveness_find_node(bgp, &round->subject);
-		if (entry) {
-			entry->last_seen = monotime(NULL);
-			midr_liveness_on_alive(bgp, entry);
-		}
+	if (result == MIDR_LIVENESS_RESULT_ALIVE) {
+		time_t lease_until =
+			now + ctx->config.suspect_timeout - effective_age;
+
+		if (entry->nontransitive_alive_until < lease_until)
+			entry->nontransitive_alive_until = lease_until;
+		midr_liveness_recover(bgp, entry, false);
 		return;
 	}
 
@@ -930,11 +1420,15 @@ static void midr_liveness_handle_probe_resp(
 	 * STALE quorum happened to arrive first.
 	 */
 	if (stale_votes >= round->required_quorum &&
-	    responses == round->voter_count)
+	    responses == round->voter_count) {
+		midr_liveness_round_schedule(
+			ctx, round, MIDR_LIVENESS_ROUND_BACKOFF,
+			now + ctx->config.retry_backoff);
 		midr_liveness_commit_dead(bgp, round);
-	else if (responses == round->voter_count) {
-		round->waiting = false;
-		round->deadline = monotime(NULL) + ctx->config.retry_backoff;
+	} else if (responses == round->voter_count) {
+		midr_liveness_round_schedule(
+			ctx, round, MIDR_LIVENESS_ROUND_BACKOFF,
+			now + ctx->config.retry_backoff);
 	}
 }
 
@@ -997,7 +1491,8 @@ static void midr_liveness_handle_dead(
 	seen_result = midr_liveness_seen_accept(
 		bgp, ctx, MIDR_LIVENESS_DEAD, dead.hdr.origin, message_id,
 		dead.subject, dead.subject_transport, dead.hop_limit, now);
-	if (seen_result == MIDR_LIVENESS_SEEN_DUPLICATE)
+	if (seen_result == MIDR_LIVENESS_SEEN_DUPLICATE ||
+	    seen_result == MIDR_LIVENESS_SEEN_SUBJECT_SUPPRESSED)
 		return;
 
 	if (seen_result == MIDR_LIVENESS_SEEN_FIRST) {
@@ -1056,6 +1551,8 @@ static void midr_liveness_handle_leave(
 	leave.hop_limit--;
 	midr_liveness_gossip_raw(bgp, (const uint8_t *)&leave, sizeof(leave),
 				 source);
+	midr_liveness_leave_retx_schedule(
+		bgp, (const uint8_t *)&leave, sizeof(leave), source);
 }
 
 bool midr_liveness_handle_ctrl(struct bgp *bgp, const uint8_t *buf,
@@ -1112,12 +1609,14 @@ static void midr_liveness_tick(struct event *event)
 				continue;
 			age = midr_liveness_age(now, entry->last_seen);
 			if (entry->liveness_state == MIDR_NODE_ACTIVE &&
-			    age > ctx->config.suspect_timeout)
+			    !midr_liveness_any_evidence_fresh(
+				    ctx, entry, now))
 				midr_liveness_mark_suspect(bgp, entry,
 							   MIDR_NODE_SUSPECT_TIMEOUT,
 							   "keepalive timeout");
 			else if (entry->liveness_state == MIDR_NODE_SUSPECT) {
-				if (age > ctx->config.suspect_timeout)
+				if (age == MIDR_LIVENESS_AGE_UNKNOWN ||
+				    age > ctx->config.suspect_timeout)
 					entry->liveness_suspect_causes |=
 						MIDR_NODE_SUSPECT_TIMEOUT;
 				if (!midr_liveness_round_find(ctx,
@@ -1135,21 +1634,25 @@ static void midr_liveness_tick(struct event *event)
 
 		entry = midr_liveness_find_node(bgp, &round->subject);
 		if (!entry || entry->liveness_state != MIDR_NODE_SUSPECT) {
-			list_delete_node(ctx->rounds, node);
-			XFREE(MTYPE_MIDR_LIVENESS_ROUND, round);
+			midr_liveness_round_delete(ctx, round);
 			continue;
 		}
 		if (now < round->deadline)
 			continue;
-		if (round->waiting) {
+		if (round->state == MIDR_LIVENESS_ROUND_WAITING) {
 			midr_liveness_round_counts(round, &responses,
 						   &stale_votes);
 			if (stale_votes >= round->required_quorum) {
+				midr_liveness_round_schedule(
+					ctx, round,
+					MIDR_LIVENESS_ROUND_BACKOFF,
+					now + ctx->config.retry_backoff);
 				midr_liveness_commit_dead(bgp, round);
 				continue;
 			}
-			round->waiting = false;
-			round->deadline = now + ctx->config.retry_backoff;
+			midr_liveness_round_schedule(
+				ctx, round, MIDR_LIVENESS_ROUND_BACKOFF,
+				now + ctx->config.retry_backoff);
 			MIDR_LOG("MIDR liveness: round %u for %pFX timed out; retry in %us",
 				 round->round_id, &round->subject,
 				 ctx->config.retry_backoff);
@@ -1207,6 +1710,9 @@ void midr_liveness_init(struct bgp *bgp)
 	midr_liveness_config_defaults(&ctx->config);
 	ctx->rounds = list_new();
 	ctx->seen = list_new();
+	ctx->leave_retx = list_new();
+	ctx->max_inflight_rounds =
+		MIDR_LIVENESS_DEFAULT_MAX_INFLIGHT_ROUNDS;
 	now = monotime(NULL);
 	ctx->tx_counter = (uint32_t)frr_weak_random() ^
 			  ntohl(bgp->router_id.s_addr) ^ (uint32_t)now;
@@ -1227,6 +1733,7 @@ void midr_liveness_finish(struct bgp *bgp)
 	struct listnode *node, *next;
 	struct midr_liveness_round *round;
 	struct midr_liveness_seen *seen;
+	struct midr_liveness_retx *retry;
 
 	if (!bgp || !bgp->midr_info || !bgp->midr_info->liveness)
 		return;
@@ -1245,6 +1752,12 @@ void midr_liveness_finish(struct bgp *bgp)
 		XFREE(MTYPE_MIDR_LIVENESS_SEEN, seen);
 	}
 	list_delete(&ctx->seen);
+	for (ALL_LIST_ELEMENTS(ctx->leave_retx, node, next, retry)) {
+		event_cancel(&retry->timer);
+		list_delete_node(ctx->leave_retx, node);
+		XFREE(MTYPE_MIDR_LIVENESS_RETX, retry);
+	}
+	list_delete(&ctx->leave_retx);
 	XFREE(MTYPE_BGP_MIDR_LIVENESS, ctx);
 	mi->liveness = NULL;
 }
@@ -1277,8 +1790,11 @@ void midr_liveness_show(struct vty *vty, struct bgp *bgp)
 		"Voting: sample %u, quorum %u; gossip hop-limit %u, seen-cache %us\n",
 		ctx->config.voter_sample_size, ctx->config.quorum,
 		ctx->config.hop_limit, ctx->config.cache_ttl);
-	vty_out(vty, "Nodes: %zu active, %zu suspect; rounds %u; seen rumors %u\n",
-		active, suspect, listcount(ctx->rounds), listcount(ctx->seen));
+	vty_out(vty,
+		"Nodes: %zu active, %zu suspect; rounds %u (%u/%u in flight); seen rumors %u; leave retries %u\n",
+		active, suspect, listcount(ctx->rounds),
+		ctx->inflight_rounds, ctx->max_inflight_rounds,
+		listcount(ctx->seen), listcount(ctx->leave_retx));
 	if (list_isempty(ctx->rounds))
 		return;
 
@@ -1294,7 +1810,7 @@ void midr_liveness_show(struct vty *vty, struct bgp *bgp)
 				stale_votes++;
 		vty_out(vty, "%-18pI4 %-10u %-8s %-8zu %zu/%-5u %lds\n",
 			&round->subject.u.prefix4, round->round_id,
-			round->waiting ? "waiting" : "backoff",
+			midr_liveness_round_state_name(round),
 			round->voter_count, stale_votes, round->required_quorum,
 			(long)remaining);
 	}

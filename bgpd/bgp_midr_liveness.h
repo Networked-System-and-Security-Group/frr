@@ -62,7 +62,10 @@ extern void midr_liveness_init(struct bgp *bgp);
 extern void midr_liveness_finish(struct bgp *bgp);
 extern void midr_liveness_schedule_self_advertisement(struct bgp *bgp);
 
-/* Evidence/state hooks called by NDS. */
+/* Evidence/state hooks called by NDS.  on_alive is reserved for a real
+ * Node-NLRI/self refresh; indirect confirmation is handled internally and
+ * never refreshes the transferable last_seen timestamp.
+ */
 extern void midr_liveness_on_alive(struct bgp *bgp,
 				   struct midr_node_entry *entry);
 extern void midr_liveness_on_withdraw(struct bgp *bgp,
@@ -83,8 +86,13 @@ extern bool
 midr_liveness_node_usable(const struct midr_node_entry *entry);
 extern bool midr_liveness_transport_usable(struct bgp *bgp,
 					   struct in_addr transport);
+extern bool midr_liveness_endpoint_usable(struct bgp *bgp,
+					  const struct prefix *endpoint);
 extern bool midr_liveness_indirect_discovery_allowed(
 	struct bgp *bgp, const struct prefix *node_id);
+extern bool midr_liveness_indirect_endpoint_usable(
+	struct bgp *bgp, const struct prefix *node_id,
+	const struct in_addr *transport);
 extern const char *
 midr_liveness_state_name(const struct midr_node_entry *entry);
 

@@ -15,6 +15,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_liveness.h"
 #include "bgpd/bgp_midr_pm.h"
 
 /*
@@ -41,6 +42,18 @@ int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 
 	if (!bgp || !bgp->midr_info || !node_id)
 		return -1;
+
+	/*
+	 * I-1 callers pass the probe endpoint (normally TLV 1188, falling back
+	 * to Router-ID).  Indirect discovery must not restart probing for an
+	 * endpoint owned by a SUSPECT/REMOVING node or retained in the recent
+	 * removal quarantine.
+	 */
+	if (!midr_liveness_endpoint_usable(bgp, node_id)) {
+		MIDR_LOG("MIDR PM I-1: ignore quarantined probe target %pFX",
+			 node_id);
+		return -1;
+	}
 
 	midr_pm_fake_metrics(&m);
 
@@ -83,6 +96,8 @@ static void midr_pm_probe_timer(struct event *t)
 		struct midr_link_metrics m;
 
 		if (entry->is_self)
+			continue;
+		if (!midr_liveness_node_usable(entry))
 			continue;
 		/*
 		 * 只探邻居：is_adjacent 是语义判据（是不是邻居），

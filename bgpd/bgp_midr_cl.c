@@ -42,6 +42,7 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 	case MIDR_TRIGGER_REP_PROBE_DONE: {
 		struct midr_cluster_decision d = {};
 		struct midr_rep_entry *chosen = NULL;
+		struct list *usable;
 		struct listnode *node;
 
 		/*
@@ -59,14 +60,16 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		 * I-5 喂入的链路指标（各代表 is_adjacent 链路的 delay/loss/bw）选
 		 * 最优，此处即其落点。 */
 
-		/* --- 策略一：取首条 ACTIVE/未知手工项（默认启用）--- */
-		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, chosen))
-			if (midr_liveness_transport_usable(
-				    bgp, chosen->rep_transport))
-				break;
-		if (!chosen ||
-		    !midr_liveness_transport_usable(bgp,
-						   chosen->rep_transport)) {
+		/* --- 策略一：取可用目录视图首条（默认启用）---
+		 * 视图中的元素借用自 rep_dir；删除视图不会删除原始目录项。
+		 * 恢复后的代表仍可在下一轮重新成为候选。
+		 */
+		usable = list_new();
+		midr_rep_directory_usable(bgp, usable);
+		for (ALL_LIST_ELEMENTS_RO(usable, node, chosen))
+			break;
+		if (!chosen) {
+			list_delete(&usable);
 			MIDR_LOG("MIDR CL：REP_PROBE_DONE 无可用群代表（均为 SUSPECT）");
 			break;
 		}
@@ -75,10 +78,10 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		{
 			struct listnode *n;
 			struct midr_rep_entry *r;
-			unsigned int pick = frr_weak_random() % mi->rep_dir->count;
+			unsigned int pick = frr_weak_random() % usable->count;
 			unsigned int i = 0;
 
-			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r))
+			for (ALL_LIST_ELEMENTS_RO(usable, n, r))
 				if (i++ == pick) {
 					chosen = r;
 					break;
@@ -91,6 +94,7 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		d.recommended_rep.family = AF_INET;
 		d.recommended_rep.prefixlen = IPV4_MAX_BITLEN;
 		d.recommended_rep.u.prefix4 = chosen->rep_transport;
+		list_delete(&usable);
 		MIDR_FLOW_LOG("MIDR CL：REP_PROBE_DONE → 推荐群代表 %pI4（群 %u）",
 			      &chosen->rep_transport, chosen->group_id);
 		midr_nds_on_cluster_decision(bgp, &d);

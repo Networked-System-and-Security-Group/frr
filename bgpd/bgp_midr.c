@@ -363,6 +363,7 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	}
 
 	entry->last_seen = monotime(NULL);
+	entry->nontransitive_alive_until = 0;
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 	midr_liveness_on_alive(bgp, entry);
 
@@ -407,6 +408,7 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_global_view *gv;
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
+	struct midr_liveness_config liveness_config;
 	struct prefix locator;
 	bool is_new = false;
 
@@ -416,21 +418,27 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	gv = bgp->midr_info->global_view;
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
+	/*
+	 * MEMBER_LIST is weak, indirect discovery evidence.  Apply the complete
+	 * identity + endpoint quarantine gate before looking up or mutating the
+	 * node, so a delayed list cannot change a SUSPECT/REMOVING entry, revive a
+	 * recently removed identity, remap a quarantined transport, mark the node
+	 * adjacent, or restart PM.
+	 */
+	if (!midr_liveness_indirect_endpoint_usable(bgp, &key.node_id,
+						    &transport)) {
+		MIDR_LOG("MIDR: ignore quarantined MEMBER_LIST member %pFX via %pI4",
+			 &key.node_id, &transport);
+		return;
+	}
+
 	entry = midr_node_hash_find(&gv->nodes, &key);
 	if (!entry) {
-		if (!midr_liveness_indirect_discovery_allowed(bgp,
-							       &key.node_id)) {
-			MIDR_LOG("MIDR: ignore indirect rediscovery of removed member %pFX",
-				 &key.node_id);
-			return;
-		}
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
 		midr_node_hash_add(&gv->nodes, entry);
 		is_new = true;
 	}
-	if (entry->liveness_state == MIDR_NODE_REMOVING)
-		return;
 	entry->asn = asn;
 	entry->group_id = group_id;
 	entry->transport_addr = transport;
@@ -439,8 +447,11 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	 * newly discovered member an initial grace window, but never let a
 	 * delayed list refresh or recover an existing SUSPECT node.
 	 */
-	if (is_new)
-		entry->last_seen = monotime(NULL);
+	if (is_new) {
+		midr_liveness_get_config(bgp, &liveness_config);
+		entry->nontransitive_alive_until =
+			monotime(NULL) + liveness_config.suspect_timeout;
+	}
 	entry->is_self = midr_prefix_is_self(bgp, &entry->node_id);
 	entry->is_adjacent = true; /* 成员表里的成员就是要建邻居的对象 */
 
@@ -482,6 +493,7 @@ void midr_nds_local_node_update(struct bgp *bgp)
 		entry->has_transport_addr = true;
 	}
 	entry->last_seen = monotime(NULL);
+	entry->nontransitive_alive_until = 0;
 	entry->is_self = true;
 	midr_liveness_on_alive(bgp, entry);
 }
@@ -674,6 +686,18 @@ void midr_nds_on_link_update(struct bgp *bgp, const struct prefix *node_id,
 
 	if (!bgp || !bgp->midr_info || !node_id)
 		return;
+
+	/*
+	 * PM may complete after its target entered SUSPECT or was removed.  Drop
+	 * that stale result before it can recreate/update a link or export TLV
+	 * 1186.  The endpoint predicate understands both Router-ID keys and
+	 * transport locators, including recent removal tombstones.
+	 */
+	if (!midr_liveness_endpoint_usable(bgp, node_id)) {
+		MIDR_LOG("MIDR I-5: ignore quarantined link update for %pFX",
+			 node_id);
+		return;
+	}
 
 	mi = bgp->midr_info;
 
@@ -924,6 +948,34 @@ struct midr_rep_entry *midr_rep_dir_find_group(struct bgp *bgp,
 }
 
 /*
+ * Return a liveness-filtered view of the configured/learned representative
+ * directory.  The caller owns `out`; its midr_rep_entry pointers remain owned
+ * by mi->rep_dir.  Keeping the raw directory intact lets a representative
+ * become selectable again after authoritative recovery.
+ */
+void midr_rep_directory_usable(struct bgp *bgp, struct list *out)
+{
+	struct bgp_midr *mi;
+	struct listnode *node;
+	struct midr_rep_entry *entry;
+	struct prefix endpoint;
+
+	if (!bgp || !bgp->midr_info || !bgp->midr_info->rep_dir || !out)
+		return;
+	mi = bgp->midr_info;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, entry)) {
+		if (entry->group_id == 0 || entry->rep_asn == 0 ||
+		    entry->rep_transport.s_addr == INADDR_ANY)
+			continue;
+		midr_prefix_from_in_addr(&endpoint, entry->rep_transport);
+		if (!midr_liveness_endpoint_usable(bgp, &endpoint))
+			continue;
+		listnode_add(out, entry);
+	}
+}
+
+/*
  * "Table A": every non-self node in `group_id`, derived from the BGP-LS global
  * view.  Single source of truth — when BGP-LS propagation scoping changes,
  * only this function changes.  `out` collects borrowed entry pointers (caller
@@ -1058,6 +1110,7 @@ void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 void midr_join_on_rep_list(struct bgp *bgp)
 {
 	struct bgp_midr *mi;
+	struct list *usable;
 	struct listnode *node;
 	struct midr_rep_entry *r;
 
@@ -1080,16 +1133,17 @@ void midr_join_on_rep_list(struct bgp *bgp)
 	mi->join_phase = MIDR_JOIN_PROBING_REPS;
 
 	/* I-1：对每个群代表启动探测（PM stub 同步把指标灌进 link_entry，不再 notify）。 */
-	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
+	usable = list_new();
+	midr_rep_directory_usable(bgp, usable);
+	for (ALL_LIST_ELEMENTS_RO(usable, node, r)) {
 		struct prefix locator;
 
-		if (!midr_liveness_transport_usable(bgp, r->rep_transport))
-			continue;
 		midr_prefix_from_in_addr(&locator, r->rep_transport);
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
 			      &r->rep_transport, r->group_id);
 	}
+	list_delete(&usable);
 
 	/* 探完整批群代表后，编排层显式发 REP_PROBE_DONE，交 CL 选最优代表
 	 * （I-7 RECOMMEND）。一整批只发一次，避免每个代表各 notify 一次。 */
