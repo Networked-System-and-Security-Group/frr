@@ -10,6 +10,5 @@ links:
     local_address: 10.0.19.1
     remote_address: 10.0.19.9
     cost: 10
-    available_bandwidth_kbps: 1000
 node_prefixes: []
 prefix_groups: []

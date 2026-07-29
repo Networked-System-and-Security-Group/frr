@@ -34,7 +34,7 @@ enum midr_ls_attribute_presence {
 	MIDR_LS_ATTR_HAS_CAP_FLAGS = (1U << 4),
 	MIDR_LS_ATTR_HAS_LINK_LOCAL_ADDRESS = (1U << 5),
 	MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS = (1U << 6),
-	MIDR_LS_ATTR_HAS_LINK_METRICS = (1U << 7),
+	MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST = (1U << 7),
 };
 
 struct midr_ls_attributes {
@@ -46,7 +46,7 @@ struct midr_ls_attributes {
 	uint64_t cap_flags;
 	struct ipaddr link_local_address;
 	struct ipaddr link_remote_address;
-	struct midr_ls_metrics link_metrics;
+	uint32_t link_canonical_cost;
 };
 
 struct midr_propagation_path {

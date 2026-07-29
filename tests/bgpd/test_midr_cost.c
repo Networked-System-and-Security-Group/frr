@@ -15,12 +15,14 @@
 struct zebra_privs_t bgpd_privs = {};
 struct event_loop *master;
 
-static struct midr_ls_metrics valid_metrics(void)
+static struct midr_link_metrics valid_metrics(void)
 {
-	return (struct midr_ls_metrics){
-		.present_flags = MIDR_METRIC_REQUIRED_MASK,
+	return (struct midr_link_metrics){
+		.has_rtt_us = true,
 		.rtt_us = 1000,
+		.has_loss_ppm = true,
 		.loss_ppm = 0,
+		.has_available_bandwidth_kbps = true,
 		.available_bandwidth_kbps = 1000000,
 	};
 }
@@ -49,7 +51,7 @@ static void test_integer_helpers(void)
 
 static void test_reference_cost(void)
 {
-	struct midr_ls_metrics metrics = valid_metrics();
+	struct midr_link_metrics metrics = valid_metrics();
 	uint32_t cost = 0;
 
 	assert(midr_cost_from_metrics(&metrics, &cost) == 0);
@@ -74,15 +76,12 @@ static void test_reference_cost(void)
 
 static void test_invalid_metrics(void)
 {
-	struct midr_ls_metrics metrics = valid_metrics();
+	struct midr_link_metrics metrics = valid_metrics();
 	uint32_t cost = 123;
 
 	assert(midr_cost_from_metrics(NULL, &cost) == -EINVAL);
 	assert(midr_cost_from_metrics(&metrics, NULL) == -EINVAL);
-	metrics.present_flags &= ~MIDR_METRIC_PRESENT_LOSS;
-	assert(midr_cost_from_metrics(&metrics, &cost) == -EINVAL);
-	metrics = valid_metrics();
-	metrics.present_flags |= 0x8;
+	metrics.has_loss_ppm = false;
 	assert(midr_cost_from_metrics(&metrics, &cost) == -EINVAL);
 	metrics = valid_metrics();
 	metrics.rtt_us = 0;
@@ -96,6 +95,24 @@ static void test_invalid_metrics(void)
 	assert(cost == 123);
 }
 
+static void test_cost_deadband(void)
+{
+	assert(!midr_cost_change_significant(100, 100));
+	assert(!midr_cost_change_significant(100, 104));
+	assert(midr_cost_change_significant(100, 105));
+	assert(midr_cost_change_significant(100, 95));
+
+	assert(!midr_cost_change_significant(101, 106));
+	assert(midr_cost_change_significant(101, 107));
+	assert(!midr_cost_change_significant(1, 1));
+	assert(midr_cost_change_significant(1, 2));
+
+	assert(!midr_cost_change_significant(MIDR_LINK_COST_MAX,
+					     MIDR_LINK_COST_MAX - 214748364U));
+	assert(midr_cost_change_significant(MIDR_LINK_COST_MAX,
+					    MIDR_LINK_COST_MAX - 214748365U));
+}
+
 static void test_saturating_path_cost(void)
 {
 	assert(midr_path_cost_add(10, 20) == 30);
@@ -105,27 +122,13 @@ static void test_saturating_path_cost(void)
 	assert(midr_path_cost_add(UINT64_MAX - 1, 1) == UINT64_MAX);
 }
 
-static void test_update_threshold(void)
-{
-	assert(midr_cost_should_advertise(100, 100, true, false));
-	assert(midr_cost_should_advertise(100, 100, false, true));
-	assert(!midr_cost_should_advertise(100, 104, false, false));
-	assert(midr_cost_should_advertise(100, 105, false, false));
-	assert(!midr_cost_should_advertise(100, 96, false, false));
-	assert(midr_cost_should_advertise(100, 95, false, false));
-	assert(!midr_cost_should_advertise(1, 1, false, false));
-	assert(midr_cost_should_advertise(1, 2, false, false));
-	assert(!midr_cost_should_advertise(UINT32_MAX, UINT32_MAX - 1, false, false));
-	assert(midr_cost_should_advertise(UINT32_MAX, 0, false, false));
-}
-
 int main(void)
 {
 	test_integer_helpers();
 	test_reference_cost();
 	test_invalid_metrics();
+	test_cost_deadband();
 	test_saturating_path_cost();
-	test_update_threshold();
 	printf("MIDR cost tests passed\n");
 	return 0;
 }

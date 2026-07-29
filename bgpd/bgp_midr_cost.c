@@ -11,6 +11,9 @@
 
 _Static_assert(MIDR_REFERENCE_TRANSFER_BYTES > 0, "reference transfer size must be non-zero");
 _Static_assert(MIDR_COST_QUANTUM_US > 0, "cost quantum must be non-zero");
+_Static_assert(MIDR_LINK_COST_DEADBAND_PERCENT > 0 &&
+		       MIDR_LINK_COST_DEADBAND_PERCENT <= 100,
+	       "cost deadband percentage must be in 1..100");
 
 int midr_cost_ceil_div_u64(uint64_t dividend, uint64_t divisor, uint64_t *result)
 {
@@ -35,7 +38,8 @@ int midr_cost_ceil_mul_div_u64(uint64_t multiplicand, uint64_t multiplier, uint6
 	return midr_cost_ceil_div_u64(product, divisor, result);
 }
 
-int midr_cost_from_metrics(const struct midr_ls_metrics *metrics, uint32_t *cost)
+int midr_cost_from_metrics(const struct midr_link_metrics *metrics,
+			   uint32_t *cost)
 {
 	uint64_t reference_bits;
 	uint64_t serialization_us;
@@ -45,8 +49,11 @@ int midr_cost_from_metrics(const struct midr_ls_metrics *metrics, uint32_t *cost
 	uint32_t computed_cost;
 	int result;
 
-	if (!metrics || !cost || metrics->present_flags != MIDR_METRIC_REQUIRED_MASK ||
-	    !metrics->rtt_us || !metrics->available_bandwidth_kbps || metrics->loss_ppm >= 1000000U)
+	if (!metrics || !cost || !metrics->has_rtt_us ||
+	    !metrics->has_loss_ppm ||
+	    !metrics->has_available_bandwidth_kbps || !metrics->rtt_us ||
+	    !metrics->available_bandwidth_kbps ||
+	    metrics->loss_ppm >= 1000000U)
 		return -EINVAL;
 
 	reference_bits = (uint64_t)MIDR_REFERENCE_TRANSFER_BYTES * 8;
@@ -77,29 +84,31 @@ int midr_cost_from_metrics(const struct midr_ls_metrics *metrics, uint32_t *cost
 	return 0;
 }
 
+bool midr_cost_change_significant(uint32_t advertised_cost,
+				  uint32_t candidate_cost)
+{
+	uint64_t threshold;
+	uint32_t delta;
+
+	delta = advertised_cost > candidate_cost
+			? advertised_cost - candidate_cost
+			: candidate_cost - advertised_cost;
+	threshold = ((uint64_t)advertised_cost *
+		     MIDR_LINK_COST_DEADBAND_PERCENT) /
+		    100;
+	if (((uint64_t)advertised_cost *
+	     MIDR_LINK_COST_DEADBAND_PERCENT) %
+	    100)
+		threshold++;
+	if (threshold < 1)
+		threshold = 1;
+	return delta >= threshold;
+}
+
 uint64_t midr_path_cost_add(uint64_t left, uint64_t right)
 {
 	if (left == MIDR_PATH_COST_INFINITY || right == MIDR_PATH_COST_INFINITY ||
 	    left > UINT64_MAX - right)
 		return MIDR_PATH_COST_INFINITY;
 	return left + right;
-}
-
-bool midr_cost_should_advertise(uint32_t advertised_cost, uint32_t candidate_cost,
-				bool first_publish, bool non_measurement_change)
-{
-	uint64_t threshold;
-	uint32_t delta;
-
-	if (first_publish || non_measurement_change)
-		return true;
-
-	delta = advertised_cost > candidate_cost ? advertised_cost - candidate_cost
-						 : candidate_cost - advertised_cost;
-	threshold = ((uint64_t)advertised_cost * 5) / 100;
-	if (((uint64_t)advertised_cost * 5) % 100)
-		threshold++;
-	if (threshold < 1)
-		threshold = 1;
-	return delta >= threshold;
 }
