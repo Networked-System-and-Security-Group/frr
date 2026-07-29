@@ -122,49 +122,43 @@ DEFUN(show_midr_prefix_contributors, show_midr_prefix_contributors_cmd,
 	return CMD_SUCCESS;
 }
 
-DEFUN(midr_external_prefix_source, midr_external_prefix_source_cmd,
-      "neighbor <A.B.C.D|X:X::X:X|WORD> midr external-prefix-source",
-      NEIGHBOR_STR
-      "Neighbor address or interface\n"
-      "Neighbor address or interface\n"
-      "Neighbor address or interface\n"
+DEFUN(midr_prefix_export_max_as_path_length,
+      midr_prefix_export_max_as_path_length_cmd,
+      "midr prefix-export max-as-path-length (0-4294967295)",
       "MIDR configuration\n"
-      "Classify this peer as an external Prefix source\n")
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Limit accepted AS_PATH hop count\n"
+      "Maximum AS_PATH hop count\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct peer *peer;
+	uint32_t length;
 	afi_t afi;
 
-	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi))
-		return CMD_WARNING_CONFIG_FAILED;
-	peer = peer_and_group_lookup_vty(vty, argv[1]->arg);
-	if (!peer)
-		return CMD_WARNING_CONFIG_FAILED;
-	if (midr_prefix_external_peer_set(&bgp->midr_info->ctx, peer, afi, true) != 0)
+	if (!bgp || !bgp->midr_info ||
+	    !midr_vty_prefix_family(vty, &afi) ||
+	    midr_parse_u32(argv[3]->arg, &length) != 0 ||
+	    midr_prefix_max_as_path_length_set(
+		    &bgp->midr_info->ctx, afi, length) != 0)
 		return CMD_WARNING_CONFIG_FAILED;
 	return CMD_SUCCESS;
 }
 
-DEFUN(no_midr_external_prefix_source, no_midr_external_prefix_source_cmd,
-      "no neighbor <A.B.C.D|X:X::X:X|WORD> midr external-prefix-source",
+DEFUN(no_midr_prefix_export_max_as_path_length,
+      no_midr_prefix_export_max_as_path_length_cmd,
+      "no midr prefix-export max-as-path-length [(0-4294967295)]",
       NO_STR
-      NEIGHBOR_STR
-      "Neighbor address or interface\n"
-      "Neighbor address or interface\n"
-      "Neighbor address or interface\n"
       "MIDR configuration\n"
-      "Classify this peer as an external Prefix source\n")
+      "Export eligible unicast Prefixes into MIDR\n"
+      "Limit accepted AS_PATH hop count\n"
+      "Maximum AS_PATH hop count\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct peer *peer;
 	afi_t afi;
 
-	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi))
-		return CMD_WARNING_CONFIG_FAILED;
-	peer = peer_and_group_lookup_vty(vty, argv[2]->arg);
-	if (!peer)
-		return CMD_WARNING_CONFIG_FAILED;
-	if (midr_prefix_external_peer_set(&bgp->midr_info->ctx, peer, afi, false) != 0)
+	if (!bgp || !bgp->midr_info ||
+	    !midr_vty_prefix_family(vty, &afi) ||
+	    midr_prefix_max_as_path_length_unset(
+		    &bgp->midr_info->ctx, afi) != 0)
 		return CMD_WARNING_CONFIG_FAILED;
 	return CMD_SUCCESS;
 }
@@ -198,59 +192,6 @@ DEFUN(no_midr_prefix_export_route_map, no_midr_prefix_export_route_map_cmd,
 
 	if (!bgp || !bgp->midr_info || !midr_vty_prefix_family(vty, &afi) ||
 	    midr_prefix_route_map_unset(&bgp->midr_info->ctx, afi) != 0)
-		return CMD_WARNING_CONFIG_FAILED;
-	return CMD_SUCCESS;
-}
-
-static uint32_t midr_vty_local_source(const char *name)
-{
-	if (strcmp(name, "network") == 0)
-		return MIDR_PREFIX_SOURCE_NETWORK;
-	if (strcmp(name, "connected") == 0)
-		return MIDR_PREFIX_SOURCE_CONNECTED;
-	if (strcmp(name, "static") == 0)
-		return MIDR_PREFIX_SOURCE_STATIC;
-	return 0;
-}
-
-DEFUN(midr_prefix_export_local_source, midr_prefix_export_local_source_cmd,
-      "midr prefix-export local-source <network|connected|static>",
-      "MIDR configuration\n"
-      "Export eligible unicast Prefixes into MIDR\n"
-      "Allow an explicit local route source\n"
-      "BGP network statement\n"
-      "Redistributed connected route\n"
-      "Redistributed static route\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	uint32_t source;
-	afi_t afi;
-
-	source = midr_vty_local_source(argv[3]->arg);
-	if (!bgp || !bgp->midr_info || !source || !midr_vty_prefix_family(vty, &afi) ||
-	    midr_prefix_local_source_set(&bgp->midr_info->ctx, afi, source, true) != 0)
-		return CMD_WARNING_CONFIG_FAILED;
-	return CMD_SUCCESS;
-}
-
-DEFUN(no_midr_prefix_export_local_source,
-      no_midr_prefix_export_local_source_cmd,
-      "no midr prefix-export local-source <network|connected|static>",
-      NO_STR
-      "MIDR configuration\n"
-      "Export eligible unicast Prefixes into MIDR\n"
-      "Allow an explicit local route source\n"
-      "BGP network statement\n"
-      "Redistributed connected route\n"
-      "Redistributed static route\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	uint32_t source;
-	afi_t afi;
-
-	source = midr_vty_local_source(argv[4]->arg);
-	if (!bgp || !bgp->midr_info || !source || !midr_vty_prefix_family(vty, &afi) ||
-	    midr_prefix_local_source_set(&bgp->midr_info->ctx, afi, source, false) != 0)
 		return CMD_WARNING_CONFIG_FAILED;
 	return CMD_SUCCESS;
 }
@@ -943,17 +884,17 @@ void bgp_midr_vty_init(void)
 	install_element(BGP_NODE, &no_midr_eor_timeout_cmd);
 	install_element(BGP_NODE, &midr_group_prefix_takeover_delay_cmd);
 	install_element(BGP_NODE, &no_midr_group_prefix_takeover_delay_cmd);
-	install_element(BGP_IPV4_NODE, &midr_external_prefix_source_cmd);
-	install_element(BGP_IPV4_NODE, &no_midr_external_prefix_source_cmd);
-	install_element(BGP_IPV6_NODE, &midr_external_prefix_source_cmd);
-	install_element(BGP_IPV6_NODE, &no_midr_external_prefix_source_cmd);
+	install_element(BGP_IPV4_NODE,
+			&midr_prefix_export_max_as_path_length_cmd);
+	install_element(BGP_IPV4_NODE,
+			&no_midr_prefix_export_max_as_path_length_cmd);
+	install_element(BGP_IPV6_NODE,
+			&midr_prefix_export_max_as_path_length_cmd);
+	install_element(BGP_IPV6_NODE,
+			&no_midr_prefix_export_max_as_path_length_cmd);
 	install_element(BGP_IPV4_NODE, &midr_prefix_export_route_map_cmd);
 	install_element(BGP_IPV4_NODE, &no_midr_prefix_export_route_map_cmd);
 	install_element(BGP_IPV6_NODE, &midr_prefix_export_route_map_cmd);
 	install_element(BGP_IPV6_NODE, &no_midr_prefix_export_route_map_cmd);
-	install_element(BGP_IPV4_NODE, &midr_prefix_export_local_source_cmd);
-	install_element(BGP_IPV4_NODE, &no_midr_prefix_export_local_source_cmd);
-	install_element(BGP_IPV6_NODE, &midr_prefix_export_local_source_cmd);
-	install_element(BGP_IPV6_NODE, &no_midr_prefix_export_local_source_cmd);
 	hook_register(bgp_inst_config_write, midr_config_write);
 }
