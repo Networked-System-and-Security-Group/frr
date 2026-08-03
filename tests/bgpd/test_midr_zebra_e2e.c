@@ -215,7 +215,6 @@ int main(int argc, char **argv)
 		for (int i = 0; i < 10; i++) { event_fetch(master, &t); event_call(&t); }
 	}
 	sleep(1);
-	T_SPF_RECHECK:
 	if (ip_route_has(TEST_PFX_SPF))
 		printf("  OK: SPF route installed\n");
 	else {
@@ -250,9 +249,11 @@ int main(int argc, char **argv)
 
 	if (ip_route6_has(TEST_PFX_SRV6))
 		printf("  OK: SRv6 route installed\n");
-	else {
-		/* SRv6 kernel support not guaranteed — warn, not fail */
-		printf("  WARN: SRv6 route not in FIB (kernel may lack seg6 support)\n");
+	else if (system("sysctl -n net.ipv6.conf.all.seg6_enabled 2>/dev/null | grep -q '1'") != 0) {
+		printf("  SKIP: SRv6 not checked (kernel lacks seg6 support)\n");
+	} else {
+		printf("  FAIL: SRv6 route NOT in FIB (seg6 enabled but route missing)\n");
+		rc = 1;
 	}
 
 	/* B.3 Delete SRv6 route — nothing to verify besides no crash */

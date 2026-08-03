@@ -51,6 +51,7 @@ static void install_one(struct bgp *bgp, const char *pfx, const char *nh, uint32
 	memset(paths, 0, sizeof(paths));
 	inet_pton(AF_INET, nh, &paths[0].nexthop.ipv4);
 	paths[0].metric = metric;
+	paths[0].ifindex = IFINDEX_INTERNAL; /* let zebra resolve nexthop via RIB */
 	r.paths = paths; r.path_count = 1;
 	r.explicit.sid_count = 0; r.instance = MIDR_INSTANCE_SPF;
 	midr_zebra_route_add(bgp, &p, &r);
@@ -61,20 +62,17 @@ static void delete_one(struct bgp *bgp, const char *pfx, uint8_t instance) {
 	midr_zebra_route_del(bgp, &p, instance);
 }
 
-static int mode_blackhole(const char *sock, const char *pfx, const char *nh, int hold) {
+static int mode_blackhole(const char *sock, const char *pfx, const char *real_nh,
+			  const char *dead_nh, int hold) {
 	struct bgp bgp = {};
 	int fail = 0;
 
 	printf("=== MIDR Blackhole (zebra-only) ===\n");
 
-	/* Setup dummy_bh */
-	printf("[1] Setup dummy_bh with %s/32...\n", nh);
-	run_cmd("ip link add dummy_bh type dummy 2>/dev/null || true");
-	run_cmd("ip link set dummy_bh up");
-	run_cmd("ip addr add %s/32 dev dummy_bh 2>/dev/null || true", nh);
+	sleep(2); /* allow zebra to fully process connected routes */
 
-	/* Connect zebra - exact same pattern as working batch test */
-	printf("[2] Connect zebra...\n");
+	/* Connect zebra */
+	printf("[1] Connect zebra...\n");
 	master = event_master_create("midr_clab");
 	struct bgp_master dmb = {}; dmb.master = master; bm = &dmb;
 	bgp_zclient = zclient_new(master, &zclient_options_default, NULL, 0);
@@ -90,14 +88,14 @@ static int mode_blackhole(const char *sock, const char *pfx, const char *nh, int
 
 	midr_zebra_init(&bgp);
 
-	/* Install blackhole */
-	printf("[3] Install blackhole...\n");
-	install_one(&bgp, pfx, nh, 1);
+	/* Step 1: Install real route (metric=10) via real nexthop */
+	printf("[2] Install real route (nh=%s, metric=10)...\n", real_nh);
+	install_one(&bgp, pfx, real_nh, 10);
 	midr_zebra_route_flush(&bgp);
-	sleep(3);
+	sleep(2);
 
-	/* Verify FIB */
-	printf("[4] Verify FIB...\n");
+	/* Verify FIB has the route */
+	printf("[3] Verify real route in FIB...\n");
 	if (fib_has(pfx))
 		printf("  OK: %s in FIB (proto 199)\n", pfx);
 	else {
@@ -106,24 +104,42 @@ static int mode_blackhole(const char *sock, const char *pfx, const char *nh, int
 		fail++;
 	}
 
-	/* Hold */
-	printf("[5] Holding %ds (caller verifies blackhole)...\n", hold);
+	/* Hold for caller to verify connectivity */
+	printf("[4] Holding %ds (caller verifies real route connectivity)...\n", hold);
 	fflush(stdout); sleep(hold);
 
-	/* Delete */
-	printf("[6] Delete blackhole...\n");
+	/* Step 2: Override with blackhole route (metric=1, lower wins) */
+	printf("[5] Install blackhole (nh=%s, metric=1)...\n", dead_nh);
+	install_one(&bgp, pfx, dead_nh, 1);
+	midr_zebra_route_flush(&bgp);
+	sleep(2);
+
+	/* Verify FIB still has the route (now blackhole due to metric=1 < 10) */
+	printf("[6] Verify blackhole override in FIB...\n");
+	if (fib_has(pfx))
+		printf("  OK: %s in FIB (proto 199, blackhole active)\n", pfx);
+	else {
+		printf("  FAIL: %s NOT in FIB after blackhole\n", pfx);
+		fail++;
+	}
+
+	/* Hold for caller to verify blackhole effect (unreachable) */
+	printf("[7] Holding %ds (caller verifies blackhole)...\n", hold);
+	fflush(stdout); sleep(hold);
+
+	/* Step 3: Delete the route */
+	printf("[8] Delete blackhole...\n");
 	delete_one(&bgp, pfx, MIDR_INSTANCE_SPF);
 	midr_zebra_route_flush(&bgp);
 	sleep(2);
 
 	/* Verify removed */
-	printf("[7] Verify removed...\n");
+	printf("[9] Verify removed...\n");
 	if (!fib_has(pfx)) printf("  OK: removed\n");
 	else { printf("  FAIL: still in FIB\n"); fail++; }
 
 	/* Cleanup */
 	midr_zebra_fini(&bgp);
-	run_cmd("ip link del dummy_bh 2>/dev/null || true");
 
 	if (fail == 0) printf("\n=== BLACKHOLE PASSED ===\n");
 	else printf("\n=== BLACKHOLE FAILED (%d) ===\n", fail);
@@ -136,10 +152,8 @@ static int mode_stress(const char *sock, const char *pfx, const char *nh, int it
 
 	printf("=== MIDR Stress (zebra-only, %d iters) ===\n", iters);
 
-	/* Setup dummy_bh */
-	run_cmd("ip link add dummy_bh type dummy 2>/dev/null || true");
-	run_cmd("ip link set dummy_bh up");
-	run_cmd("ip addr add %s/32 dev dummy_bh 2>/dev/null || true", nh);
+	/* Dead-end 10.200.0.1/32 already configured on eth1 via topo.yaml exec */
+	sleep(2); /* allow zebra to fully process connected routes */
 
 	/* Connect */
 	printf("[1] Connect zebra...\n");
@@ -176,7 +190,7 @@ static int mode_stress(const char *sock, const char *pfx, const char *nh, int it
 
 out:
 	midr_zebra_fini(&bgp);
-	run_cmd("ip link del dummy_bh 2>/dev/null || true");
+	/* Cleanup: dead-end IP already removed by topo.yaml exec cleanup */
 	if (fail == 0) printf("\n=== STRESS PASSED ===\n");
 	else printf("\n=== STRESS FAILED ===\n");
 	return fail;
@@ -184,16 +198,24 @@ out:
 
 int main(int argc, char **argv) {
 	if (argc < 4) {
-		fprintf(stderr, "Usage: %s <mode> <prefix> <nexthop> [param] [zebra_sock]\n"
-			"  %s blackhole 10.100.0.0/24 10.200.0.1 5\n"
+		fprintf(stderr, "Usage: %s <mode> <prefix> <nexthop> [dead_nexthop] [param] [zebra_sock]\n"
+			"  %s blackhole 10.100.0.0/24 10.0.99.2 10.200.0.1 5\n"
 			"  %s stress    10.100.0.0/24 10.200.0.1 20\n", argv[0], argv[0], argv[0]);
 		return 1;
 	}
 	const char *mode = argv[1], *pfx = argv[2], *nh = argv[3];
-	int param = (argc > 4) ? atoi(argv[4]) : 5;
-	const char *sock = (argc > 5) ? argv[5] : "/var/run/frr/zserv.api";
+	int param = (argc > 5) ? atoi(argv[5]) : ((argc > 4) ? atoi(argv[4]) : 5);
+	const char *sock = (argc > 6) ? argv[6] : ((argc > 5) ? argv[5] : "/var/run/frr/zserv.api");
 
-	if (strcmp(mode, "blackhole") == 0) return mode_blackhole(sock, pfx, nh, param);
+	if (strcmp(mode, "blackhole") == 0) {
+		/* blackhole needs 2 nexthops: real_nh + dead_nh */
+		const char *dead_nh = (argc > 4) ? argv[4] : NULL;
+		if (!dead_nh) {
+			fprintf(stderr, "blackhole mode requires 2 nexthops: <real_nh> <dead_nh>\n");
+			return 1;
+		}
+		return mode_blackhole(sock, pfx, nh, dead_nh, param);
+	}
 	if (strcmp(mode, "stress") == 0) return mode_stress(sock, pfx, nh, param);
 	fprintf(stderr, "Unknown mode: %s\n", mode);
 	return 1;

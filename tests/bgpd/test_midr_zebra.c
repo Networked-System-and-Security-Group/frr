@@ -62,8 +62,18 @@ struct bgp_master dummy_bm;
 struct bgp_master *bm = &dummy_bm;
 struct zclient *bgp_zclient;
 
+/* Capture the last zapi_route sent through the mock */
+static struct zapi_route g_last_api;
+static uint8_t g_last_cmd;
+static int g_send_count = 0;
+
 enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
 	struct zclient *z, struct zapi_route *api) {
+	g_last_cmd = cmd;
+	if (api) {
+		g_last_api = *api;
+	}
+	g_send_count++;
 	return ZCLIENT_SEND_SUCCESS;
 }
 
@@ -72,15 +82,23 @@ enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
  * ================================================================== */
 #define VT100_RED    "\x1b[31m"
 #define VT100_GREEN  "\x1b[32m"
+#define VT100_CYAN   "\x1b[36m"
 #define VT100_RESET  "\x1b[0m"
 #define OK   VT100_GREEN "OK" VT100_RESET
 #define FAIL VT100_RED "FAIL" VT100_RESET
+#define CHECK VT100_CYAN "CHECK" VT100_RESET
 
 static int g_failed = 0;
 
 #define T(cond, msg) do { \
 	if (!(cond)) { printf("  " FAIL ": %s\n", msg); g_failed++; } \
 	else          printf("  " OK   ": %s\n", msg); \
+} while (0)
+
+/* validate captured zapi_route fields */
+#define TV(cond, msg) do { \
+	if (!(cond)) { printf("  " FAIL ": %s\n", msg); g_failed++; } \
+	else          printf("  " CHECK ": %s\n", msg); \
 } while (0)
 
 /* helpers */
@@ -158,6 +176,12 @@ static void test_add_flush_diff(void)
 	midr_zebra_route_flush(&bgp);
 	T(pending_count(&bgp) == 0, "queue empty after flush");
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "installed hash has prefix");
+
+	/* verify zapi_route fields on first flush */
+	TV(g_last_api.instance == MIDR_INSTANCE_SPF, "zapi instance=SPF(0)");
+	TV(g_last_api.distance == ZEBRA_BGP_MIDR_DISTANCE_DEFAULT, "zapi distance=115");
+	TV(g_last_api.type == ZEBRA_ROUTE_BGP_MIDR, "zapi type=MIDR");
+	TV(CHECK_FLAG(g_last_api.message, ZAPI_MESSAGE_METRIC), "zapi has METRIC flag");
 
 	/* no-op reinstall */
 	midr_zebra_route_add(&bgp, &p, &result);
@@ -283,6 +307,15 @@ static void test_srv6_path(void)
 	midr_zebra_route_flush(&bgp);
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_TE), "SRv6 installed under TE instance");
 
+	/* verify SRv6 zapi_route fields */
+	TV(g_last_api.instance == MIDR_INSTANCE_TE, "SRv6 zapi instance=TE(1)");
+	TV(g_last_api.metric == 1, "SRv6 zapi metric=1 (TE always wins)");
+	TV(g_last_api.distance == ZEBRA_BGP_MIDR_DISTANCE_DEFAULT, "SRv6 zapi distance=115");
+	TV(g_last_api.nexthop_num == 1, "SRv6 zapi single nexthop");
+	TV(CHECK_FLAG(g_last_api.nexthops[0].flags, ZAPI_NEXTHOP_FLAG_SEG6),
+	   "SRv6 zapi has SEG6 flag");
+	TV(g_last_api.nexthops[0].seg_num == 3, "SRv6 zapi seg_num=3");
+
 	midr_zebra_fini(&bgp);
 }
 
@@ -353,6 +386,19 @@ static void test_ucmp(void)
 	T(pending_count(&bgp) == 1, "UCMP queued");
 	midr_zebra_route_flush(&bgp);
 	T(installed_has(&bgp, &p, MIDR_INSTANCE_SPF), "UCMP installed");
+
+	/* verify UCMP zapi_route fields */
+	TV(g_last_api.nexthop_num == 3, "UCMP zapi 3 nexthops");
+	TV(g_last_api.nexthops[0].weight == 204, "UCMP zapi nh[0].weight=204");
+	TV(CHECK_FLAG(g_last_api.nexthops[0].flags, ZAPI_NEXTHOP_FLAG_WEIGHT),
+	   "UCMP zapi nh[0] has WEIGHT flag");
+	TV(g_last_api.nexthops[1].weight == 51, "UCMP zapi nh[1].weight=51");
+	TV(g_last_api.nexthops[2].weight == 0, "UCMP zapi nh[2].weight=0");
+	TV(!CHECK_FLAG(g_last_api.nexthops[2].flags, ZAPI_NEXTHOP_FLAG_WEIGHT),
+	   "UCMP zapi nh[2] no WEIGHT flag (weight=0)");
+	TV(CHECK_FLAG(g_last_api.flags, ZEBRA_FLAG_USE_RECURSIVE_WEIGHT),
+	   "UCMP zapi has RECURSIVE_WEIGHT flag");
+
 	midr_zebra_fini(&bgp);
 }
 

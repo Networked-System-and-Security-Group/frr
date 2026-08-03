@@ -14,13 +14,15 @@ echo "============================================"
 echo "  Test 03: MIDR Unit Tests (10 tests)"
 echo "============================================"
 
-CONTAINER="frr-ubuntu24-ymy"
+FRR_CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
+FRR_ROOT=${FRR_ROOT:-/home/frr/frr}
+CONTAINER="$FRR_CONTAINER"
 TEST_BIN="/tmp/test_midr_zebra_unit"
 
 # Step 1: Ensure bgpd is compiled (need bgp_midr_zebra.o)
 log_info "Step 1: Ensure bgpd compiled..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_ROOT
 make bgpd/bgpd -j\$(nproc) 2>&1 | tail -3
 " || { log_fail "bgpd compile failed"; exit 1; }
 log_pass "bgpd compiled"

@@ -286,7 +286,7 @@ gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
 
 ### 8.2 单元测试
 
-**文件**: `tests/bgpd/test_midr_zebra.c`（10 项测试，46 断言，含 Dual-Instance）
+**文件**: `tests/bgpd/test_midr_zebra.c`（10 项测试，50 断言，含 Dual-Instance）
 
 **编译**:
 ```bash
@@ -317,7 +317,7 @@ gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
 | 9 | `test_struct_layout` | 5 | sizeof 检查、零值语义、instance 默认值=SPF |
 | 10 | `test_dual_instance` | 4 | SPF(instance=0) + TE(instance=1) 同前缀共存 |
 
-**v4.0 实际结果**: 10/10 PASS，0 FAIL。
+**实际结果**: 10/10 PASS，0 FAIL。
 
 ### 8.3 批量压力测试
 
@@ -341,7 +341,7 @@ gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
 | Batch IPv4 | 1024 路由 | 入队期间零 ZAPI 发送（全部批处理）、flush 一次性发送 >=1024、diff 去重无重复、批量删除完整 |
 | Batch SRv6 | 256 路由 | SID 列表无损坏 |
 
-**v4.0 实际结果**: 0 FAIL。
+**实际结果**: 0 FAIL。
 
 ### 8.4 E2E ZAPI 端到端测试
 
@@ -376,7 +376,7 @@ sleep 3
 | Test A: SPF 单路由 | connect zebra → midr_zebra_init → midr_zebra_route_add(SPF) → flush → 验证 kernel FIB → del + flush → 验证清除 | SPF 路由完整生命周期 |
 | Test B: Dual-Instance | install SPF(instance=0) → install TE SRv6(instance=1) → delete TE → verify SPF survives | TE 删除后 SPF 存活 |
 
-**v4.0 实际结果**: ALL CHECKS PASSED（SRv6 WARN 为容器内核不支持 seg6 的预期限制）。
+**实际结果**: ALL CHECKS PASSED（SRv6 WARN 为容器内核不支持 seg6 的预期限制）。
 
 ### 8.5 Proto 199 内核验证（ip route 命令层）
 
@@ -390,7 +390,7 @@ ip route del 10.200.200.0/24 proto 199
 ip route show 10.200.200.0/24  # → (empty)
 ```
 
-**v4.0 结果**: add/show/del 全部正常。
+**结果**: add/show/del 全部正常。
 
 ### 8.6 Netlink C 验证（libnl 底层验证，不引用 MIDR 代码）
 
@@ -414,7 +414,7 @@ sudo /tmp/test_proto199
 | 4 | `ip route show proto 199` 验证 | ❌ shell 命令 |
 | 5 | `rtnl_route_delete()` | ❌ 标准 netlink |
 
-**v4.0 结果**: proto 199 路由 add/verify/delete 全部通过。确认内核接受 RTPROT_BGP_MIDR=199。
+**结果**: proto 199 路由 add/verify/delete 全部通过。确认内核接受 RTPROT_BGP_MIDR=199。
 
 **MIDR 关联**：此测试成功后，意味着当 MIDR DP 通过 `zclient_route_send()` → zebra → netlink → kernel 下发路由时，内核层能正确识别 proto 199。MIDR DP 代码本身的正确性由 8.2 单元测试和 8.4 E2E ZAPI 测试验证。
 
@@ -438,7 +438,7 @@ sudo /tmp/test_proto199
 10. 删除全部路由 → FIB 清空
 11. **路由删除后连通性**: `ping 10.0.99.2` → 0% loss
 
-**v4.0 结果**: 11/11 PASS（连通性对比：路由下发前后均为 0% packet loss）。
+**结果**: 11/11 PASS（连通性对比：路由下发前后均为 0% packet loss）。
 
 ### 8.8 完整自动化测试脚本
 
@@ -457,12 +457,12 @@ echo "thu325325" | sudo -S docker exec frr-ubuntu24-ymy \
     bash /home/frr/frr/tests/bgpd/run_midr_full_test.sh
 ```
 
-### 8.9 测试结果汇总 (v4.0)
+### 8.9 测试结果汇总
 
 | 测试层 | 项数 | 结果 |
 |--------|:---:|:---:|
 | bgpd 编译验证 | 2 | ✅ 100% |
-| 单元测试 | 10 (46 断言) | ✅ 100% |
+| 单元测试 | 10 (50 断言) | ✅ 100% |
 | 批量压力测试 | 2 (1280 路由) | ✅ 100% |
 | Proto 199 内核验证 | 5 | ✅ 100% |
 | Netlink C 验证 | 5 | ✅ 100% |
@@ -473,7 +473,7 @@ echo "thu325325" | sudo -S docker exec frr-ubuntu24-ymy \
 
 ## 九、变更记录
 
-### v4.0 (2026-07-08)
+### (2026-07-08)
 
 1. **编译策略改进**
    - 所有测试二进制改用共享库链接: `bgp_midr_zebra.o` + `-L lib/.libs -lfrr`
