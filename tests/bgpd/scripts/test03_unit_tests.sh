@@ -14,15 +14,14 @@ echo "============================================"
 echo "  Test 03: MIDR Unit Tests (10 tests)"
 echo "============================================"
 
-FRR_CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
-FRR_ROOT=${FRR_ROOT:-/home/frr/frr}
-CONTAINER="$FRR_CONTAINER"
+CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
+FRR_DIR=${FRR_DIR:-/home/frr/frr}
 TEST_BIN="/tmp/test_midr_zebra_unit"
 
 # Step 1: Ensure bgpd is compiled (need bgp_midr_zebra.o)
 log_info "Step 1: Ensure bgpd compiled..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd $FRR_ROOT
+cd $FRR_DIR
 make bgpd/bgpd -j\$(nproc) 2>&1 | tail -3
 " || { log_fail "bgpd compile failed"; exit 1; }
 log_pass "bgpd compiled"
@@ -30,9 +29,9 @@ log_pass "bgpd compiled"
 # Step 2: Compile unit test binary
 log_info "Step 2: Compile unit test..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 rm -f $TEST_BIN
-gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
+gcc -std=gnu11 -w -g -O0 -include config.h \
   -I lib -I bgpd -I . \
   \$(pkg-config --cflags libyang 2>/dev/null) \
   -o $TEST_BIN tests/bgpd/test_midr_zebra.c bgpd/bgp_midr_zebra.o \
@@ -44,7 +43,7 @@ log_pass "Binary compiled"
 
 # Step 3: Run unit test
 log_info "Step 3: Run unit tests..."
-OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=/home/frr/frr/lib/.libs $TEST_BIN" 2>&1)
+OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=$FRR_DIR/lib/.libs $TEST_BIN" 2>&1)
 echo "$OUTPUT"
 
 # Step 4: Parse results

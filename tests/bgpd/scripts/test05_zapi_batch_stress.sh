@@ -14,16 +14,15 @@ echo "============================================"
 echo "  Test 05: ZAPI Batch Stress Test"
 echo "============================================"
 
-CONTAINER="frr-ubuntu24-ymy"
+CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
+FRR_DIR=${FRR_DIR:-/home/frr/frr}
 TEST_BIN="/tmp/test_midr_zapi_batch"
 LIBFRR_SRC="/home/frr/frr/lib/.libs/libfrr.so.0.0.0"
-HOST_BIN="/tmp/test_midr_zapi_batch"
-HOST_LIB="/tmp/libfrr.so"
 
 # Step 1: Ensure bgpd compiled
 log_info "Step 1: Ensure bgpd compiled..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 make bgpd/bgpd -j\$(nproc) 2>&1 | tail -3
 " || { log_fail "bgpd compile failed"; exit 1; }
 log_pass "bgpd compiled"
@@ -31,9 +30,9 @@ log_pass "bgpd compiled"
 # Step 2: Compile batch test binary in container
 log_info "Step 2: Compile batch test binary..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 rm -f $TEST_BIN
-gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
+gcc -std=gnu11 -w -g -O0 -include config.h \
   -I lib -I bgpd -I . \$(pkg-config --cflags libyang 2>/dev/null) \
   -o $TEST_BIN tests/bgpd/test_midr_zapi_batch.c \
   bgpd/bgp_midr_zebra.o \
@@ -42,11 +41,8 @@ gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
 " || { log_fail "Compile failed"; exit 1; }
 log_pass "Binary compiled"
 
-# Copy libfrr
-sudo docker cp "$CONTAINER:$LIBFRR_SRC" "$HOST_LIB" 2>/dev/null || true
-sudo docker cp "$CONTAINER:$TEST_BIN" "$HOST_BIN" 2>/dev/null || true
-sudo docker cp "$HOST_BIN" "$CONTAINER:/tmp/test_midr_zapi_batch" 2>/dev/null || true
-sudo docker cp "$HOST_LIB" "$CONTAINER:/tmp/libfrr.so" 2>/dev/null || true
+# Copy libfrr to /tmp so LD_LIBRARY_PATH can find it
+sudo docker exec -u 0 "$CONTAINER" cp "$LIBFRR_SRC" /tmp/libfrr.so 2>/dev/null || true
 
 # Step 3: Start zebra
 log_info "Step 3: Start zebra daemon..."
@@ -54,7 +50,7 @@ sudo docker exec -u 0 "$CONTAINER" bash -c "
 pkill -9 zebra 2>/dev/null || true
 sleep 1
 echo -e 'bgpd=no\nzebra=yes\nstaticd=no\nospfd=no\nisisd=no\nripd=no' > /etc/frr/daemons
-/usr/lib/frr/zebra -d -u frr -g frr 2>&1 || true
+/usr/lib/frr/zebra -d -u frr -g frr --limit-fds 100000 2>&1 || true
 sleep 3
 pgrep zebra && echo 'zebra OK' || echo 'zebra NOT running'
 " 2>&1

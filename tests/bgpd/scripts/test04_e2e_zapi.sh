@@ -14,13 +14,14 @@ echo "============================================"
 echo "  Test 04: E2E ZAPI Route Test"
 echo "============================================"
 
-CONTAINER="frr-ubuntu24-ymy"
+CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
+FRR_DIR=${FRR_DIR:-/home/frr/frr}
 TEST_BIN="/tmp/test_e2e_zapi"
 
 # Step 1: Ensure bgpd compiled
 log_info "Step 1: Ensure bgpd compiled..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 make bgpd/bgpd -j\$(nproc) 2>&1 | tail -3
 " || { log_fail "bgpd compile failed"; exit 1; }
 log_pass "bgpd compiled"
@@ -28,9 +29,9 @@ log_pass "bgpd compiled"
 # Step 2: Compile E2E test binary
 log_info "Step 2: Compile E2E test..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 rm -f $TEST_BIN
-gcc -std=gnu11 -Wall -Wextra -g -O0 -include config.h \
+gcc -std=gnu11 -w -g -O0 -include config.h \
   -I lib -I bgpd -I . \
   \$(pkg-config --cflags libyang 2>/dev/null) \
   -o $TEST_BIN tests/bgpd/test_midr_zebra_e2e.c bgpd/bgp_midr_zebra.o \
@@ -45,7 +46,7 @@ sudo docker exec -u 0 "$CONTAINER" bash -c "
 pkill -9 zebra 2>/dev/null || true
 sleep 1
 echo -e 'bgpd=no\nzebra=yes\nstaticd=no\nospfd=no\nisisd=no\nripd=no' > /etc/frr/daemons
-/usr/lib/frr/zebra -d -u frr -g frr 2>&1 || true
+/usr/lib/frr/zebra -d -u frr -g frr --limit-fds 100000 2>&1 || true
 sleep 3
 " 2>&1
 
@@ -61,7 +62,7 @@ sudo docker exec "$CONTAINER" test -S /var/run/frr/zserv.api || { log_fail "zebr
 
 # Step 4: Run E2E test
 log_info "Step 4: Run E2E ZAPI test..."
-OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=/home/frr/frr/lib/.libs $TEST_BIN /var/run/frr/zserv.api" 2>&1)
+OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=$FRR_DIR/lib/.libs $TEST_BIN /var/run/frr/zserv.api" 2>&1)
 echo "$OUTPUT"
 
 # Step 5: Parse results

@@ -14,13 +14,14 @@ echo "============================================"
 echo "  Test 02: Netlink C Proto 199 Verification"
 echo "============================================"
 
-CONTAINER="frr-ubuntu24-ymy"
+CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
+FRR_DIR=${FRR_DIR:-/home/frr/frr}
 TEST_BIN="/tmp/test_midr_proto199"
 
 # Step 1: Compile the test binary inside the container
 log_info "Step 1: Compile test_midr_proto199..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr/tests/bgpd
+cd $FRR_DIR/tests/bgpd
 rm -f $TEST_BIN
 gcc -std=gnu11 -Wall -Wextra -g -O0 \
     -I/usr/include/libnl3 \

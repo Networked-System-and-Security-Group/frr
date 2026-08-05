@@ -199,24 +199,30 @@ out:
 int main(int argc, char **argv) {
 	if (argc < 4) {
 		fprintf(stderr, "Usage: %s <mode> <prefix> <nexthop> [dead_nexthop] [param] [zebra_sock]\n"
-			"  %s blackhole 10.100.0.0/24 10.0.99.2 10.200.0.1 5\n"
-			"  %s stress    10.100.0.0/24 10.200.0.1 20\n", argv[0], argv[0], argv[0]);
+			"  %s blackhole 10.100.0.0/24 10.0.99.2 10.200.0.1 [hold_sec] [zebra_sock]\n"
+			"  %s stress    10.100.0.0/24 10.200.0.1 [iterations] [zebra_sock]\n",
+			argv[0], argv[0], argv[0]);
 		return 1;
 	}
 	const char *mode = argv[1], *pfx = argv[2], *nh = argv[3];
-	int param = (argc > 5) ? atoi(argv[5]) : ((argc > 4) ? atoi(argv[4]) : 5);
-	const char *sock = (argc > 6) ? argv[6] : ((argc > 5) ? argv[5] : "/var/run/frr/zserv.api");
 
 	if (strcmp(mode, "blackhole") == 0) {
-		/* blackhole needs 2 nexthops: real_nh + dead_nh */
-		const char *dead_nh = (argc > 4) ? argv[4] : NULL;
-		if (!dead_nh) {
+		/* blackhole: pfx real_nh dead_nh [hold_sec=5] [sock] */
+		if (argc <= 4) {
 			fprintf(stderr, "blackhole mode requires 2 nexthops: <real_nh> <dead_nh>\n");
 			return 1;
 		}
-		return mode_blackhole(sock, pfx, nh, dead_nh, param);
+		const char *dead_nh = argv[4];
+		int hold_sec = (argc > 5) ? atoi(argv[5]) : 5;
+		const char *sock = (argc > 6) ? argv[6] : "/var/run/frr/zserv.api";
+		return mode_blackhole(sock, pfx, nh, dead_nh, hold_sec);
 	}
-	if (strcmp(mode, "stress") == 0) return mode_stress(sock, pfx, nh, param);
+	if (strcmp(mode, "stress") == 0) {
+		/* stress: pfx nh [iters=20] [sock] */
+		int iters = (argc > 4) ? atoi(argv[4]) : 20;
+		const char *sock = (argc > 5) ? argv[5] : "/var/run/frr/zserv.api";
+		return mode_stress(sock, pfx, nh, iters);
+	}
 	fprintf(stderr, "Unknown mode: %s\n", mode);
 	return 1;
 }

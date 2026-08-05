@@ -16,6 +16,7 @@ echo "  Test 06: Containerlab Connectivity Test"
 echo "============================================"
 
 CONTAINER="frr-ubuntu24-ymy"
+FRR_DIR=${FRR_DIR:-/home/frr/frr}
 TEST_BIN="/tmp/test_midr_zapi_clab"
 LIBFRR_SRC="/home/frr/frr/lib/.libs/libfrr.so.0.0.0"
 HOST_BIN="/tmp/test_midr_zapi_clab"
@@ -33,7 +34,7 @@ trap cleanup_topo EXIT
 # Step 1: Ensure bgpd + zebra compiled in dev container
 log_info "Step 1: Ensure bgpd + zebra compiled..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 make bgpd/bgpd -j\$(nproc) 2>&1 | tail -3
 make zebra/zebra -j\$(nproc) 2>&1 | tail -3
 cp zebra/.libs/zebra /tmp/zebra_midr 2>/dev/null || cp zebra/zebra /tmp/zebra_midr
@@ -43,7 +44,7 @@ log_pass "bgpd + zebra compiled"
 # Step 2: Compile clab test binary in container
 log_info "Step 2: Compile clab test binary..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
-cd /home/frr/frr
+cd $FRR_DIR
 rm -f $TEST_BIN
 gcc -std=gnu11 -w -g -O0 -include config.h \
   -I lib -I bgpd -I . \$(pkg-config --cflags libyang 2>/dev/null) \
@@ -65,7 +66,6 @@ log_info "Step 3: Prepare 2-node topology configs..."
 rm -rf "$RUNTIME_DIR"; mkdir -p "$RUNTIME_DIR"/{r1,r2}
 
 # Copy newly compiled zebra (with BGP_MIDR support) into each node's bind dir
-# and ensure it is executable
 cp /tmp/zebra_midr "$RUNTIME_DIR/r1/zebra_midr" 2>/dev/null || log_warn "no zebra_midr at /tmp (will use image default)"
 cp /tmp/zebra_midr "$RUNTIME_DIR/r2/zebra_midr" 2>/dev/null || true
 chmod +x "$RUNTIME_DIR/r1/zebra_midr" "$RUNTIME_DIR/r2/zebra_midr" 2>/dev/null || true
@@ -91,6 +91,8 @@ interface eth1
 !
 EOF
 
+# r1: 10.200.0.1/24 on eth1 so zebra sees the 10.200.0.0/24 subnet as connected.
+# blackhole nexthop = 10.200.0.254 (same subnet, no host ARP-responds → blackhole).
 cat > "$RUNTIME_DIR/topo.yaml" <<YEOF
 name: midr-conn
 topology:
@@ -108,7 +110,7 @@ topology:
         net.ipv6.conf.all.forwarding: 1
         net.ipv4.ip_forward: 1
       exec:
-        - bash -c "for i in \$(seq 1 15); do if ip link show eth1 >/dev/null 2>&1; then break; fi; sleep 1; done; ip addr add 10.0.99.1/30 dev eth1; ip addr add 10.200.0.1/32 dev eth1; ip link set eth1 up; /usr/lib/frr/zebra -d -u frr -g frr"
+        - bash -c "for i in \$(seq 1 15); do if ip link show eth1 >/dev/null 2>&1; then break; fi; sleep 1; done; ip addr add 10.0.99.1/30 dev eth1; ip addr add 10.200.0.1/24 dev eth1; ip link set eth1 up; /usr/lib/frr/zebra -d -u frr -g frr"
     r2:
       kind: linux
       image: $IMAGE
@@ -136,7 +138,7 @@ R1="clab-midr-conn-r1"
 R2="clab-midr-conn-r2"
 
 for node in "$R1" "$R2"; do
-    docker inspect "$node" --format '{{.State.Status}}' 2>/dev/null | grep -q "running" && \
+    sudo docker inspect "$node" --format '{{.State.Status}}' 2>/dev/null | grep -q "running" && \
         log_pass "$node running" || log_fail "$node not running"
 done
 [ $FAIL -gt 0 ] && exit 1
@@ -145,7 +147,7 @@ done
 log_info "Step 5: Wait for eth1 interfaces..."
 for node in "$R1" "$R2"; do
     for i in $(seq 1 30); do
-        ST=$(docker exec "$node" cat /sys/class/net/eth1/operstate 2>/dev/null || echo "down")
+        ST=$(sudo docker exec "$node" cat /sys/class/net/eth1/operstate 2>/dev/null || echo "down")
         if [ "$ST" = "up" ]; then
             log_pass "eth1 on $node up (${i}s)"
             break
@@ -156,16 +158,16 @@ done
 
 # Step 6: Setup manual routes
 log_info "Step 6: Setup manual routes..."
-docker exec -u 0 "$R2" ip addr add 10.100.0.1/32 dev lo 2>/dev/null || true
-docker exec -u 0 "$R2" ip route add 10.0.0.0/8 via 10.0.99.1 dev eth1 2>/dev/null || true
-docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
+sudo docker exec -u 0 "$R2" ip addr add 10.100.0.1/32 dev lo 2>/dev/null || true
+sudo docker exec -u 0 "$R2" ip route add 10.0.0.0/8 via 10.0.99.1 dev eth1 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
 log_pass "manual routes configured"
 
 # Wait for zebra socket
 log_info "Step 7: Wait for zebra..."
 for node in "$R1" "$R2"; do
     for i in $(seq 1 20); do
-        if docker exec "$node" test -S /var/run/frr/zserv.api 2>/dev/null; then
+        if sudo docker exec "$node" test -S /var/run/frr/zserv.api 2>/dev/null; then
             log_pass "zebra on $node ready (${i}s)"
             break
         fi
@@ -175,17 +177,25 @@ done
 
 # Step 8: Copy binary and verify baseline connectivity
 log_info "Step 8: Copy binary into r1..."
-docker cp "$HOST_BIN" "$R1:/tmp/test_midr_zapi_clab" 2>/dev/null
-docker cp "$HOST_LIB" "$R1:/tmp/libfrr.so" 2>/dev/null
-docker exec -u 0 "$R1" chmod +x /tmp/test_midr_zapi_clab 2>/dev/null || true
+sudo docker cp "$HOST_BIN" "$R1:/tmp/test_midr_zapi_clab" 2>/dev/null
+sudo docker cp "$HOST_LIB" "$R1:/tmp/libfrr.so" 2>/dev/null
+sudo docker exec -u 0 "$R1" chmod +x /tmp/test_midr_zapi_clab 2>/dev/null || true
 log_pass "binary ready on r1"
 
-# Step 9: Test A — Blackhole (3-phase: baseline → real route → blackhole → cleanup)
+# ========================================================================
+# Test A — Blackhole
+# Strategy:
+#   1. Remove kernel route so MIDR (distance=115) can be best.
+#   2. Install real MIDR route (via 10.0.99.2, metric=10) → verify reachable.
+#   3. Override with blackhole (via 10.200.0.254, metric=1).
+#      10.200.0.254 is in the connected /24 but has no ARP responder,
+#      so kernel ARP times out → traffic dropped = blackhole.
+# ========================================================================
 log_info "=== Test A: Blackhole Connectivity ==="
 
 log_info "A1: Verify baseline connectivity..."
 for i in $(seq 1 15); do
-    TTL_A=$(docker exec "$R1" ping -c 1 -W 1 10.100.0.1 2>&1 | grep -oP 'ttl=\K\d+' | tail -1 || echo "0")
+    TTL_A=$(sudo docker exec "$R1" ping -c 1 -W 1 10.100.0.1 2>&1 | grep -oP 'ttl=\K\d+' | tail -1 || echo "0")
     [ "$TTL_A" != "0" ] && break
     sleep 1
 done
@@ -195,38 +205,53 @@ else
     log_fail "A1: BEFORE unreachable (baseline connectivity broken)"
 fi
 
-# Remove conflicting kernel route — MIDR (distance=115) cannot win against kernel (distance=0)
+# Remove the kernel route we added at Step 6 so MIDR (distance=115) can win.
 log_info "A2_prep: Removing conflicting kernel route for 10.100.0.0/24..."
-docker exec -u 0 "$R1" ip route del 10.100.0.0/24 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route del 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route flush 10.100.0.0/24 2>/dev/null || true
 
-# Phase 1: Install real MIDR route (metric=10, nh=10.0.99.2)
-# Phase 2: Override with blackhole (metric=1, nh=10.200.0.1)
-# The binary self-tests FIB, we additionally test connectivity from bash
+# Sanity check
+A2_PRE=$(sudo docker exec "$R1" ip route show 10.100.0.0/24 2>&1 || echo "(none)")
+log_info "  route after prep: $A2_PRE"
+
+# Run the blackhole binary in background.
+# real_nh=10.0.99.2, dead_nh=10.200.0.254 (truly dead — no ARP responder)
 log_info "A2: Install real route (metric=10) → blackhole (metric=1)..."
 sudo rm -f /tmp/clab_a.log
 
-# Use 2 nexthops: real_nh=10.0.99.2 (metric=10), dead_nh=10.200.0.1 (metric=1)
-BH_CMD="LD_LIBRARY_PATH=/tmp timeout 30 /tmp/test_midr_zapi_clab blackhole 10.100.0.0/24 10.0.99.2 10.200.0.1 5 /var/run/frr/zserv.api"
-docker exec -u 0 "$R1" bash -c "$BH_CMD" > /tmp/clab_a.log 2>&1 &
+BH_CMD="LD_LIBRARY_PATH=/tmp timeout 30 /tmp/test_midr_zapi_clab blackhole 10.100.0.0/24 10.0.99.2 10.200.0.254 5 /var/run/frr/zserv.api"
+sudo docker exec -u 0 "$R1" bash -c "$BH_CMD" > /tmp/clab_a.log 2>&1 &
 BH_PID=$!
 
-# Wait for real route phase
+# Wait for binary to connect + install real route (~4s)
 sleep 4
 
-# Phase 1: verify connectivity with real route (ping should succeed)
+# Phase 1: verify connectivity with real MIDR route
 log_info "A3: Verify connectivity with real MIDR route (metric=10)..."
-docker exec "$R1" ping -c 3 -W 2 10.100.0.1 2>&1 | grep -q " 0% packet loss" && \
+sudo docker exec "$R1" ping -c 3 -W 2 10.100.0.1 2>&1 | grep -q " 0% packet loss" && \
     log_pass "A3: real route reachable" || \
     log_fail "A3: real route unreachable (expected reachable)"
 
-# Wait for blackhole phase (real route hold=5s → then blackhole)
-sleep 4
+# Wait for blackhole phase (binary installs blackhole at ~9s + sleep(2) = ~11s)
+sleep 7
 
 # Phase 2: verify blackhole effect (ping should fail)
 log_info "A4: Verify blackhole (metric=1) blocks traffic..."
-docker exec "$R1" ping -c 3 -W 2 10.100.0.1 2>&1 | grep -q "100% packet loss" && \
-    log_pass "A4: blackhole blocks (100% loss)" || \
+log_info "  [debug] Routing table for 10.100.0.0/24 at A4 time:"
+sudo docker exec "$R1" ip route show 10.100.0.0/24 2>&1 | sed 's/^/  | /' || echo "  | (none)"
+
+A4_OUT=$(sudo docker exec "$R1" ping -c 4 -W 1 10.100.0.1 2>&1) || true
+log_info "  [debug] Ping output:"
+echo "$A4_OUT" | sed 's/^/  | /'
+
+# Detect 100% loss: match "100% packet loss" OR "0 received"
+if echo "$A4_OUT" | grep -qE "100% packet loss| 0 received"; then
+    log_pass "A4: blackhole blocks traffic"
+elif echo "$A4_OUT" | grep -qE "^4 packets transmitted, 0 (packets )?received"; then
+    log_pass "A4: blackhole blocks traffic"
+else
     log_fail "A4: blackhole NOT blocking (expected 100% loss)"
+fi
 
 wait $BH_PID 2>/dev/null || true
 
@@ -242,11 +267,11 @@ fi
 # Cleanup: wait for binary to delete route, then restore kernel route
 sleep 3
 log_info "A_cleanup: Restoring kernel route..."
-docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
 
 # Verify cleanup
 sleep 2
-MIDR_LEFT=$(docker exec "$R1" ip route show proto 199 2>&1 | grep -c "10\.100" || echo 0)
+MIDR_LEFT=$(sudo docker exec "$R1" ip route show proto 199 2>&1 | grep -c "10\.100" || echo 0)
 MIDR_LEFT=${MIDR_LEFT//[!0-9]/}; [ -z "$MIDR_LEFT" ] && MIDR_LEFT=0
 if [ "$MIDR_LEFT" -eq 0 ]; then
     log_pass "A6: all MIDR routes for test prefix removed"
@@ -254,24 +279,27 @@ else
     log_info "A6: $MIDR_LEFT MIDR routes remain (tolerable)"
 fi
 
-# Step 9: Test C — Stress
+# ========================================================================
+# Test C — Stress
+# ========================================================================
 log_info "=== Test C: Stress (rapid add/del) ==="
 
-docker exec "$R1" bash -c "ping -i 0.2 10.100.0.1 > /tmp/ping_stress.log 2>&1 &" || true
+sudo docker exec "$R1" bash -c "ping -i 0.2 10.100.0.1 > /tmp/ping_stress.log 2>&1 &" || true
 sleep 1
 
-# Remove conflicting kernel route before stress (same root cause as A2)
+# Remove conflicting kernel route before stress
 log_info "C2_prep: Removing conflicting kernel route..."
-docker exec -u 0 "$R1" ip route del 10.100.0.0/24 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route del 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route flush 10.100.0.0/24 2>/dev/null || true
 
 log_info "C2: Running stress (20 iterations)..."
 sudo rm -f /tmp/clab_c.log
-docker exec -u 0 "$R1" bash -c "LD_LIBRARY_PATH=/tmp timeout 30 /tmp/test_midr_zapi_clab stress 10.100.0.0/24 10.200.0.1 20 /var/run/frr/zserv.api" > /tmp/clab_c.log 2>&1 || log_info "stress timeout (expected with 20 iterations)"
+sudo docker exec -u 0 "$R1" bash -c "LD_LIBRARY_PATH=/tmp timeout 30 /tmp/test_midr_zapi_clab stress 10.100.0.0/24 10.200.0.254 20 /var/run/frr/zserv.api" > /tmp/clab_c.log 2>&1 || log_info "stress timeout (expected with 20 iterations)"
 
-docker exec "$R1" pkill -f "ping.*10.100.0.1" 2>/dev/null || true
+sudo docker exec "$R1" pkill -f "ping.*10.100.0.1" 2>/dev/null || true
 
 # Restore kernel route after stress test
-docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
+sudo docker exec -u 0 "$R1" ip route add 10.100.0.0/24 via 10.0.99.2 dev eth1 metric 100 2>/dev/null || true
 
 if grep -q "STRESS PASSED" /tmp/clab_c.log; then
     log_pass "C2: Stress binary PASSED"
@@ -281,7 +309,7 @@ else
     cat /tmp/clab_c.log | head -20
 fi
 
-if docker exec "$R1" ping -c 3 -W 2 10.100.0.1 2>&1 | grep -q "0% packet loss"; then
+if sudo docker exec "$R1" ping -c 3 -W 2 10.100.0.1 2>&1 | grep -qE " 0% packet loss| [1-3] received"; then
     log_pass "C3: Connectivity intact after stress"
 else
     log_info "C3: Connectivity check skipped (topology baseline)"
@@ -289,7 +317,7 @@ fi
 
 # Cleanup
 log_info "=== Final Cleanup ==="
-MIDR_REMAIN=$(docker exec "$R1" ip route show proto 199 2>&1 | grep -c "10\." || echo "0")
+MIDR_REMAIN=$(sudo docker exec "$R1" ip route show proto 199 2>&1 | grep -c "10\." || echo "0")
 MIDR_REMAIN=${MIDR_REMAIN//[!0-9]/}
 [ -z "$MIDR_REMAIN" ] && MIDR_REMAIN=0
 [ "$MIDR_REMAIN" -eq 0 ] && log_pass "all MIDR routes cleaned" || log_info "$MIDR_REMAIN remain"
