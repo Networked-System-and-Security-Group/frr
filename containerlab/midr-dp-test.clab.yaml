@@ -1,0 +1,24 @@
+name: midr-dp-test
+
+topology:
+  nodes:
+    router1:
+      kind: linux
+      image: frr-ubuntu24:latest
+      binds:
+        - ./configs-dp-test/router1/frr.conf:/etc/frr/frr.conf
+        - ./configs-dp-test/router1/daemons:/etc/frr/daemons
+      exec:
+        - bash -c "ip link add dummy0 type dummy 2>/dev/null; ip link set dummy0 up; ip addr add 192.0.2.1/32 dev dummy0 2>/dev/null; /usr/lib/frr/frrinit.sh start"
+
+    router2:
+      kind: linux
+      image: frr-ubuntu24:latest
+      binds:
+        - ./configs-dp-test/router2/frr.conf:/etc/frr/frr.conf
+        - ./configs-dp-test/router2/daemons:/etc/frr/daemons
+      exec:
+        - bash -c "ip link add dummy0 type dummy 2>/dev/null; ip link set dummy0 up; ip addr add 192.0.2.2/32 dev dummy0 2>/dev/null; /usr/lib/frr/frrinit.sh start"
+
+  links:
+    - endpoints: ["router1:eth1", "router2:eth1"]

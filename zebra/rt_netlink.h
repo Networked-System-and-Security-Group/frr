@@ -45,6 +45,8 @@ extern "C" {
 #define RTPROT_ZSTATIC     196
 #define RTPROT_OPENFABRIC  197
 #define RTPROT_SRTE        198
+/* Reason: expose MIDR as a distinct kernel protocol for iproute2. */
+#define RTPROT_BGP_MIDR  199
 
 void rt_netlink_init(void);
 

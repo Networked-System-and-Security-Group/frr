@@ -347,6 +347,10 @@ netlink_prot_to_s(unsigned char prot)
 	case RTPROT_BGP:
 		return "BGP";
 
+	case RTPROT_BGP_MIDR:
+		/* Reason: FPM route dumps should preserve the new kernel proto. */
+		return "MIDR";
+
 	case RTPROT_ISIS:
 		return "ISIS";
 
