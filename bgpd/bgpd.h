@@ -129,7 +129,6 @@ struct bgp_master {
 	/* BGP thread master.  */
 	struct event_loop *master;
 
-	/* Listening sockets */
 	struct list *listen_sockets;
 
 	/* BGP port number.  */
@@ -1126,7 +1125,8 @@ struct bgp {
 	uint64_t bestpath_runs;
 	uint64_t node_already_on_queue;
 	uint64_t node_deferred_on_queue;
-
+	/* MIDR data-plane deferred batch state (opaque). */
+	void *midr_dp;
 	QOBJ_FIELDS;
 };
 DECLARE_QOBJ_TYPE(bgp);

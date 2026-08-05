@@ -1,0 +1,67 @@
+classDiagram
+    class bgp {
+        +void* midr_dp
+    }
+    note for bgp "FRR 核心 BGP 实例 (bgpd/bgpd.h)"
+
+    class bgp_midr_dp {
+        +struct event* t_deferred
+        +struct list* pending_ops
+        +struct hash* installed
+        +bool flush_pending
+    }
+    note for bgp_midr_dp "per-BGP 数据平面状态机 (bgp_midr_zebra.c 私有)"
+
+    class midr_pending_op {
+        +enum midr_op_type op
+        +struct prefix prefix
+        +uint8_t instance
+        +struct midr_path* paths
+        +uint8_t path_count
+        +uint8_t sid_count
+        +struct in6_addr sid_list[SRV6_MAX_SEGS]
+    }
+    note for midr_pending_op "排队操作单元 (深拷贝自 CP 入参)"
+
+    class midr_installed_entry {
+        +struct prefix prefix
+        +uint8_t instance
+        +struct midr_path* paths
+        +uint8_t path_count
+        +uint8_t sid_count
+        +struct in6_addr sid_list[SRV6_MAX_SEGS]
+    }
+    note for midr_installed_entry "已安装路由快照 (哈希键 = prefix + instance)"
+
+    class midr_path_result {
+        +struct midr_path* paths
+        +uint8_t path_count
+        +uint8_t instance
+        +struct explicit_srv6 explicit
+    }
+    note for midr_path_result "CP→DP 唯一数据载体 (bgp_midr_zebra.h)"
+
+    class midr_path {
+        +union g_addr nexthop
+        +uint32_t ifindex
+        +uint32_t metric
+        +float path_avail_bw
+        +uint8_t weight
+    }
+    note for midr_path "单条物理路径 (bgp_midr_zebra.h)"
+
+    class explicit_srv6 {
+        +struct in6_addr sid_list[SRV6_MAX_SEGS]
+        +uint8_t sid_count
+    }
+    note for explicit_srv6 "SRv6 显式段列表 (sid_count=0 时为空)"
+
+    bgp --> bgp_midr_dp : "挂载为 bgp->midr_dp (void* 不透明指针)"
+    bgp_midr_dp --> midr_pending_op : "维护 FIFO 队列 pending_ops"
+    bgp_midr_dp --> midr_installed_entry : "维护 installed hash (联合键=prefix+instance)"
+    midr_pending_op --> midr_path : "深拷贝 1..N 条下一跳路径"
+    midr_pending_op --> explicit_srv6 : "深拷贝 sid_list + sid_count"
+    midr_installed_entry --> midr_path : "持久化已安装的下一跳快照"
+    midr_installed_entry --> explicit_srv6 : "持久化已安装的 SID 快照"
+    midr_path_result --> midr_path : "包含 paths + path_count"
+    midr_path_result --> explicit_srv6 : "包含 explicit 匿名结构体"

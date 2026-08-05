@@ -132,6 +132,16 @@ static const struct {
 	[ZEBRA_ROUTE_BGP] = {ZEBRA_ROUTE_BGP,
 			     ZEBRA_EBGP_DISTANCE_DEFAULT /* IBGP is 200. */,
 			     META_QUEUE_BGP},
+	/*
+	 * Reason: MIDR is computed by bgpd but remains a separate route
+	 * type so zebra can compare, display and replace it independently from
+	 * ordinary BGP NLRI.
+	 */
+	[ZEBRA_ROUTE_BGP_MIDR] = {
+		ZEBRA_ROUTE_BGP_MIDR,
+		ZEBRA_BGP_MIDR_DISTANCE_DEFAULT,
+		META_QUEUE_BGP
+	},
 	[ZEBRA_ROUTE_PIM] = {ZEBRA_ROUTE_PIM, ZEBRA_MAX_DISTANCE_DEFAULT,
 			     META_QUEUE_OTHER},
 	[ZEBRA_ROUTE_EIGRP] = {ZEBRA_ROUTE_EIGRP, ZEBRA_EIGRP_DISTANCE_DEFAULT,
