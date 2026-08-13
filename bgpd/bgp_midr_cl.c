@@ -658,6 +658,30 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		cl_handle_periodic_sync(bgp, gv);
 		break;
 
+	case MIDR_TRIGGER_ISOLATED:
+		/*
+		 * All established sessions (group + anchor) have been gone
+		 * for a full debounce window (NDS-side check, see
+		 * midr_isolation_check()) -- a connectivity failure, not a
+		 * link-quality judgement. Always discard the current group
+		 * and restart the join flow, regardless of how
+		 * local_group_id got set: PERIODIC_SYNC's LEAVE never even
+		 * looks at this case (an isolated node's own group has 0
+		 * known adjacent members, which its threshold treats as
+		 * "stay"), so nothing else will notice.
+		 */
+		{
+			struct midr_cluster_decision d = {};
+
+			d.decision_type = MIDR_DECISION_RECONNECT;
+			d.old_group_id = mi->local_group_id;
+			d.new_group_id = 0;
+			MIDR_FLOW_LOG("MIDR CL: ISOLATED — 群 %u 已无任何已建立会话，RECONNECT",
+				      mi->local_group_id);
+			midr_nds_on_cluster_decision(bgp, &d);
+		}
+		break;
+
 	case MIDR_TRIGGER_NODE_CHANGE:
 		/*
 		 * 节点加入/离开/失效时触发。

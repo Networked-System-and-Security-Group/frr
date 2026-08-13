@@ -940,6 +940,62 @@ static void midr_join_rep_probe_done_cb(struct event *t)
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_REP_PROBE_DONE);
 }
 
+/* Count established sessions carrying the BGP-LS AF -- group members and
+ * anchor connections alike, both use it, so this one count covers "any
+ * working MIDR session" regardless of which kind. */
+static unsigned int midr_established_session_count(struct bgp *bgp)
+{
+	struct peer *peer;
+	struct listnode *node;
+	unsigned int count = 0;
+
+	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
+		if (!peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+			continue;
+		if (peer->connection->status == Established)
+			count++;
+	}
+	return count;
+}
+
+/*
+ * Debounced isolation detection (MIDR_TRIGGER_ISOLATED). PERIODIC_SYNC's own
+ * LEAVE judgement only looks at known adjacent members of the local group,
+ * which is trivially empty -- and therefore always "stay" -- for a node that
+ * has lost every session; it never notices total isolation. This is a
+ * separate check for exactly that gap.
+ *
+ * Skipped outside steady state (no group yet, or a join still in progress)
+ * since a transient zero-session count there is expected, not a failure.
+ */
+static void midr_isolation_check(struct bgp *bgp)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+
+	if (mi->local_group_id == 0 || mi->join_phase != MIDR_JOIN_IDLE) {
+		mi->isolated_ticks = 0;
+		return;
+	}
+
+	if (midr_established_session_count(bgp) > 0) {
+		mi->isolated_ticks = 0;
+		return;
+	}
+
+	mi->isolated_ticks++;
+	if (mi->isolated_ticks < MIDR_ISOLATION_DEBOUNCE_TICKS) {
+		MIDR_LOG("MIDR: 0 个已建立会话（第 %u/%u 次探测，群 %u），未达去抖阈值",
+			 mi->isolated_ticks, MIDR_ISOLATION_DEBOUNCE_TICKS,
+			 mi->local_group_id);
+		return;
+	}
+
+	MIDR_FLOW_LOG("MIDR: 连续 %u 次探测 0 个已建立会话（群 %u），判定孤岛，通知 CL",
+		      mi->isolated_ticks, mi->local_group_id);
+	mi->isolated_ticks = 0;
+	midr_nds_notify_cl(bgp, MIDR_TRIGGER_ISOLATED);
+}
+
 /*
  * Periodic-sync timer: hand the global view to CL for a full re-evaluation
  * on a fixed cadence (independent of probe/membership events).
@@ -951,6 +1007,7 @@ static void midr_periodic_sync_timer(struct event *t)
 	struct midr_node_entry *entry;
 
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_PERIODIC_SYNC);
+	midr_isolation_check(bgp);
 
 	/* §8.31：顺路把当前视图里的引导节点刷一遍种子库 last_seen（"我最近还
 	 * 见过它"），再 prune 到上限防膨胀。下线/过期不删库——种子跨活性留底。 */
@@ -1260,6 +1317,38 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 /* B1：LEAVE 分支重开加入轮，定义在本文件后段的 §8.32 bootstrap 韧性一节。 */
 static void midr_bootstrap_start_attempt(struct bgp *bgp); /* forward */
 
+/*
+ * Shared by MIDR_DECISION_LEAVE and MIDR_DECISION_RECONNECT: discard the
+ * current group (reconverge to group 0) and kick off a fresh join attempt
+ * from the top of the bootstrap candidate list -- the same "open a new
+ * round" steps midr_bootstrap_self_boot_cb() uses: set the intent, clear
+ * every candidate's failed flag, rewind the cursor to the head, send the
+ * first hop.
+ *
+ * Returns false (and changes nothing) if there's no bootstrap candidate to
+ * fall back on: reconverge(0) would tear down the current group's sessions
+ * and then have nowhere to go, which is worse than leaving the caller's
+ * decision unapplied.
+ */
+static bool midr_restart_join_from_bootstrap(struct bgp *bgp)
+{
+	struct bgp_midr *mi = bgp->midr_info;
+	struct listnode *bn;
+	struct midr_bootstrap_entry *b;
+
+	if (!mi->bootstrap_list || list_isempty(mi->bootstrap_list))
+		return false;
+
+	midr_group_reconverge(bgp, 0);
+
+	mi->join_intent = true;
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, bn, b))
+		b->failed = false;
+	mi->bootstrap_cur = listhead(mi->bootstrap_list);
+	midr_bootstrap_start_attempt(bgp);
+	return true;
+}
+
 void midr_nds_on_cluster_decision(struct bgp *bgp,
 				  const struct midr_cluster_decision *decision)
 {
@@ -1367,38 +1456,60 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			MIDR_LOG("MIDR I-7：LEAVE 但本节点当前无群，忽略");
 			break;
 		}
+		{
+			uint32_t left_gid = mi->local_group_id;
+
+			/*
+			 * 退群只有在"退完还能重新找群"时才划算——没有引导候选
+			 * 就没有回头路，reconverge(0) 会先拆掉当前（哪怕不完美
+			 * 但至少连通）的群内会话，然后卡在无群状态出不来，比留
+			 * 在原群更差。没候选就直接放弃整个 LEAVE（不拆会话、不
+			 * 清群号），等运维补 `midr bootstrap` 候选或以后有别的
+			 * 触发路径再说。
+			 */
+			if (!midr_restart_join_from_bootstrap(bgp)) {
+				MIDR_LOG("MIDR I-7：LEAVE 群 %u 但无引导候选可回退，放弃退群（留在原群好过无群）",
+					 left_gid);
+				break;
+			}
+			MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，自动重新加入（%u 个引导候选）",
+				      left_gid, listcount(mi->bootstrap_list));
+		}
+		break;
+	case MIDR_DECISION_RECONNECT:
 		/*
-		 * 退群只有在"退完还能重新找群"时才划算——没有引导候选就没有回
-		 * 头路，reconverge(0) 会先拆掉当前（哪怕不完美但至少连通）的群
-		 * 内会话，然后卡在无群状态出不来，比留在原群更差。这里提前判
-		 * 断，没候选就直接放弃整个 LEAVE（不拆会话、不清群号），等运
-		 * 维补 `midr bootstrap` 候选或以后有别的触发路径再说。
+		 * Triggered by total connectivity loss (MIDR_TRIGGER_ISOLATED).
+		 * Shares the restart-join-round logic with LEAVE, but the
+		 * meaning differs: LEAVE is "the algorithm judged link
+		 * quality too low and wants to switch"; this is "every
+		 * session died", which isn't a quality judgement -- so it
+		 * doesn't check whether local_group_id came from the
+		 * algorithm or from `midr group-id`; a node should be
+		 * allowed to at least try reconnecting either way once it's
+		 * totally isolated.
+		 * Same guards as LEAVE: only act in true steady state (avoid
+		 * colliding with an in-flight join); ignore as a stale
+		 * notification if the node already has no group.
 		 */
-		if (!mi->bootstrap_list || list_isempty(mi->bootstrap_list)) {
-			MIDR_LOG("MIDR I-7：LEAVE 群 %u 但无引导候选可回退，放弃退群（留在原群好过无群）",
-				 mi->local_group_id);
+		if (mi->join_phase != MIDR_JOIN_IDLE) {
+			MIDR_LOG("MIDR I-7：RECONNECT 但不在稳态（join_phase=%d），忽略",
+				 mi->join_phase);
+			break;
+		}
+		if (mi->local_group_id == 0) {
+			MIDR_LOG("MIDR I-7：RECONNECT 但本节点当前无群，忽略");
 			break;
 		}
 		{
 			uint32_t left_gid = mi->local_group_id;
-			struct listnode *bn;
-			struct midr_bootstrap_entry *b;
 
-			/* 清群号、拆本群邻接、停非本群代表探测、重通告（群号 0）。 */
-			midr_group_reconverge(bgp, 0);
-
-			/*
-			 * 自动重开一轮加入，复用 §8.32 候选引导清单——与
-			 * midr_bootstrap_self_boot_cb 相同的"开新一轮"手法：置
-			 * 意图、清 failed 标记、游标指表头、发第一跳。
-			 */
-			mi->join_intent = true;
-			for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, bn, b))
-				b->failed = false;
-			mi->bootstrap_cur = listhead(mi->bootstrap_list);
-			MIDR_FLOW_LOG("MIDR I-7：LEAVE 群 %u，自动重新加入（%u 个引导候选）",
+			if (!midr_restart_join_from_bootstrap(bgp)) {
+				MIDR_LOG("MIDR I-7：RECONNECT 群 %u 但无引导候选可回退，放弃（留在原群好过无群）",
+					 left_gid);
+				break;
+			}
+			MIDR_FLOW_LOG("MIDR I-7：RECONNECT 群 %u 因失联触发，自动重新加入（%u 个引导候选）",
 				      left_gid, listcount(mi->bootstrap_list));
-			midr_bootstrap_start_attempt(bgp);
 		}
 		break;
 	case MIDR_DECISION_SPLIT:

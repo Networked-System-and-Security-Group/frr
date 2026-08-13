@@ -58,6 +58,13 @@
  * and bad-link RTTs before CL evaluates. */
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
 
+/* Consecutive MIDR_PERIODIC_SYNC_INTERVAL ticks of zero established sessions
+ * (group members + anchors alike) required before a node is declared
+ * isolated and restarts the join flow. At 2 ticks / 30s cadence this is a 60s
+ * debounce window, keeping a momentary reconnect blip from tearing down a
+ * working group membership. */
+#define MIDR_ISOLATION_DEBOUNCE_TICKS 2
+
 /* ---------------------------------------------------------------------------
  * §8.21 指标变化门控（去抖）阈值 —— ⚠ 全部为粗定值，待真实网络跑出数据后校准。
  *
@@ -243,6 +250,18 @@ enum midr_trigger_type {
 	 * 选锚点（cl_handle_anchor_probe_done → I-7 ANCHOR）。
 	 */
 	MIDR_TRIGGER_ANCHOR_PROBE_DONE = 6,
+	/*
+	 * Established sessions (group members and anchors alike, both use
+	 * the BGP-LS AF, counted together) have been at zero for
+	 * MIDR_ISOLATION_DEBOUNCE_TICKS consecutive periodic checks in a
+	 * row. PERIODIC_SYNC's own LEAVE judgement looks at "how good are
+	 * the known adjacent members of my group" -- for an isolated node
+	 * that count is 0 already, which its threshold reads as "stay", so
+	 * it never catches this case. Raised from the debounce counter in
+	 * midr_periodic_sync_timer(); CL responds with
+	 * MIDR_DECISION_RECONNECT.
+	 */
+	MIDR_TRIGGER_ISOLATED = 7,
 };
 
 /* §2.6 I-7 clustering decision */
@@ -266,6 +285,19 @@ enum midr_decision_type {
 	 * midr_ctrl_connect()。
 	 */
 	MIDR_DECISION_ANCHOR = 8,
+	/*
+	 * Restart the join flow after total connectivity loss
+	 * (MIDR_TRIGGER_ISOLATED). old_group_id takes local_group_id,
+	 * new_group_id takes 0, same field usage as LEAVE. Deliberately not
+	 * reusing MIDR_DECISION_LEAVE: LEAVE means "the algorithm judged
+	 * link quality too low and wants to switch groups"; RECONNECT means
+	 * "every session died", which isn't a quality judgement. Keeping
+	 * them separate lets logs distinguish the two triggers, and avoids
+	 * a future LEAVE guard ("a configured group-id wins over the
+	 * algorithm's opinion") accidentally blocking isolation recovery
+	 * too.
+	 */
+	MIDR_DECISION_RECONNECT = 9,
 };
 
 struct midr_node_evidence {
@@ -330,6 +362,14 @@ struct bgp_midr {
 	 * 刚入群就抖动着又退群。
 	 */
 	time_t group_settled_at;
+
+	/*
+	 * Debounce counter for MIDR_TRIGGER_ISOLATED: midr_periodic_sync_timer()
+	 * increments it each time it finds zero established sessions, resets
+	 * it to 0 the moment it finds even one, and fires (then resets) once
+	 * it reaches MIDR_ISOLATION_DEBOUNCE_TICKS.
+	 */
+	uint32_t isolated_ticks;
 
 	/*
 	 * `no midr session` 持久排除名单——list of `struct in_addr *`
