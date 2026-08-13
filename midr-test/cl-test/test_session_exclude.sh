@@ -21,6 +21,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VTYSH="$REPO_ROOT/vtysh/vtysh"
 LOG="$SCRIPT_DIR/logs/bgpd-newnode.log"
 VTY="/tmp/midr-cl-vty/newnode"
 
@@ -33,12 +35,17 @@ TARGET_RID="10.0.12.1"
 fail() { echo "[test_session_exclude] ✗ $1"; exit 1; }
 pass() { echo "[test_session_exclude] ✓ $1"; }
 
+# A bare `vtysh` resolves to whatever's in PATH — on a machine with a system
+# FRR package installed, that binary has no MIDR commands and fails outright.
+# Use the repo-built one explicitly.
+[[ -x "$VTYSH" ]] || fail "$VTYSH not found or not executable — build it first (make vtysh/vtysh)"
+
 [[ -S "$VTY/bgpd.vty" ]] || fail "no vty socket at $VTY — run run_test.sh first and leave it running"
 [[ -f "$LOG" ]] || fail "$LOG not found — run run_test.sh first"
 grep -q "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$LOG" || \
     fail "newnode hasn't JOINed a group yet — run run_test.sh to completion first"
 
-vty() { vtysh --vty_socket "$VTY" "$@"; }
+vty() { "$VTYSH" --vty_socket "$VTY" "$@"; }
 
 # Baseline: confirm g1b is currently connected before we start excluding it.
 vty -c "show midr neighbors" | grep -q "$TARGET_TRANSPORT" || \
