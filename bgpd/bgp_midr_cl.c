@@ -337,7 +337,22 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
  * 处理 MEMBER_PROBE_DONE：
  *   目标群 = mi->join_group_id（由 RECOMMEND 阶段确定）。
  *   遍历全局视图中该群的 is_adjacent 节点，统计满足长期 RTT/丢包率阈值的数量。
- *   ≥ MIDR_CL_MIN_GOOD_LINKS 则 JOIN；否则 CREATE（分配新群 ID = 最大 + 1）。
+ *   够格则 JOIN；否则 CREATE（分配新群 ID = 最大 + 1）。
+ *
+ * JOIN threshold is capped the same way the PERIODIC_SYNC stay threshold is
+ * (min(MIDR_CL_MIN_GOOD_LINKS, total known members) — see cl_handle_periodic_
+ * sync()): a brand-new group only has as many members as have already
+ * joined it, so an uncapped absolute floor of MIDR_CL_MIN_GOOD_LINKS means no
+ * group smaller than that can ever gain its first member — every arriving
+ * node sees too few candidates and just CREATEs another singleton group of
+ * its own instead. Capping lets a group grow one good link at a time until
+ * it reaches the real floor, at which point the cap no longer applies and
+ * the strict absolute bar takes back over.
+ *
+ * Unlike the stay path, an empty candidate group (total == 0) must NOT pass
+ * trivially — joining something we have zero data on is an active decision
+ * that needs at least one known good link to justify, whereas staying put
+ * on zero data defaults to "don't panic-leave".
  *
  * 注：当前 NDS 不支持次优代表重试流程（RECOMMEND guard 仅在 PROBING_REPS 阶段
  * 生效）。若需要重试，后续可在 NDS 放开 guard 后在此输出 RECOMMEND，CL 保存有
@@ -350,20 +365,24 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 	uint32_t target_gid = mi->join_group_id;
 	uint32_t worst_rtt = 0;
 	double worst_loss = 0.0;
-	size_t good_links;
+	size_t good_links, total_known, join_threshold;
 	struct midr_cluster_decision d = {};
 
 	good_links = cl_count_good_member_links(bgp, gv, target_gid,
-						&worst_rtt, &worst_loss, NULL);
+						&worst_rtt, &worst_loss,
+						&total_known);
+	join_threshold = total_known < MIDR_CL_MIN_GOOD_LINKS
+				  ? total_known
+				  : MIDR_CL_MIN_GOOD_LINKS;
 
-	if (good_links >= MIDR_CL_MIN_GOOD_LINKS) {
+	if (total_known > 0 && good_links >= join_threshold) {
 		d.decision_type = MIDR_DECISION_JOIN;
 		d.new_group_id = target_gid;
 		d.old_group_id = mi->local_group_id;
 		MIDR_FLOW_LOG(
 			"MIDR CL: MEMBER_PROBE_DONE → JOIN 群 %u"
-			"（%zu 条好链路，达到 %u 条阈值）",
-			target_gid, good_links, MIDR_CL_MIN_GOOD_LINKS);
+			"（%zu/%zu 条好链路，认识 %zu 个成员）",
+			target_gid, good_links, join_threshold, total_known);
 	} else {
 		uint32_t new_gid = cl_max_group_id(gv) + 1;
 
@@ -371,9 +390,9 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 		d.new_group_id = new_gid;
 		d.old_group_id = mi->local_group_id;
 		MIDR_FLOW_LOG(
-			"MIDR CL: MEMBER_PROBE_DONE → 群 %u 仅 %zu/%u 条好链路"
-			"（最差 rtt=%u us, loss=%.4f），CREATE 新群 %u",
-			target_gid, good_links, MIDR_CL_MIN_GOOD_LINKS,
+			"MIDR CL: MEMBER_PROBE_DONE → 群 %u 仅 %zu/%zu 条好链路"
+			"（认识 %zu 个成员，最差 rtt=%u us, loss=%.4f），CREATE 新群 %u",
+			target_gid, good_links, join_threshold, total_known,
 			worst_rtt, worst_loss, new_gid);
 	}
 
