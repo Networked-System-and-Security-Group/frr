@@ -841,15 +841,15 @@ static void midr_ctrl_udp_recv(struct event *t)
 		memcpy(&msg, buf, sizeof(msg));
 		target_group = ntohl(msg.target_group);
 
-		/* Receiver-side filter: only act if the request targets our
-		 * group; unrelated nodes ignore it (this is what makes the
-		 * unavoidable broadcast harmless and the connect targeted). */
-		if (target_group == 0 || target_group != mi->local_group_id) {
-			MIDR_LOG("midr_ctrl: ignoring PEER_REQUEST from %pI4 (target group %u, ours %u)",
-				   &msg.requester_rid, target_group,
-				   mi->local_group_id);
-			return;
-		}
+		/*
+		 * No same-group filter: this is always unicast to a specific
+		 * target the sender already chose to connect to (group member,
+		 * cross-group anchor, or backbone link), so there's no
+		 * "unrelated node" case to filter. A group-match check here
+		 * would drop every cross-group request, since target_group is
+		 * the sender's own group. Exclusion-list enforcement still
+		 * happens downstream, inside midr_ctrl_connect().
+		 */
 
 		/* The message is self-describing — build a transient entry and
 		 * peer back; no dependency on the BGP-LS node table. */
