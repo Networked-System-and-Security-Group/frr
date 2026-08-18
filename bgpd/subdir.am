@@ -54,14 +54,16 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_ls.c \
 	bgpd/bgp_ls_nlri.c \
 	bgpd/bgp_ls_ted.c \
-	bgpd/bgp_midr.c \
+	bgpd/bgp_midr_nds.c \
+	bgpd/bgp_midr_nds_facts.c \
+	bgpd/bgp_midr_group2_shim.c \
 	bgpd/bgp_midr_pm.c \
 	bgpd/bgp_midr_cl.c \
 	bgpd/bgp_midr_tlv.c \
 	bgpd/bgp_midr_ctrl.c \
 	bgpd/bgp_midr_ctrl_tcp.c \
 	bgpd/bgp_midr_store.c \
-	bgpd/bgp_midr_vty.c \
+	bgpd/bgp_midr_nds_vty.c \
 	bgpd/bgp_mac.c \
 	bgpd/bgp_memory.c \
 	bgpd/bgp_mpath.c \
@@ -69,6 +71,12 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_network.c \
 	bgpd/bgp_nexthop.c \
 	bgpd/bgp_nht.c \
+	bgpd/midr_ip2asn.c \
+	bgpd/midr_tier1.c \
+	bgpd/midr_tier1_vty.c \
+	bgpd/midr_trace_exec.c \
+	bgpd/midr_trace_observer.c \
+	bgpd/midr_trace_scheduler.c \
 	bgpd/bgp_open.c \
 	bgpd/bgp_packet.c \
 	bgpd/bgp_pbr.c \
@@ -151,12 +159,14 @@ noinst_HEADERS += \
 	bgpd/bgp_ls_nlri.h \
 	bgpd/bgp_ls_ted.h \
 	bgpd/bgp_midr.h \
+	bgpd/bgp_midr_nds.h \
+	bgpd/bgp_midr_nds_facts.h \
 	bgpd/bgp_midr_pm.h \
 	bgpd/bgp_midr_cl.h \
 	bgpd/bgp_midr_tlv.h \
 	bgpd/bgp_midr_ctrl.h \
 	bgpd/bgp_midr_store.h \
-	bgpd/bgp_midr_vty.h \
+	bgpd/bgp_midr_nds_vty.h \
 	bgpd/bgp_mac.h \
 	bgpd/bgp_memory.h \
 	bgpd/bgp_mpath.h \
@@ -184,6 +194,12 @@ noinst_HEADERS += \
 	bgpd/bgp_zebra.h \
 	bgpd/bgpd.h \
 	bgpd/bgp_trace.h \
+	bgpd/midr_ip2asn.h \
+	bgpd/midr_tier1.h \
+	bgpd/midr_tier1_vty.h \
+	bgpd/midr_trace_exec.h \
+	bgpd/midr_trace_observer.h \
+	bgpd/midr_trace_scheduler.h \
 	bgpd/bgp_nhg.h \
 	bgpd/bgp_attr_srv6.h \
 	bgpd/bgp_srv6.h \

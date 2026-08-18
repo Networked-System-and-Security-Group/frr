@@ -61,8 +61,8 @@
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
-#include "bgpd/bgp_midr.h"
-#include "bgpd/bgp_midr_vty.h"
+#include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_nds_vty.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_nhg.h"
@@ -84,6 +84,7 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -3934,7 +3935,7 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
-		bgp_midr_init(bgp);
+		bgp_midr_nds_init(bgp);
 	}
 
 	/*initialize global GR FSM */
@@ -4756,7 +4757,7 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
-	bgp_midr_finish(bgp);
+	bgp_midr_nds_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
@@ -9372,13 +9373,17 @@ void bgp_init(unsigned short instance)
 	/* Init zebra. */
 	bgp_zebra_init(bm->master, instance);
 
+	if (midr_trace_scheduler_init(bm->master) != 0)
+		zlog_warn(
+			"MIDR traceroute scheduler is unavailable; traceroute requests will be rejected");
+
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
 #endif
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
-	bgp_midr_vty_init();
+	bgp_midr_nds_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
@@ -9431,6 +9436,14 @@ void bgp_terminate(void)
 	struct peer *peer;
 	struct listnode *node, *nnode;
 	struct listnode *mnode, *mnnode;
+
+	/*
+	 * No further event-loop iteration is guaranteed after this function.
+	 * First settle callbacks while their consumers are alive, then perform
+	 * the executor's synchronous child/fd teardown.
+	 */
+	midr_trace_scheduler_quiesce();
+	midr_trace_scheduler_fini();
 
 	QOBJ_UNREG(bm);
 

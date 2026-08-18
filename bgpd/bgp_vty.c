@@ -67,10 +67,14 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
+#include "bgpd/midr_ip2asn.h"
+#include "bgpd/midr_tier1_vty.h"
+#include "bgpd/midr_trace_scheduler.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_midr_nds.h" /* midr_nds_is_bootstrap()：distribute 命令的引导提示 */
 
 // 自己注册的命令
 
@@ -20501,6 +20505,22 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->enable_distribution = true;
 
 	/*
+	 * MIDR 引导节点上提醒一句（保底轮 2 批 5b）——只提示、不拦（运维显式操作
+	 * 优先）。引导本该对普通节点隐身：一旦导出，它会把自己的 Node/Link/Prefix
+	 * NLRI 通告给挂靠它的群代表，代表把它当普通节点学进节点表，而此后无人刷新，
+	 * 15s 老化时 expire 会连带拆掉挂靠会话（08-13 实测）。
+	 * 只对引导提示：普通 MIDR 节点配这条命令是正常操作，无差别提示等于对正常
+	 * 操作报警，会稀释掉真正该看的这一次。
+	 */
+	if (midr_nds_is_bootstrap(bgp)) {
+		vty_out(vty,
+			"%% 警告：本机是 MIDR 引导节点。开启 distribute 后，引导会把自己通告给挂靠它的群代表；\n"
+			"%%       代表把它当普通节点学入节点表，15s 无刷新即老化，并连带拆掉挂靠会话。\n"
+			"%%       如非排障需要，请 no distribute bgp-fabric-link-state。\n");
+		zlog_warn("MIDR：引导节点上启用了 distribute bgp-fabric-link-state——引导将通告自身 NLRI，可能导致挂靠会话被 expire 连带拆除");
+	}
+
+	/*
 	 * Defer the actual export to the keepalive timer (fires within
 	 * MIDR_KEEPALIVE_INTERVAL seconds) to avoid a deep call-chain that
 	 * can overflow the stack when bgp_ls_export_bgp_topology() is invoked
@@ -21906,6 +21926,11 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
+	if (midr_ip2asn_config_write(vty))
+		vty_out(vty, "!\n");
+	if (midr_trace_scheduler_config_write(vty))
+		vty_out(vty, "!\n");
+
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
@@ -24565,6 +24590,9 @@ void bgp_vty_init(void)
 
 	/* "show bgp vrfs bestpath" command. */
 	install_element(VIEW_NODE, &show_bgp_vrf_bestpath_cmd);
+
+	/* MIDR application-layer underlay observation helpers. */
+	midr_tier1_vty_init();
 
 	/* Community-list. */
 	community_list_vty();

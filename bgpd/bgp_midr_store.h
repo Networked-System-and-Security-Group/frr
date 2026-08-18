@@ -16,22 +16,28 @@
 #include <stdint.h>
 #include <time.h>
 
-/* 种子读回回调：每条一次；transport 为点分 IPv4 字符串（借用 SQLite 列内存，
- * 仅在回调内有效——调用方需立即用掉/拷走，不得留存指针）。 */
-typedef void (*midr_seed_cb)(const char *transport, uint32_t asn, void *arg);
+/* 种子读回回调：每条一次；transport / rid 为点分 IPv4 字符串（借用 SQLite 列
+ * 内存，仅在回调内有效——调用方需立即用掉/拷走，不得留存指针）。
+ * rid = 该引导节点的 router-id（批 5 R 系列新增，候选池"rid 恒非 0"不变量要求
+ * 种子这条路也带真名回来）。
+ * last_seen = 落库时的**本机墙钟**（time(NULL)，纯本地语义、从不跨节点比较），
+ * 供 `show midr bootstrap-seeds` 印"距今"；自举读回那条回调用不上、忽略即可。 */
+typedef void (*midr_seed_cb)(const char *transport, uint32_t asn,
+			     const char *rid, time_t last_seen, void *arg);
 
 #ifdef HAVE_SQLITE3
 /* 建表（幂等）；返回 0 成功、-1 失败（失败时上层静默降级、种子功能不可用）。 */
 int midr_store_init(void);
-/* 写入/刷新一条种子（有则更新 asn+last_seen、无则插入）。 */
-void midr_store_seed_save(const char *transport, uint32_t asn, time_t now);
+/* 写入/刷新一条种子（有则更新 asn+rid+last_seen、无则插入）。 */
+void midr_store_seed_save(const char *transport, uint32_t asn, const char *rid,
+			  time_t now);
 /* 按 last_seen 新→旧逐条回调吐出全部种子。 */
 void midr_store_seed_load(midr_seed_cb cb, void *arg);
 /* 只保留最新 keep_n 条种子，删掉其余（防库无限膨胀）。 */
 void midr_store_seed_prune(int keep_n);
 #else
 #define midr_store_init()	     (-1)
-#define midr_store_seed_save(t, a, n) do {                                     \
+#define midr_store_seed_save(t, a, r, n) do {                                  \
 	} while (0)
 #define midr_store_seed_load(cb, arg) do {                                     \
 	} while (0)

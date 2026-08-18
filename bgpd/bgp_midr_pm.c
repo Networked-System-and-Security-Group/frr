@@ -37,7 +37,7 @@
 #include "sockopt.h"
 
 #include "bgpd/bgpd.h"
-#include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_pm.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_PROBE_CTX, "MIDR probe context");
@@ -73,7 +73,7 @@ static bool probe_ctx_hash_cmp(const void *a, const void *b)
 }
 
 /* Look up a probe context by node_id prefix. */
-static struct midr_probe_ctx *pm_ctx_find(struct bgp_midr *mi,
+static struct midr_probe_ctx *pm_ctx_find(struct bgp_midr_nds *mi,
 					  const struct prefix *node_id)
 {
 	struct midr_probe_ctx key = {};
@@ -129,7 +129,7 @@ static void pm_push_i5(struct midr_probe_ctx *ctx,
 		       enum midr_link_status status)
 {
 	struct bgp *bgp = ctx->bgp;
-	struct midr_link_metrics st = {}, lt = {};
+	struct midr_nds_link_metrics st = {}, lt = {};
 	double loss = pm_loss_rate(ctx);
 	double rtt_s = 0.0, bw_score = 0.0;
 
@@ -234,7 +234,7 @@ static void midr_pm_timeout(struct event *t);	     /* forward */
 /* Send one probe packet and arm the per-probe timeout. */
 static void pm_send_probe(struct midr_probe_ctx *ctx)
 {
-	struct bgp_midr *mi = ctx->bgp->midr_info;
+	struct bgp_midr_nds *mi = ctx->bgp->midr_nds_info;
 	struct midr_probe_pkt pkt = {};
 	struct sockaddr_in dst = {};
 	uint64_t now;
@@ -322,7 +322,7 @@ static void midr_pm_probe_timer_fn(struct event *t)
  *
  * A validated packet (REQ or REP) from a known source is itself a liveness
  * signal, same reasoning as I-5's last_seen refresh in
- * midr_nds_on_link_update() (bgp_midr.c) — but that refresh only covers the
+ * midr_nds_on_link_update() (bgp_midr_nds.c) — but that refresh only covers the
  * *prober's* view of a target it successfully probed. A "probe-only" peer
  * that is purely a *responder* (e.g. a rep being probed by a joining node)
  * never goes through that path for the requester's entry in its own
@@ -333,7 +333,7 @@ static void midr_pm_probe_timer_fn(struct event *t)
  * as "unknown transport", regardless of how recently it last sent one.
  * Refreshing last_seen here, on every validated packet, closes that gap.
  */
-static bool pm_is_known_transport(struct bgp_midr *mi, struct in_addr addr)
+static bool pm_is_known_transport(struct bgp_midr_nds *mi, struct in_addr addr)
 {
 	struct midr_node_entry *entry;
 
@@ -376,7 +376,7 @@ static void pm_ctx_find_by_ip_cb(struct hash_bucket *hb, void *arg)
 static void midr_pm_recv(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_probe_pkt pkt;
 	struct sockaddr_in src = {};
 	socklen_t srclen = sizeof(src);
@@ -492,7 +492,7 @@ static void midr_pm_recv(struct event *t)
 
 static void midr_pm_open_sock(struct bgp *bgp)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct sockaddr_in sa = {};
 	int sock;
 
@@ -533,7 +533,7 @@ static void midr_pm_open_sock(struct bgp *bgp)
 
 static void midr_pm_close_sock(struct bgp *bgp)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 
 	event_cancel(&mi->t_pm_read);
 	if (mi->pm_sock >= 0) {
@@ -550,7 +550,7 @@ static void midr_pm_close_sock(struct bgp *bgp)
 static void midr_pm_probe_timer(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_node_entry *entry;
 
 	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
@@ -569,7 +569,7 @@ static void midr_pm_probe_timer(struct event *t)
 		/* Push a minimal UP update to keep the link entry alive in NDS
 		 * for nodes without explicit probe_ctx registration. */
 		{
-			struct midr_link_metrics m = {};
+			struct midr_nds_link_metrics m = {};
 
 			midr_nds_on_link_update(bgp, &entry->node_id,
 						MIDR_LINK_UP, 0, &m, &m);
@@ -601,7 +601,7 @@ static void pm_ctx_free_cb(void *data)
 int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 		       enum midr_node_source source, uint32_t capabilities)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
 	struct midr_probe_ctx *ctx;
@@ -656,7 +656,7 @@ int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 			  enum midr_stop_reason reason)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_probe_ctx *ctx;
 
 	if (!bgp || !mi || !node_id)
@@ -674,7 +674,7 @@ int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 
 	/* If a probe was in-flight, push LINK_DOWN so NDS/CL can react */
 	if (ctx->probe_outstanding) {
-		struct midr_link_metrics zero = {};
+		struct midr_nds_link_metrics zero = {};
 
 		midr_nds_on_link_update(bgp, node_id, MIDR_LINK_DOWN,
 					ctx->consecutive_failures, &zero, &zero);
@@ -690,19 +690,19 @@ int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 /*
  * Called by the VTY `midr transport-address` handler after the address is set.
  * The PM socket cannot be opened during midr_pm_init() because the config file
- * is read AFTER bgp_midr_init() runs.  This function retrofits the open and
+ * is read AFTER bgp_midr_nds_init() runs.  This function retrofits the open and
  * rescans global_view for neighbors whose I-1 call was silently dropped because
  * the socket was not ready.
  */
 void midr_pm_on_transport_addr_set(struct bgp *bgp)
 {
-	struct bgp_midr *mi;
+	struct bgp_midr_nds *mi;
 	struct midr_node_entry *entry;
 
-	if (!bgp || !bgp->midr_info)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
 
-	mi = bgp->midr_info;
+	mi = bgp->midr_nds_info;
 
 	if (mi->pm_sock < 0)
 		midr_pm_open_sock(bgp);
@@ -729,12 +729,12 @@ void midr_pm_on_transport_addr_set(struct bgp *bgp)
 
 void midr_pm_init(struct bgp *bgp)
 {
-	struct bgp_midr *mi;
+	struct bgp_midr_nds *mi;
 
-	if (!bgp || !bgp->midr_info)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
 
-	mi = bgp->midr_info;
+	mi = bgp->midr_nds_info;
 	mi->pm_sock = -1;
 
 	midr_pm_open_sock(bgp);
@@ -745,12 +745,12 @@ void midr_pm_init(struct bgp *bgp)
 
 void midr_pm_finish(struct bgp *bgp)
 {
-	struct bgp_midr *mi;
+	struct bgp_midr_nds *mi;
 
-	if (!bgp || !bgp->midr_info)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
 
-	mi = bgp->midr_info;
+	mi = bgp->midr_nds_info;
 
 	event_cancel(&mi->t_pm_probe);
 	midr_pm_close_sock(bgp);

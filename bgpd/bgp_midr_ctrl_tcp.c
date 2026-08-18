@@ -38,7 +38,7 @@
 #include "log.h"
 
 #include "bgpd/bgpd.h"
-#include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_ctrl.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_TCP_CONN, "MIDR ctrl TCP connection");
@@ -106,7 +106,7 @@ static void midr_tcp_su_from_in_addr(union sockunion *su, struct in_addr a)
 static struct midr_ctrl_tcp_conn *
 midr_ctrl_tcp_conn_new(struct bgp *bgp, int fd, enum midr_ctrl_conn_role role)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_ctrl_tcp_conn *conn;
 	size_t ibuf_init;
 
@@ -136,7 +136,7 @@ midr_ctrl_tcp_conn_new(struct bgp *bgp, int fd, enum midr_ctrl_conn_role role)
  * 调用方在此之后必须立即 return (回调内不得再访问 conn)。 */
 static void midr_ctrl_tcp_conn_close(struct midr_ctrl_tcp_conn *conn)
 {
-	struct bgp_midr *mi = conn->bgp->midr_info;
+	struct bgp_midr_nds *mi = conn->bgp->midr_nds_info;
 
 	event_cancel(&conn->t_read);
 	event_cancel(&conn->t_write);
@@ -157,7 +157,7 @@ static void midr_ctrl_tcp_timeout(struct event *t)
 {
 	struct midr_ctrl_tcp_conn *conn = EVENT_ARG(t);
 
-	MIDR_LOG("midr_ctrl: TCP %s conn to %pI4 timed out (%ds) — closing",
+	MIDR_LOG("MIDR ctrl: TCP %s conn to %pI4 timed out (%ds) — closing",
 		 conn->role == MIDR_CTRL_CONN_CLIENT ? "client" : "server",
 		 &conn->remote, MIDR_CTRL_TCP_TIMEOUT);
 	midr_ctrl_tcp_conn_close(conn);
@@ -193,14 +193,14 @@ static void midr_ctrl_tcp_write(struct event *t)
 					conn->fd, &conn->t_write);
 			return;
 		}
-		MIDR_LOG("midr_ctrl: TCP write to %pI4 failed: %s — closing",
+		MIDR_LOG("MIDR ctrl: TCP write to %pI4 failed: %s — closing",
 			 &conn->remote, safe_strerror(errno));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
 	}
 	if (n == 0) {
 		/* 有数据待发却写出 0: 不应发生; 防死循环当致命。 */
-		MIDR_LOG("midr_ctrl: TCP write to %pI4 returned 0 — closing",
+		MIDR_LOG("MIDR ctrl: TCP write to %pI4 returned 0 — closing",
 			 &conn->remote);
 		midr_ctrl_tcp_conn_close(conn);
 		return;
@@ -264,7 +264,7 @@ static void midr_ctrl_tcp_read(struct event *t)
 		/* 校验帧长 (在扩缓冲之前拦下非法值)。 */
 		if (conn->role == MIDR_CTRL_CONN_SERVER) {
 			if (conn->frame_len != sizeof(struct midr_ctrl_msg)) {
-				MIDR_LOG("midr_ctrl: TCP request from %pI4 bad frame_len %u (want %zu) — closing",
+				MIDR_LOG("MIDR ctrl: TCP request from %pI4 bad frame_len %u (want %zu) — closing",
 					 &conn->remote, conn->frame_len,
 					 sizeof(struct midr_ctrl_msg));
 				midr_ctrl_tcp_conn_close(conn);
@@ -273,7 +273,7 @@ static void midr_ctrl_tcp_read(struct event *t)
 		} else {
 			if (conn->frame_len == 0 ||
 			    conn->frame_len > MIDR_CTRL_TCP_MAX_FRAME) {
-				MIDR_LOG("midr_ctrl: TCP response from %pI4 bad frame_len %u (max %zu) — closing",
+				MIDR_LOG("MIDR ctrl: TCP response from %pI4 bad frame_len %u (max %zu) — closing",
 					 &conn->remote, conn->frame_len,
 					 (size_t)MIDR_CTRL_TCP_MAX_FRAME);
 				midr_ctrl_tcp_conn_close(conn);
@@ -333,7 +333,8 @@ static void midr_ctrl_tcp_read(struct event *t)
 		stream_free(resp);
 		midr_ctrl_tcp_start_send(conn);
 	} else {
-		midr_ctrl_on_tcp_response(bgp, conn->type, payload, plen);
+		midr_ctrl_on_tcp_response(bgp, conn->type, payload, plen,
+					  conn->remote);
 		midr_ctrl_tcp_conn_close(conn);
 	}
 }
@@ -368,13 +369,13 @@ static void midr_ctrl_tcp_connect_check(struct event *t)
 	event_cancel(&conn->t_write);
 
 	if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &status, &slen) < 0) {
-		MIDR_LOG("midr_ctrl: TCP connect to %pI4 getsockopt failed: %s — closing",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 getsockopt failed: %s — closing",
 			 &conn->remote, safe_strerror(errno));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
 	}
 	if (status != 0) {
-		MIDR_LOG("midr_ctrl: TCP connect to %pI4 failed: %s — closing (等重试)",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 failed: %s — closing (等重试)",
 			 &conn->remote, safe_strerror(status));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
@@ -386,7 +387,7 @@ static void midr_ctrl_tcp_connect_check(struct event *t)
 void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 				uint8_t type, uint32_t target_group)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct listnode *node;
 	struct midr_ctrl_tcp_conn *c;
 	struct midr_ctrl_tcp_conn *conn;
@@ -412,7 +413,7 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
-		zlog_warn("midr_ctrl: TCP socket() failed: %s",
+		zlog_warn("MIDR ctrl: TCP socket() failed: %s",
 			  safe_strerror(errno));
 		return;
 	}
@@ -426,16 +427,16 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 
 		midr_tcp_su_from_in_addr(&su_local, mi->local_transport_addr);
 		if (sockunion_bind(fd, &su_local, 0, &su_local) < 0)
-			zlog_warn("midr_ctrl: TCP bind source %pI4 failed: %s (软降级, 直连仍可用)",
-				  &mi->local_transport_addr,
-				  safe_strerror(errno));
+			MIDR_LOG("MIDR ctrl: TCP bind source %pI4 failed: %s (软降级, 直连仍可用)",
+				 &mi->local_transport_addr,
+				 safe_strerror(errno));
 	}
 
 	midr_tcp_su_from_in_addr(&su_dst, dst);
 	res = sockunion_connect(fd, &su_dst, htons(MIDR_CTRL_TCP_PORT));
 	switch (res) {
 	case connect_error:
-		MIDR_LOG("midr_ctrl: TCP connect to %pI4 refused: %s (等重试)",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 refused: %s (等重试)",
 			 &dst, safe_strerror(errno));
 		close(fd); /* conn 未建, pending 队列会稍后重试 */
 		return;
@@ -461,7 +462,7 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 	}
 }
 
-bool midr_ctrl_tcp_client_inflight(struct bgp_midr *mi, struct in_addr dst,
+bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi, struct in_addr dst,
 				   uint8_t type)
 {
 	struct listnode *node;
@@ -485,7 +486,7 @@ bool midr_ctrl_tcp_client_inflight(struct bgp_midr *mi, struct in_addr dst,
 static void midr_ctrl_tcp_accept(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_ctrl_tcp_conn *conn;
 	union sockunion su;
 	int client_fd;
@@ -497,7 +498,7 @@ static void midr_ctrl_tcp_accept(struct event *t)
 	client_fd = sockunion_accept(mi->ctrl_tcp_lsock, &su);
 	if (client_fd < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-			zlog_warn("midr_ctrl: TCP accept failed: %s",
+			zlog_warn("MIDR ctrl: TCP accept failed: %s",
 				  safe_strerror(errno));
 		return;
 	}
@@ -505,7 +506,7 @@ static void midr_ctrl_tcp_accept(struct event *t)
 
 	/* 并发上限: 引导节点被大量节点同时连时防 fd 耗尽。 */
 	if (listcount(mi->ctrl_tcp_conns) >= MIDR_CTRL_TCP_MAX_CONNS) {
-		MIDR_LOG("midr_ctrl: TCP conns at cap %d — dropping accept",
+		MIDR_LOG("MIDR ctrl: TCP conns at cap %d — dropping accept",
 			 MIDR_CTRL_TCP_MAX_CONNS);
 		close(client_fd);
 		return;
@@ -520,14 +521,14 @@ static void midr_ctrl_tcp_accept(struct event *t)
 
 static void midr_ctrl_tcp_listen(struct bgp *bgp)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct sockaddr_in sa = {};
 	int sock;
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
-		zlog_warn("midr_ctrl: TCP socket() failed: %s (列表交换监听未开, 客户端侧不受影响)",
-			  safe_strerror(errno));
+		zlog_err("MIDR ctrl: TCP socket() failed: %s (列表交换监听未开, 客户端侧不受影响)",
+			 safe_strerror(errno));
 		return;
 	}
 	sockopt_reuseaddr(sock);
@@ -536,14 +537,14 @@ static void midr_ctrl_tcp_listen(struct bgp *bgp)
 	sa.sin_addr.s_addr = htonl(INADDR_ANY);
 	sa.sin_port = htons(MIDR_CTRL_TCP_PORT);
 	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_warn("midr_ctrl: TCP bind(:%u) failed: %s",
-			  MIDR_CTRL_TCP_PORT, safe_strerror(errno));
+		zlog_err("MIDR ctrl: TCP bind(:%u) failed: %s",
+			 MIDR_CTRL_TCP_PORT, safe_strerror(errno));
 		close(sock);
 		return;
 	}
 	if (listen(sock, SOMAXCONN) < 0) {
-		zlog_warn("midr_ctrl: TCP listen(:%u) failed: %s",
-			  MIDR_CTRL_TCP_PORT, safe_strerror(errno));
+		zlog_err("MIDR ctrl: TCP listen(:%u) failed: %s",
+			 MIDR_CTRL_TCP_PORT, safe_strerror(errno));
 		close(sock);
 		return;
 	}
@@ -552,7 +553,7 @@ static void midr_ctrl_tcp_listen(struct bgp *bgp)
 	event_add_read(bm->master, midr_ctrl_tcp_accept, bgp, sock,
 		       &mi->t_ctrl_tcp_accept);
 
-	MIDR_LOG("midr_ctrl: TCP list-exchange channel on :%u",
+	MIDR_LOG("MIDR ctrl: TCP list-exchange channel on :%u",
 		 MIDR_CTRL_TCP_PORT);
 }
 
@@ -562,7 +563,7 @@ static void midr_ctrl_tcp_listen(struct bgp *bgp)
 
 void midr_ctrl_tcp_init(struct bgp *bgp)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 
 	if (!mi)
 		return;
@@ -576,7 +577,7 @@ void midr_ctrl_tcp_init(struct bgp *bgp)
 
 void midr_ctrl_tcp_finish(struct bgp *bgp)
 {
-	struct bgp_midr *mi = bgp->midr_info;
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct listnode *node;
 
 	if (!mi)

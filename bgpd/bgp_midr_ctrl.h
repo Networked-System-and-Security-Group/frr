@@ -2,7 +2,7 @@
 /*
  * MIDR Control Layer
  *
- * Bridges the MIDR node table (bgp_midr.c / NDS) and the BGP peer FSM.
+ * Bridges the MIDR node table (bgp_midr_nds.c / NDS) and the BGP peer FSM.
  * Evaluates peering policy and drives peer_remote_as() / peer_delete()
  * based on node table events.
  */
@@ -14,8 +14,12 @@
 #include <stdbool.h>
 #include <netinet/in.h>
 
+/* enum midr_session_reason（会话台账原因）按值出现在 midr_ctrl_connect 的
+ * 签名里，必须见到定义；顺带让本头自洽（原先靠各 .c 先包含 nds.h 才编得过）。 */
+#include "bgpd/bgp_midr_nds.h"
+
 struct bgp;
-struct bgp_midr;
+struct bgp_midr_nds;
 struct midr_node_entry;
 struct peer;
 struct stream;
@@ -39,7 +43,14 @@ struct stream;
 
 #define MIDR_CTRL_UDP_PORT    5859 /* control channel only (distinct from PM) */
 #define MIDR_CTRL_TCP_PORT    MIDR_CTRL_UDP_PORT /* 列表交换 TCP，与 UDP 同号并存 */
-#define MIDR_CTRL_MSG_VERSION 2 /* v2: REP_LIST_RESP 条目加 rep_rid 栏 (12B→16B) */
+/*
+ * v2: REP_LIST_RESP 条目加 rep_rid 栏 (12B→16B)
+ * v3: BOOTSTRAP_LIST_RESP 条目加 rid 栏 (8B→12B，保底轮 2 批 5 R 系列)
+ *     —— 条目变长必须升版：不升的话旧 v2 收方会按 8B 错位解析出垃圾，升了则
+ *     整包直接丢弃、干净失败。新增**消息类型**不必升版（PEER_REJECT /
+ *     BOOTSTRAP_LIST / ATTACH_REQUEST 都没升），改**条目长度**才必须升。
+ */
+#define MIDR_CTRL_MSG_VERSION 3
 
 enum midr_ctrl_msg_type {
 	MIDR_CTRL_PEER_REQUEST = 1,	  /* "please peer back with me" */
@@ -50,6 +61,49 @@ enum midr_ctrl_msg_type {
 	MIDR_CTRL_ANNOUNCE = 6,	  /* new node -> each candidate member: "this is
 					   * who I am" so it can validate my PM probes.
 					   * One-way, no reply expected. */
+	/*
+	 * B2（2026-08-11 半边残留评审定案，执行计划答疑 93）：接收侧拒绝
+	 * PEER_REQUEST 时回发一包，让发起方**提前死心**——不必盲等 3s×5=15s
+	 * 才靠超时拆掉自己预配的半边。
+	 *
+	 * 新增消息类型不碰"帧不动"红线：红线的准确范围是"PEER_REQUEST 帧不加
+	 * 字段、不为闸门升协议版"；新增一种类型是常规操作（批 3 的
+	 * BOOTSTRAP_LIST 同样是新类型）。协议版本号不动。
+	 *
+	 * 字段语义与 PEER_REQUEST **完全一致**：requester_* 三件恒表示"本包
+	 * 发送者自己"（这里就是拒绝方），target_group = 拒绝方自己的群号。
+	 * 发起方据 requester_transport 去 ctrl_pending 里找"我是不是正朝这个
+	 * 地址发着 PEER_REQUEST"——找不到就丢（防伪，见 midr_ctrl_udp_recv）。
+	 * 拒绝原因不进帧（reserved 保持保留位）：原因写在拒绝方自己的日志里，
+	 * 发起方只需知道"被拒了"。要带原因码时再启用 reserved，届时另议。
+	 */
+	MIDR_CTRL_PEER_REJECT = 7,
+	/*
+	 * ② 按需拉取活引导名单（保底轮 2 批 3；子稿《引导节点更新-对接稿》§2②）：
+	 * 群代表问一台引导"当下活着的引导有哪些"，引导以"手配名单 ∩ 自己骨干会话
+	 * 活性"作答。走 **TCP 短连接**（与 REP_LIST/MEMBER_LIST 同族：列表交换一律
+	 * TCP，见决策 midr-preexchange-transport-udp-vs-tcp.md），复用 4B 长度前缀
+	 * 分帧与 ctrl_pending 重试。协议版本不动（新增类型不升版，同 PEER_REJECT）。
+	 *
+	 * REQ 用与 REP_LIST_REQ 同构的 20B 请求帧，target_group 无意义置 0。
+	 */
+	MIDR_CTRL_BOOTSTRAP_LIST_REQ = 8,
+	MIDR_CTRL_BOOTSTRAP_LIST_RESP = 9,
+	/*
+	 * 挂靠专用建连请求（保底轮 2 批 5 前置①）。语义 = "我是群代表，来挂靠"，
+	 * 帧结构与 PEER_REQUEST **完全一致**（同 20B、字段同义），只是 type 值不同。
+	 *
+	 * 为什么要单独一类：引导的负面守卫靠"查节点表猜发起方是谁"决定拒不拒，而
+	 * learn_requester 造出的幽灵条目（只有 rid/transport/asn、caps 与 group_id
+	 * 全 0）会让刚问过路的代表看起来像普通成员 —— 挂靠被自己人拒掉，且现象随
+	 * 时序与哈希漂。换成专用类型后判据从"猜你是谁"变成"看你来干嘛"：
+	 * **身份会过时，意图不会**。引导收到它 = 过排除名单 → 直接回配，跳过负面
+	 * 守卫；收到普通 PEER_REQUEST 仍然拒 + PEER_REJECT（定稿结论 15 措辞不动）。
+	 *
+	 * ⚠ 新旧不混跑：旧节点收到本类型走 default 丢弃 → 挂靠失败。落地时全网同批
+	 * 换二进制（先例：协议 v2）。
+	 */
+	MIDR_CTRL_ATTACH_REQUEST = 10,
 };
 
 /*
@@ -89,6 +143,25 @@ struct midr_ctrl_rep_item {
 	struct in_addr rep_rid;
 };
 
+/*
+ * BOOTSTRAP_LIST_RESP item, 12 bytes, network byte order.
+ *
+ * 三栏 = transport + asn + rid（保底轮 2 批 5 R 系列，协议 v3）。
+ * 〔旧注释说"没有 rid：引导专职化后不发 Node NLRI，谁都学不到它的 router-id"，
+ *  该理由已被推翻——引导的 rid 现在由**运维手配**：`midr bootstrap <IP>
+ *  remote-as <ASN> router-id <RID>` 三个参数全必选，rid 因此静态可得、不依赖
+ *  引导发不发 NLRI，也不依赖会话是否 Established。〕
+ *
+ * 为什么名单要带 rid：① 挂靠挑台按 rid 排环（确定可重放）；② 会话排除名单以
+ * router-id 为键，没有 rid 就没法把一台引导拉黑；③ 会话台账的"对端 rid"栏。
+ * 收侧规矩：rid 为 0 的条目**拒收**（见 midr_nds_bootstrap_learn）。
+ */
+struct midr_ctrl_bootstrap_item {
+	struct in_addr transport;
+	uint32_t asn;
+	struct in_addr rid;
+};
+
 /* MEMBER_LIST_RESP item, 16 bytes, network byte order. */
 struct midr_ctrl_member_item {
 	struct in_addr rid;
@@ -97,8 +170,26 @@ struct midr_ctrl_member_item {
 	uint32_t group_id;
 };
 
+/*
+ * 重传参数——每个入队点自带一份，不再吃全局硬编码（小整理批参数化）。
+ *   interval_ms    重传间隔（毫秒）
+ *   count          总尝试次数，首发算第 1 次
+ *   stop_on_signal 有"完成信号"即停：PEER_REQUEST 认反向会话 Established，
+ *                  列表类认响应到达（recv 路径 midr_ctrl_drop_pending 摘队）。
+ *                  false = 不等信号，发满 count 次自然收摊，**不算失败**、也不
+ *                  走死心处置（拆半边 / failover / 盖章）。
+ * ⚠ 当前四个入队点全填 stop_on_signal=true —— 队列本就是"等响应"的设计。
+ *   false 是给 ANNOUNCE 那类单程消息将来要重发时预留的口子（记档第 13 条：
+ *   我方只提供能力，要不要用由 ANNOUNCE 的 owner 定）。
+ */
+struct midr_ctrl_retx_params {
+	int interval_ms;
+	int count;
+	bool stop_on_signal;
+};
+
 /* A pending request to retransmit (keyed by destination + type).  Lives in
- * bgp_midr->ctrl_pending; exposed here so `show midr join` can render the
+ * bgp_midr_nds->ctrl_pending; exposed here so `show midr join` can render the
  * not-yet-answered requests.
  * retries_left 语义: PEER_REQUEST 计 UDP 重发次数; 列表类 (REP_LIST_REQ /
  * MEMBER_LIST_REQ) 迁 TCP 后计 "TCP 短连接尝试次数" (retx tick 遇在途连接
@@ -108,22 +199,39 @@ struct midr_ctrl_pending {
 	uint8_t type;			 /* request type being retransmitted */
 	uint32_t target_group;		 /* group field carried in the request */
 	int retries_left;
+	/*
+	 * 入队时那份参数（含预算 count）。有了它，死心那句 warn 才能说出**实际**
+	 * 试了几次——挂靠第二批候选的预算被 midr_ctrl_set_retx_budget() 压成 2 次，
+	 * 若照旧打默认的 5 就是日志说假话（试了 2 次却报 5 次，批 6 实测抓到）。
+	 */
+	struct midr_ctrl_retx_params params;
+	/*
+	 * 距下次重传还剩多少毫秒。retx tick 对全队统一递减"本跳实际经过的时间"，
+	 * 减到 <=0 的才轮到处理，处理完重置成本条的 interval_ms；下一跳的间隔取
+	 * 全队 due_ms 的最小值。所有条目 interval 相同时（当前即如此）等价于
+	 * 参数化之前的"单节拍、每跳全队各减一次"。
+	 */
+	int due_ms;
 };
 
 /* Human-readable name of an enum midr_ctrl_msg_type value (for logs/show). */
 extern const char *midr_ctrl_msg_type_str(uint8_t type);
 
-/* Open / close the control-channel UDP socket (called from bgp_midr_init/finish). */
+/* Open / close the control-channel UDP socket (called from bgp_midr_nds_init/finish). */
 extern void midr_ctrl_init(struct bgp *bgp);
 extern void midr_ctrl_finish(struct bgp *bgp);
 
 /*
- * Called by bgp_midr.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
+ * Called by bgp_midr_nds.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
  * a node, after NDS has decided to peer.  Dedups against an existing peer and
  * sends a reverse PEER_REQUEST so the far end peers back.
+ *
+ * reason = 调用方"为什么要这条边"，登进会话台账（结论 20）。每个调用点自报
+ * 来意，不在这里猜——拆会话/对账时凭它认出保底、群间、运维点名的合法边。
  */
 extern void midr_ctrl_connect(struct bgp *bgp,
-			      const struct midr_node_entry *entry);
+			      const struct midr_node_entry *entry,
+			      enum midr_session_reason reason);
 
 /*
  * 把一个刚建出的 peer 整形成 MIDR overlay 会话：multihop + update-source
@@ -136,25 +244,36 @@ extern void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 
 /*
  * 会话归属判据（⑦，四处守卫共用）：peer 是不是 MIDR 自建的 overlay 会话。
- * 双条件 = PEER_FLAG_MIDR_OVERLAY 标记（出身）∧ 除 BGP-LS 外无激活地址族（签名）。
- * 用于让 no midr neighbor / midr neighbor / try_disconnect / connect 去重四处
+ * 判据 = 带 PEER_FLAG_MIDR_OVERLAY 标记（出身）——运维原生会话永远没有它。
+ * 〔批 5c 删掉了原来的第二条"只载 BGP-LS"签名判据，理由见函数定义处注释。〕
+ * 用于让 no midr session / midr session / try_disconnect / connect 去重四处
  * 一律"运维会话让路"：真是 MIDR 自己的才动，否则拒绝 + 告警。
  */
 extern bool midr_nds_peer_is_overlay(struct peer *peer);
 
 /*
- * Called by bgp_midr.c (NDS) before a node entry is removed (withdraw or
+ * Called by bgp_midr_nds.c (NDS) before a node entry is removed (withdraw or
  * expiry). Tears down the dynamically-created BGP session if one exists.
  */
 extern void midr_ctrl_on_node_remove(struct bgp *bgp,
 				     struct midr_node_entry *entry);
 
 /*
+ * 按 transport 拆一条 MIDR 边（批 5 挂靠钩子：卸任清位 / 钩子 (b) 换台先拆旧）。
+ * 对端是引导节点时节点表里没有它的条目，故不走 on_node_remove 那条路；内部拼
+ * 临时条目后复用同一套拆除逻辑（MANUAL 豁免 + 销账 + ⑦ 归属守卫）。
+ * rid 只用于日志可读，可为 0。
+ */
+extern void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
+				       struct in_addr rid);
+
+/*
  * Initiate BGP sessions to every non-self node in the given group (used by
  * the new-node join orchestration after a JOIN decision).  Returns the
- * number of members a session was initiated to.
+ * number of members a session was initiated to.  reason 透传给台账。
  */
-extern int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id);
+extern int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id,
+				   enum midr_session_reason reason);
 
 /*
  * Hierarchical-discovery requests (new node side), sent over the TCP short
@@ -169,6 +288,26 @@ extern void midr_ctrl_send_rep_request(struct bgp *bgp,
 extern void midr_ctrl_send_member_request(struct bgp *bgp,
 					  struct in_addr rep_transport,
 					  uint32_t group_id);
+
+/*
+ * 群代表 -> 引导：要一份"当下活着的引导名单"（BOOTSTRAP_LIST_REQ，同走 TCP 短
+ * 连接 + ctrl_pending 重试）。调用方 = NDS 的 midr_nds_bootstrap_list_fetch()。
+ * 重试耗尽（死心）时 retx 定时器回调 midr_nds_bootstrap_list_failed() 换下一个
+ * 候选——与 REP_LIST_REQ 的 join failover 是**两条独立的路**，各用各的游标。
+ */
+extern void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp,
+						  struct in_addr dst);
+
+/*
+ * 改一条**在途请求**的剩余重传次数（保底轮 2 批 6）。
+ * 唯一用途 = 挂靠挑台的第二批候选（不在最新活引导名单里）建连后把预算压到
+ * MIDR_ATTACH_RETX_SECOND，让"多半已经死了"的候选 6s 就死心、早点轮到下一台；
+ * 第一批不调用、照吃入队时那份 params 的默认 count。
+ * 按 (目标 transport, 消息类型) 定位，查不到就什么都不做——调用方在
+ * midr_ctrl_connect() 之后调，而 connect 可能因去重根本没入队。
+ */
+extern void midr_ctrl_set_retx_budget(struct bgp *bgp, struct in_addr dst,
+				      uint8_t type, int retries);
 
 /*
  * New node -> an arbitrary candidate's transport address: one-way
@@ -218,11 +357,15 @@ extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
 
 /*
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型，供响应
- * 类型配对校验；内部转现有 recv_rep_list / recv_member_list 灌全局视图并推进
- * join 状态机。
+ * 类型配对校验；src = 响应来源（即当初请求的目的地），供并发多个
+ * MEMBER_LIST_REQ（主候选群 + 至多 2 个次优群）时精确清对应的重传 pending
+ * 条目（按 (dst,type) 而非只按 type，否则某个目标的响应会误清掉另一个尚未
+ * 响应的目标的重传追踪）；内部转现有 recv_rep_list / recv_member_list 灌全
+ * 局视图并推进 join 状态机。
  */
 extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
-				      const uint8_t *payload, size_t len);
+				      const uint8_t *payload, size_t len,
+				      struct in_addr src);
 
 /* --- 传输层 (tcp.c) 提供给语义层调用 --- */
 
@@ -241,7 +384,7 @@ extern void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 
 /* 重试定时器查询: 到 dst 的 type 请求是否已有在途 TCP 连接 (在途则本轮不减
  * retries_left，避免虚耗重试数)。 */
-extern bool midr_ctrl_tcp_client_inflight(struct bgp_midr *mi,
+extern bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi,
 					  struct in_addr dst, uint8_t type);
 
 #endif /* _FRR_BGP_MIDR_CTRL_H */

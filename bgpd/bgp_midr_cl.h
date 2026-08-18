@@ -10,11 +10,11 @@
 #ifndef _FRR_BGP_MIDR_CL_H
 #define _FRR_BGP_MIDR_CL_H
 
-#include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_nds.h"
 
 struct bgp;
 
-/* Register the CL global-view callback on bgp->midr_info. */
+/* Register the CL global-view callback on bgp->midr_nds_info. */
 extern void midr_cl_register_callback(struct bgp *bgp, midr_global_view_cb cb);
 
 /* Initialize the CL module for a BGP instance (registers its callback). */

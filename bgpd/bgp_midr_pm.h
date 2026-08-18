@@ -81,7 +81,7 @@ enum midr_probe_state {
 	MIDR_PROBE_FAST,
 };
 
-/* Per-target probe context (PM owns these in bgp_midr->probe_contexts) */
+/* Per-target probe context (PM owns these in bgp_midr_nds->probe_contexts) */
 struct midr_probe_ctx {
 	struct bgp *bgp;
 	struct prefix target;	       /* node_id — hash key */
@@ -133,7 +133,7 @@ extern int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 extern void midr_pm_on_transport_addr_set(struct bgp *bgp);
 
 /* Module lifecycle: open/close PM socket and arm/cancel probe timers.
- * Called from bgp_midr_init() / bgp_midr_finish(). */
+ * Called from bgp_midr_nds_init() / bgp_midr_nds_finish(). */
 extern void midr_pm_init(struct bgp *bgp);
 extern void midr_pm_finish(struct bgp *bgp);
 

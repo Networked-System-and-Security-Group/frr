@@ -14,7 +14,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_ls_ted.h"
-#include "bgpd/bgp_midr.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_tlv.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_attr.h"
@@ -972,11 +972,7 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 	struct bgp_ls_attr *ls_attr;
 	int ret;
 
-	/* MIDR always distributes its Node NLRI regardless of enable_distribution.
-	 * Standard BGP-LS distribution also requires enable_distribution=true. */
-	if (!bgp || !bgp->ls_info)
-		return 0;
-	if (!bgp->ls_info->enable_distribution && !bgp->midr_info)
+	if (!bgp || !bgp->ls_info || !bgp->ls_info->enable_distribution)
 		return 0;
 
 	nlri = bgp_ls_nlri_alloc();
@@ -1004,14 +1000,14 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 
 	/* TLV 1185: MIDR Group ID / TLV 1187: MIDR Node Capability /
 	 * TLV 1188: MIDR Transport Address */
-	if (bgp->midr_info) {
-		midr_tlv_set_group_id(ls_attr, bgp->midr_info->local_group_id);
+	if (bgp->midr_nds_info) {
+		midr_tlv_set_group_id(ls_attr, bgp->midr_nds_info->local_group_id);
 		midr_tlv_set_node_cap(ls_attr,
-				      bgp->midr_info->local_capabilities,
+				      bgp->midr_nds_info->local_capabilities,
 				      (uint64_t)monotime(NULL));
-		if (bgp->midr_info->transport_addr_set)
+		if (bgp->midr_nds_info->transport_addr_set)
 			midr_tlv_set_transport_addr(
-				ls_attr, bgp->midr_info->local_transport_addr);
+				ls_attr, bgp->midr_nds_info->local_transport_addr);
 	}
 
 	ret = bgp_ls_update(bgp, nlri, ls_attr);
