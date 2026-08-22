@@ -76,8 +76,7 @@ static struct midr_ted_prefix_key prefix_key(const char *text)
 
 static const struct midr_spf_results *compute_results(const char *prefix_text,
 						      const char *nexthop_text, uint32_t cost,
-						      uint32_t bandwidth_kbps, ifindex_t ifindex,
-						      bool local_destination)
+						      ifindex_t ifindex, bool local_destination)
 {
 	const uint32_t local = node_id("1.1.1.1");
 	const uint32_t remote = node_id("2.2.2.2");
@@ -92,7 +91,6 @@ static const struct midr_spf_results *compute_results(const char *prefix_text,
 		.remote_group_id = 100,
 		.link_id = 1,
 		.canonical_cost = cost,
-		.available_bandwidth_kbps = bandwidth_kbps,
 		.link_local_address = ip_address(strchr(nexthop_text, ':') ? "2001:db8::1"
 									   : "192.0.2.1"),
 		.link_remote_address = ip_address(nexthop_text),
@@ -141,7 +139,6 @@ static const struct midr_spf_results *compute_ecmp_results(void)
 			.remote_group_id = 100,
 			.link_id = 1,
 			.canonical_cost = 2,
-			.available_bandwidth_kbps = 64000,
 			.link_local_address = ip_address("192.0.2.1"),
 			.link_remote_address = ip_address("192.0.2.2"),
 			.local_ifindex = 7,
@@ -153,7 +150,6 @@ static const struct midr_spf_results *compute_ecmp_results(void)
 			.remote_group_id = 100,
 			.link_id = 2,
 			.canonical_cost = 2,
-			.available_bandwidth_kbps = 32000,
 			.link_local_address = ip_address("192.0.2.1"),
 			.link_remote_address = ip_address("192.0.2.3"),
 			.local_ifindex = 8,
@@ -214,7 +210,6 @@ compute_cross_results(uint64_t generation, uint64_t group_score, uint32_t local_
 		.remote_group_id = 200,
 		.link_id = 1,
 		.canonical_cost = local_cost,
-		.available_bandwidth_kbps = 64000,
 		.link_local_address = ip_address("192.0.2.1"),
 		.link_remote_address = ip_address("192.0.2.2"),
 		.local_ifindex = 7,
@@ -277,7 +272,7 @@ static void test_spf_install_adapter(void)
 	ctx.bgp = &bgp;
 	midr_zebra_init(&bgp);
 
-	initial = compute_results("203.0.113.0/24", "192.0.2.2", 5, 64000, 7, false);
+	initial = compute_results("203.0.113.0/24", "192.0.2.2", 5, 7, false);
 	midr_spf_install_results(&ctx, NULL, initial);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 1);
@@ -291,12 +286,12 @@ static void test_spf_install_adapter(void)
 	assert(inet_pton(AF_INET, "192.0.2.2", &expected_v4) == 1);
 	assert(IPV4_ADDR_SAME(&sent_routes[0].route.nexthops[0].gate.ipv4, &expected_v4));
 
-	same = compute_results("203.0.113.0/24", "192.0.2.2", 5, 64000, 7, false);
+	same = compute_results("203.0.113.0/24", "192.0.2.2", 5, 7, false);
 	midr_spf_install_results(&ctx, initial, same);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 1);
 
-	changed = compute_results("203.0.113.0/24", "192.0.2.2", 9, 64000, 7, false);
+	changed = compute_results("203.0.113.0/24", "192.0.2.2", 9, 7, false);
 	midr_spf_install_results(&ctx, same, changed);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 3);
@@ -304,7 +299,7 @@ static void test_spf_install_adapter(void)
 	assert(sent_routes[2].command == ZEBRA_ROUTE_ADD);
 	assert(sent_routes[2].route.metric == 9);
 
-	local = compute_results("203.0.113.0/24", "192.0.2.2", 9, 64000, 7, true);
+	local = compute_results("203.0.113.0/24", "192.0.2.2", 9, 7, true);
 	midr_spf_install_results(&ctx, changed, local);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 4);
@@ -320,7 +315,7 @@ static void test_spf_install_adapter(void)
 	assert(sent_routes[4].route.nexthops[0].ifindex == 7);
 	assert(sent_routes[4].route.nexthops[1].ifindex == 8);
 
-	ipv6 = compute_results("2001:db8:100::/64", "2001:db8::2", 11, 32000, 8, false);
+	ipv6 = compute_results("2001:db8:100::/64", "2001:db8::2", 11, 8, false);
 	midr_spf_install_results(&ctx, NULL, ipv6);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 6);
@@ -336,7 +331,7 @@ static void test_spf_install_adapter(void)
 	 * The current data-plane API does not carry a nexthop address family.
 	 * The adapter must not silently reinterpret an IPv6 nexthop as IPv4.
 	 */
-	mixed = compute_results("198.51.100.0/24", "2001:db8::3", 3, 1000, 9, false);
+	mixed = compute_results("198.51.100.0/24", "2001:db8::3", 3, 9, false);
 	midr_spf_install_results(&ctx, NULL, mixed);
 	midr_zebra_route_flush(&bgp);
 	assert(sent_route_count == 6);

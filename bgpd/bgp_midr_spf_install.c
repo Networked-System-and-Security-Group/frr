@@ -143,7 +143,7 @@ static void midr_spf_install_delete(struct bgp *bgp, const struct midr_spf_route
 	if (!route)
 		return;
 	prefix = route->prefix.prefix;
-	midr_zebra_route_del(bgp, &prefix);
+	midr_zebra_route_del(bgp, &prefix, MIDR_INSTANCE_SPF);
 }
 
 void midr_spf_install_results(struct midr_context *ctx, const struct midr_spf_results *old_results,

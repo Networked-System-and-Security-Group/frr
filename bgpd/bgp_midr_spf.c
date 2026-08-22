@@ -649,8 +649,7 @@ static void midr_spf_route_nexthops_clear(struct midr_spf_route *route)
 
 static void midr_spf_route_nexthop_add(struct midr_spf_route *route,
 				       const struct midr_ted_link *link,
-				       uint32_t destination_group_id, uint32_t next_group_id,
-				       uint32_t bandwidth)
+				       uint32_t destination_group_id, uint32_t next_group_id)
 {
 	struct midr_spf_nexthop *nexthop;
 	size_t count = route->nexthop_count + 1;
@@ -668,7 +667,7 @@ static void midr_spf_route_nexthop_add(struct midr_spf_route *route,
 		.destination_group_id = destination_group_id,
 		.next_group_id = next_group_id,
 		.link_id = link->link_id,
-		.available_bandwidth_kbps = bandwidth,
+		.available_bandwidth_kbps = 0,
 	};
 }
 
@@ -685,73 +684,13 @@ static void midr_spf_route_nexthops_sort(struct midr_spf_route *route)
 	output = 0;
 	for (input = 0; input < route->nexthop_count; input++) {
 		if (output &&
-		    midr_spf_nexthop_same(&route->nexthops[output - 1], &route->nexthops[input])) {
-			if (route->nexthops[input].available_bandwidth_kbps >
-			    route->nexthops[output - 1].available_bandwidth_kbps)
-				route->nexthops[output - 1].available_bandwidth_kbps =
-					route->nexthops[input].available_bandwidth_kbps;
+		    midr_spf_nexthop_same(&route->nexthops[output - 1], &route->nexthops[input]))
 			continue;
-		}
 		if (output != input)
 			route->nexthops[output] = route->nexthops[input];
 		output++;
 	}
 	route->nexthop_count = output;
-}
-
-static int midr_spf_path_bandwidth_state(const struct midr_spf_graph *graph,
-					 const struct midr_spf_vertex *vertex,
-					 const struct midr_spf_graph_edge *required_first_hop,
-					 struct list *visiting, uint32_t *bandwidth)
-{
-	const struct midr_spf_vertex *predecessor;
-	struct midr_spf_graph_edge *edge;
-	struct listnode *node;
-
-	if (vertex == graph->source) {
-		*bandwidth = UINT32_MAX;
-		return 0;
-	}
-	if (listnode_lookup(visiting, vertex))
-		return -ELOOP;
-
-	listnode_add(visiting, (void *)vertex);
-	for (ALL_LIST_ELEMENTS_RO(vertex->predecessors, node, edge)) {
-		uint32_t prefix_bandwidth;
-		uint32_t edge_bandwidth;
-
-		if (edge->kind != MIDR_SPF_EDGE_LINK)
-			continue;
-		predecessor = midr_spf_vertex_lookup_const(graph, edge->source_id);
-		if (!predecessor)
-			continue;
-		if (predecessor == graph->source && edge != required_first_hop)
-			continue;
-		if (midr_spf_path_bandwidth_state(graph, predecessor, required_first_hop, visiting,
-						  &prefix_bandwidth) != 0)
-			continue;
-
-		edge_bandwidth = edge->payload.link->available_bandwidth_kbps;
-		*bandwidth = MIN(prefix_bandwidth, edge_bandwidth);
-		listnode_delete(visiting, vertex);
-		return 0;
-	}
-
-	listnode_delete(visiting, vertex);
-	return -ENOENT;
-}
-
-static uint32_t midr_spf_path_bandwidth(const struct midr_spf_graph *graph,
-					const struct midr_spf_vertex *destination,
-					const struct midr_spf_graph_edge *first_hop)
-{
-	struct list *visiting = list_new();
-	uint32_t bandwidth = 0;
-
-	if (midr_spf_path_bandwidth_state(graph, destination, first_hop, visiting, &bandwidth) != 0)
-		bandwidth = 0;
-	list_delete(&visiting);
-	return bandwidth == UINT32_MAX ? 0 : bandwidth;
 }
 
 static bool midr_spf_local_paths_build(const struct midr_ted_snapshot *snapshot,
@@ -789,13 +728,10 @@ static bool midr_spf_local_paths_build(const struct midr_ted_snapshot *snapshot,
 		if (mapping->node_id == snapshot->local_node_id)
 			continue;
 		for (ALL_LIST_ELEMENTS_RO(destination->first_hops, node, first_hop)) {
-			uint32_t bandwidth;
-
 			if (first_hop->kind != MIDR_SPF_EDGE_LINK)
 				continue;
-			bandwidth = midr_spf_path_bandwidth(router, destination, first_hop);
 			midr_spf_route_nexthop_add(route, first_hop->payload.link,
-						   snapshot->local_group_id, 0, bandwidth);
+						   snapshot->local_group_id, 0);
 		}
 	}
 
@@ -877,7 +813,7 @@ static void midr_spf_cross_paths_build(const struct midr_ted_snapshot *snapshot,
 
 				if (border == router->source) {
 					midr_spf_route_nexthop_add(route, egress, mapping->group_id,
-								   next_group_id, 0);
+								   next_group_id);
 					continue;
 				}
 				for (ALL_LIST_ELEMENTS_RO(border->first_hops, router_node,
@@ -887,7 +823,7 @@ static void midr_spf_cross_paths_build(const struct midr_ted_snapshot *snapshot,
 					midr_spf_route_nexthop_add(route,
 								   router_first_hop->payload.link,
 								   mapping->group_id,
-								   next_group_id, 0);
+								   next_group_id);
 				}
 			}
 		}

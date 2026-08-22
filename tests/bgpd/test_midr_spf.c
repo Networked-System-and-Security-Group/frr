@@ -51,8 +51,8 @@ static struct midr_ted_prefix_key prefix_key(const char *text)
 
 static struct midr_ted_link ted_link(uint32_t local_node_id, uint32_t remote_node_id,
 				     uint32_t local_group_id, uint32_t remote_group_id,
-				     uint64_t link_id, uint32_t cost, uint32_t bandwidth,
-				     const char *remote_address, ifindex_t ifindex)
+				     uint64_t link_id, uint32_t cost, const char *remote_address,
+				     ifindex_t ifindex)
 {
 	struct ipaddr remote = ip_address(remote_address);
 	struct ipaddr local;
@@ -69,7 +69,6 @@ static struct midr_ted_link ted_link(uint32_t local_node_id, uint32_t remote_nod
 		.remote_group_id = remote_group_id,
 		.link_id = link_id,
 		.canonical_cost = cost,
-		.available_bandwidth_kbps = bandwidth,
 		.link_local_address = local,
 		.link_remote_address = remote,
 		.local_ifindex = ifindex,
@@ -89,12 +88,12 @@ static void test_intra_group_ecmp_and_owned_result(void)
 		{ .node_id = d, .group_id = 100 },
 	};
 	struct midr_ted_link links[] = {
-		ted_link(a, b, 100, 100, 1, 2, 100000, "10.0.12.2", 12),
-		ted_link(a, c, 100, 100, 2, 2, 90000, "10.0.13.3", 13),
-		ted_link(a, b, 100, 100, 6, 2, 95000, "10.0.22.2", 22),
-		ted_link(b, d, 100, 100, 3, 3, 80000, "10.0.24.4", 24),
-		ted_link(c, d, 100, 100, 4, 3, 70000, "10.0.34.4", 34),
-		ted_link(a, d, 100, 100, 5, 10, 110000, "10.0.14.4", 14),
+		ted_link(a, b, 100, 100, 1, 2, "10.0.12.2", 12),
+		ted_link(a, c, 100, 100, 2, 2, "10.0.13.3", 13),
+		ted_link(a, b, 100, 100, 6, 2, "10.0.22.2", 22),
+		ted_link(b, d, 100, 100, 3, 3, "10.0.24.4", 24),
+		ted_link(c, d, 100, 100, 4, 3, "10.0.34.4", 34),
+		ted_link(a, d, 100, 100, 5, 10, "10.0.14.4", 14),
 	};
 	struct midr_ted_node_prefix node_prefixes[] = {
 		{ .key = prefix_key("203.0.113.0/24"), .node_id = d },
@@ -126,16 +125,15 @@ static void test_intra_group_ecmp_and_owned_result(void)
 	assert(route->nexthop_count == 3);
 	assert(ipaddr_cmp(&route->nexthops[0].address, &links[0].link_remote_address) == 0);
 	assert(route->nexthops[0].ifindex == 12);
-	assert(route->nexthops[0].available_bandwidth_kbps == 80000);
+	assert(route->nexthops[0].available_bandwidth_kbps == 0);
 	assert(ipaddr_cmp(&route->nexthops[1].address, &links[1].link_remote_address) == 0);
-	assert(route->nexthops[1].available_bandwidth_kbps == 70000);
+	assert(route->nexthops[1].available_bandwidth_kbps == 0);
 	assert(ipaddr_cmp(&route->nexthops[2].address, &links[2].link_remote_address) == 0);
-	assert(route->nexthops[2].available_bandwidth_kbps == 80000);
+	assert(route->nexthops[2].available_bandwidth_kbps == 0);
 
 	links[0].link_remote_address = ip_address("198.51.100.1");
-	links[0].available_bandwidth_kbps = 1;
 	assert(ipaddr_cmp(&route->nexthops[0].address, &links[0].link_remote_address) != 0);
-	assert(route->nexthops[0].available_bandwidth_kbps == 80000);
+	assert(route->nexthops[0].available_bandwidth_kbps == 0);
 
 	midr_spf_route_free(&route);
 	assert(!route);
@@ -150,8 +148,8 @@ static void test_ipv6_prefix_and_nexthops(void)
 		{ .node_id = b, .group_id = 100 },
 	};
 	struct midr_ted_link links[] = {
-		ted_link(a, b, 100, 100, 1, 7, 100000, "2001:db8:12::2", 12),
-		ted_link(a, b, 100, 100, 2, 7, 90000, "2001:db8:13::2", 13),
+		ted_link(a, b, 100, 100, 1, 7, "2001:db8:12::2", 12),
+		ted_link(a, b, 100, 100, 2, 7, "2001:db8:13::2", 13),
 	};
 	struct midr_ted_node_prefix node_prefixes[] = {
 		{ .key = prefix_key("192.0.2.0/24"), .node_id = b },
@@ -280,13 +278,13 @@ static void test_cross_group_hierarchy_and_ecmp(void)
 		{ .node_id = d, .group_id = 100 },
 	};
 	struct midr_ted_link intra[] = {
-		ted_link(a, b, 100, 100, 1, 5, 100000, "10.0.12.2", 12),
-		ted_link(a, c, 100, 100, 2, 2, 100000, "10.0.13.3", 13),
+		ted_link(a, b, 100, 100, 1, 5, "10.0.12.2", 12),
+		ted_link(a, c, 100, 100, 2, 2, "10.0.13.3", 13),
 	};
 	struct midr_ted_link egress[] = {
-		ted_link(b, x, 100, 200, 10, 10, 90000, "10.0.20.1", 20),
-		ted_link(c, y, 100, 200, 11, 13, 80000, "10.0.20.2", 21),
-		ted_link(a, z, 100, 400, 12, 22, 70000, "10.0.40.1", 40),
+		ted_link(b, x, 100, 200, 10, 10, "10.0.20.1", 20),
+		ted_link(c, y, 100, 200, 11, 13, "10.0.20.2", 21),
+		ted_link(a, z, 100, 400, 12, 22, "10.0.40.1", 40),
 	};
 	struct midr_ted_group_edge group_edges[] = {
 		{ .source_group_id = 100, .target_group_id = 200, .aggregate_cost = 10 },
@@ -350,8 +348,8 @@ static void test_cross_group_lexicographic_selection(void)
 		.group_id = 100,
 	};
 	struct midr_ted_link egress[] = {
-		ted_link(a, x, 100, 200, 1, 100, 100000, "10.0.20.1", 20),
-		ted_link(a, y, 100, 300, 2, 1, 100000, "10.0.30.1", 30),
+		ted_link(a, x, 100, 200, 1, 100, "10.0.20.1", 20),
+		ted_link(a, y, 100, 300, 2, 1, "10.0.30.1", 30),
 	};
 	struct midr_ted_group_edge group_edges[] = {
 		{ .source_group_id = 100, .target_group_id = 200, .aggregate_cost = 4 },
@@ -401,8 +399,8 @@ static void test_cross_group_local_tiebreak_and_ecmp(void)
 		.group_id = 100,
 	};
 	struct midr_ted_link egress[] = {
-		ted_link(a, x, 100, 200, 1, 20, 100000, "10.0.20.1", 20),
-		ted_link(a, y, 100, 300, 2, 5, 100000, "10.0.30.1", 30),
+		ted_link(a, x, 100, 200, 1, 20, "10.0.20.1", 20),
+		ted_link(a, y, 100, 300, 2, 5, "10.0.30.1", 30),
 	};
 	struct midr_ted_group_edge group_edges[] = {
 		{ .source_group_id = 100, .target_group_id = 200, .aggregate_cost = 4 },
@@ -457,7 +455,7 @@ static void test_unexecutable_group_first_hop_filtered(void)
 		.node_id = a,
 		.group_id = 100,
 	};
-	struct midr_ted_link egress = ted_link(a, y, 100, 300, 1, 7, 100000, "10.0.30.1", 30);
+	struct midr_ted_link egress = ted_link(a, y, 100, 300, 1, 7, "10.0.30.1", 30);
 	struct midr_ted_group_edge group_edges[] = {
 		{ .source_group_id = 100, .target_group_id = 200, .aggregate_cost = 1 },
 		{ .source_group_id = 200, .target_group_id = 500, .aggregate_cost = 1 },
@@ -503,7 +501,7 @@ static void test_invalid_edge_and_overflow_skip(void)
 		{ .node_id = b, .group_id = 100 },
 	};
 	struct midr_ted_link intra[] = {
-		ted_link(a, b, 100, 100, 1, 0, 1000, "10.0.0.2", 2),
+		ted_link(a, b, 100, 100, 1, 0, "10.0.0.2", 2),
 	};
 	struct midr_ted_group_edge group_edges[] = {
 		{ .source_group_id = 100, .target_group_id = 200, .aggregate_cost = UINT64_MAX },
@@ -571,7 +569,6 @@ static void publish_runtime_snapshot(struct midr_context *ctx, uint32_t link_cos
 		.remote_node_id = b,
 		.link_id = 1,
 		.canonical_cost = link_cost,
-		.available_bandwidth_kbps = 50000,
 		.link_local_address = ip_address("10.0.0.1"),
 		.link_remote_address = ip_address("10.0.0.2"),
 		.local_ifindex = 2,

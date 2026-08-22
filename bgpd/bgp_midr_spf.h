@@ -47,11 +47,11 @@ struct midr_spf_nexthop {
 
 /*
  * Result for one normalized unicast prefix.  The nexthops array is owned by
- * this route.  Cross-group available bandwidth is zero because a local TED
- * snapshot does not expose remote groups' internal bottlenecks.  Intra-group
- * routes use group_score 0 and an exact local_cost.  Inter-group routes keep
- * the aggregate Group SPF score and exact local egress cost separate; callers
- * must not add them.
+ * this route.  Available bandwidth is zero (unknown) because the TED snapshot
+ * exposes owner-computed canonical cost rather than raw link metrics.
+ * Intra-group routes use group_score 0 and an exact local_cost.  Inter-group
+ * routes keep the aggregate Group SPF score and exact local egress cost
+ * separate; callers must not add them.
  */
 struct midr_spf_route {
 	struct midr_ted_prefix_key prefix;
