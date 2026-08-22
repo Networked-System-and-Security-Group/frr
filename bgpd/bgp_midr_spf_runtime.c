@@ -14,6 +14,7 @@
 #include "bgpd/bgp_memory.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_spf.h"
+#include "bgpd/bgp_midr_spf_install.h"
 
 #define MIDR_SPF_DEBOUNCE_MSEC 50
 
@@ -66,6 +67,7 @@ static void midr_spf_recompute_cb(struct event *event)
 
 	old = runtime->cached;
 	runtime->cached = candidate;
+	midr_spf_install_results(runtime->ctx, old, candidate);
 	runtime->pending_generation = 0;
 	runtime->pending_change_flags = MIDR_TED_CHANGE_NONE;
 	runtime->recompute_count++;
@@ -122,6 +124,7 @@ int midr_spf_context_init(struct midr_context *ctx)
 
 void midr_spf_context_finish(struct midr_context *ctx)
 {
+	const struct midr_spf_results *cached;
 	struct midr_spf_runtime *runtime;
 
 	if (!ctx || !ctx->spf)
@@ -131,7 +134,9 @@ void midr_spf_context_finish(struct midr_context *ctx)
 
 	event_cancel(&runtime->t_recompute);
 	midr_ted_consumer_unregister(ctx, &runtime->consumer);
-	midr_spf_results_release(&runtime->cached);
+	cached = runtime->cached;
+	midr_spf_install_results(ctx, cached, NULL);
+	midr_spf_results_release(&cached);
 	XFREE(MTYPE_MIDR_SPF_RUNTIME, runtime);
 }
 

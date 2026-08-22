@@ -66,6 +66,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_prefix.c \
 	bgpd/bgp_midr_rib.c \
 	bgpd/bgp_midr_sequence.c \
+	bgpd/bgp_midr_spf_install.c \
 	bgpd/bgp_midr_spf_runtime.c \
 	bgpd/bgp_midr_sync.c \
 	bgpd/bgp_midr_ted.c \
@@ -171,6 +172,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_private.h \
 	bgpd/bgp_midr_rib.h \
 	bgpd/bgp_midr_sequence.h \
+	bgpd/bgp_midr_spf_install.h \
 	bgpd/bgp_midr_sync.h \
 	bgpd/bgp_midr_ted.h \
 	bgpd/bgp_midr_ted_private.h \
