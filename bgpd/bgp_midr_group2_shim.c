@@ -230,7 +230,13 @@ int midr_topology_link_upsert(struct midr_context *ctx,
 		 link->metrics.loss_ppm,
 		 link->metrics.available_bandwidth_kbps, link->version);
 
-	/* TODO(轮 2)：此处转调 E-1（midr_e1_write_to_bgpls）重发 Link NLRI。 */
+	/*
+	 * 轮 2：转调 E-1 重发 Link NLRI（壳换芯不换）。seqno 用上报层填进
+	 * metrics 的那个值，保证 TLV 1186 里的 seqno 与 measurement_seqno 是
+	 * 同一个数 —— 否则两条路各自计数、日志对不上。
+	 */
+	midr_nds_e1_write_by_rid(bgp_get_default(), link->key.remote_node_id,
+				 link->metrics.measurement_seqno);
 	return 0;
 }
 

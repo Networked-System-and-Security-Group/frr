@@ -228,10 +228,15 @@ extern void midr_ctrl_finish(struct bgp *bgp);
  *
  * reason = 调用方"为什么要这条边"，登进会话台账（结论 20）。每个调用点自报
  * 来意，不在这里猜——拆会话/对账时凭它认出保底、群间、运维点名的合法边。
+ * reason == SAME_GROUP 时另外承担"把对端纳入本群邻居"（见定义处该分支）。
+ *
+ * send_nudge = 要不要朝对端发 PEER_REQUEST。**回配路必须传 false**（我是被请求
+ * 方，再发就是回声），发起类三处传 true。不做默认值：默认发会把"回配忘了关
+ * nudge"这类错误静默化。
  */
 extern void midr_ctrl_connect(struct bgp *bgp,
 			      const struct midr_node_entry *entry,
-			      enum midr_session_reason reason);
+			      enum midr_session_reason reason, bool send_nudge);
 
 /*
  * 把一个刚建出的 peer 整形成 MIDR overlay 会话：multihop + update-source
@@ -263,9 +268,13 @@ extern void midr_ctrl_on_node_remove(struct bgp *bgp,
  * 对端是引导节点时节点表里没有它的条目，故不走 on_node_remove 那条路；内部拼
  * 临时条目后复用同一套拆除逻辑（MANUAL 豁免 + 销账 + ⑦ 归属守卫）。
  * rid 只用于日志可读，可为 0。
+ *
+ * force：真则跳过 MANUAL 豁免（α）。**只有本端 `midr shutdown` 退网传 true**
+ * ——那是运维显式命令、与手配同级；自动路径（挂靠卸任、B1 老化、换台先拆旧）
+ * 一律传 false。判据与理由见 midr_try_disconnect 内 α 注释。
  */
 extern void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
-				       struct in_addr rid);
+				       struct in_addr rid, bool force);
 
 /*
  * Initiate BGP sessions to every non-self node in the given group (used by

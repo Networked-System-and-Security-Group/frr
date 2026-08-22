@@ -146,6 +146,11 @@ extern struct midr_nds_fact_link *
 midr_nds_facts_link_get(struct bgp *bgp, uint32_t remote_node_id,
 			uint64_t link_id);
 
+/*
+ * ⚠ 当前**无调用者**：撤销路径改为留墓碑（只置 reported=false，保住 version），
+ * 条目只在 midr_nds_facts_finish() 统一释放 —— 理由见 midr_nds_report_link_withdraw()
+ * 里的注释。保留本函数供将来真需要淘汰单条目时用。
+ */
 extern void midr_nds_facts_link_del(struct bgp *bgp,
 				    struct midr_nds_fact_link *fl);
 
@@ -193,8 +198,10 @@ extern uint32_t midr_nds_metric_rtt_us(const struct midr_nds_link_metrics *m);
 /*
  * loss：我方是 0.0~1.0 的比例，×1e6 即 ppm。
  * 注意上限 —— 第二组是 loss_ppm >= 1000000 即 -EINVAL（**严格小于**，不是文档
- * 里写的「≤1e6」），所以 100% 丢包不能 upsert、必须走 withdraw。本函数把结果
- * 夹到 [0, 999999]，是否该 withdraw 由 midr_nds_metrics_to_group2() 判。
+ * 里写的「≤1e6」），故本函数把结果夹到 [0, 999999]。
+ *
+ * ⚠ 2026-08-19 口径改定：满格丢包**照报**（夹在 999999），不再转 withdraw
+ * ——理由见 midr_nds_metrics_to_group2() 头注释。
  */
 extern uint32_t midr_nds_metric_loss_ppm(const struct midr_nds_link_metrics *m);
 
@@ -204,14 +211,60 @@ extern uint32_t midr_nds_metric_bw_kbps(const struct midr_nds_link_metrics *m);
 /*
  * 把我方一组链路指标换成第二组的 struct midr_link_metrics。
  *
- * 返回 false = **这条链路不该 upsert**，调用方应改发 withdraw 或干脆不报：
+ * 返回 false = **这条链路此刻没有可上报的指标**，调用方跳过本次（不是撤销）：
  *   - rtt_us == 0：还没探到（60s 热身期 / 目标不可达）。对上「接口不定义
- *     link_state，探测中/热身中不提交」的约定；
- *   - loss_rate >= 1.0：链路全丢，第二组要求转 withdraw。
+ *     link_state，探测中/热身中不提交」的约定。
  * 返回 true 时 *out 已填满，可直接塞进 struct midr_link_update.metrics。
+ *
+ * ⚠ **满格丢包（loss_rate >= 1.0）照样返回 true**（loss_ppm 夹在 999999）——
+ * 2026-08-19 口径改定，推翻轮 1 交接书里「loss==1e6 转 withdraw」那句：
+ *   - 他们 loss_ppm >= 1e6 拒收管的是**值域**，不是「该撤链路」，「死链怎么
+ *     表达」他们文档没规定，转 withdraw 是我方当初的推导；
+ *   - 会话还 Established 而丢包打满 = 「活着但质量烂穿」（07-21 overlay 环路
+ *     bug 正是此形态：BGP 全 Established、转发面成环、探测全丢），此时该让
+ *     CL 看见差指标自然绕开，而不是宣告这条链路不存在；
+ *   - 链路生死一律归**会话/节点级**：清理路径（detach 时
+ *     midr_nds_report_link_withdraw）与轮 4/5 的 peer_status_changed 钩子。
+ *     指标层不再有任何 withdraw 触发点，两层不打架。
  */
 extern bool midr_nds_metrics_to_group2(const struct midr_nds_link_metrics *m,
 				       uint64_t seqno,
 				       struct midr_link_metrics *out);
+
+/* ===========================================================================
+ * link 上报（轮 2）
+ * =========================================================================*/
+
+/*
+ * link 上报出口：更新事实表 → midr_topology_link_upsert()。node 侧
+ * midr_nds_report_node() 的同层同构物，**取代 I-5 去抖放行后原先直调的 E-1**
+ * （shim 期 upsert 内部转调回 E-1，NLRI 照发、行为不变）。
+ *
+ * 唯一调用点 = midr_nds_on_link_update() 里去抖放行处。上层（探测 / I-5 /
+ * 去抖）对本函数一无所知：该不该报的判断全在这里。
+ *
+ * 三道闸门（放行才报，判据与理由见函数体）：
+ *   ① 会话 Established —— 会话没建就报链路等于虚报；
+ *   ② 指标可用 —— 热身期 rtt=0 不报（midr_nds_metrics_to_group2 判）；
+ *   ③ 键合法 —— 本机 router-id 非 0、对端 rid 非 0 且与本机不同
+ *      （他们 midr_validate_link_update 的第一关，不满足必 -ENOENT/-EINVAL）。
+ * 外加一道**保险**：引导 / 保底边不上报（midr_nds_link_is_backbone），详见
+ * 该函数头注释。
+ */
+extern void midr_nds_report_link(struct bgp *bgp,
+				 const struct midr_link_entry *link);
+
+/*
+ * link 撤销出口：报过才撤，撤完删事实表条目。调用点 = 统一收口原语
+ * midr_nds_detach_node()（换群拆边 / 节点下线 / 运维拆边都经它）。
+ *
+ * 这是「链路生死归会话/节点级」的清理路径那一半（另一半是轮 4/5 要挂的
+ * peer_status_changed 钩子）。没报过（reported 为假）就没什么可撤，只删条目。
+ *
+ * ⚠ shim 期它只打日志不发真撤销 —— 旧 E-1 路径本来就没有「撤 Link NLRI」这个
+ * 动作，接上去反而改变行为（换壳不改行为是轮 2 的红线）。
+ */
+extern void midr_nds_report_link_withdraw(struct bgp *bgp,
+					  const struct prefix *remote_node_id);
 
 #endif /* _FRR_BGP_MIDR_NDS_FACTS_H */

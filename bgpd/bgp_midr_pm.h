@@ -126,6 +126,13 @@ extern int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 extern int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 				 enum midr_stop_reason reason);
 
+/*
+ * I-2 全量版：停掉所有探测目标，返回停掉的个数（退网 `midr shutdown` 专用）。
+ * 逐节点停会漏掉不在节点表里的占位目标（join 期代表/成员、锚点评估），故单列。
+ */
+extern int midr_pm_remove_all_targets(struct bgp *bgp,
+				      enum midr_stop_reason reason);
+
 /* Called by the VTY `midr transport-address` command after the local
  * transport address is configured.  Opens the PM socket if not already open,
  * then starts probing any already-established adjacent neighbors whose I-1

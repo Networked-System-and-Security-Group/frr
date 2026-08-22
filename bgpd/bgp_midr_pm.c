@@ -688,6 +688,40 @@ int midr_pm_remove_target(struct bgp *bgp, const struct prefix *node_id,
 }
 
 /*
+ * I-2 全量版：停掉本实例的**所有**探测目标，返回停掉的个数。
+ *
+ * 退网（`midr shutdown`）专用。为什么不逐个调 midr_pm_remove_target：探测目标不
+ * 都在节点表里——join 期对群代表/成员起的探测用的是占位条目，锚点评估探的是次
+ * 优群代表，按节点表遍历会漏，漏掉的就是永远停不下来的探测流。
+ *
+ * 用 hash_clean 而不是逐条 remove，还顺带避开一个副作用：单条版对"探测在途"的
+ * 目标会推一发 LINK_DOWN 回灌 I-5，退网时那是纯噪声（链路事实的作废由退网清表
+ * 路径统一发 link withdraw，见 midr_nds_detach_node）。
+ * 清空后哈希表本身留着继续用（重入后照常 add_target），与 midr_pm_finish 的
+ * hash_clean + hash_free 不同。
+ */
+int midr_pm_remove_all_targets(struct bgp *bgp, enum midr_stop_reason reason)
+{
+	struct bgp_midr_nds *mi;
+	int n;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return 0;
+	mi = bgp->midr_nds_info;
+	if (!mi->probe_contexts)
+		return 0;
+
+	n = (int)hashcount(mi->probe_contexts);
+	if (!n)
+		return 0;
+
+	hash_clean(mi->probe_contexts, pm_ctx_free_cb);
+	MIDR_LOG("MIDR PM I-2: stop probing ALL (%d targets) reason=%d", n,
+		 reason);
+	return n;
+}
+
+/*
  * Called by the VTY `midr transport-address` handler after the address is set.
  * The PM socket cannot be opened during midr_pm_init() because the config file
  * is read AFTER bgp_midr_nds_init() runs.  This function retrofits the open and

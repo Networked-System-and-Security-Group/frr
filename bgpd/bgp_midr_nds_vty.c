@@ -149,10 +149,10 @@ static struct in_addr midr_vty_rid_for_session_addr(struct bgp *bgp,
 		return rid;
 	/*
 	 * 第三本字典：bootstrap 候选池（批 5 R 系列）。
-	 * 前两本对**引导节点**都翻不到——引导不发 Node NLRI，节点表里永远没有它；
-	 * 而挂靠没建成的半边（对方死了/拒了、会话停在 Active）也没有 remote_id。
-	 * 于是"拆掉这条挂靠边顺便把这台引导拉黑"就落空（报"未能持久排除"）。
-	 * 候选池里每条都带运维手配的 rid，正好补上这一级。
+	 * 前两本对**引导节点**不保证翻得到——节点表要等它的 Node NLRI 传过来（刚起
+	 * 或链路不通时就没有），而挂靠没建成的半边（对方死了/拒了、会话停在 Active）
+	 * 也没有 remote_id。于是"拆掉这条挂靠边顺便把这台引导拉黑"就落空（报"未能
+	 * 持久排除"）。候选池里每条都带运维手配的 rid，正好补上这一级。
 	 */
 	return midr_nds_bootstrap_rid_by_transport(bgp, addr);
 }
@@ -431,36 +431,15 @@ DEFUN(no_midr_role_bootstrap,
       "Act as a bootstrap node\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	bool was_boot;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
-	was_boot = midr_nds_is_bootstrap(bgp);
 
 	midr_nds_set_capability(bgp, bgp->midr_nds_info->local_capabilities &
 					     ~MIDR_CAP_BOOTSTRAP);
 	vty_out(vty, "MIDR role bootstrap cleared\n");
-
-	/*
-	 * 卸引导**不自动恢复** BGP-LS 本地拓扑导出（5b：成为引导时自动关掉，见
-	 * midr_nds_bootstrap_enforce）。不自动恢复是有意的——"恢复成什么"没有正确
-	 * 答案：这台机器原来的 conf 里可能压根没配过 `distribute`，替运维猜一个反而
-	 * 更糟。
-	 * 但由此会留下一个**不对称**：进（成为引导）是自动的，出不是——节点变成
-	 * "已经不是引导了，却仍然不通告自身 NLRI"，别人看不到它、它自己也不声张。
-	 * 所以这里必须说一声（08-13 定案：方案 a = 只提示不代劳）。
-	 * 判据两条，避免对"本来就没开过 distribute 的普通节点"误报：**本来是引导**
-	 * ∧ **导出确实关着**。
-	 */
-	if (was_boot && bgp->ls_info && !bgp->ls_info->enable_distribution) {
-		vty_out(vty,
-			"%% 注意：本机的 BGP-LS 本地拓扑导出仍处于关闭状态（成为引导时自动关的），\n"
-			"%%       现在已不是引导、却仍不通告自身 NLRI，别人看不到本机——\n"
-			"%%       如需恢复请敲 distribute bgp-fabric-link-state\n");
-		zlog_warn("MIDR：已卸下引导角色，但 BGP-LS 本地拓扑导出仍关闭——本机不通告自身 NLRI，如需恢复请配 distribute bgp-fabric-link-state");
-	}
 
 	return CMD_SUCCESS;
 }
@@ -742,26 +721,51 @@ DEFUN(no_midr_transport_address,
 }
 
 /* ------------------------------------------------------------------ */
-/* midr shutdown   (graceful departure: withdraw self + stop keepalive) */
+/* midr shutdown   (退网：撤通告 + 拆会话 + 停探 + 清表 + 群号回落)      */
+/*                                                                      */
+/* 语义是**退网**不是暂停：本机退化成"只有静态配置、尚未入网"的新节点，  */
+/* bgpd 与 underlay 一动不动。动作全在 NDS 层，本命令只置状态并回显      */
+/* （"midr 命令只置状态"的规矩：动作交事件 / 收敛机器 / config_end）。   */
+/* 决策 docs/decisions/midr-shutdown-semantics.md                        */
 /* ------------------------------------------------------------------ */
 
 DEFUN(midr_shutdown,
       midr_shutdown_cmd,
       "midr shutdown",
       "MIDR configuration\n"
-      "Gracefully leave MIDR: withdraw our Node NLRI and stop advertising\n")
+      "Leave the MIDR fabric: withdraw, tear down MIDR sessions, stop probing\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	bool was_rep;
+	unsigned int manual;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
 
-	bgp->midr_nds_info->shutdown = true; /* keepalive will stop re-originating */
-	midr_nds_report_node(bgp, MIDR_ORIGIN_LEAVE); /* withdraw: we are leaving */
+	if (bgp->midr_nds_info->shutdown) {
+		vty_out(vty, "MIDR: 已处于退网状态，无动作\n");
+		return CMD_SUCCESS;
+	}
 
-	vty_out(vty, "MIDR: gracefully shut down (Node NLRI withdrawn)\n");
+	/* 角色位在 enter 里会被清掉，提醒要用的信息先取。 */
+	was_rep = !!(bgp->midr_nds_info->local_capabilities &
+		     MIDR_CAP_GROUP_REP);
+
+	manual = midr_nds_shutdown_enter(bgp);
+
+	vty_out(vty,
+		"MIDR: 已退网（撤销自身通告、拆除 MIDR 会话、停止探测、清空节点表；群号回落 %u）\n",
+		bgp->midr_nds_info->local_group_id);
+	/* 运维手配过的两样：退网清运行态，提醒重入后自己重敲（不替运维记账）。 */
+	if (manual)
+		vty_out(vty,
+			"%% 其中 %u 条是运维手配会话——重入后如仍需要，请重敲 `midr session <IP> remote-as <ASN>`\n",
+			manual);
+	if (was_rep)
+		vty_out(vty,
+			"%% 已卸掉群代表角色——重入后如仍需要，请重敲 `midr role group-rep`\n");
 	return CMD_SUCCESS;
 }
 
@@ -770,7 +774,7 @@ DEFUN(no_midr_shutdown,
       "no midr shutdown",
       NO_STR
       "MIDR configuration\n"
-      "Rejoin MIDR: resume advertising our Node NLRI\n")
+      "Rejoin the MIDR fabric: re-advertise and join via a bootstrap node\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 
@@ -779,10 +783,17 @@ DEFUN(no_midr_shutdown,
 		return CMD_WARNING;
 	}
 
-	bgp->midr_nds_info->shutdown = false;
-	midr_nds_report_node(bgp, MIDR_ORIGIN_REJOIN); /* re-announce ourselves */
+	if (!bgp->midr_nds_info->shutdown) {
+		vty_out(vty, "MIDR: 当前未退网，无动作\n");
+		return CMD_SUCCESS;
+	}
 
-	vty_out(vty, "MIDR: resumed (Node NLRI re-originated)\n");
+	if (midr_nds_shutdown_exit(bgp))
+		vty_out(vty,
+			"MIDR: 已重入（恢复通告，按新节点流程重新经引导加入）\n");
+	else
+		vty_out(vty,
+			"%% MIDR: 已恢复通告，但引导候选清单为空、未发起加入——请先配 `midr bootstrap <IP> remote-as <ASN>`\n");
 	return CMD_SUCCESS;
 }
 
@@ -1307,10 +1318,9 @@ static const char *midr_join_phase_str(enum midr_join_phase phase)
  *
  * 为什么单开一条命令、而不是从 `show midr nodes` 里看自己（08-13 立）：节点表里
  * 那条"自身条目"是 origination 的**副产品**——只在 bgp_ls_originate_bgp_node()
- * 成功之后才刷新。引导专职化之后引导不导出本地拓扑（见 midr_nds_bootstrap_
- * stop_distribute），自身条目从此不再更新，于是"我是谁"这件最基本的事反而在
- * 表里查不到。本命令直接读运行态实例（bgp->midr_nds_info），与"发不发得出去"
- * 彻底解耦：不管通告链路是通是断、是不是引导，都能答得出。
+ * 成功之后才刷新，通告发不出去时（没配 distribute / 退网中 / LS 会话全断）它就
+ * 不再更新，"我是谁"这件最基本的事反而在表里查不到。本命令直接读运行态实例
+ * （bgp->midr_nds_info），与"发不发得出去"彻底解耦。
  */
 DEFUN(show_midr_self,
       show_midr_self_cmd,
@@ -1349,17 +1359,117 @@ DEFUN(show_midr_self,
 	vty_out(vty, "Shutdown          : %s\n", mi->shutdown ? "yes" : "no");
 
 	/*
-	 * BGP-LS 本地拓扑导出开关。放在这里是因为它直接决定"本机发不发得出去
-	 * Node/Link/Prefix NLRI"——引导上它由 MIDR 自动关闭，排查"别人为什么看不到
-	 * 我"时第一眼就该看它。
+	 * BGP-LS 本地拓扑导出开关：直接决定"本机发不发得出去 Node/Link/Prefix
+	 * NLRI"，排查"别人为什么看不到我"时第一眼就该看它。引导也一样要开
+	 * （08-21 起引导照发自身 NLRI，群号恒 0）。
 	 */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
 		vty_out(vty, "BGP-LS distribute : enabled（本机 NLRI 正常通告）\n");
-	else if (mi->local_capabilities & MIDR_CAP_BOOTSTRAP)
-		vty_out(vty, "BGP-LS distribute : disabled（引导专职化：本机不通告自身，转发他人不受影响）\n");
 	else
-		vty_out(vty, "BGP-LS distribute : disabled（⚠ 本机不是引导却未开启，MIDR 身份无法通告——检查 distribute bgp-fabric-link-state）\n");
+		vty_out(vty, "BGP-LS distribute : disabled（⚠ 未开启，MIDR 身份无法通告——检查 distribute bgp-fabric-link-state）\n");
 
+	return CMD_SUCCESS;
+}
+
+/*
+ * 「第二组视角看到的我们」—— 手动触发一次 snapshot_get 并把返回的数组打出来。
+ *
+ * 为什么要有它：snapshot_get 平时只有第二组会调（resync 时），我方看不见返回
+ * 值；本命令给那个方向开个窗口，与 `show midr nodes` 肉眼对账。打印的是**单
+ * 节点**信息 —— 本机 1 个 Node + 本机全部出向 Link，不是组内也不是全网（全网
+ * 视图走反方向的 remote view 接口，第二组实现）。
+ *
+ * ⚠ 临时调试件，轮 5 收尾时评估删留（记档不做清单）。
+ */
+DEFUN(show_midr_group2_snapshot,
+      show_midr_group2_snapshot_cmd,
+      "show midr group2-snapshot",
+      SHOW_STR
+      "MIDR information\n"
+      "Dump the topology snapshot as the second group would receive it\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct midr_topology_snapshot snapshot = {};
+	struct midr_context *ctx;
+	struct bgp_midr_nds *mi;
+	char caps_buf[64];
+	unsigned int table_links = 0;
+	size_t i;
+	int ret;
+
+	if (!bgp || !bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	mi = bgp->midr_nds_info;
+	if (mi->facts && mi->facts->links)
+		table_links = mi->facts->links->count;
+
+	ctx = midr_nds_group2_ctx(bgp);
+	ret = midr_topology_snapshot_get(ctx, &snapshot);
+	if (ret) {
+		vty_out(vty, "snapshot_get() = %d", ret);
+		if (ret == -EAGAIN)
+			vty_out(vty,
+				" (-EAGAIN：事实表或本机身份尚未就绪，或对象自检失败——查 warn 日志。第二组会保留旧基线并稍后重试)\n");
+		else if (ret == -ENOSYS)
+			vty_out(vty, " (-ENOSYS：provider 不可用)\n");
+		else
+			vty_out(vty, "\n");
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "snapshot_get() = 0（完整权威全量：未列出的对象会被对方视为已失效）\n");
+	vty_out(vty, "snapshot_version : %" PRIu64 "\n",
+		snapshot.snapshot_version);
+	vty_out(vty, "node_count       : %zu\n", snapshot.node_count);
+	/* 表内条目数 vs 入选数：差值就是被闸门排除的（未报过 / 墓碑 / 热身未完 /
+	 * 会话已断 / 保底边），对账时一眼看出"为什么少了"。 */
+	vty_out(vty, "link_count       : %zu（事实表内 %u 条，差值 = 被上报闸门排除）\n",
+		snapshot.link_count, table_links);
+
+	if (!snapshot.node_count && !snapshot.link_count)
+		vty_out(vty, "\n(空快照%s)\n",
+			midr_nds_is_bootstrap(bgp)
+				? "：本机是引导节点，只转发不自产"
+				: mi->shutdown ? "：本机已优雅下线" : "");
+
+	for (i = 0; i < snapshot.node_count; i++) {
+		const struct midr_node_update *n = &snapshot.nodes[i];
+
+		vty_out(vty, "\nNode:\n");
+		vty_out(vty, "  node_id      : %pI4\n",
+			(struct in_addr *)&n->node_id);
+		vty_out(vty, "  group_id     : %u\n", n->group_id);
+		vty_out(vty, "  cap_flags    : 0x%" PRIx64 " (%s)\n", n->cap_flags,
+			midr_caps_str((uint32_t)n->cap_flags, caps_buf,
+				      sizeof(caps_buf)));
+		if (n->has_transport_address)
+			vty_out(vty, "  transport    : %pI4\n",
+				&n->transport_address.ipaddr_v4);
+		else
+			vty_out(vty, "  transport    : -\n");
+		vty_out(vty, "  version      : %" PRIu64 "\n", n->version);
+	}
+
+	if (snapshot.link_count)
+		vty_out(vty, "\nLinks (本机出向):\n");
+	for (i = 0; i < snapshot.link_count; i++) {
+		const struct midr_link_update *l = &snapshot.links[i];
+
+		vty_out(vty, "  -> %pI4  link_id=%" PRIu64 "\n",
+			(struct in_addr *)&l->key.remote_node_id, l->key.link_id);
+		vty_out(vty, "     rtt=%uus loss=%uppm bw=%ukbps seqno=%" PRIu64
+			     " version=%" PRIu64 "\n",
+			l->metrics.rtt_us, l->metrics.loss_ppm,
+			l->metrics.available_bandwidth_kbps,
+			l->metrics.measurement_seqno, l->version);
+		vty_out(vty, "     addr %pI4 -> %pI4\n",
+			&l->link_local_address.ipaddr_v4,
+			&l->link_remote_address.ipaddr_v4);
+	}
+
+	midr_topology_snapshot_release(ctx, &snapshot);
 	return CMD_SUCCESS;
 }
 
@@ -1698,4 +1808,6 @@ void bgp_midr_nds_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_bootstrap_seeds_cmd);
 	install_element(VIEW_NODE, &show_midr_neighbors_cmd);
 	install_element(VIEW_NODE, &show_midr_join_cmd);
+	/* 临时调试件（对接轮 3）：第二组视角的 snapshot 窗口，轮 5 评估删留。 */
+	install_element(VIEW_NODE, &show_midr_group2_snapshot_cmd);
 }

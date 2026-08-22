@@ -132,19 +132,21 @@ static bool cl_metrics_is_better(const struct midr_nds_link_metrics *cand,
 }
 
 /*
- * 遍历 gv->nodes，找出其中最大的 group_id，用于 CREATE 分配新群编号。
+ * 遍历节点表，找出其中最大的 group_id，用于 CREATE 分配新群编号。
  * 若节点表为空，返回 0（CREATE 新群 ID 将为 1）。
  */
 static uint32_t cl_max_group_id(const struct midr_global_view *gv)
 {
+	struct list *nodes = midr_nds_cl_nodes_getter(gv);
 	struct midr_node_entry *entry;
+	struct listnode *n;
 	uint32_t max_id = 0;
 
-	frr_each (midr_node_hash, (struct midr_node_hash_head *)&gv->nodes,
-		  entry) {
+	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry))
 		if (entry->group_id > max_id)
 			max_id = entry->group_id;
-	}
+
+	list_delete(&nodes);
 	return max_id;
 }
 
@@ -289,14 +291,15 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 					 double *out_worst_loss,
 					 size_t *out_total)
 {
+	struct list *nodes = midr_nds_cl_nodes_getter(gv);
 	struct midr_node_entry *entry;
+	struct listnode *n;
 	size_t good = 0;
 	size_t total = 0;
 	uint32_t worst_rtt = 0;
 	double worst_loss = 0.0;
 
-	frr_each (midr_node_hash, (struct midr_node_hash_head *)&gv->nodes,
-		  entry) {
+	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry)) {
 		struct midr_link_entry *link;
 
 		if (!entry->is_adjacent || entry->is_self)
@@ -322,6 +325,8 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 			 link ? link->long_term.rtt_us : 0,
 			 link ? link->long_term.loss_rate : 0.0);
 	}
+
+	list_delete(&nodes);
 
 	if (out_worst_rtt_us)
 		*out_worst_rtt_us = worst_rtt;
@@ -419,15 +424,18 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 					uint32_t target_group_id,
 					struct list *out)
 {
+	struct list *nodes;
 	struct midr_node_entry *entry;
 	struct midr_node_entry *top1 = NULL, *top2 = NULL;
 	struct midr_nds_link_metrics top1_m = {}, top2_m = {};
+	struct listnode *n;
 
 	if (target_group_id == 0)
 		return;
 
-	frr_each (midr_node_hash, (struct midr_node_hash_head *)&gv->nodes,
-		  entry) {
+	nodes = midr_nds_cl_nodes_getter(gv);
+
+	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry)) {
 		struct midr_link_entry *link;
 
 		if (entry->is_self || entry->group_id != target_group_id)
@@ -453,6 +461,8 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 			top2_m = link->long_term;
 		}
 	}
+
+	list_delete(&nodes);
 
 	if (top1) {
 		struct midr_node_evidence *ev =

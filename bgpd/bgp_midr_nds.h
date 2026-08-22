@@ -658,6 +658,17 @@ extern void midr_nds_learn_anchor_candidate(struct bgp *bgp,
 					    struct in_addr transport,
 					    uint32_t group_id);
 
+/* 把一个同群对端纳入本群邻居：查建条目 + 标 is_adjacent + I-1 起探。删探测 A 后
+ * "老成员认识新成员"的唯一入口；详见定义处。 */
+extern void midr_nds_adopt_group_peer(struct bgp *bgp, struct in_addr rid,
+				      as_t asn, struct in_addr transport,
+				      uint32_t group_id);
+
+/* 反面：一条边没了之后按 transport 反查节点表做完整清理（停探 + 撤链路上报 +
+ * 清 link_entry + 清 is_adjacent，不拆会话）。死心与拆边两处共用。 */
+extern void midr_nds_cleanup_by_transport(struct bgp *bgp,
+					  struct in_addr transport);
+
 /*
  * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时，为请求方灌入一条最小 global_view
  * 条目（仅 transport_addr，用于 PM 的 pm_is_known_transport 来源校验），不置
@@ -677,6 +688,28 @@ extern void midr_node_get_locator(const struct midr_node_entry *e,
 /* Update local capability / group-id and re-originate immediately */
 extern void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps);
 extern void midr_nds_set_group_id(struct bgp *bgp, uint32_t new_gid);
+
+/*
+ * 清锚点评估上下文（备选群号 + 60s 热身定时器）。挂在**异常路径**收尾：退网、
+ * 手动改组、重开 join round、中止 join。
+ * ⚠ 绝不能挂 midr_group_reconverge——I-7 JOIN 正常入网也走它，那时锚点评估
+ * 合法在途，清了等于群间锚点边永远建不起来。详见函数定义处注释。
+ */
+extern void midr_nds_anchor_ctx_clear(struct bgp *bgp);
+
+/*
+ * 退网 / 重入（决策 midr-shutdown-semantics）。`[no] midr shutdown` 的全部动作，
+ * vty 层只负责回显。
+ *
+ * enter：置 shutdown 位 → 撤自身通告 → 凭台账拆光自建会话（含 MANUAL，运维意志）
+ *        → 全量停探 → 清节点表（除 self）→ 群号回落配置值 + 清群代表位 / join /
+ *        锚点残留。bgpd 与 underlay 一动不动。
+ *        返回**被拆掉的 MANUAL 会话条数**，供 vty 提醒运维重入后重敲。
+ * exit ：清位 → 重新通告 → 走与新节点相同的 join。
+ *        返回是否真的发起了加入（候选清单为空时只 warn 并返回 false）。
+ */
+extern unsigned int midr_nds_shutdown_enter(struct bgp *bgp);
+extern bool midr_nds_shutdown_exit(struct bgp *bgp);
 
 /*
  * Single entry point for advertising/withdrawing our own Node NLRI to the
@@ -725,6 +758,11 @@ extern void midr_nds_on_link_update(struct bgp *bgp,
 /* I-3: NDS -> CL, hand the global view to the clustering module */
 extern void midr_nds_notify_cl(struct bgp *bgp,
 			       enum midr_trigger_type trigger);
+
+/* CL 读节点表的唯一入口：返回滤掉群号 0（引导 / 尚未入群）后的节点清单。
+ * 恒非 NULL；元素是节点表条目的借用指针，用完 list_delete() 只释放链表本身。 */
+extern struct list *
+midr_nds_cl_nodes_getter(const struct midr_global_view *gv);
 
 /* Find the Established BGP peer whose router-id matches node_id; NULL if none.
  * Shared by E-1 (Link NLRI origination) and the periodic PM probe. */
@@ -848,6 +886,33 @@ midr_nds_attach_mark_failed(struct bgp *bgp, struct in_addr transport);
  * 实例结构体内部；MIDR 内部自己判位即可，不必绕这个函数。
  */
 extern bool midr_nds_is_bootstrap(struct bgp *bgp);
+
+/*
+ * 这条链路是不是「保底边」——即对端是引导节点（骨干互连 / 挂靠 / 手配指向引导）。
+ *
+ * 用途：轮 2 起 link 上报出口据此跳过保底边（执行总纲"对接第二组携带项"的硬
+ * 要求，已向第二组预告）。他们发送端无闸，我方若把保底链路 upsert 出去，会全网
+ * 泛洪一批各节点 lsdb 最终判 unusable 的无效 NLRI。
+ *
+ * 判据三选一命中即真，**顺序即可靠性**：
+ *   ① 引导候选池按 rid 命中 —— 不依赖 NLRI 传播时机（引导刚起、链路没通时节点表
+ *      里还没有它），也正好补上台账认不出的 MANUAL 盲区（台账只记"运维手配"、
+ *      不记对端身份）；
+ *   ② 会话台账 reason ∈ {BACKBONE, ATTACH} —— 自动建的保底边一律有账，按条目
+ *      里的 remote_rid 认人（不用 transport 反查，省一次节点表查询）；
+ *   ③ 节点表条目带 BOOTSTRAP 位 —— 08-21 起引导照发 Node NLRI，本条实际可命中
+ *      （在此之前引导进不了节点表，这条恒假）。
+ */
+extern bool midr_nds_link_is_backbone(struct bgp *bgp,
+				      const struct prefix *remote_node_id);
+
+/*
+ * shim 专用（轮 4 随 bgp_midr_group2_shim.c 一并删除）：按对端 router-id 反查
+ * link_entry 并调 E-1 发 Link NLRI。存在的理由 = E-1 与 global_view 查找都是
+ * bgp_midr_nds.c 的 static，而 shim 手上只有 uint32 形式的 rid。
+ */
+extern void midr_nds_e1_write_by_rid(struct bgp *bgp, uint32_t remote_rid,
+				     uint64_t seqno);
 
 /*
  * 把"引导节点该有的样子"坐实（幂等；非引导直接返回）：清群代表位、清群号、

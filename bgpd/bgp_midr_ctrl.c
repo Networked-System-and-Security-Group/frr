@@ -466,6 +466,10 @@ static void midr_ctrl_drop_half_peer(struct bgp *bgp, struct in_addr transport,
 	}
 
 	midr_nds_ledger_drop(bgp, transport);
+
+	/* 账销了、会话拆了，节点表那边也得跟着收拾：停探 + 撤链路上报 + 清
+	 * link_entry + 清 is_adjacent，否则 CL 还当它是条好边、PM 还对着它探。 */
+	midr_nds_cleanup_by_transport(bgp, transport);
 }
 
 /*
@@ -843,8 +847,8 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
  *
  * 内容 = **手配名单 ∩ 自己骨干会话活性** + **本机自己**：
  *   - 手配名单 = 本机 bootstrap_list（`midr bootstrap` 逐条配的，引导之间互配）。
- *     引导不发 Node NLRI（批 5）、也没人替它泛洪，"天下有哪些引导"从头到尾只有
- *     运维登记这一个来源，不存在自动学来的部分。
+ *     运维登记是主来源；08-21 起引导也发 Node NLRI，学到带 BOOTSTRAP 位的条目会
+ *     以 SEED 身份补进同一个池（midr_maybe_save_bootstrap_seed），本函数一视同仁。
  *   - 活性过滤 = 到该地址的 BGP 会话是否 Established（判活统一走会话状态，子稿
  *     §1 前提二）。运维 `no midr session` 拆掉的骨干边，会话一没就自然掉出名单，
  *     不必另查排除名单（排除只管建连、不管发名单，答疑 69）。
@@ -1144,6 +1148,14 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 	if (msg.version != MIDR_CTRL_MSG_VERSION)
 		return NULL;
 
+	/* 退网守卫（TCP 请求侧，同 UDP 那道的理由）：退网了就不再以引导/代表身份
+	 * 应答任何列表请求。返回 NULL = 沉默不回包，与闸门不过时同款处置。 */
+	if (mi->shutdown) {
+		MIDR_LOG("MIDR 退网：丢弃控制通道 TCP 请求 type=%u（本机已退网）",
+			 msg.type);
+		return NULL;
+	}
+
 	switch (msg.type) {
 	case MIDR_CTRL_REP_LIST_REQ:
 		/* Only a bootstrap node answers (闸门照 MEMBER_LIST 的
@@ -1237,6 +1249,15 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 	if (hdr->version != MIDR_CTRL_MSG_VERSION)
 		return;
 
+	/* 退网守卫（TCP 响应侧）：退网时 join 状态已清空，迟到的 REP/MEMBER_LIST_RESP
+	 * 不该再灌视图、更不该推进一个已经不存在的 join（join_intent 那道守卫只拦
+	 * REP_LIST_RESP 那一路，这里一并堵死）。 */
+	if (bgp->midr_nds_info && bgp->midr_nds_info->shutdown) {
+		MIDR_LOG("MIDR 退网：丢弃控制通道 TCP 响应 type=%u（本机已退网）",
+			 hdr->type);
+		return;
+	}
+
 	switch (hdr->type) {
 	case MIDR_CTRL_REP_LIST_RESP:
 		if (req_type != MIDR_CTRL_REP_LIST_REQ) {
@@ -1292,11 +1313,32 @@ static void midr_ctrl_udp_recv(struct event *t)
 	if (buf[0] != MIDR_CTRL_MSG_VERSION)
 		return;
 
+	/*
+	 * 退网守卫之三（控制通道入站）。**必须放在 recvfrom 之后**：提前 return
+	 * 数据报还赖在缓冲区里，读事件会立刻再触发，转成忙等。
+	 *
+	 * 为什么需要这一道（实测挖出，2026-08-21 骨干台子）：退网本体把会话拆净、
+	 * 节点表清空之后，对端的 PEER_REQUEST 一到，本机照旧"应邀回配"，当场把会话
+	 * 又建了回来——日志实录：退网收尾行的**下一行**就是 `PEER_REQUEST … peering
+	 * back` + 台账重新登记。只堵 BGP-LS 收包与 I-3 递交两条路是不够的，5859
+	 * 控制通道是第三条独立入站路径。
+	 *
+	 * 一律丢弃、不分类型：退网 = 不再参与 MIDR。回配建连（PEER_REQUEST /
+	 * ATTACH_REQUEST）是参与；以引导/代表身份应答目录（REP/MEMBER/BOOTSTRAP_LIST
+	 * _REQ）也是参与；迟到的 *_RESP 更不该推进一个已经不存在的 join。
+	 */
+	if (mi->shutdown) {
+		MIDR_LOG("MIDR 退网：丢弃控制通道 UDP 消息 type=%u（本机已退网）",
+			 buf[1]);
+		return;
+	}
+
 	switch (buf[1]) {
 	case MIDR_CTRL_PEER_REQUEST:
 	case MIDR_CTRL_ATTACH_REQUEST: {
 		uint32_t target_group;
 		struct midr_node_entry req = {};
+		enum midr_session_reason reason;
 		/*
 		 * 批 5 前置①：挂靠走专用类型，两类共用本分支——帧结构与回配动作
 		 * 完全一致，**唯一差别是挂靠跳过引导负面守卫**（见下面 ③′）。
@@ -1423,11 +1465,18 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * "同群"（本机是引导时 local_group_id 恒 0，不加这条会把每一条挂靠
 		 * 边都记成 SAME_GROUP）。
 		 */
-		midr_ctrl_connect(bgp, &req,
-				  (target_group != 0 &&
-				   target_group == mi->local_group_id)
-					  ? MIDR_SESSION_SAME_GROUP
-					  : MIDR_SESSION_PEER_REQ_REPLY);
+		reason = (target_group != 0 &&
+			  target_group == mi->local_group_id)
+				 ? MIDR_SESSION_SAME_GROUP
+				 : MIDR_SESSION_PEER_REQ_REPLY;
+
+		/* send_nudge=false：我是被请求方，再发一次 PEER_REQUEST 就是回声。 */
+		midr_ctrl_connect(bgp, &req, reason, false);
+
+		/* SAME_GROUP 时 connect 内已把对端纳入本群邻居（置位 + 起探），
+		 * 视图变了要告知 CL；本路一次一个节点，就地发一条。 */
+		if (reason == MIDR_SESSION_SAME_GROUP)
+			midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
 		break;
 	}
 	case MIDR_CTRL_PEER_REJECT: {
@@ -1653,8 +1702,9 @@ bool midr_nds_peer_is_overlay(struct peer *peer)
 }
 
 void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
-		       enum midr_session_reason reason)
+		       enum midr_session_reason reason, bool send_nudge)
 {
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	union sockunion su;
 	struct prefix locator;
 	struct peer *peer;
@@ -1671,6 +1721,22 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	/* Peer with the node's real reachable address (TLV 1188), not its
 	 * router-id; router-id is only an identity and may be unroutable. */
 	midr_node_get_locator(entry, &locator);
+
+	/*
+	 * 自连闸：谁也不许跟本机建会话（判据 = rid 撞本机 router-id 或目标撞本机
+	 * transport）。四条路里只有 connect_group 天然挡得住（过 should_peer）；
+	 * 回配的 rid 是对端帧自报的，挂靠候选池只拒 rid=0 不拒本机
+	 * （`midr bootstrap <本机地址>` 即可造出）。不拦则发给本机 5859 的请求被
+	 * 自己收下、再走回配，自己给自己记账、自己探自己。
+	 */
+	if ((entry->node_id.family == AF_INET &&
+	     IPV4_ADDR_SAME(&entry->node_id.u.prefix4, &bgp->router_id)) ||
+	    (mi && mi->transport_addr_set && locator.family == AF_INET &&
+	     IPV4_ADDR_SAME(&locator.u.prefix4, &mi->local_transport_addr))) {
+		zlog_warn("MIDR ctrl: 拒绝与本机自身建会话（%pFX）——请检查 bootstrap / session 配置是否把本机填成了对端",
+			  &entry->node_id);
+		return;
+	}
 
 	/*
 	 * 运维 `no midr session` 持久排除的节点，任何自动路径（发现建邻居、
@@ -1706,6 +1772,31 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 				     entry->group_id);
 
 	/*
+	 * SAME_GROUP 状态动作：这条边因同群而建，就在此把对端纳入本群邻居——回配与
+	 * connect_group 共用（三件套原先手写在后者）。
+	 * ⚠ 必须在两道去重之前：地址上已有会话时同样要置位起探，否则老成员拿不到
+	 * link_entry，periodic_sync 会误判 LEAVE 散群。
+	 * notify CL 由调用方按"一批边建完"的粒度发。
+	 */
+	if (reason == MIDR_SESSION_SAME_GROUP) {
+		struct in_addr transport = { .s_addr = INADDR_ANY };
+
+		if (entry->has_transport_addr)
+			transport = entry->transport_addr;
+		midr_nds_adopt_group_peer(bgp, remote_rid, asn, transport,
+					  entry->group_id);
+		midr_mark_topology(bgp, entry);
+	}
+
+	/*
+	 * 反向建连 nudge：请对端也建一条回来。由函数末尾提到去重之前——去重 return
+	 * 掉的情况（本端已有会话）对端未必也有。原先靠去重顺手吞掉 nudge 来终止
+	 * A↔B 回声，现改为显式刹车（回配传 false）。
+	 */
+	if (send_nudge)
+		midr_ctrl_send_peer_request(bgp, entry, reason);
+
+	/*
 	 * S5 第一道去重（⑦）：transport 地址上已有会话。地址被占 = 无法另建（BGP
 	 * 一地址一会话），只能复用或告警——终止 A<->B notify 握手也靠这条 return
 	 * （收到回响 PEER_REQUEST 的一端在此发现已建的 peer 便停发）。按归属分类：
@@ -1724,7 +1815,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 				MIDR_LOG("MIDR ctrl: %pFX transport 地址由已激活 LS 的运维会话占用，借用其为 LS 通道",
 					 &entry->node_id);
 			} else {
-				zlog_warn("MIDR ctrl: %pFX 的 transport 地址被一条未激活 link-state 的运维会话占用，LS 邻接不可用；请在原生配置为该邻居激活 link-state",
+				zlog_warn("MIDR ctrl: %pFX 的 transport 地址上有一条运维会话，MIDR 不整形运维配置、这条边建不起来；请检查该静态邻居是否误用了 transport（loopback）地址——静态会话只应配链路地址",
 					  &entry->node_id);
 			}
 			return;
@@ -1732,27 +1823,10 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	}
 
 	/*
-	 * S5 第二道去重（⑦）：按对端 router-id 找一条现成 Established 会话——典型是
-	 * 直连节点的静态链路会话（键 = 链路地址，第一道按 transport 查不到它）。
-	 * 收紧：必须【已激活 BGP-LS】才算"已可达、可复用"；只 Established 不够——
-	 * 未激活 LS 的会话传不了拓扑、邻接实为坏（原注释"已激活 BGP-LS"是没查证的
-	 * 假设）。此时 transport 地址空闲（第一道已放行），照常另建自己的多跳会话。
-	 * 只在调用点加 LS 判定、不动 midr_node_established_peer 本身——PM 探测闸门
-	 * 与 E-1 origination 还在用它，对"会话"的语义要求不同（Established 即可）。
+	 * 〔发现链专题删去原 S5 第二道去重（按 router-id 复用现成 LS 会话）：它的
+	 * 前提是静态会话可能载 LS，真分离基线上该判据永不成立。约定见
+	 * containerlab/部署手册.md。〕
 	 */
-	{
-		struct peer *reachable =
-			midr_node_established_peer(bgp, &entry->node_id);
-
-		if (reachable && reachable->afc[AFI_BGP_LS][SAFI_BGP_LS]) {
-			MIDR_LOG("MIDR ctrl: %pFX already reachable via existing LS session (router-id match) — skip duplicate transport peering",
-				 &entry->node_id);
-			return;
-		}
-		if (reachable)
-			MIDR_LOG("MIDR ctrl: %pFX 有现成会话但未激活 LS，另建 transport overlay 会话以承载拓扑",
-				 &entry->node_id);
-	}
 
 	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
 	if (ret != 0) {
@@ -1769,18 +1843,11 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	peer = peer_lookup(bgp, &su);
 	if (peer)
 		midr_nds_ctrl_setup_overlay_peer(bgp, peer);
-
-	/*
-	 * Bidirectional build-up: ask the target to peer back with us over the
-	 * UDP control channel.  Encapsulated here so every connect attempt
-	 * (join orchestration or an incoming PEER_REQUEST) notifies the far
-	 * end uniformly; the dedup above keeps the handshake from looping.
-	 */
-	midr_ctrl_send_peer_request(bgp, entry, reason);
 }
 
 static void midr_try_disconnect(struct bgp *bgp,
-				const struct midr_node_entry *entry)
+				const struct midr_node_entry *entry,
+				bool force)
 {
 	union sockunion su;
 	struct prefix locator;
@@ -1807,8 +1874,15 @@ static void midr_try_disconnect(struct bgp *bgp,
 	 * 换成第二组的 withdraw 回调后，这道守卫照旧生效。
 	 *
 	 * warn 级、不带 debug 门控：本案的"静默拆边"正是两处日志都 debug 级害的。
+	 *
+	 * force 旁路（退网专题，2026-08-21）：α 防的是**自动侧**越权拆运维的账，
+	 * 而本端 `midr shutdown` 是运维显式敲的命令、与手配同级——退网要把本机的
+	 * MIDR 会话拆净（留一条还在收发 LS 的会话，对上层的影响说不清），故那一条
+	 * 路径传 force=true 走旁路。**除退网外一律传 false**：expire / 对端 withdraw /
+	 * 换组 / 挂靠卸任 / B1 老化都是自动侧，豁免照旧。对端那半边收到的是
+	 * withdraw、走的正是自动路径，所以仍被 α 拦下（只 warn 不拆，判据 1）。
 	 */
-	if (locator.family == AF_INET) {
+	if (locator.family == AF_INET && !force) {
 		const struct midr_session_ledger_entry *led =
 			midr_nds_ledger_lookup(bgp, locator.u.prefix4);
 
@@ -1855,7 +1929,8 @@ static void midr_try_disconnect(struct bgp *bgp,
 
 void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
 {
-	midr_try_disconnect(bgp, entry);
+	/* 自动路径（expire / 对端 withdraw / 换组清理）：α 豁免照旧生效。 */
+	midr_try_disconnect(bgp, entry, false);
 }
 
 /*
@@ -1867,9 +1942,12 @@ void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
  * try_disconnect：MANUAL 豁免（α）、销账、⑦ 归属守卫，一个都不绕过。
  *
  * rid 用于日志可读（"拆的是谁"）；给 0 也能工作（locator 由 transport 决定）。
+ *
+ * force 见 midr_try_disconnect 内的 α 说明：只有本端退网（运维显式命令）传 true，
+ * 自动路径一律 false。
  */
 void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
-				struct in_addr rid)
+				struct in_addr rid, bool force)
 {
 	struct midr_node_entry e = {};
 
@@ -1882,7 +1960,12 @@ void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
 	e.transport_addr = transport;
 	e.has_transport_addr = true;
 
-	midr_try_disconnect(bgp, &e);
+	midr_try_disconnect(bgp, &e, force);
+
+	/* 拆完会话还要收拾节点表那半边（停探 + 撤链路上报 + 清 link_entry +
+	 * 清 is_adjacent）——临时条目碰不到表里的真条目，不补就留下"标着邻居、
+	 * 边却没了"的幻影。对端是引导时反查落空、天然 no-op。 */
+	midr_nds_cleanup_by_transport(bgp, transport);
 }
 
 void midr_mark_topology(struct bgp *bgp, const struct midr_node_entry *entry)
@@ -1918,23 +2001,12 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id,
 		 */
 		if (!midr_discovery_should_peer(bgp, entry))
 			continue;
-		midr_ctrl_connect(bgp, entry, reason);
 		/*
-		 * 标记为邻居——与发现路径 midr_nds_on_node_discovered 一致。少了这句，
-		 * connect_group 建的会话不带 is_adjacent，后续换组/离群时按 is_adjacent
-		 * 判据的拆连（midr_group_reconverge 第 3 步）就找不到它们、造成会话泄漏。
+		 * 三件套（is_adjacent + I-1 + mark_topology）已收编进
+		 * midr_ctrl_connect() 的 SAME_GROUP 分支——回配路要做同样的事。
+		 * ⚠ 故本函数的 reason 必须是 SAME_GROUP，换别的值三件套就不生效。
 		 */
-		entry->is_adjacent = true;
-		/*
-		 * I-1 启动探测——同样与发现路径一致。少了这句，经 connect_group
-		 * 建连的成员（手动换组、I-7 JOIN）永远没有 probe_ctx：PM 每 10s 的
-		 * 兜底扫描只会灌零指标保活，E-1 导出的 TLV 1186 恒为 rtt=0/bw=0，
-		 * CL 后续拿这些假零做稳态判断即失真。JOIN 路径因成员表阶段已 add
-		 * 过而侥幸不显，手动换组则必现（07-21 十节点实验实证）。
-		 */
-		midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_GOSSIP,
-				   entry->capabilities);
-		midr_mark_topology(bgp, entry);
+		midr_ctrl_connect(bgp, entry, reason, true);
 		count++;
 	}
 
