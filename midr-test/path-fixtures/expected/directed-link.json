@@ -16,7 +16,6 @@
       "remote_group_id": 100,
       "link_id": 7,
       "cost": 15,
-      "available_bandwidth_kbps": 50000,
       "policy_tags": 0,
       "local_address": "10.0.12.2",
       "remote_address": "10.0.12.1",

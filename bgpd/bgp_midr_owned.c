@@ -22,7 +22,7 @@
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
 
-#define MIDR_LINK_ADVERTISEMENT_INTERVAL_MSEC 1000U
+#define MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MSEC 300000U
 #define MIDR_SEQUENCE_RETRY_MSEC 1000U
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_OWNED_STORE, "MIDR owned object store");
@@ -41,9 +41,8 @@ struct midr_owned_entry {
 	struct midr_ls_object_key key;
 	struct midr_ls_object advertised;
 	struct midr_link_update latest_link;
-	uint32_t advertised_cost;
 	ifindex_t local_ifindex;
-	time_t last_advertised;
+	struct timeval last_advertised;
 	struct event *timer;
 	uint32_t domain;
 	bool advertised_present;
@@ -150,7 +149,6 @@ static void midr_owned_path_withdraw(struct midr_owned_store *store,
 				     &entry->key);
 	entry->advertised_present = false;
 	memset(&entry->advertised, 0, sizeof(entry->advertised));
-	entry->advertised_cost = 0;
 }
 
 static void midr_owned_entry_free(void *arg)
@@ -247,8 +245,7 @@ static bool midr_owned_object_payload_same(const struct midr_ls_object *a,
 
 static int midr_owned_publish(struct midr_owned_store *store,
 			      struct midr_owned_entry *entry,
-			      struct midr_ls_object *object,
-			      uint32_t canonical_cost)
+			      struct midr_ls_object *object)
 {
 	struct midr_propagation_path path = {};
 	uint64_t sequence;
@@ -274,22 +271,9 @@ static int midr_owned_publish(struct midr_owned_store *store,
 
 	entry->advertised = *object;
 	entry->advertised_present = true;
-	entry->advertised_cost = canonical_cost;
-	entry->last_advertised = monotime(NULL);
+	monotime(&entry->last_advertised);
 	entry->suppressed = false;
 	return 0;
-}
-
-static struct midr_ls_metrics
-midr_owned_metrics(const struct midr_link_metrics *metrics)
-{
-	return (struct midr_ls_metrics){
-		.present_flags = MIDR_METRIC_REQUIRED_MASK,
-		.rtt_us = metrics->rtt_us,
-		.loss_ppm = metrics->loss_ppm,
-		.available_bandwidth_kbps =
-			metrics->available_bandwidth_kbps,
-	};
 }
 
 static struct midr_ls_object
@@ -314,7 +298,8 @@ midr_owned_membership_object(const struct midr_node_update *node)
 }
 
 static struct midr_ls_object
-midr_owned_link_object(const struct midr_link_update *link)
+midr_owned_link_object(const struct midr_link_update *link,
+		       uint32_t canonical_cost)
 {
 	return (struct midr_ls_object){
 		.key =
@@ -336,7 +321,7 @@ midr_owned_link_object(const struct midr_link_update *link)
 					link->link_local_address,
 				.link_remote_address =
 					link->link_remote_address,
-				.metrics = midr_owned_metrics(&link->metrics),
+				.canonical_cost = canonical_cost,
 			},
 	};
 }
@@ -356,7 +341,7 @@ static int midr_owned_node_fact(const struct midr_node_update *node,
 		return 0;
 	}
 
-	return midr_owned_publish(store, entry, &object, 0);
+	return midr_owned_publish(store, entry, &object);
 }
 
 static bool midr_owned_link_non_measurement_changed(
@@ -376,17 +361,23 @@ static bool midr_owned_link_non_measurement_changed(
 static int midr_owned_publish_link(struct midr_owned_store *store,
 				   struct midr_owned_entry *entry)
 {
-	struct midr_ls_metrics metrics;
 	struct midr_ls_object object;
 	uint32_t cost;
 	int ret;
 
-	metrics = midr_owned_metrics(&entry->latest_link.metrics);
-	ret = midr_cost_from_metrics(&metrics, &cost);
+	ret = midr_cost_from_metrics(&entry->latest_link.metrics, &cost);
 	if (ret)
 		return ret;
-	object = midr_owned_link_object(&entry->latest_link);
-	ret = midr_owned_publish(store, entry, &object, cost);
+	object = midr_owned_link_object(&entry->latest_link, cost);
+	if (entry->advertised_present &&
+	    !midr_cost_change_significant(
+		    entry->advertised.payload.link.canonical_cost, cost)) {
+		entry->suppressed =
+			!midr_owned_object_payload_same(&entry->advertised,
+						       &object);
+		return 0;
+	}
+	ret = midr_owned_publish(store, entry, &object);
 	if (!ret)
 		entry->suppressed = false;
 	return ret;
@@ -406,12 +397,17 @@ static void midr_owned_link_timer_cb(struct event *event)
 static int midr_owned_link_fact(const struct midr_link_update *link, void *arg)
 {
 	struct midr_owned_store *store = arg;
-	struct midr_ls_object object = midr_owned_link_object(link);
+	struct midr_ls_object object;
 	struct midr_owned_entry *entry;
 	uint32_t cost;
-	time_t now;
+	int64_t elapsed_usec;
+	uint32_t remaining_msec;
 	int ret;
 
+	ret = midr_cost_from_metrics(&link->metrics, &cost);
+	if (ret)
+		return ret;
+	object = midr_owned_link_object(link, cost);
 	entry = midr_owned_entry_get(store, &object.key);
 	entry->seen = true;
 	entry->local_ifindex = link->local_ifindex;
@@ -422,32 +418,39 @@ static int midr_owned_link_fact(const struct midr_link_update *link, void *arg)
 		return 0;
 	}
 
-	ret = midr_cost_from_metrics(&object.payload.link.metrics, &cost);
-	if (ret)
-		return ret;
 	if (!entry->advertised_present ||
 	    midr_owned_link_non_measurement_changed(entry, link)) {
 		event_cancel(&entry->timer);
-		return midr_owned_publish(store, entry, &object, cost);
+		return midr_owned_publish(store, entry, &object);
 	}
-	if (!midr_cost_should_advertise(entry->advertised_cost, cost, false,
-					false)) {
-		entry->suppressed =
-			!midr_owned_object_payload_same(&entry->advertised,
-						       &object);
+	if (midr_owned_object_payload_same(&entry->advertised, &object)) {
+		event_cancel(&entry->timer);
+		entry->suppressed = false;
+		return 0;
+	}
+	if (!midr_cost_change_significant(
+		    entry->advertised.payload.link.canonical_cost, cost)) {
+		event_cancel(&entry->timer);
+		entry->suppressed = true;
 		return 0;
 	}
 
-	now = monotime(NULL);
-	if (now - entry->last_advertised >= 1) {
+	elapsed_usec = monotime_since(&entry->last_advertised, NULL);
+	if (elapsed_usec < 0)
+		elapsed_usec = 0;
+	if (elapsed_usec >=
+	    (int64_t)MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MSEC *
+		    1000) {
 		event_cancel(&entry->timer);
-		return midr_owned_publish(store, entry, &object, cost);
+		return midr_owned_publish(store, entry, &object);
 	}
 	entry->suppressed = true;
+	remaining_msec =
+		MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MSEC -
+		(uint32_t)(elapsed_usec / 1000);
 	if (!entry->timer && bm && bm->master)
 		event_add_timer_msec(bm->master, midr_owned_link_timer_cb, entry,
-				     MIDR_LINK_ADVERTISEMENT_INTERVAL_MSEC,
-				     &entry->timer);
+				     remaining_msec, &entry->timer);
 	return 0;
 }
 
@@ -500,7 +503,7 @@ static int midr_owned_node_prefix(const struct prefix *prefix, void *arg)
 	apply_mask(&object.key.u.node_prefix.prefix);
 	entry = midr_owned_entry_get(store, &object.key);
 	entry->seen = true;
-	return midr_owned_publish(store, entry, &object, 0);
+	return midr_owned_publish(store, entry, &object);
 }
 
 static int midr_owned_group_prefix(const struct midr_lsdb_group_prefix_candidate *candidate,
@@ -528,7 +531,7 @@ static int midr_owned_group_prefix(const struct midr_lsdb_group_prefix_candidate
 		return 0;
 	entry = midr_owned_entry_get(store, &object.key);
 	entry->seen = true;
-	return midr_owned_publish(store, entry, &object, 0);
+	return midr_owned_publish(store, entry, &object);
 }
 
 static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t domains)

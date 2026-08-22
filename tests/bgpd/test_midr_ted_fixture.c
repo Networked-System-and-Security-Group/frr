@@ -60,8 +60,6 @@ static struct json_object *snapshot_link_json(const struct midr_ted_link *link)
 			       json_object_new_uint64(link->remote_group_id));
 	json_object_object_add(object, "link_id", json_object_new_uint64(link->link_id));
 	json_object_object_add(object, "cost", json_object_new_uint64(link->canonical_cost));
-	json_object_object_add(object, "available_bandwidth_kbps",
-			       json_object_new_uint64(link->available_bandwidth_kbps));
 	json_object_object_add(object, "policy_tags", json_object_new_uint64(link->policy_tags));
 	json_object_object_add(object, "local_address",
 			       json_object_new_string(ipaddr2str(&link->link_local_address,

@@ -14,7 +14,6 @@ links:
     local_address: 10.0.13.1
     remote_address: 10.0.13.3
     cost: 20
-    available_bandwidth_kbps: 90000
     local_ifindex: 13
   - local: 1.1.1.1
     remote: 2.2.2.2
@@ -22,7 +21,6 @@ links:
     local_address: 10.0.12.1
     remote_address: 10.0.12.2
     cost: 10
-    available_bandwidth_kbps: 100000
     local_ifindex: 12
 
 node_prefixes: []

@@ -81,17 +81,9 @@ static struct midr_ls_object link_object(void)
 			{
 				.link_local_address =
 					ip_address("2001:db8::1"),
-				.link_remote_address =
-					ip_address("2001:db8::2"),
-				.metrics =
-					{
-						.present_flags =
-							MIDR_METRIC_REQUIRED_MASK,
-						.rtt_us = 1000,
-						.loss_ppm = 100,
-						.available_bandwidth_kbps =
-							100000,
-					},
+					.link_remote_address =
+						ip_address("2001:db8::2"),
+					.canonical_cost = 100,
 			},
 	};
 
@@ -192,7 +184,7 @@ static void test_link_validation_and_equality(void)
 	assert(midr_ls_object_same(&object, &copy));
 	assert(object.key.u.link.link_id == 0);
 
-	copy.payload.link.metrics.loss_ppm++;
+	copy.payload.link.canonical_cost++;
 	assert(!midr_ls_object_same(&object, &copy));
 
 	object.key.u.link.remote_node_id = object.key.originator_node_id;
@@ -201,16 +193,10 @@ static void test_link_validation_and_equality(void)
 	object.payload.link.link_remote_address = ip_address("192.0.2.2");
 	assert(midr_ls_object_validate(&object) == -EINVAL);
 	object = link_object();
-	object.payload.link.metrics.present_flags |= 0x8;
+	object.payload.link.canonical_cost = 0;
 	assert(midr_ls_object_validate(&object) == -EINVAL);
 	object = link_object();
-	object.payload.link.metrics.rtt_us = 0;
-	assert(midr_ls_object_validate(&object) == -EINVAL);
-	object = link_object();
-	object.payload.link.metrics.available_bandwidth_kbps = 0;
-	assert(midr_ls_object_validate(&object) == -EINVAL);
-	object = link_object();
-	object.payload.link.metrics.loss_ppm = 1000000;
+	object.payload.link.canonical_cost = UINT32_MAX;
 	assert(midr_ls_object_validate(&object) == -EINVAL);
 }
 

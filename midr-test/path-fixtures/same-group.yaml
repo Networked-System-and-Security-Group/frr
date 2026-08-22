@@ -13,14 +13,12 @@ links:
     local_address: 10.0.12.2
     remote_address: 10.0.12.1
     cost: 11
-    available_bandwidth_kbps: 90000
   - local: 1.1.1.1
     remote: 2.2.2.2
     link_id: 10
     local_address: 10.0.12.1
     remote_address: 10.0.12.2
     cost: 10
-    available_bandwidth_kbps: 100000
     local_ifindex: 2
 
 node_prefixes:

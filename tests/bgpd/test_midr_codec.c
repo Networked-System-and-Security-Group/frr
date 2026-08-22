@@ -87,19 +87,11 @@ static struct midr_ls_object link_object(void)
 		.policy_tags = 0x2122232425262728ULL,
 		.payload.link =
 			{
-				.link_local_address =
-					ip_address("2001:db8::1"),
-				.link_remote_address =
-					ip_address("2001:db8::2"),
-				.metrics =
-					{
-						.present_flags =
-							MIDR_METRIC_REQUIRED_MASK,
-						.rtt_us = 1000,
-						.loss_ppm = 100,
-						.available_bandwidth_kbps =
-							100000,
-					},
+					.link_local_address =
+						ip_address("2001:db8::1"),
+					.link_remote_address =
+						ip_address("2001:db8::2"),
+					.canonical_cost = 250,
 			},
 	};
 }
@@ -400,7 +392,7 @@ static void test_attribute_errors(void)
 	stream_free(stream);
 }
 
-static void test_attribute_type_and_metric_validation(void)
+static void test_attribute_type_and_cost_validation(void)
 {
 	struct midr_ls_object membership = membership_object(false, 0);
 	struct midr_ls_object link = link_object();
@@ -420,7 +412,10 @@ static void test_attribute_type_and_metric_validation(void)
 	assert(midr_ls_attribute_encode(stream, &link) == MIDR_CODEC_OK);
 	length = stream_get_endp(stream);
 	assert(midr_ls_attribute_decode(stream, length, &attributes) == MIDR_CODEC_OK);
-	attributes.link_metrics.present_flags |= 0x8;
+	attributes.link_canonical_cost = 0;
+	assert(midr_ls_object_from_wire(&link.key, &attributes, &decoded) ==
+	       MIDR_CODEC_MALFORMED_ATTRIBUTE);
+	attributes.link_canonical_cost = UINT32_MAX;
 	assert(midr_ls_object_from_wire(&link.key, &attributes, &decoded) ==
 	       MIDR_CODEC_MALFORMED_ATTRIBUTE);
 	stream_free(stream);
@@ -582,7 +577,7 @@ int main(void)
 	test_membership_attribute_golden();
 	test_attribute_round_trip();
 	test_attribute_errors();
-	test_attribute_type_and_metric_validation();
+	test_attribute_type_and_cost_validation();
 	test_attribute_defensive_errors();
 	test_propagation_path();
 	test_propagation_path_errors_and_limit();

@@ -5372,7 +5372,6 @@ static const struct peer_flag_action peer_af_flag_action_list[] = {
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_SRV6, 0, peer_change_best_path },
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_SRV6_RELAX, 0, peer_change_best_path },
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_MPLS, 0, peer_change_best_path },
-	{ PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE, 0, peer_change_none },
 	{ 0, 0, 0 }
 };
 

@@ -255,7 +255,6 @@ static int mock_parse_links(struct midr_ted_builder *builder, struct json_object
 		"local_address",
 		"remote_address",
 		"cost",
-		"available_bandwidth_kbps",
 		"local_ifindex",
 		"policy_tags",
 	};
@@ -308,10 +307,6 @@ static int mock_parse_links(struct midr_ted_builder *builder, struct json_object
 			return mock_error(error, error_size, "%s.remote_address is invalid", where);
 		ret = mock_get_u32(object, "cost", 1, MIDR_TED_LINK_COST_MAX, &link.canonical_cost,
 				   where, error, error_size);
-		if (ret)
-			return ret;
-		ret = mock_get_u32(object, "available_bandwidth_kbps", 1, UINT32_MAX,
-				   &link.available_bandwidth_kbps, where, error, error_size);
 		if (ret)
 			return ret;
 		ret = mock_get_u32(object, "local_ifindex", 0, INT32_MAX, &value32, where, error,

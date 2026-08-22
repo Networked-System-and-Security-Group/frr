@@ -263,7 +263,7 @@ static size_t midr_codec_ls_attribute_length(const struct midr_ls_object *object
 		length +=
 			MIDR_TLV_HEADER_LENGTH +
 			midr_codec_address_value_length(&object->payload.link.link_remote_address);
-		length += MIDR_TLV_HEADER_LENGTH + 16;
+		length += MIDR_TLV_HEADER_LENGTH + 4;
 		break;
 	case MIDR_NLRI_TYPE_NODE_PREFIX:
 	case MIDR_NLRI_TYPE_GROUP_PREFIX:
@@ -309,11 +309,9 @@ enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
 				       &object->payload.link.link_local_address);
 		midr_codec_put_address(stream, MIDR_LS_TLV_LINK_REMOTE_ADDRESS,
 				       &object->payload.link.link_remote_address);
-		midr_codec_put_tlv_header(stream, MIDR_LS_TLV_LINK_METRICS, 16);
-		stream_putl(stream, object->payload.link.metrics.present_flags);
-		stream_putl(stream, object->payload.link.metrics.rtt_us);
-		stream_putl(stream, object->payload.link.metrics.loss_ppm);
-		stream_putl(stream, object->payload.link.metrics.available_bandwidth_kbps);
+		midr_codec_put_tlv_header(
+			stream, MIDR_LS_TLV_LINK_CANONICAL_COST, 4);
+		stream_putl(stream, object->payload.link.canonical_cost);
 		break;
 	case MIDR_NLRI_TYPE_NODE_PREFIX:
 	case MIDR_NLRI_TYPE_GROUP_PREFIX:
@@ -442,16 +440,13 @@ enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t le
 			if (result != MIDR_CODEC_OK)
 				return result;
 			break;
-		case MIDR_LS_TLV_LINK_METRICS:
-			presence = MIDR_LS_ATTR_HAS_LINK_METRICS;
-			if (value_length != 16 ||
+		case MIDR_LS_TLV_LINK_CANONICAL_COST:
+			presence = MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;
+			if (value_length != 4 ||
 			    midr_codec_attribute_is_duplicate(decoded.present, presence))
 				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-			decoded.link_metrics.present_flags = stream_getl_from(stream, value_offset);
-			decoded.link_metrics.rtt_us = stream_getl_from(stream, value_offset + 4);
-			decoded.link_metrics.loss_ppm = stream_getl_from(stream, value_offset + 8);
-			decoded.link_metrics.available_bandwidth_kbps =
-				stream_getl_from(stream, value_offset + 12);
+			decoded.link_canonical_cost =
+				stream_getl_from(stream, value_offset);
 			break;
 		default:
 			return MIDR_CODEC_UNKNOWN_TLV;
@@ -497,9 +492,11 @@ enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key 
 		break;
 	case MIDR_NLRI_TYPE_LINK:
 		required |= MIDR_LS_ATTR_HAS_LINK_LOCAL_ADDRESS |
-			    MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS | MIDR_LS_ATTR_HAS_LINK_METRICS;
+			    MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS |
+			    MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;
 		allowed |= MIDR_LS_ATTR_HAS_LINK_LOCAL_ADDRESS |
-			   MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS | MIDR_LS_ATTR_HAS_LINK_METRICS;
+			   MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS |
+			   MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;
 		break;
 	case MIDR_NLRI_TYPE_NODE_PREFIX:
 	case MIDR_NLRI_TYPE_GROUP_PREFIX:
@@ -528,7 +525,8 @@ enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key 
 	} else if (decoded_key.type == MIDR_NLRI_TYPE_LINK) {
 		decoded.payload.link.link_local_address = attributes->link_local_address;
 		decoded.payload.link.link_remote_address = attributes->link_remote_address;
-		decoded.payload.link.metrics = attributes->link_metrics;
+		decoded.payload.link.canonical_cost =
+			attributes->link_canonical_cost;
 	}
 
 	if (midr_ls_object_validate(&decoded) != 0)

@@ -205,7 +205,6 @@ static bool midr_ted_link_same(const struct midr_ted_link *a, const struct midr_
 	       a->local_group_id == b->local_group_id &&
 	       a->remote_group_id == b->remote_group_id && a->link_id == b->link_id &&
 	       a->canonical_cost == b->canonical_cost &&
-	       a->available_bandwidth_kbps == b->available_bandwidth_kbps &&
 	       a->policy_tags == b->policy_tags &&
 	       ipaddr_cmp(&a->link_local_address, &b->link_local_address) == 0 &&
 	       ipaddr_cmp(&a->link_remote_address, &b->link_remote_address) == 0 &&
@@ -323,7 +322,6 @@ static void midr_ted_link_from_input(struct midr_ted_link *output,
 	output->remote_group_id = remote_group_id;
 	output->link_id = input->link_id;
 	output->canonical_cost = input->canonical_cost;
-	output->available_bandwidth_kbps = input->available_bandwidth_kbps;
 	output->policy_tags = input->policy_tags;
 	output->link_local_address = input->link_local_address;
 	output->link_remote_address = input->link_remote_address;
@@ -731,7 +729,7 @@ int midr_ted_builder_add_link(struct midr_ted_builder *builder,
 
 	if (!builder || !link || !link->local_node_id || !link->remote_node_id ||
 	    link->local_node_id == link->remote_node_id || !link->canonical_cost ||
-	    link->canonical_cost > MIDR_TED_LINK_COST_MAX || !link->available_bandwidth_kbps ||
+	    link->canonical_cost > MIDR_TED_LINK_COST_MAX ||
 	    link->local_ifindex < 0 ||
 	    (link->local_node_id != builder->local_node_id && link->local_ifindex != 0) ||
 	    (link->link_local_address.ipa_type != IPADDR_V4 &&
@@ -754,7 +752,6 @@ int midr_ted_builder_add_link(struct midr_ted_builder *builder,
 	normalized.remote_node_id = link->remote_node_id;
 	normalized.link_id = link->link_id;
 	normalized.canonical_cost = link->canonical_cost;
-	normalized.available_bandwidth_kbps = link->available_bandwidth_kbps;
 	normalized.policy_tags = link->policy_tags;
 	normalized.link_local_address = link->link_local_address;
 	normalized.link_remote_address = link->link_remote_address;

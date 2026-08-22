@@ -242,12 +242,11 @@ configure_prefix()
 		-c "exit"
 	vty "$node" -c "configure terminal" \
 		-c "router bgp 65000" \
-		-c "no bgp network import-check" \
-		-c "midr group-prefix takeover-delay-ms 500" \
-		-c "address-family ipv4 unicast" \
-		-c "midr prefix-export route-map EXPORT-MIDR" \
-		-c "midr prefix-export local-source network" \
-		-c "network $prefix"
+			-c "no bgp network import-check" \
+			-c "midr group-prefix takeover-delay-ms 500" \
+			-c "address-family ipv4 unicast" \
+			-c "midr prefix-export route-map EXPORT-MIDR" \
+			-c "network $prefix"
 }
 
 withdraw_prefix()

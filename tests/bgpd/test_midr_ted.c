@@ -72,7 +72,6 @@ static struct midr_ted_link_input link_input(uint32_t local_node_id, uint32_t re
 		.remote_node_id = remote_node_id,
 		.link_id = link_id,
 		.canonical_cost = canonical_cost,
-		.available_bandwidth_kbps = 100000,
 		.link_local_address = ip_address("192.0.2.1"),
 		.link_remote_address = ip_address("192.0.2.2"),
 	};
@@ -265,9 +264,6 @@ static void test_builder_input_validation(void)
 	link = link_input(r1, r2, 1, 0);
 	assert(midr_ted_builder_add_link(builder, &link) == -EINVAL);
 	link.canonical_cost = UINT32_MAX;
-	assert(midr_ted_builder_add_link(builder, &link) == -EINVAL);
-	link = link_input(r1, r2, 1, 1);
-	link.available_bandwidth_kbps = 0;
 	assert(midr_ted_builder_add_link(builder, &link) == -EINVAL);
 	link = link_input(r1, r2, 1, 1);
 	link.local_ifindex = -1;

@@ -26,7 +26,12 @@ def main():
         for command in missing:
             print(f"  {command}", file=sys.stderr)
         return 1
-    required_sections = ("正式生产配置", "只读 Show 与诊断", "仅测试注入")
+    required_sections = (
+        "持久化生产配置",
+        "当前联调操作命令",
+        "只读 Show 与诊断",
+        "仅测试注入",
+    )
     if any(section not in reference for section in required_sections):
         print("MIDR command reference is missing a command class", file=sys.stderr)
         return 1

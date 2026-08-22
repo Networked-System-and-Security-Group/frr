@@ -8,7 +8,6 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
-#include <unistd.h>
 
 #include "command.h"
 #include "privs.h"
@@ -172,7 +171,7 @@ static void test_origination_suppression_and_withdraw(void)
 	midr_topology_process_pending(ctx);
 	membership_sequence = selected_sequence(&membership_key, &selected);
 	link_sequence = selected_sequence(&link_key, &selected);
-	assert(selected.payload.link.metrics.rtt_us == 1000);
+	assert(selected.payload.link.canonical_cost == 63);
 
 	node.version = 2;
 	link.version = 2;
@@ -187,13 +186,15 @@ static void test_origination_suppression_and_withdraw(void)
 	assert(midr_owned_link_metadata_get(ctx, &link_key, &ifindex) == 0);
 	assert(ifindex == 17);
 
-	link = link_update(3, 1010);
+	link = link_update(3, 1200);
 	link.local_ifindex = 17;
 	assert(midr_topology_link_upsert(ctx, &link) == 0);
 	midr_topology_process_pending(ctx);
 	assert(selected_sequence(&link_key, &selected) == link_sequence);
+	assert(selected.payload.link.canonical_cost == 63);
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(summary.suppressed_link_count == 1);
+	assert(summary.pending_timer_count == 0);
 
 	link = link_update(4, 3000);
 	link.local_ifindex = 17;
@@ -202,11 +203,29 @@ static void test_origination_suppression_and_withdraw(void)
 	assert(selected_sequence(&link_key, &selected) == link_sequence);
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(summary.pending_timer_count == 1);
+
+	link = link_update(5, 1200);
+	link.local_ifindex = 17;
+	assert(midr_topology_link_upsert(ctx, &link) == 0);
+	midr_topology_process_pending(ctx);
+	assert(selected_sequence(&link_key, &selected) == link_sequence);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(summary.suppressed_link_count == 1);
+	assert(summary.pending_timer_count == 0);
+	midr_owned_test_fire_timers(ctx);
+	assert(selected_sequence(&link_key, &selected) == link_sequence);
+
+	link = link_update(6, 3000);
+	link.local_ifindex = 17;
+	assert(midr_topology_link_upsert(ctx, &link) == 0);
+	midr_topology_process_pending(ctx);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(summary.pending_timer_count == 1);
 	midr_owned_test_fire_timers(ctx);
 	assert(selected_sequence(&link_key, &selected) > link_sequence);
-	assert(selected.payload.link.metrics.rtt_us == 3000);
+	assert(selected.payload.link.canonical_cost == 83);
 
-	link.version = 5;
+	link.version = 7;
 	link.policy_state = MIDR_POLICY_BLOCKED;
 	assert(midr_topology_link_upsert(ctx, &link) == 0);
 	midr_topology_process_pending(ctx);
@@ -380,11 +399,14 @@ static void test_owned_lifecycle_and_validation(void)
 	       0);
 
 	sequence = selected.ls_sequence;
-	sleep(1);
 	link.version = 24;
 	link.metrics.rtt_us = 4000;
 	assert(midr_topology_link_upsert(ctx, &link) == 0);
 	midr_topology_process_pending(ctx);
+	assert(selected_sequence(&link_key, &selected) == sequence);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(summary.pending_timer_count == 1);
+	midr_owned_test_fire_timers(ctx);
 	assert(selected_sequence(&link_key, &selected) > sequence);
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(summary.pending_timer_count == 0);

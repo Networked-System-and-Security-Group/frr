@@ -14,6 +14,7 @@
 #include "routemap.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
@@ -33,7 +34,7 @@ struct midr_prefix_entry {
 
 struct midr_prefix_family {
 	char *route_map_name;
-	uint32_t local_sources;
+	uint32_t max_as_path_length;
 };
 
 struct midr_prefix_store {
@@ -46,7 +47,7 @@ struct midr_prefix_store {
 	uint64_t scans;
 	uint64_t route_events;
 	uint64_t policy_rechecks;
-	uint64_t rejected_midr;
+	uint64_t rejected_as_path;
 };
 
 static bool midr_prefix_afi_valid(afi_t afi)
@@ -147,35 +148,6 @@ static bool midr_prefix_tables_same(struct hash *left, struct hash *right)
 	return true;
 }
 
-static bool midr_prefix_path_is_local_source(const struct midr_prefix_store *store, afi_t afi,
-					     const struct bgp_path_info *path)
-{
-	uint32_t sources = store->family[afi].local_sources;
-
-	if (path->peer != store->ctx->bgp->peer_self)
-		return false;
-	if (path->type == ZEBRA_ROUTE_BGP && path->sub_type == BGP_ROUTE_STATIC)
-		return CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_NETWORK);
-	if (path->sub_type != BGP_ROUTE_REDISTRIBUTE)
-		return false;
-	if (path->type == ZEBRA_ROUTE_CONNECT)
-		return CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_CONNECTED);
-	if (path->type == ZEBRA_ROUTE_STATIC)
-		return CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_STATIC);
-	return false;
-}
-
-static bool midr_prefix_path_source_allowed(const struct midr_prefix_store *store, afi_t afi,
-					    const struct bgp_path_info *path)
-{
-	if (midr_prefix_path_is_local_source(store, afi, path))
-		return true;
-	if (!path->peer || path->peer == store->ctx->bgp->peer_self)
-		return false;
-	return peer_af_flag_check(path->peer, afi, SAFI_UNICAST,
-				  PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE);
-}
-
 static bool midr_prefix_route_map_permits(const struct midr_prefix_store *store, afi_t afi,
 					  struct bgp_dest *dest, struct bgp_path_info *path)
 {
@@ -188,7 +160,7 @@ static bool midr_prefix_route_map_permits(const struct midr_prefix_store *store,
 	route_map_result_t result;
 
 	if (!name)
-		return false;
+		return true;
 	route_map = route_map_lookup_by_name(name);
 	if (!route_map)
 		return false;
@@ -203,17 +175,18 @@ static bool midr_prefix_route_map_permits(const struct midr_prefix_store *store,
 static bool midr_prefix_path_eligible(struct midr_prefix_store *store, afi_t afi,
 				      struct bgp_dest *dest, struct bgp_path_info *path)
 {
-	if (path->type == ZEBRA_ROUTE_MIDR) {
-		store->rejected_midr++;
-		return false;
-	}
-	if (!midr_prefix_path_source_allowed(store, afi, path))
-		return false;
-	if (!CHECK_FLAG(path->flags, BGP_PATH_VALID) || CHECK_FLAG(path->flags, BGP_PATH_STALE))
+	if (!path || !path->attr || !path->attr->aspath ||
+	    !CHECK_FLAG(path->flags, BGP_PATH_VALID) ||
+	    CHECK_FLAG(path->flags, BGP_PATH_STALE))
 		return false;
 	if (!CHECK_FLAG(path->flags, BGP_PATH_SELECTED) &&
 	    !CHECK_FLAG(path->flags, BGP_PATH_MULTIPATH))
 		return false;
+	if (aspath_count_hops(path->attr->aspath) >
+	    store->family[afi].max_as_path_length) {
+		store->rejected_as_path++;
+		return false;
+	}
 	return midr_prefix_route_map_permits(store, afi, dest, path);
 }
 
@@ -473,49 +446,34 @@ const char *midr_prefix_route_map_name(struct midr_context *ctx, afi_t afi)
 	return ctx->prefix_store->family[afi].route_map_name;
 }
 
-int midr_prefix_local_source_set(struct midr_context *ctx, afi_t afi, uint32_t source, bool enabled)
+int midr_prefix_max_as_path_length_set(struct midr_context *ctx, afi_t afi,
+				       uint32_t length)
 {
 	struct midr_prefix_store *store;
-	uint32_t valid = MIDR_PREFIX_SOURCE_NETWORK | MIDR_PREFIX_SOURCE_CONNECTED |
-			 MIDR_PREFIX_SOURCE_STATIC;
 
 	if (!ctx || !ctx->prefix_store)
 		return -ENOENT;
-	if (!midr_prefix_afi_valid(afi) || !source || (source & ~valid) || (source & (source - 1)))
+	if (!midr_prefix_afi_valid(afi))
 		return -EINVAL;
 	store = ctx->prefix_store;
-	if (enabled)
-		SET_FLAG(store->family[afi].local_sources, source);
-	else
-		UNSET_FLAG(store->family[afi].local_sources, source);
+	if (store->family[afi].max_as_path_length == length)
+		return 0;
+	store->family[afi].max_as_path_length = length;
 	midr_prefix_schedule_policy_recheck(store);
 	return 0;
 }
 
-uint32_t midr_prefix_local_sources(struct midr_context *ctx, afi_t afi)
+int midr_prefix_max_as_path_length_unset(struct midr_context *ctx, afi_t afi)
 {
-	if (!ctx || !ctx->prefix_store || !midr_prefix_afi_valid(afi))
-		return 0;
-	return ctx->prefix_store->family[afi].local_sources;
+	return midr_prefix_max_as_path_length_set(
+		ctx, afi, MIDR_PREFIX_MAX_AS_PATH_LENGTH_DEFAULT);
 }
 
-int midr_prefix_external_peer_set(struct midr_context *ctx, struct peer *peer, afi_t afi,
-				  bool enabled)
+uint32_t midr_prefix_max_as_path_length(struct midr_context *ctx, afi_t afi)
 {
-	int ret;
-
-	if (!ctx || !ctx->prefix_store)
-		return -ENOENT;
-	if (!peer || peer->bgp != ctx->bgp || !midr_prefix_afi_valid(afi))
-		return -EINVAL;
-	ret = enabled ? peer_af_flag_set(peer, afi, SAFI_UNICAST,
-					 PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE)
-		      : peer_af_flag_unset(peer, afi, SAFI_UNICAST,
-					   PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE);
-	if (ret)
-		return -EINVAL;
-	midr_prefix_schedule_policy_recheck(ctx->prefix_store);
-	return 0;
+	if (!ctx || !ctx->prefix_store || !midr_prefix_afi_valid(afi))
+		return MIDR_PREFIX_MAX_AS_PATH_LENGTH_DEFAULT;
+	return ctx->prefix_store->family[afi].max_as_path_length;
 }
 
 int midr_prefix_status_get(struct midr_context *ctx, struct midr_prefix_status *status)
@@ -534,7 +492,7 @@ int midr_prefix_status_get(struct midr_context *ctx, struct midr_prefix_status *
 	status->scans = store->scans;
 	status->route_events = store->route_events;
 	status->policy_rechecks = store->policy_rechecks;
-	status->rejected_midr = store->rejected_midr;
+	status->rejected_as_path = store->rejected_as_path;
 	return 0;
 }
 
@@ -606,7 +564,8 @@ void midr_show_prefix_summary(struct vty *vty, struct midr_context *ctx)
 	vty_out(vty, "  scans:             %" PRIu64 "\n", status.scans);
 	vty_out(vty, "  route events:      %" PRIu64 "\n", status.route_events);
 	vty_out(vty, "  policy rechecks:   %" PRIu64 "\n", status.policy_rechecks);
-	vty_out(vty, "  MIDR paths denied: %" PRIu64 "\n", status.rejected_midr);
+	vty_out(vty, "  AS_PATH rejects:   %" PRIu64 "\n",
+		status.rejected_as_path);
 }
 
 static int midr_show_prefix_cb(const struct prefix *prefix, void *arg)
@@ -632,31 +591,22 @@ void midr_show_prefix_contributors(struct vty *vty, struct midr_context *ctx)
 void midr_prefix_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi)
 {
 	struct midr_context *ctx;
-	struct listnode *node;
-	struct peer *peer;
 	const char *route_map;
-	uint32_t sources;
+	uint32_t max_as_path_length;
 
 	if (!bgp || !bgp->midr_info || safi != SAFI_UNICAST || !midr_prefix_afi_valid(afi))
 		return;
 	ctx = &bgp->midr_info->ctx;
 	route_map = midr_prefix_route_map_name(ctx, afi);
-	sources = midr_prefix_local_sources(ctx, afi);
+	max_as_path_length = midr_prefix_max_as_path_length(ctx, afi);
 
+	if (max_as_path_length !=
+	    MIDR_PREFIX_MAX_AS_PATH_LENGTH_DEFAULT)
+		vty_out(vty,
+			"  midr prefix-export max-as-path-length %u\n",
+			max_as_path_length);
 	if (route_map)
 		vty_out(vty, "  midr prefix-export route-map %s\n", route_map);
-	if (CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_NETWORK))
-		vty_out(vty, "  midr prefix-export local-source network\n");
-	if (CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_CONNECTED))
-		vty_out(vty, "  midr prefix-export local-source connected\n");
-	if (CHECK_FLAG(sources, MIDR_PREFIX_SOURCE_STATIC))
-		vty_out(vty, "  midr prefix-export local-source static\n");
-
-	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
-		if (peer_is_config_node(peer) &&
-		    peer_af_flag_check(peer, afi, SAFI_UNICAST,
-				       PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE))
-			vty_out(vty, "  neighbor %s midr external-prefix-source\n", peer->host);
 }
 
 int midr_prefix_init(struct midr_context *ctx)
@@ -672,6 +622,10 @@ int midr_prefix_init(struct midr_context *ctx)
 	store->ctx = ctx;
 	store->contributors = midr_prefix_table_new("MIDR prefix contributors");
 	store->dirty = midr_prefix_table_new("MIDR prefix scan dirty");
+	store->family[AFI_IP].max_as_path_length =
+		MIDR_PREFIX_MAX_AS_PATH_LENGTH_DEFAULT;
+	store->family[AFI_IP6].max_as_path_length =
+		MIDR_PREFIX_MAX_AS_PATH_LENGTH_DEFAULT;
 	store->state = MIDR_PREFIX_NOT_READY;
 	ctx->prefix_store = store;
 	if (ctx->bgp->router_id.s_addr)
