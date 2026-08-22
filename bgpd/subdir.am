@@ -66,6 +66,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_prefix.c \
 	bgpd/bgp_midr_rib.c \
 	bgpd/bgp_midr_sequence.c \
+	bgpd/bgp_midr_spf_runtime.c \
 	bgpd/bgp_midr_sync.c \
 	bgpd/bgp_midr_ted.c \
 	bgpd/bgp_midr_vty.c \

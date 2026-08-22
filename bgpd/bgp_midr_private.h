@@ -14,6 +14,7 @@ struct midr_lsdb_store;
 struct midr_owned_store;
 struct midr_prefix_store;
 struct midr_rib_store;
+struct midr_spf_runtime;
 struct midr_sync_store;
 struct midr_ted_store;
 struct vty;
@@ -25,6 +26,7 @@ struct midr_context {
 	struct midr_owned_store *owned_store;
 	struct midr_prefix_store *prefix_store;
 	struct midr_rib_store *rib_store;
+	struct midr_spf_runtime *spf;
 	struct midr_sync_store *sync_store;
 	struct midr_lsdb_store *lsdb_store;
 	struct midr_ted_store *ted_store;

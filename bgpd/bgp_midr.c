@@ -16,6 +16,7 @@
 #include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_spf.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_route.h"
@@ -247,6 +248,19 @@ void bgp_midr_init(struct bgp *bgp)
 		XFREE(MTYPE_BGP_MIDR, midr);
 		return;
 	}
+	ret = midr_spf_context_init(&midr->ctx);
+	if (ret) {
+		midr_prefix_finish(&midr->ctx);
+		bgp->midr_info = NULL;
+		midr_input_finish(&midr->ctx);
+		midr_owned_finish(&midr->ctx);
+		midr_lsdb_finish(&midr->ctx);
+		midr_sync_finish(&midr->ctx);
+		midr_ted_context_finish(&midr->ctx);
+		midr_rib_finish(&midr->ctx);
+		XFREE(MTYPE_BGP_MIDR, midr);
+		return;
+	}
 }
 
 void bgp_midr_finish(struct bgp *bgp)
@@ -257,6 +271,7 @@ void bgp_midr_finish(struct bgp *bgp)
 		return;
 
 	midr = bgp->midr_info;
+	midr_spf_context_finish(&midr->ctx);
 	midr_prefix_finish(&midr->ctx);
 	midr_input_finish(&midr->ctx);
 	midr_owned_finish(&midr->ctx);

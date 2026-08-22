@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * MIDR shortest path first computation
+ * MIDR hierarchical shortest path computation
  *
  * Copyright (C) 2026
  */
@@ -9,75 +9,108 @@
 #define _FRR_BGP_MIDR_SPF_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include "bgpd/bgp_midr_ted.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct list;
-struct ls_edge;
-struct ls_ted;
-struct ls_vertex;
+struct midr_context;
+struct midr_spf_results;
 
-/*
- * Optional policy hooks used while computing a shortest-path tree.  The
- * built-in validity checks always run first; these callbacks may impose
- * additional MIDR policy and topology-view restrictions.
- */
-struct midr_spf_ops {
-	bool (*vertex_allowed)(const struct ls_vertex *vertex, void *arg);
-	bool (*edge_allowed)(const struct ls_edge *edge, void *arg);
-	int (*edge_cost)(const struct ls_edge *edge, uint64_t *cost, void *arg);
+enum midr_spf_route_scope {
+	MIDR_SPF_ROUTE_UNREACHABLE = 0,
+	MIDR_SPF_ROUTE_LOCAL,
+	MIDR_SPF_ROUTE_INTRA_GROUP,
+	MIDR_SPF_ROUTE_INTER_GROUP,
 };
 
 /*
- * Result for one destination vertex.  The object and first_hops list are
- * owned by the containing SPF tree and remain valid only until that tree is
- * freed.  The list elements are borrowed const struct ls_edge pointers owned
- * by the TED.
+ * One installable physical next hop.  All fields are copied from the input
+ * snapshot, so the object remains valid after midr_ted_snapshot_release().
  */
-struct midr_spf_vertex_result {
-	uint64_t vertex_key;
-	uint64_t distance;
+struct midr_spf_nexthop {
+	struct ipaddr address;
+	ifindex_t ifindex;
+	uint32_t local_node_id;
+	uint32_t remote_node_id;
+	uint32_t local_group_id;
+	uint32_t remote_group_id;
+	uint32_t destination_group_id;
+	uint32_t next_group_id;
+	uint64_t link_id;
+	uint32_t available_bandwidth_kbps;
+};
+
+/*
+ * Result for one normalized unicast prefix.  The nexthops array is owned by
+ * this route.  Cross-group available bandwidth is zero because a local TED
+ * snapshot does not expose remote groups' internal bottlenecks.  Intra-group
+ * routes use group_score 0 and an exact local_cost.  Inter-group routes keep
+ * the aggregate Group SPF score and exact local egress cost separate; callers
+ * must not add them.
+ */
+struct midr_spf_route {
+	struct midr_ted_prefix_key prefix;
+	uint64_t generation;
+	uint64_t sync_reason_flags;
+	enum midr_spf_route_scope scope;
+	uint64_t group_score;
+	uint64_t local_cost;
 	bool reachable;
-	const struct list *first_hops;
+	bool local_destination;
+	struct midr_spf_nexthop *nexthops;
+	size_t nexthop_count;
 };
 
-struct midr_spf_tree;
-struct midr_spf_path;
+/*
+ * Compute one prefix from an immutable TED snapshot.  Unreachable is a valid
+ * route result, not a function failure.  The caller owns the returned route.
+ */
+extern int midr_compute_path(const struct midr_ted_snapshot *snapshot,
+			     const struct midr_ted_prefix_key *prefix, struct midr_spf_route **out);
+extern void midr_spf_route_free(struct midr_spf_route **route);
 
 /*
- * Compute a single-source shortest-path tree without modifying the TED.
- *
- * Returns 0 on success or a negative errno value for invalid input.  An
- * unreachable destination is represented by its vertex result and is not a
- * global computation failure.
+ * Compute every unique node-prefix and prefix-group key in the snapshot.
+ * Result sets are immutable and reference counted.
  */
-extern int midr_dijkstra(const struct ls_ted *ted,
-			 const struct ls_vertex *source,
-			 const struct midr_spf_ops *ops, void *ops_arg,
-			 struct midr_spf_tree **result);
-
-/* Look up the result for a TED vertex key.  Returns NULL for an unknown key. */
-extern const struct midr_spf_vertex_result *
-midr_spf_tree_lookup(const struct midr_spf_tree *tree,
-		     uint64_t destination_key);
-
-extern void midr_spf_tree_free(struct midr_spf_tree *tree);
+extern int midr_spf_compute_all(const struct midr_ted_snapshot *snapshot,
+				const struct midr_spf_results **out);
+extern uint64_t midr_spf_results_generation(const struct midr_spf_results *results);
+extern uint64_t midr_spf_results_sync_reason_flags(const struct midr_spf_results *results);
+extern size_t midr_spf_results_count(const struct midr_spf_results *results);
+extern const struct midr_spf_route *midr_spf_results_at(const struct midr_spf_results *results,
+							size_t index);
+extern const struct midr_spf_route *
+midr_spf_results_lookup(const struct midr_spf_results *results,
+			const struct midr_ted_prefix_key *prefix);
+extern const struct midr_spf_results *
+midr_spf_results_acquire(const struct midr_spf_results *results);
+extern void midr_spf_results_release(const struct midr_spf_results **results);
 
 /*
- * Build one deterministic representative path from the source to a
- * destination.  ECMP is reported separately through first_hops; this function
- * deliberately returns only one edge sequence.
+ * Per-MIDR-instance runtime.  It subscribes to TED changes, coalesces updates,
+ * and atomically caches the latest complete result set.
  */
-extern int midr_spf_path_build(const struct midr_spf_tree *tree,
-			       uint64_t destination_key,
-			       struct midr_spf_path **result);
+extern int midr_spf_context_init(struct midr_context *ctx);
+extern void midr_spf_context_finish(struct midr_context *ctx);
+extern int midr_spf_results_get(struct midr_context *ctx, const struct midr_spf_results **out);
 
-extern uint64_t midr_spf_path_distance(const struct midr_spf_path *path);
-extern const struct list *midr_spf_path_edges(const struct midr_spf_path *path);
-extern void midr_spf_path_free(struct midr_spf_path *path);
+struct midr_spf_runtime_status {
+	uint64_t cached_generation;
+	uint64_t pending_generation;
+	uint32_t pending_change_flags;
+	uint64_t recompute_count;
+	int last_error;
+	bool recompute_pending;
+};
+
+extern int midr_spf_runtime_status_get(struct midr_context *ctx,
+				       struct midr_spf_runtime_status *status);
 
 #ifdef __cplusplus
 }
