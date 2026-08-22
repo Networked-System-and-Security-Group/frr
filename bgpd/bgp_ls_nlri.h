@@ -253,6 +253,12 @@ enum bgp_ls_attr_tlv {
 	/* SRv6 SID Attribute TLVs (RFC 9514 Section 7.1) */
 	BGP_LS_ATTR_SRV6_ENDPOINT_BEHAVIOR = 1250,  /* SRv6 Endpoint Behavior */
 	BGP_LS_ATTR_SRV6_SID_STRUCTURE = 1252,	     /* SRv6 SID Structure */
+
+	/* MIDR 扩展 TLVs */
+	BGP_LS_ATTR_MIDR_GROUP_ID = 1185,	   /* Group ID - MIDR 节点分群标识 */
+	BGP_LS_ATTR_MIDR_LINK_PERF = 1186,	   /* Link Performance - MIDR 链路性能度量 */
+	BGP_LS_ATTR_MIDR_NODE_CAPABILITY = 1187,   /* Node Capability - MIDR 节点能力宣告 */
+	BGP_LS_ATTR_MIDR_TRANSPORT_ADDR = 1188,	   /* Transport Address - MIDR 节点可达地址(建连/探测目标) */
 };
 
 /*
@@ -358,6 +364,18 @@ enum bgp_ls_attr_tlv {
 #define BGP_LS_MAX_LINK_NAME_LEN 255	/* Maximum link name length */
 #define BGP_LS_MAX_SRV6_SIDS	 256	/* Maximum SRv6 SIDs per TLV type */
 
+/* MIDR TLV sizes */
+#define BGP_LS_MIDR_GROUP_ID_SIZE  4  /* group-id: 4 bytes uint32 */
+#define BGP_LS_MIDR_LINK_PERF_SIZE 20 /* delay(4)+loss(4)+bw_score(4)+seqno(8) */
+#define BGP_LS_MIDR_NODE_CAP_SIZE  12 /* caps(4)+seqno(8) */
+#define BGP_LS_MIDR_TRANSPORT_ADDR_SIZE 4 /* transport addr: 4 bytes IPv4 */
+
+/* MIDR capability bits */
+#define MIDR_CAP_SRV6	   (1U << 0)
+#define MIDR_CAP_ROUTING   (1U << 1)
+#define MIDR_CAP_BOOTSTRAP (1U << 2) /* 引导节点 */
+#define MIDR_CAP_GROUP_REP (1U << 3) /* 群代表 */
+
 /*
  * Bit positions for attribute presence bitmasks
  */
@@ -407,6 +425,11 @@ enum bgp_ls_attr_tlv {
 #define BGP_LS_ATTR_SRV6_LAN_ENDX_SID_BIT      (1ULL << 42)
 #define BGP_LS_ATTR_SRV6_ENDPOINT_BEHAVIOR_BIT (1ULL << 43)
 #define BGP_LS_ATTR_SRV6_SID_STRUCTURE_BIT     (1ULL << 44)
+/* MIDR attribute bits */
+#define BGP_LS_ATTR_MIDR_GROUP_ID_BIT		(1ULL << 45)
+#define BGP_LS_ATTR_MIDR_LINK_PERF_BIT		(1ULL << 46)
+#define BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT	(1ULL << 47)
+#define BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT	(1ULL << 48)
 
 /*
  * Node Flag Bits (TLV 1024)
@@ -797,6 +820,22 @@ struct bgp_ls_attr {
 	uint16_t srv6_endpoint_behavior;
 	uint8_t srv6_endpoint_flags;
 	uint8_t srv6_endpoint_algo;
+
+	/* MIDR: Group ID (TLV 1185) */
+	uint32_t midr_group_id;
+
+	/* MIDR: Link Performance (TLV 1186) */
+	uint32_t midr_delay_us;	  /* 单向时延 (微秒) */
+	uint32_t midr_loss_rate;  /* 丢包率 (百万分比, ppm) */
+	uint32_t midr_bw_score;	  /* 带宽分数 (×1000 整数编码) */
+	uint64_t midr_perf_seqno; /* 性能序列号 */
+
+	/* MIDR: Node Capability (TLV 1187) */
+	uint32_t midr_node_caps;  /* 能力位图 */
+	uint64_t midr_cap_seqno;  /* 能力序列号 */
+
+	/* MIDR: Transport Address (TLV 1188) — 节点真实可达地址(建连/探测目标) */
+	struct in_addr midr_transport_addr;
 
 	unsigned long refcnt; /* Reference count */
 

@@ -67,10 +67,16 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
+#include "bgpd/midr_ip2asn.h"
+#include "bgpd/midr_tier1_vty.h"
+#include "bgpd/midr_trace_scheduler.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_midr_nds.h" /* midr_nds_is_bootstrap()：distribute 命令的引导提示 */
+
+// 自己注册的命令
 
 FRR_CFG_DEFAULT_BOOL(BGP_IMPORT_CHECK,
 	{
@@ -2001,6 +2007,7 @@ DEFPY (no_bgp_router_id,
 
 	return CMD_SUCCESS;
 }
+
 
 DEFPY(bgp_community_alias, bgp_community_alias_cmd,
       "[no$no] bgp community alias WORD$community ALIAS_NAME$alias_name",
@@ -20497,11 +20504,12 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->instance_id = instance_id;
 	bgp->ls_info->enable_distribution = true;
 
-	if (bgp_ls_export_bgp_topology(bgp) != 0) {
-		vty_out(vty, "%% Failed to export BGP topology\n");
-		return CMD_WARNING;
-	}
-
+	/*
+	 * Defer the actual export to the keepalive timer (fires within
+	 * MIDR_KEEPALIVE_INTERVAL seconds) to avoid a deep call-chain that
+	 * can overflow the stack when bgp_ls_export_bgp_topology() is invoked
+	 * synchronously during frr.conf loading or VTY processing.
+	 */
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty,
 			"BGP-LS: BGP fabric topology export enabled (instance-id %" PRIu64 ")\n",
@@ -20575,7 +20583,7 @@ DEFPY(neighbor_ls_local_link_id,
 
 	/* Re-originate with the new local link ID. */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer);
+		bgp_ls_originate_bgp_link(bgp, peer, NULL);
 
 	return CMD_SUCCESS;
 }
@@ -20608,7 +20616,7 @@ DEFPY(no_neighbor_ls_local_link_id,
 
 	/* Re-originate using the fallback local link ID (ifindex). */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer);
+		bgp_ls_originate_bgp_link(bgp, peer, NULL);
 
 	return CMD_SUCCESS;
 }
@@ -20642,7 +20650,7 @@ DEFPY(neighbor_ls_remote_link_id,
 
 	/* Re-originate with the new remote link ID. */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer);
+		bgp_ls_originate_bgp_link(bgp, peer, NULL);
 
 	return CMD_SUCCESS;
 }
@@ -20675,7 +20683,7 @@ DEFPY(no_neighbor_ls_remote_link_id,
 
 	/* Re-originate using the fallback remote link ID (0). */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer);
+		bgp_ls_originate_bgp_link(bgp, peer, NULL);
 
 	return CMD_SUCCESS;
 }
@@ -21902,6 +21910,11 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
+	if (midr_ip2asn_config_write(vty))
+		vty_out(vty, "!\n");
+	if (midr_trace_scheduler_config_write(vty))
+		vty_out(vty, "!\n");
+
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
@@ -24561,6 +24574,9 @@ void bgp_vty_init(void)
 
 	/* "show bgp vrfs bestpath" command. */
 	install_element(VIEW_NODE, &show_bgp_vrf_bestpath_cmd);
+
+	/* MIDR application-layer underlay observation helpers. */
+	midr_tier1_vty_init();
 
 	/* Community-list. */
 	community_list_vty();
