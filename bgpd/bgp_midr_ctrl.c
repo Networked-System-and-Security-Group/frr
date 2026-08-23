@@ -140,6 +140,10 @@ const char *midr_ctrl_msg_type_str(uint8_t type)
 		return "BOOTSTRAP_LIST_RESP";
 	case MIDR_CTRL_ATTACH_REQUEST:
 		return "ATTACH_REQUEST";
+	case MIDR_CTRL_GROUP_ALLOC_REQ:
+		return "GROUP_ALLOC_REQ";
+	case MIDR_CTRL_GROUP_ALLOC_RESP:
+		return "GROUP_ALLOC_RESP";
 	default:
 		return "UNKNOWN";
 	}
@@ -343,6 +347,18 @@ void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp, struct in_addr dst)
 	MIDR_FLOW_LOG("MIDR ctrl: sent BOOTSTRAP_LIST_REQ to %pI4", &dst);
 }
 
+/* New node -> the network's elected allocator bootstrap: ask for an
+ * authoritative new group id before settling a CREATE. See the
+ * MIDR_CTRL_GROUP_ALLOC_REQ enum comment (bgp_midr_ctrl.h) for why. */
+void midr_ctrl_send_group_alloc_request(struct bgp *bgp, struct in_addr dst)
+{
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	midr_ctrl_enqueue_request(bgp, dst, MIDR_CTRL_GROUP_ALLOC_REQ, 0,
+				  &midr_ctrl_retx_default);
+	MIDR_FLOW_LOG("MIDR ctrl: sent GROUP_ALLOC_REQ to %pI4", &dst);
+}
+
 /*
  * New node -> an arbitrary candidate (rep or member): self-announce so the
  * receiver can validate our subsequent PM probes without an explicit
@@ -516,6 +532,8 @@ static void midr_ctrl_retx_timer(struct event *t)
 	bool rep_gave_up = false;
 	struct in_addr blist_failed = { 0 }; /* 本轮死心的 BOOTSTRAP_LIST_REQ 目标 */
 	bool blist_gave_up = false;
+	bool galloc_gave_up = false; /* 本轮死心的 GROUP_ALLOC_REQ——目标固定为
+				      * 唯一发号引导，不用像 rep/blist 那样带地址 */
 	bool attach_gave_up = false; /* 本轮有挂靠死心 → 循环外重挑（D2） */
 	/* 死者所在批次，决定重挑从哪一批继续（批 6 的 A-3）。一拍里多条挂靠同时
 	 * 死心时以最后一条为准：重挑一次补齐所有缺口，而 SECOND 只在第一批已试尽
@@ -589,6 +607,11 @@ static void midr_ctrl_retx_timer(struct event *t)
 				blist_failed = p->target_transport;
 				blist_gave_up = true;
 			}
+			/* 发号引导问不到：没有候补名单可换（只信任那一台确定性选出
+			 * 的分配者），直接回落本地估算，见
+			 * midr_nds_group_alloc_failed()。 */
+			if (p->type == MIDR_CTRL_GROUP_ALLOC_REQ)
+				galloc_gave_up = true;
 			/*
 			 * 死心拆除（方案定稿结论 23，08-11 批 2）：PEER_REQUEST
 			 * 死心 = 对端始终没回配，本机当初为它预配的**半边 peer**
@@ -648,6 +671,9 @@ static void midr_ctrl_retx_timer(struct event *t)
 	/* 同理放循环外：回调会向下一个候选发请求、往 ctrl_pending 追加条目。 */
 	if (blist_gave_up)
 		midr_nds_bootstrap_list_failed(bgp, blist_failed);
+	/* 发号请求死心 → 直接回落本地估算完成落定（无候补池，见上）。 */
+	if (galloc_gave_up)
+		midr_nds_group_alloc_failed(bgp);
 	/* 挂靠死心的换台（D2）。同样放循环外，且必须排在下面重挂重试定时器**之前**
 	 * ——新发出的 ATTACH_REQUEST 才能被这一轮的定时器武装上重传。
 	 * 判据（是代表 ∧ ATTACH 账不足 K ∧ 还有没盖章的候选）全在 pick 内部。 */
@@ -958,6 +984,68 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 	return s;
 }
 
+/*
+ * Allocator side: hand out the next group id from a monotonic counter.
+ * Seeded lazily (on first request, not at ctrl-init) from a scan of this
+ * bootstrap's own node table — the same cl_max_group_id() computation CL
+ * does locally, just run here where the view is far more complete than any
+ * freshly-joining node's. From then on we only ever increment, never
+ * re-scan: a group can still be momentarily invisible in global_view due to
+ * NLRI propagation lag, so re-deriving the baseline on every request could
+ * hand out a number that collides with one already granted a moment ago.
+ *
+ * Any bootstrap answers if asked (no local election check here) — refusing
+ * would just make the requester time out and fall back anyway, no safety
+ * gained. The correctness property this protocol leans on is "only one
+ * process is ever actually asked" (every node computes the same elected
+ * allocator independently, see midr_nds_pick_group_allocator() in
+ * bgp_midr_nds.c), not "only one process is capable of answering".
+ */
+static struct stream *midr_ctrl_build_group_alloc_resp(struct bgp *bgp,
+							struct in_addr dst)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct stream *s;
+	struct midr_ctrl_group_alloc_item item;
+	uint32_t gid;
+
+	if (!(mi->local_capabilities & MIDR_CAP_BOOTSTRAP)) {
+		MIDR_LOG("MIDR ctrl: ignoring GROUP_ALLOC_REQ from %pI4 (caps 0x%x — not a bootstrap)",
+			 &dst, mi->local_capabilities);
+		return NULL;
+	}
+
+	if (!mi->group_alloc_seeded) {
+		struct list *nodes = midr_nds_cl_nodes_getter(mi->global_view);
+		struct listnode *n;
+		struct midr_node_entry *entry;
+		uint32_t max_id = 0;
+
+		for (ALL_LIST_ELEMENTS_RO(nodes, n, entry))
+			if (entry->group_id > max_id)
+				max_id = entry->group_id;
+		list_delete(&nodes);
+
+		mi->group_alloc_next = max_id + 1;
+		mi->group_alloc_seeded = true;
+		MIDR_LOG("MIDR ctrl: group-id 发号器起播，起始值 %u（本机节点表当前最大群号 %u）",
+			 mi->group_alloc_next, max_id);
+	}
+
+	gid = mi->group_alloc_next++;
+
+	s = stream_new(sizeof(struct midr_ctrl_list_hdr) + sizeof(item));
+	stream_putc(s, MIDR_CTRL_MSG_VERSION);
+	stream_putc(s, MIDR_CTRL_GROUP_ALLOC_RESP);
+	stream_putw(s, 1); /* count，恒为 1 */
+	item.group_id = htonl(gid);
+	stream_put(s, &item, sizeof(item));
+
+	MIDR_FLOW_LOG("MIDR ctrl: GROUP_ALLOC_REQ from %pI4 — 分配群 %u",
+		      &dst, gid);
+	return s;
+}
+
 /* 代表侧：收下一份活引导名单——逐条吸收（候选池 + 种子库），再交 NDS 汇总。 */
 static void midr_ctrl_recv_bootstrap_list(struct bgp *bgp, const uint8_t *buf,
 					  ssize_t n, struct in_addr src)
@@ -993,6 +1081,44 @@ static void midr_ctrl_recv_bootstrap_list(struct bgp *bgp, const uint8_t *buf,
 					 items[i].rid);
 
 	midr_nds_on_bootstrap_list(bgp, src, count);
+}
+
+/* Requester side: unpack the allocated id and hand it to NDS to finish the
+ * CREATE that's been waiting on it. Malformed/zero replies are treated the
+ * same as a give-up — NDS falls back to its own local estimate either way. */
+static void midr_ctrl_recv_group_alloc(struct bgp *bgp, const uint8_t *buf,
+				       ssize_t n, struct in_addr src)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	const struct midr_ctrl_list_hdr *hdr =
+		(const struct midr_ctrl_list_hdr *)buf;
+	const struct midr_ctrl_group_alloc_item *item;
+	uint16_t count;
+	uint32_t gid;
+
+	if (n < (ssize_t)sizeof(*hdr))
+		return;
+	count = ntohs(hdr->count);
+	if (count != 1 ||
+	    n != (ssize_t)(sizeof(*hdr) + sizeof(struct midr_ctrl_group_alloc_item))) {
+		MIDR_LOG("MIDR ctrl: GROUP_ALLOC_RESP malformed (count=%u len=%zd) from %pI4 — dropping",
+			 count, n, &src);
+		return;
+	}
+	item = (const struct midr_ctrl_group_alloc_item *)(buf + sizeof(*hdr));
+	gid = ntohl(item->group_id);
+
+	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_GROUP_ALLOC_REQ);
+
+	if (gid == 0) {
+		zlog_warn("MIDR ctrl: GROUP_ALLOC_RESP from %pI4 returned 群 0（非法）——回退本地估算",
+			  &src);
+		midr_nds_group_alloc_failed(bgp);
+		return;
+	}
+
+	MIDR_FLOW_LOG("MIDR ctrl: GROUP_ALLOC_RESP from %pI4 — 分得群 %u", &src, gid);
+	midr_nds_group_alloc_done(bgp, gid);
 }
 
 /* New node: store the bootstrap's rep directory, then run join stage 1. */
@@ -1252,6 +1378,11 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 		MIDR_FLOW_LOG("MIDR ctrl: BOOTSTRAP_LIST_REQ from %pI4 — replying with live bootstrap list",
 			      &msg.requester_transport);
 		return midr_ctrl_build_bootstrap_list(bgp, remote);
+	case MIDR_CTRL_GROUP_ALLOC_REQ:
+		/* 闸门同 BOOTSTRAP_LIST_REQ：只有引导节点答，理由见
+		 * midr_ctrl_build_group_alloc_resp() 头注释。不学请求方身份——
+		 * 这条路径之后没有 PM 探测要放行。 */
+		return midr_ctrl_build_group_alloc_resp(bgp, remote);
 	default:
 		MIDR_LOG("MIDR ctrl: TCP unexpected request type %u from %pI4",
 			 msg.type, &remote);
@@ -1312,6 +1443,14 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 			return;
 		}
 		midr_ctrl_recv_bootstrap_list(bgp, payload, (ssize_t)len, src);
+		break;
+	case MIDR_CTRL_GROUP_ALLOC_RESP:
+		if (req_type != MIDR_CTRL_GROUP_ALLOC_REQ) {
+			MIDR_LOG("MIDR ctrl: GROUP_ALLOC_RESP but our request was type %u — dropping",
+				 req_type);
+			return;
+		}
+		midr_ctrl_recv_group_alloc(bgp, payload, (ssize_t)len, src);
 		break;
 	default:
 		MIDR_LOG("MIDR ctrl: TCP unexpected response type %u", hdr->type);

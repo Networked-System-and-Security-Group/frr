@@ -697,15 +697,102 @@ static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
 }
 
 /*
+ * True if `entry` is a *colliding* rep of our own group, not a legitimate
+ * fellow member: same group_id, entry itself also holds GROUP_REP, and our
+ * own group is currently still just us *excluding entry itself* (see
+ * MIDR_TRIGGER_GROUP_ID_COLLISION's comment, bgp_midr_nds.h, for why the
+ * check is scoped to the singleton case). midr_discovery_should_peer() has
+ * no way to tell "genuine same-group peer" apart from "another
+ * self-appointed rep of a group that happens to share our number" -- both
+ * just look like "same group_id" to it -- so callers that connect on
+ * group_id match (midr_nds_on_node_discovered()) or sweep periodically for
+ * staleness (midr_group_collision_check()) both need to check this *first*.
+ *
+ * The "excluding entry itself" part is load-bearing, not defensive: entry
+ * already satisfies `entry->group_id == mi->local_group_id` by the time this
+ * runs (that's the precondition above it), so midr_group_members() -- which
+ * matches purely on group_id, not adjacency -- would otherwise always find
+ * entry itself sitting in the result and conclude "not alone", making this
+ * function unconditionally return false regardless of whether entry is a
+ * genuine collision (caught the hard way: group-alloc-test's repair
+ * scenario kept reporting zero collisions detected even after the NLRI
+ * race above was fixed, because *this* self-inclusion bug alone was already
+ * enough to mask every case).
+ */
+static bool midr_nds_is_colliding_rep(struct bgp *bgp,
+				      const struct midr_node_entry *entry)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct list *members;
+	struct listnode *node;
+	struct midr_node_entry *m;
+	bool alone = true;
+
+	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP) ||
+	    mi->local_group_id == 0)
+		return false;
+	if (entry->group_id != mi->local_group_id ||
+	    !midr_node_is_group_rep(entry))
+		return false;
+
+	members = list_new();
+	midr_group_members(bgp, mi->local_group_id, members);
+	for (ALL_LIST_ELEMENTS_RO(members, node, m)) {
+		if (m == entry)
+			continue;
+		alone = false;
+		break;
+	}
+	list_delete(&members);
+	return alone;
+}
+
+/*
+ * Deterministic tie-break, computable independently by both sides with no
+ * coordination: the smaller router-id keeps the number. Only the losing
+ * side acts (fires the trigger that makes CL emit RECONNECT); the winner
+ * does nothing and isn't even aware anything needed to change -- the other
+ * node will run this same comparison on its own and reach the opposite
+ * conclusion.
+ */
+static void midr_nds_resolve_group_collision(struct bgp *bgp,
+					      const struct midr_node_entry *entry)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+
+	if (ntohl(entry->node_id.u.prefix4.s_addr) <
+	    ntohl(bgp->router_id.s_addr)) {
+		zlog_warn("MIDR：检测到群号 %u 撞车——对端 %pI4 router-id 更小，本机让号并重新加入",
+			  mi->local_group_id, &entry->node_id.u.prefix4);
+		midr_nds_notify_cl(bgp, MIDR_TRIGGER_GROUP_ID_COLLISION);
+	}
+}
+
+/*
  * 收包侧反应：同群且还没纳入邻居就建边。发现链专题（08-21）在此只删了**无差别
  * 起探**那一半（探测改由 connect 的 SAME_GROUP 分支只对同群起），建连保留——
  * connect_group 只连落定那刻表里已有的成员，两台成员 join 窗口一重叠就互相错过、
  * 落定后无人补（m1a↔m1b 双向零会话实测，见 轮3/plan-同群补边.md）。
+ *
+ * 撞车判定排在最前面（2026-08-23）：本函数原先按"group_id 相同"就直接建边，
+ * 分不清"真的同群成员"和"号撞了的另一个代表"——两者在这里长得一模一样。
+ * 不排在前面的话，两个撞车节点一旦经 NLRI 互相看见，会在这里被当成普通同群
+ * 成员立刻建连/纳入邻居，member 表从此不再是空的，
+ * midr_group_collision_check() 的"仅单人群"判据永远读到假——撞车状态被这条
+ * 更快的收包路径悄悄"焊死"，周期检查再也逮不到。
  */
 static void midr_nds_on_node_discovered(struct bgp *bgp,
 					struct midr_node_entry *entry)
 {
-	if (entry->is_adjacent || !midr_discovery_should_peer(bgp, entry))
+	if (entry->is_adjacent)
+		return;
+
+	if (midr_nds_is_colliding_rep(bgp, entry)) {
+		midr_nds_resolve_group_collision(bgp, entry);
+		return;
+	}
+
+	if (!midr_discovery_should_peer(bgp, entry))
 		return;
 
 	MIDR_FLOW_LOG("MIDR 发现：节点 %pFX 群 %u -> 同群未邻接，建边",
@@ -806,6 +893,27 @@ void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
 	 * (looped back) is skipped too.
 	 */
 	if (!entry->is_self) {
+		/*
+		 * 撞车判定必须在这里、is_new/changed 分支之前独立跑一遍，不能只
+		 * 挂在 midr_nds_on_node_discovered() 里（2026-08-23，group-alloc-test
+		 * 实测抓到）：group_id（TLV 1185）和 GROUP_REP 能力位（TLV 1187）
+		 * 是两次分开的 midr_nds_report_node() 各自触发的独立 NLRI 通告
+		 * （见 midr_join_settle_group()），不保证同一条更新一起到——对方
+		 * 落定时完全可能先发群号、稍后才发能力位。若第一条（entry
+		 * 刚创建，group_id=1，capabilities 还是 0）恰好触发下面 is_new 分
+		 * 支的 on_node_discovered()，此时 midr_nds_is_colliding_rep() 会读
+		 * 到假的"对方不是代表"，落进同群自动建边——一旦建边、置了
+		 * is_adjacent，后面能力位单独到达时既不算 is_new 也不算
+		 * group_changed，不会再有第二次判撞车的机会，冲突就此被静默焊死。
+		 * 放在这里、只要字段有更新（is_new||changed）就查一遍，两条通告
+		 * 不管谁先到，总有一条能在 entry 状态补全后命中。
+		 */
+		if ((is_new || changed) &&
+		    midr_nds_is_colliding_rep(bgp, entry)) {
+			midr_nds_resolve_group_collision(bgp, entry);
+			return;
+		}
+
 		/* §8.31：学到/变更了引导节点就记一笔种子（keepalive 刷新不触发，
 		 * 因为下面两分支只在 is_new/changed 进入）。 */
 		if (is_new || changed)
@@ -1407,6 +1515,22 @@ static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 	/* 1. 改群号 + 重通告（先于建连）。 */
 	midr_originate_group_update(bgp, new_gid, old_gid);
 
+	/*
+	 * 1.5. 退到无群（new_gid==0）时若还挂着 GROUP_REP 位，一并清掉。
+	 * "群 0 的代表"本身就是别处已经拒绝的非法组合（REP_ELECT 的守卫：
+	 * "群号 0 不得当代表"），这里补上结构性保证而不是只在置位那一条路上
+	 * 检查——不清的话，这次弃群多半是被强制拉回来重新加入的（RECONNECT：
+	 * 失联自救 / 群号撞车让号），midr_join_settle_group() 落定新群时会读到
+	 * 这枚**属于已放弃的旧群**的陈旧 was_rep=true，把它当"本来就是代表"，
+	 * 在一个可能已有其他成员的新群里错误地再次自任代表。
+	 */
+	if (new_gid == 0 && (mi->local_capabilities & MIDR_CAP_GROUP_REP)) {
+		zlog_info("MIDR 换组重收敛：退到无群，清除陈旧的 GROUP_REP 位（原群 %u）",
+			  old_gid);
+		midr_nds_set_capability(bgp, mi->local_capabilities &
+					      ~MIDR_CAP_GROUP_REP);
+	}
+
 	/* 2. 与新群成员建连（离群 new_gid==0 时无成员可连，跳过）。 */
 	if (new_gid != 0)
 		connected = midr_ctrl_connect_group(bgp, new_gid,
@@ -1863,6 +1987,50 @@ static void midr_nds_reconnect_missing_peers(struct bgp *bgp)
 	}
 }
 
+/*
+ * Group-id collision check (2026-08-23): the layer-1 fix in
+ * midr_nds_on_cluster_decision()'s CREATE branch (asking a deterministically
+ * elected bootstrap for an authoritative id) narrows but can't fully close
+ * the race — e.g. the allocator bootstrap itself unreachable at CREATE time,
+ * falling back to the local estimate. This is the safety net: once two
+ * colliding reps eventually become mutually visible via ordinary NLRI
+ * propagation (which always happens, since bootstraps flood every Node NLRI
+ * network-wide regardless of group), either side can detect it for free —
+ * no extra protocol needed.
+ *
+ * Runs every periodic-sync tick (see midr_periodic_sync_timer()), same home
+ * as midr_isolation_check(). In practice midr_nds_on_node_discovered() (the
+ * receive-path hook, far more frequent) already catches this the instant
+ * both sides become mutually visible — this sweep is the fallback for
+ * whatever narrow ordering that one misses (e.g. this node self-appoints
+ * *after* already having learned of the other rep via some other path).
+ * Deliberately narrow in scope: only acts while this node's own group is
+ * still just itself — see MIDR_TRIGGER_GROUP_ID_COLLISION's comment
+ * (bgp_midr_nds.h) for why a colliding group that has already grown other
+ * members isn't handled here.
+ */
+static void midr_group_collision_check(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct midr_node_entry *entry;
+
+	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP) ||
+	    mi->local_group_id == 0)
+		return;
+
+	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
+		if (entry->is_self)
+			continue;
+		if (!midr_nds_is_colliding_rep(bgp, entry))
+			continue;
+		midr_nds_resolve_group_collision(bgp, entry);
+		/* 一次周期只处理一个：处理完这条，本机大概率已经让号回稳态，
+		 * 或者对方赢、本机什么都没变——继续遍历同样的节点表已经没有
+		 * 意义（is_colliding_rep 的"单人群"前提在让号那一刻就不再成立）。 */
+		return;
+	}
+}
+
 static void midr_periodic_sync_timer(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
@@ -1882,6 +2050,10 @@ static void midr_periodic_sync_timer(struct event *t)
 
 	/* 失联自救：会话全断时没有任何别的机制会反应（见函数头注释）。 */
 	midr_isolation_check(bgp);
+
+	/* 群号撞车检测：两个几乎同时加入、彼此都还看不到对方的节点可能算出
+	 * 同一个新群号，各自自任代表（见函数头注释）。 */
+	midr_group_collision_check(bgp);
 
 	/* 同群补边兜底：收包侧那条路只在状态跳变时触发，失败就没有下一次。 */
 	midr_nds_reconnect_missing_peers(bgp);
@@ -2323,6 +2495,71 @@ static void midr_join_settle_group(struct bgp *bgp, uint32_t gid)
 }
 
 /*
+ * Deterministically pick the network's one group-id allocator: the
+ * candidate with the numerically smallest router-id in mi->bootstrap_list.
+ * Every node has the full bootstrap set configured (`midr bootstrap` to all
+ * of them), so every node computes the same winner independently — no
+ * election protocol needed, same "stable total order everyone can derive
+ * locally" pattern already used for attach-target selection
+ * (hash(router-id)%N). Returns NULL if the candidate list is empty (no
+ * bootstrap configured at all).
+ */
+static struct midr_bootstrap_entry *
+midr_nds_pick_group_allocator(struct bgp_midr_nds *mi)
+{
+	struct listnode *node;
+	struct midr_bootstrap_entry *b, *best = NULL;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b)) {
+		if (!best || ntohl(b->rid.s_addr) < ntohl(best->rid.s_addr))
+			best = b;
+	}
+	return best;
+}
+
+void midr_nds_group_alloc_done(struct bgp *bgp, uint32_t allocated_gid)
+{
+	struct bgp_midr_nds *mi;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+
+	if (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+	    mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
+		MIDR_LOG("MIDR I-7：GROUP_ALLOC_RESP 到达但不在加入流程中，忽略（意图已作废/已落定）");
+		return;
+	}
+
+	midr_join_settle_group(bgp, allocated_gid);
+	zlog_info("MIDR I-7：CREATE 落定群 %u（引导分配），加入流程结束（回稳态）",
+		  allocated_gid);
+}
+
+void midr_nds_group_alloc_failed(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+	uint32_t fallback_gid;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+
+	if (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+	    mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
+		MIDR_LOG("MIDR I-7：GROUP_ALLOC 请求死心但不在加入流程中，忽略");
+		return;
+	}
+
+	fallback_gid = mi->group_alloc_fallback_gid;
+	zlog_warn("MIDR I-7：GROUP_ALLOC 请求无应答，回退本地估算群 %u",
+		  fallback_gid);
+	midr_join_settle_group(bgp, fallback_gid);
+	zlog_info("MIDR I-7：CREATE 落定群 %u（本地估算，引导分配失败），加入流程结束（回稳态）",
+		  fallback_gid);
+}
+
+/*
  * LEAVE 分支重开一轮加入；定义在本文件后段（§8.32 bootstrap 韧性一节）。
  * 【我方改动】zhc 原补丁在此前置声明的是 midr_bootstrap_start_attempt——他手写
  * 了"置意图/清 failed/游标归位/发第一跳"四步；我方 08-06 已把同一段抽成
@@ -2630,38 +2867,47 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		/*
 		 * 手配群号优先（同 RECOMMEND）：CL 在好链路不足时会取
 		 * cl_max_group_id+1 另立新群，配了群号的节点不采纳——归属听配置，
-		 * 一律以配置群号落定。
+		 * 一律以配置群号落定。配置群号无需（也不必）问发号引导：它不是
+		 * "新发明"出来的号，撞车与否是运维配置的事，不在本机制覆盖范围。
 		 */
 		if (mi->config_group_id != 0 &&
 		    mi->config_group_id != create_gid) {
 			MIDR_FLOW_LOG("MIDR I-7：不采纳 CREATE 群 %u——按配置群 %u 落定",
 				      create_gid, mi->config_group_id);
-			create_gid = mi->config_group_id;
+			midr_join_settle_group(bgp, mi->config_group_id);
+			zlog_info("MIDR I-7：CREATE 落定群 %u，加入流程结束（回稳态）",
+				  mi->config_group_id);
+			break;
 		}
 
 		/*
-		 * 自建群同样走重收敛编排（与 JOIN 共用），承担两件事：
-		 *   1. 改群号 + 重通告（原先手写的两行即此）；
-		 *   2. **清评估期残留**——为评估候选群而灌入并探测的那批节点
-		 *      （midr_nds_learn_member 置 is_adjacent=true + I-1 起探）并不属于
-		 *      这个新群，reconverge 第 3 步按"邻接却已不同群"判据把它们统一
-		 *      detach（I-2 停探 + 双键删 link_entry + 复位 is_adjacent），
-		 *      否则 CL 稳态会把别人群的节点当成本群邻接、PM 也继续白探。
-		 *      **detach 而非删除 node 条目**：p-1 全网互知下条目删了也会经泛洪
-		 *      重学（白删），且跨群视图本就该在；要断的只是"邻居化"关系。
-		 *      （原 TODO 措辞"清空 nodes"过度，2026-07-10 批注轮已修正为本语义。）
-		 * 第 2 步 connect_group 在新群里找不到成员，自然建连 0 个；评估期未建过
-		 * 会话（⑥ 先探后判），故 detach 的拆会话半边基本空转。
-		 *
-		 * 落定（含"群里只有我一个才自任首任代表"与回稳态清 join 状态）
-		 * 统一交 midr_join_settle_group——RECOMMEND 的"配置群不在目录中"
-		 * 兜底也走它，两处保持一致。
-		 * TODO（仍缺）：如何主动引导其它节点加入本新群（现依赖它们各自 join 时
-		 * 经引导节点目录发现本群）。
+		 * create_gid 到这里还只是 CL 的本地估算（cl_max_group_id()+1，算的
+		 * 是本机这张还很单薄的 global_view）——两个几乎同时加入、彼此都还
+		 * 看不到对方的节点，很容易独立算出同一个"下一个"编号，各自建群、
+		 * 各自自任代表，群号相同但互不相通（见 CLAUDE.md 群号撞车一节）。
+		 * 落定前先问网络里唯一确定性选出的发号引导要一个权威群号，而不是
+		 * 直接采信本地猜测；midr_nds_group_alloc_done()/_failed()（分别在
+		 * 拿到应答 / 请求死心时触发，bgp_midr_ctrl.c）接手完成落定，死心
+		 * 时就地回落这份本地估算。
 		 */
-		midr_join_settle_group(bgp, create_gid);
-		zlog_info("MIDR I-7：CREATE 落定群 %u，加入流程结束（回稳态）",
-			  create_gid);
+		{
+			struct midr_bootstrap_entry *allocator =
+				midr_nds_pick_group_allocator(mi);
+
+			if (!allocator) {
+				zlog_warn("MIDR I-7：CREATE 群 %u——无引导候选可问，直接按本地估算落定",
+					  create_gid);
+				midr_join_settle_group(bgp, create_gid);
+				zlog_info("MIDR I-7：CREATE 落定群 %u，加入流程结束（回稳态）",
+					  create_gid);
+				break;
+			}
+
+			mi->group_alloc_fallback_gid = create_gid;
+			midr_ctrl_send_group_alloc_request(bgp, allocator->transport);
+			MIDR_FLOW_LOG("MIDR I-7：CREATE 群 %u（本地估算）——先问引导 %pI4 要正式群号，落定推迟到回应",
+				      create_gid, &allocator->transport);
+		}
 		break;
 	}
 	case MIDR_DECISION_REP_ELECT:

@@ -345,6 +345,28 @@ enum midr_trigger_type {
 	 * MIDR_DECISION_RECONNECT.
 	 */
 	MIDR_TRIGGER_ISOLATED = 7,
+	/*
+	 * This node is a group rep, its own group is still just itself (no
+	 * other members yet), and global_view now contains ANOTHER node also
+	 * claiming GROUP_REP for the same group_id — two nodes that joined
+	 * around the same time, neither visible to the other, independently
+	 * computed the same "next" group number for a fresh CREATE (see
+	 * CLAUDE.md's group-id collision writeup; the layer-1 fix there
+	 * narrows this but a residual race is still possible, e.g. the
+	 * allocator bootstrap itself unreachable). Raised only by the
+	 * *losing* side of a deterministic tie-break (smaller router-id
+	 * wins) — midr_group_collision_check() in midr_periodic_sync_timer();
+	 * CL responds with MIDR_DECISION_RECONNECT, same action as
+	 * MIDR_TRIGGER_ISOLATED (drop this group identity, restart the join
+	 * flow from the bootstrap candidate list).
+	 *
+	 * Deliberately scoped narrow: only fires while this node's group is
+	 * still a singleton. A collision after the losing side has already
+	 * grown other members would need to notify/migrate them too on
+	 * renumber — real work, left as future scope (same spirit as the "no
+	 * REP_RESIGN" entry in Known CL Limitations).
+	 */
+	MIDR_TRIGGER_GROUP_ID_COLLISION = 8,
 };
 
 /* §2.6 I-7 clustering decision */
@@ -588,6 +610,24 @@ struct bgp_midr_nds {
 	enum midr_join_phase join_phase; /* 加入流程阶段，决定 I-5 回灌发哪个 trigger */
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */
+
+	/*
+	 * === Distributed group-id allocation (CREATE collision avoidance,
+	 * 2026-08-23) ===
+	 * CL's CREATE decision only ever carries a *local estimate*
+	 * (cl_max_group_id()+1 off this node's own, still-thin global_view);
+	 * two nodes joining around the same time can independently compute
+	 * the same "next" number. Before settling, NDS asks the network's
+	 * one deterministically-elected allocator bootstrap
+	 * (midr_nds_pick_group_allocator()) for an authoritative id instead.
+	 * See the MIDR_CTRL_GROUP_ALLOC_REQ enum comment in bgp_midr_ctrl.h
+	 * for the full rationale.
+	 */
+	uint32_t group_alloc_fallback_gid; /* 客户端侧：本地估算值，等应答期间
+					    * 暂存；请求死心时就地转正 */
+	uint32_t group_alloc_next; /* 发号方（仅引导节点用）：下一个要发的群号 */
+	bool group_alloc_seeded;   /* 发号方：group_alloc_next 是否已从本机节点表
+				    * 起播过（懒起播，见 build_group_alloc_resp） */
 
 	/*
 	 * 正在评估的两个次优群号（RECOMMEND 时从 CL 回灌的 anchor_reps 记
@@ -942,6 +982,18 @@ extern void midr_nds_attach_on_session_down(struct bgp *bgp,
  */
 extern void midr_nds_bootstrap_list_failed(struct bgp *bgp,
 					   struct in_addr failed);
+
+/*
+ * Called from bgp_midr_ctrl.c once a GROUP_ALLOC_REQ round trip completes
+ * (an id was received) or gives up (retries exhausted). Either way finishes
+ * settling the CREATE that's been waiting on it — done() with the allocated
+ * id, failed() with the local estimate stashed in
+ * mi->group_alloc_fallback_gid. Both are no-ops if the join has since moved
+ * on (join_phase no longer PROBING_REPS/PROBING_MEMBERS) — a stale/late
+ * response for an intent that's already been settled or abandoned.
+ */
+extern void midr_nds_group_alloc_done(struct bgp *bgp, uint32_t allocated_gid);
+extern void midr_nds_group_alloc_failed(struct bgp *bgp);
 
 /*
  * Stage 1: the bootstrap's REP_LIST_RESP has been parsed into mi->rep_dir.
