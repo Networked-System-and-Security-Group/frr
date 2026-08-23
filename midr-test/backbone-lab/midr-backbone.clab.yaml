@@ -1,0 +1,263 @@
+name: midr-backbone
+
+# 13 节点真分离台子（保底轮 2 批 4）+ z1/z2 零配置实验节点（不属常驻拓扑）。
+# MIDR 节点之间零直连：所有 MIDR 会话强制多跳 overlay，8212 的触发环境。
+
+topology:
+  nodes:
+    b1:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/b1/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/b1/daemons:/etc/frr/daemons
+        - logs-backbone/b1:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    b2:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/b2/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/b2/daemons:/etc/frr/daemons
+        - logs-backbone/b2:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    b3:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/b3/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/b3/daemons:/etc/frr/daemons
+        - logs-backbone/b3:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    b4:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/b4/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/b4/daemons:/etc/frr/daemons
+        - logs-backbone/b4:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    b5:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/b5/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/b5/daemons:/etc/frr/daemons
+        - logs-backbone/b5:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    t1:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/t1/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/t1/daemons:/etc/frr/daemons
+        - logs-backbone/t1:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    t2:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/t2/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/t2/daemons:/etc/frr/daemons
+        - logs-backbone/t2:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    t3:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/t3/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/t3/daemons:/etc/frr/daemons
+        - logs-backbone/t3:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    r1:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/r1/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/r1/daemons:/etc/frr/daemons
+        - logs-backbone/r1:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    m1a:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/m1a/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/m1a/daemons:/etc/frr/daemons
+        - logs-backbone/m1a:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    m1b:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/m1b/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/m1b/daemons:/etc/frr/daemons
+        - logs-backbone/m1b:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    r2:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/r2/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/r2/daemons:/etc/frr/daemons
+        - logs-backbone/r2:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    m2a:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/m2a/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/m2a/daemons:/etc/frr/daemons
+        - logs-backbone/m2a:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    z1:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/z1/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/z1/daemons:/etc/frr/daemons
+        - logs-backbone/z1:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+    z2:
+      kind: linux
+      image: frr-ubuntu20:latest
+      binds:
+        - configs-backbone/z2/frr.conf:/etc/frr/frr.conf
+        - configs-backbone/z2/daemons:/etc/frr/daemons
+        - logs-backbone/z2:/etc/frr/logs
+      exec:
+        - mkdir -p /var/lib/frr
+        - chown frr:frr /var/lib/frr
+        - chown frr:frr /etc/frr/frr.conf
+        - chmod 640 /etc/frr/frr.conf
+        - chmod 777 /etc/frr
+        - chown -R frr:frr /etc/frr/logs
+        - /usr/lib/frr/frrinit.sh start
+
+  links:
+    - endpoints: [t1:eth1, t2:eth1]
+    - endpoints: [t2:eth2, t3:eth1]
+    - endpoints: [t1:eth2, t3:eth2]
+    - endpoints: [b1:eth1, t1:eth3]
+    - endpoints: [b2:eth1, t1:eth4]
+    - endpoints: [b3:eth1, t2:eth3]
+    - endpoints: [b4:eth1, t3:eth3]
+    - endpoints: [b5:eth1, t3:eth4]
+    - endpoints: [r1:eth1, t1:eth5]
+    - endpoints: [m1a:eth1, t1:eth6]
+    - endpoints: [m1b:eth1, t2:eth4]
+    - endpoints: [r2:eth1, t2:eth5]
+    - endpoints: [m2a:eth1, t3:eth5]
+    - endpoints: [z1:eth1, t3:eth6]
+    - endpoints: [z2:eth1, t1:eth7]
