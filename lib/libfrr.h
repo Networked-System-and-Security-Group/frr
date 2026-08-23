@@ -220,6 +220,8 @@ extern bool frr_zclient_addr(struct sockaddr_storage *sa, socklen_t *sa_len,
 
 struct json_object;
 extern struct json_object *frr_daemon_state_load(void);
+extern int frr_daemon_state_load_status(struct json_object **statep);
+extern int frr_daemon_state_save_status(struct json_object **statep);
 extern void frr_daemon_state_save(struct json_object **statep);
 
 /* these two are before the protocol daemon does its own shutdown

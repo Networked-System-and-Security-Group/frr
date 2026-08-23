@@ -1311,34 +1311,68 @@ void frr_fini(void)
 	zlog_tmpdir_fini();
 }
 
-struct json_object *frr_daemon_state_load(void)
+int frr_daemon_state_load_status(struct json_object **statep)
 {
 	struct json_object *state;
 	char **state_path;
+	int access_error;
+	int result = 0;
 
 	assertf(di->state_paths,
 		"CODE BUG: daemon trying to load state, but no state path in frr_daemon_info");
+	if (!statep)
+		return -EINVAL;
+	*statep = NULL;
 
 	for (state_path = di->state_paths; *state_path; state_path++) {
 		state = json_object_from_file(*state_path);
-		if (state)
-			return state;
+		if (state) {
+			*statep = state;
+			return 0;
+		}
+
+		if (access(*state_path, F_OK) == 0) {
+			if (!result)
+				result = -EINVAL;
+			continue;
+		}
+		access_error = errno;
+		if (access_error != ENOENT && access_error != ENOTDIR &&
+		    !result)
+			result = -access_error;
 	}
 
-	return json_object_new_object();
+	if (result)
+		return result;
+	*statep = json_object_new_object();
+	return *statep ? 0 : -ENOMEM;
+}
+
+struct json_object *frr_daemon_state_load(void)
+{
+	struct json_object *state;
+
+	if (frr_daemon_state_load_status(&state) != 0)
+		return json_object_new_object();
+	return state;
 }
 
 /* cross-reference file_write_config() in command.c
  * the code there is similar but not identical (configs use a unique temporary
  * name for writing and keep a backup of the previous config.)
  */
-void frr_daemon_state_save(struct json_object **statep)
+int frr_daemon_state_save_status(struct json_object **statep)
 {
-	struct json_object *state = *statep;
+	struct json_object *state;
 	char *state_path, *slash, *temp_name, **other;
 	size_t name_len, json_len;
 	const char *json_str;
 	int dirfd, fd;
+	int result = 0;
+
+	if (!statep || !*statep)
+		return -EINVAL;
+	state = *statep;
 
 	assertf(di->state_paths,
 		"CODE BUG: daemon trying to save state, but no state path in frr_daemon_info");
@@ -1361,22 +1395,25 @@ void frr_daemon_state_save(struct json_object **statep)
 		state_dir = XSTRDUP(MTYPE_TMP, state_path);
 		state_dir[slash - state_path] = '\0';
 		dirfd = open(state_dir, O_DIRECTORY | O_RDONLY);
-		XFREE(MTYPE_TMP, state_dir);
 
 		if (dirfd < 0) {
+			result = -errno;
 			zlog_err("failed to open directory %pSQq for saving daemon state: %m",
 				 state_dir);
-			return;
+			XFREE(MTYPE_TMP, state_dir);
+			goto out_free_state;
 		}
+		XFREE(MTYPE_TMP, state_dir);
 
 		/* skip to file name */
 		slash++;
 	} else {
 		dirfd = open(".", O_DIRECTORY | O_RDONLY);
 		if (dirfd < 0) {
+			result = -errno;
 			zlog_err(
 				"failed to open current directory for saving daemon state: %m");
-			return;
+			goto out_free_state;
 		}
 
 		/* file name = path */
@@ -1398,6 +1435,7 @@ void frr_daemon_state_save(struct json_object **statep)
 	/* state file is always 0600, it's by and for FRR itself only */
 	fd = openat(dirfd, temp_name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0) {
+		result = -errno;
 		zlog_err("failed to open temporary daemon state save file for %pSQq: %m",
 			 state_path);
 		goto out_closedir_free;
@@ -1407,6 +1445,7 @@ void frr_daemon_state_save(struct json_object **statep)
 		ssize_t nwr = write(fd, json_str, json_len);
 
 		if (nwr <= 0) {
+			result = nwr < 0 ? -errno : -EIO;
 			zlog_err("failed to write temporary daemon state to %pSQq: %m",
 				 state_path);
 
@@ -1420,20 +1459,28 @@ void frr_daemon_state_save(struct json_object **statep)
 	}
 
 	/* fsync is theoretically implicit in close(), but... */
-	if (fsync(fd) < 0)
+	if (fsync(fd) < 0) {
+		result = -errno;
 		zlog_warn("fsync for daemon state %pSQq failed: %m", state_path);
-	close(fd);
+	}
+	if (close(fd) < 0 && !result)
+		result = -errno;
 
 	/* this is the *actual* fsync that ensures we're consistent.  The
 	 * file fsync only syncs the inode, but not the directory entry
 	 * referring to it.
 	 */
-	if (fsync(dirfd) < 0)
+	if (fsync(dirfd) < 0) {
+		if (!result)
+			result = -errno;
 		zlog_warn("directory fsync for daemon state %pSQq failed: %m",
 			  state_path);
+	}
 
 	/* atomic, hopefully. */
 	if (renameat(dirfd, temp_name, dirfd, slash) < 0) {
+		if (!result)
+			result = -errno;
 		zlog_err("renaming daemon state %pSQq to %pSQq failed: %m",
 			 temp_name, state_path);
 		/* no unlink here, give the user a chance to investigate */
@@ -1441,9 +1488,12 @@ void frr_daemon_state_save(struct json_object **statep)
 	}
 
 	/* and the rename needs to be synced too */
-	if (fsync(dirfd) < 0)
+	if (fsync(dirfd) < 0) {
+		if (!result)
+			result = -errno;
 		zlog_warn("directory fsync for daemon state %pSQq failed after rename: %m",
 			  state_path);
+	}
 
 	/* daemon may specify other deprecated paths to load from; since we
 	 * just saved successfully we should delete those.
@@ -1460,10 +1510,18 @@ void frr_daemon_state_save(struct json_object **statep)
 
 out_closedir_free:
 	XFREE(MTYPE_TMP, temp_name);
-	close(dirfd);
+	if (close(dirfd) < 0 && !result)
+		result = -errno;
 
+out_free_state:
 	json_object_free(state);
 	*statep = NULL;
+	return result;
+}
+
+void frr_daemon_state_save(struct json_object **statep)
+{
+	(void)frr_daemon_state_save_status(statep);
 }
 
 #ifdef INTERP

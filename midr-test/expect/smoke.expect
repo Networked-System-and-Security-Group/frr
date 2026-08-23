@@ -1,0 +1,13 @@
+MIDR topology nodes:
+1.1.1.1 group 100 transport ipv4 10.0.0.1 policy allowed version 1 active
+MIDR topology links:
+1.1.1.1 -> 2.2.2.2 id 4294967296 local-address ipv4 10.0.0.1 remote-address ipv4 10.0.0.2 ifindex 0 rtt-us 1200 loss-ppm 10 available-bandwidth-kbps 900 policy allowed version 4294967296 seqno 4294967297 timestamp-ms 4294967298 active
+  enqueued:       2
+  processed:      2
+  ignored-old:    0
+MIDR RIB summary:
+MIDR owned objects:
+MIDR LSDB summary:
+MIDR TED summary:
+!% MIDR node upsert failed
+!% MIDR link upsert failed

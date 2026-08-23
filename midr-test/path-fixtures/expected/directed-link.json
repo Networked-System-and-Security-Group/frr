@@ -1,0 +1,31 @@
+{
+  "generation": 1,
+  "local_node_id": "1.1.1.1",
+  "local_group_id": 100,
+  "ready": true,
+  "sync_reason_flags": 0,
+  "nodes": [
+    {"node_id": "1.1.1.1", "group_id": 100, "cap_flags": 0, "policy_tags": 0},
+    {"node_id": "2.2.2.2", "group_id": 100, "cap_flags": 0, "policy_tags": 0}
+  ],
+  "intra_links": [
+    {
+      "local": "2.2.2.2",
+      "remote": "1.1.1.1",
+      "local_group_id": 100,
+      "remote_group_id": 100,
+      "link_id": 7,
+      "cost": 15,
+      "available_bandwidth_kbps": 50000,
+      "policy_tags": 0,
+      "local_address": "10.0.12.2",
+      "remote_address": "10.0.12.1",
+      "local_ifindex": 0
+    }
+  ],
+  "egress_links": [],
+  "node_prefixes": [],
+  "group_edges": [],
+  "prefix_groups": [],
+  "pending": {"links": 0, "node_prefixes": 0, "prefix_groups": 0}
+}

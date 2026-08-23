@@ -1,0 +1,11 @@
+MIDR TED summary:
+  state:                 NOT_READY
+  generation:            0
+  sync reasons:          none
+  consumers:             0
+  pending links:         0
+  pending node-prefixes: 0
+  pending prefix-groups: 0
+MIDR TED generation: 0 (NOT_READY)
+!% MIDR TED status failed
+!% MIDR TED snapshot failed

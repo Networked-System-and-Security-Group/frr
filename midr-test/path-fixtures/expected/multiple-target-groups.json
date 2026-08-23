@@ -1,0 +1,49 @@
+{
+  "generation": 1,
+  "local_node_id": "1.1.1.1",
+  "local_group_id": 100,
+  "ready": true,
+  "sync_reason_flags": 0,
+  "nodes": [
+    {"node_id": "1.1.1.1", "group_id": 100, "cap_flags": 0, "policy_tags": 0}
+  ],
+  "intra_links": [],
+  "egress_links": [
+    {
+      "local": "1.1.1.1",
+      "remote": "2.2.2.2",
+      "local_group_id": 100,
+      "remote_group_id": 200,
+      "link_id": 20,
+      "cost": 10,
+      "available_bandwidth_kbps": 100000,
+      "policy_tags": 0,
+      "local_address": "10.0.12.1",
+      "remote_address": "10.0.12.2",
+      "local_ifindex": 12
+    },
+    {
+      "local": "1.1.1.1",
+      "remote": "3.3.3.3",
+      "local_group_id": 100,
+      "remote_group_id": 300,
+      "link_id": 30,
+      "cost": 20,
+      "available_bandwidth_kbps": 90000,
+      "policy_tags": 0,
+      "local_address": "10.0.13.1",
+      "remote_address": "10.0.13.3",
+      "local_ifindex": 13
+    }
+  ],
+  "node_prefixes": [],
+  "group_edges": [
+    {"source_group_id": 100, "target_group_id": 200, "aggregate_cost": 10},
+    {"source_group_id": 100, "target_group_id": 300, "aggregate_cost": 20}
+  ],
+  "prefix_groups": [
+    {"prefix": "198.51.100.0/24", "group_id": 200},
+    {"prefix": "198.51.100.0/24", "group_id": 300}
+  ],
+  "pending": {"links": 0, "node_prefixes": 0, "prefix_groups": 0}
+}

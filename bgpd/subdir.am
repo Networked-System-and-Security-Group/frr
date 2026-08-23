@@ -54,9 +54,23 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_ls.c \
 	bgpd/bgp_ls_nlri.c \
 	bgpd/bgp_ls_ted.c \
+	bgpd/bgp_midr.c \
+	bgpd/bgp_midr_attr.c \
+	bgpd/bgp_midr_codec.c \
+	bgpd/bgp_midr_cost.c \
+	bgpd/bgp_midr_input.c \
+	bgpd/bgp_midr_ls.c \
+	bgpd/bgp_midr_lsdb.c \
+	bgpd/bgp_midr_owned.c \
+	bgpd/bgp_midr_packet.c \
+	bgpd/bgp_midr_prefix.c \
+	bgpd/bgp_midr_rib.c \
+	bgpd/bgp_midr_sequence.c \
+	bgpd/bgp_midr_sync.c \
+	bgpd/bgp_midr_ted.c \
+	bgpd/bgp_midr_vty.c \
 	bgpd/bgp_midr_nds.c \
 	bgpd/bgp_midr_nds_facts.c \
-	bgpd/bgp_midr_group2_shim.c \
 	bgpd/bgp_midr_pm.c \
 	bgpd/bgp_midr_cl.c \
 	bgpd/bgp_midr_tlv.c \
@@ -159,6 +173,21 @@ noinst_HEADERS += \
 	bgpd/bgp_ls_nlri.h \
 	bgpd/bgp_ls_ted.h \
 	bgpd/bgp_midr.h \
+	bgpd/bgp_midr_attr.h \
+	bgpd/bgp_midr_codec.h \
+	bgpd/bgp_midr_cost.h \
+	bgpd/bgp_midr_ls.h \
+	bgpd/bgp_midr_lsdb.h \
+	bgpd/bgp_midr_owned.h \
+	bgpd/bgp_midr_packet.h \
+	bgpd/bgp_midr_prefix.h \
+	bgpd/bgp_midr_private.h \
+	bgpd/bgp_midr_rib.h \
+	bgpd/bgp_midr_sequence.h \
+	bgpd/bgp_midr_sync.h \
+	bgpd/bgp_midr_ted.h \
+	bgpd/bgp_midr_ted_private.h \
+	bgpd/bgp_midr_vty.h \
 	bgpd/bgp_midr_nds.h \
 	bgpd/bgp_midr_nds_facts.h \
 	bgpd/bgp_midr_pm.h \

@@ -84,6 +84,8 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_vty.h"
 #include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
@@ -991,6 +993,8 @@ int bgp_map_afi_safi_iana2int(iana_afi_t pkt_afi, iana_safi_t pkt_safi,
 	*safi = safi_iana2int(pkt_safi);
 	if (*afi == AFI_MAX || *safi == SAFI_MAX)
 		return -1;
+	if (*safi == SAFI_MIDR_LS && *afi != AFI_BGP_LS)
+		return -1;
 
 	return 0;
 }
@@ -1001,7 +1005,8 @@ int bgp_map_afi_safi_int2iana(afi_t afi, safi_t safi, iana_afi_t *pkt_afi,
 	/* Map from internal values to IANA values, return error if
 	 * internal values are bad (unexpected).
 	 */
-	if (afi == AFI_MAX || safi == SAFI_MAX)
+	if (afi == AFI_MAX || safi == SAFI_MAX
+	    || (safi == SAFI_MIDR_LS && afi != AFI_BGP_LS))
 		return -1;
 	*pkt_afi = afi_int2iana(afi);
 	*pkt_safi = safi_int2iana(safi);
@@ -3935,6 +3940,10 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
+		/* 第二组的 MIDR 上下文必须先建：我方 NDS 侧
+		 * midr_context_get_default() 要取它（取不到有懒惰重取兜底，
+		 * 但别故意排反）。 */
+		bgp_midr_init(bgp);
 		bgp_midr_nds_init(bgp);
 	}
 
@@ -4757,7 +4766,9 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
+	/* 拆除与创建反序：NDS 后建先拆（它引用第二组 ctx），再拆 ctx 本体。 */
 	bgp_midr_nds_finish(bgp);
+	bgp_midr_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
@@ -5370,6 +5381,7 @@ static const struct peer_flag_action peer_af_flag_action_list[] = {
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_SRV6, 0, peer_change_best_path },
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_SRV6_RELAX, 0, peer_change_best_path },
 	{ PEER_FLAG_CONFIG_ENCAPSULATION_MPLS, 0, peer_change_best_path },
+	{ PEER_FLAG_MIDR_EXTERNAL_PREFIX_SOURCE, 0, peer_change_none },
 	{ 0, 0, 0 }
 };
 
@@ -9383,6 +9395,7 @@ void bgp_init(unsigned short instance)
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
+	bgp_midr_vty_init();
 	bgp_midr_nds_vty_init();
 
 	/* BGP inits. */

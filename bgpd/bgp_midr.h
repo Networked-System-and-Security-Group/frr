@@ -9,13 +9,15 @@
  * 与他们的 bgpd/bgp_midr.h 逐字节一致。**以他们为准**：不要在此手改任何原型或
  * 字段。需要同步他们的更新时，重新整份拷贝再把本注释块补回来即可。
  *
- * 我方对接侧的假实现（shim）在 bgp_midr_group2_shim.c —— 轮 4 联调时整份删除、
- * 换成他们的实现文件，调用侧一行不用改。
+ * ⊕ 2026-08-22（对接轮 4 步 0）**已合栈**：他们的实现文件（bgp_midr.c /
+ * bgp_midr_input.c / bgp_midr_lsdb.c 等 31 个）已进树，本头文件的原型从此有真
+ * 实现顶着。我方假实现 bgp_midr_group2_shim.c **已从 subdir.am 摘除**（同名同
+ * 签名，不摘则重复符号链接失败）；文件本身保留在树里，把那行翻回来即可重编回
+ * shim 做 A/B 对照，轮 5 评估删除。
  *
  * 一个例外：midr_topology_snapshot_get/release 是 **provider 方向**，由我方实现
- * （轮 3），不在 shim 里。他们树中那两个带 __attribute__((weak))
- * （bgp_midr_input.c:111/122，返回 -ENOSYS），我方的强定义会覆盖它们，合树
- * 不会出现重复符号。
+ * （轮 3，在 bgp_midr_nds_facts.c）。他们树中那两个带 __attribute__((weak))
+ * （bgp_midr_input.c，返回 -ENOSYS），我方的强定义覆盖它们，合树不出现重复符号。
  */
 
 #ifndef _FRR_BGP_MIDR_H

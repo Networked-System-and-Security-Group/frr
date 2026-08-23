@@ -1,0 +1,32 @@
+[
+  {
+    "id": "M4-RIB-001",
+    "runner": "tests/bgpd/test_midr_rib",
+    "description": "direct-owner, sequence fallback and stable selection"
+  },
+  {
+    "id": "M4-RIB-002",
+    "runner": "tests/bgpd/test_midr_rib",
+    "description": "payload conflict quarantine"
+  },
+  {
+    "id": "M4-RIB-003",
+    "runner": "tests/bgpd/test_midr_owned",
+    "description": "owned origination, suppression and fail-closed sequence handling"
+  },
+  {
+    "id": "M4-LSDB-001",
+    "runner": "tests/bgpd/test_midr_lsdb",
+    "description": "pending dependency activation and withdrawal"
+  },
+  {
+    "id": "M4-LSDB-002",
+    "runner": "tests/bgpd/test_midr_lsdb",
+    "description": "atomic LSDB and TED rollback"
+  },
+  {
+    "id": "M4-LSDB-003",
+    "runner": "tests/bgpd/test_midr_lsdb",
+    "description": "real and Mock Provider TED consistency"
+  }
+]

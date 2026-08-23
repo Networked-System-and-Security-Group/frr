@@ -387,6 +387,13 @@ static const struct frr_yang_module_info *const bgpd_yang_modules[] = {
 	&frr_bgp_route_map_info,
 };
 
+#define BGPD_STATE_NAME "%s/bgpd.json", frr_libstatedir
+static char state_path[512];
+static char *state_paths[] = {
+	state_path,
+	NULL,
+};
+
 /* clang-format off */
 FRR_DAEMON_INFO(bgpd, BGP,
 	.vty_port = BGP_VTY_PORT,
@@ -399,6 +406,8 @@ FRR_DAEMON_INFO(bgpd, BGP,
 
 	.yang_modules = bgpd_yang_modules,
 	.n_yang_modules = array_size(bgpd_yang_modules),
+
+	.state_paths = state_paths,
 );
 /* clang-format on */
 
@@ -425,6 +434,7 @@ int main(int argc, char **argv)
 	addresses->cmp = (int (*)(void *, void *))strcmp;
 
 	frr_preinit(&bgpd_di, argc, argv);
+	snprintf(state_path, sizeof(state_path), BGPD_STATE_NAME);
 	frr_opt_add("p:l:SnZe:I:s:x" DEPRECATED_OPTIONS, longopts,
 		    "  -p, --bgp_port           Set BGP listen port number (0 means do not listen).\n"
 		    "  -l, --listenon           Listen on specified address (implies -n)\n"
