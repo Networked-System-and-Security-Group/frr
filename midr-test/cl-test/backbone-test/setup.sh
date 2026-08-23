@@ -1,0 +1,192 @@
+#!/bin/bash
+# setup.sh — Migration of the teammate's containerlab `midr-backbone` rig
+# (containerlab/midr-backbone.clab.yaml + gen-backbone-configs.py on
+# feat/jyf-midr-nds) into our plain netns + tc-netem test environment.
+#
+# Same graph, same node names, same addressing scheme (reused verbatim from
+# gen-backbone-configs.py: transport = 10.99.0.<n>, router-id = 10.0.0.<n>,
+# ASN = 65000+n — so these addresses match what's already documented in
+# doc/change-3.md's backbone-discovery/backbone-shutdown judgement scripts).
+#
+# Two deliberate simplifications from the original, both noted so they're
+# not silently different:
+#
+#   1. t1/t2/t3 (the non-MIDR transit fabric) run NO bgpd here at all —
+#      the original has them speak plain eBGP with `redistribute connected`
+#      purely as a crude reachability mechanism (no IGP in a container/netns
+#      lab). Plain kernel IP forwarding (ip_forward=1 + static routes)
+#      achieves the identical result — every MIDR node reachable only via
+#      multi-hop transit, never link-adjacent — for a fraction of the
+#      complexity, and matches every other topology in this cl-test/
+#      directory. The RFC 8212 default-deny angle the original's transit
+#      BGP sessions were built to exercise is a protocol-compliance concern,
+#      not a CL clustering-decision concern, and isn't reproduced here.
+#
+#   2. Every link gets real delay + bandwidth. The original configures
+#      NEITHER on any of its 15 links (confirmed: `grep -n netem` on the
+#      clab yaml and the generator script both come back empty) — every
+#      group/rep is equidistant, so nothing in that topology ever exercised
+#      the RTT-based ranking or threshold logic CL actually runs on. See the
+#      link table below and run_test.sh's header for the reasoning.
+#
+# Topology (triangle transit core, everything else a single-hop spoke) --
+# taken from the actual `neighbor ... remote-as ...` lines in
+# containerlab/configs-backbone/*/frr.conf (ground truth: this is what the
+# real containerlab deployment actually runs), which matches
+# gen-backbone-configs.py's LINKS table exactly. topo.png turned out to be
+# stale/hand-drawn and disagreed on where r2 attaches -- don't trust it over
+# the generated configs.
+#
+#              b1,b2,r1,m1a,z2          b3,m1b,r2           b4,b5,m2a,z1
+#                    |                       |                    |
+#                   t1 -------------------- t2 ------------------ t3
+#                    \______________________________________________/
+#                                      (direct t1-t3 link too)
+#
+# Groups: group 1 = {r1 rep, m1a, m1b}; group 2 = {r2 rep, m2a} (group 3 is
+# intentionally absent — the original reserved it but never deployed it:
+# "13x = 群3(预留不部署)"). z1/z2 are zero-config nodes exercising the join
+# flow, like newnode elsewhere in cl-test.
+set -e
+
+REAL_NODES=(b1 b2 b3 b4 b5 r1 m1a m1b r2 m2a z1 z2)
+TRANSIT_NODES=(t1 t2 t3)
+ALL_NODES=("${REAL_NODES[@]}" "${TRANSIT_NODES[@]}")
+
+echo "[backbone-setup] Removing any previous namespaces..."
+for node in "${ALL_NODES[@]}"; do
+    ip netns del "ns-bb-$node" 2>/dev/null || true
+done
+
+echo "[backbone-setup] Creating namespaces..."
+for node in "${ALL_NODES[@]}"; do
+    ip netns add "ns-bb-$node"
+    ip -n "ns-bb-$node" link set lo up
+    ip netns exec "ns-bb-$node" sysctl -qw net.ipv4.ip_forward=1
+done
+
+# Stable transport identity for each real node — a /32 alias on lo, exactly
+# gen-backbone-configs.py's lo(n) = 10.99.0.<n> scheme.
+declare -A LOOPBACK=(
+    [b1]=10.99.0.101 [b2]=10.99.0.102 [b3]=10.99.0.103 [b4]=10.99.0.104 [b5]=10.99.0.105
+    [r1]=10.99.0.111 [m1a]=10.99.0.112 [m1b]=10.99.0.113
+    [r2]=10.99.0.121 [m2a]=10.99.0.122
+    [z1]=10.99.0.191 [z2]=10.99.0.192
+)
+for node in "${REAL_NODES[@]}"; do
+    ip -n "ns-bb-$node" addr add "${LOOPBACK[$node]}/32" dev lo
+done
+
+# --- Link table: node1 node2 subnet-third-octet delay-ms bandwidth ---------
+# Addressing (node1=.1, node2=.2 of the /30) and the third-octet numbering
+# are copied verbatim from gen-backbone-configs.py's LINKS table, so these
+# subnets line up with the original's own numbering scheme.
+# Delay/bandwidth are new (see header): core links fast+uniform; group 1's
+# access links fast (both members close to their rep); group 2's rep access
+# link deliberately slow (25ms) so REP_PROBE_DONE unambiguously prefers
+# group 1 and group 2 becomes the ANCHOR runner-up, the same role it plays
+# in every other cl-test topology.
+L1=(t1  t2  1   1ms  100mbit)
+L2=(t2  t3  2   1ms  100mbit)
+L3=(t1  t3  3   1ms  100mbit)
+L4=(b1  t1  11  1ms  50mbit)
+L5=(b2  t1  12  1ms  50mbit)
+L6=(b3  t2  13  1ms  50mbit)
+L7=(b4  t3  14  1ms  50mbit)
+L8=(b5  t3  15  1ms  50mbit)
+L9=(r1  t1  21  1ms  50mbit)
+L10=(m1a t1 22  1ms  50mbit)
+L11=(m1b t2 23  2ms  50mbit)
+L12=(r2  t2 24  25ms 20mbit)
+L13=(m2a t3 25  2ms  50mbit)
+L14=(z1  t3 31  0ms  100mbit)
+L15=(z2  t1 32  0ms  100mbit)
+
+echo "[backbone-setup] Wiring 15 point-to-point links..."
+for i in $(seq 1 15); do
+    eval "link=(\"\${L$i[@]}\")"
+    a="${link[0]}"; b="${link[1]}"; sub="${link[2]}"; delay="${link[3]}"; bw="${link[4]}"
+    av="vb${sub}a"; bv="vb${sub}b"
+    aip="10.10.${sub}.1"; bip="10.10.${sub}.2"
+
+    ip -n "ns-bb-$a" link add "$av" type veth peer name "$bv" netns "ns-bb-$b"
+    ip -n "ns-bb-$a" addr add "${aip}/30" dev "$av"
+    ip -n "ns-bb-$a" link set "$av" up
+    ip -n "ns-bb-$b" addr add "${bip}/30" dev "$bv"
+    ip -n "ns-bb-$b" link set "$bv" up
+
+    # Symmetric delay/bandwidth: apply on both ends so the configured value
+    # is a real per-link, direction-independent cost, not "half of it".
+    if [[ "$delay" != "0ms" ]]; then
+        ip netns exec "ns-bb-$a" tc qdisc add dev "$av" root netem delay "$delay" rate "$bw"
+        ip netns exec "ns-bb-$b" tc qdisc add dev "$bv" root netem delay "$delay" rate "$bw"
+    else
+        ip netns exec "ns-bb-$a" tc qdisc add dev "$av" root netem rate "$bw"
+        ip netns exec "ns-bb-$b" tc qdisc add dev "$bv" root netem rate "$bw"
+    fi
+
+    printf "  %-4s -- %-4s  %-14s  %-14s  delay=%-5s bw=%s\n" \
+        "$a" "$b" "${aip}/30" "${bip}/30" "$delay" "$bw"
+done
+
+echo "[backbone-setup] Routing: real nodes -> default via their transit uplink..."
+declare -A UPLINK_VIA=(
+    [b1]=10.10.11.2 [b2]=10.10.12.2 [b3]=10.10.13.2 [b4]=10.10.14.2 [b5]=10.10.15.2
+    [r1]=10.10.21.2 [m1a]=10.10.22.2 [m1b]=10.10.23.2
+    [r2]=10.10.24.2 [m2a]=10.10.25.2
+    [z1]=10.10.31.2 [z2]=10.10.32.2
+)
+for node in "${REAL_NODES[@]}"; do
+    ip -n "ns-bb-$node" route add default via "${UPLINK_VIA[$node]}"
+done
+
+echo "[backbone-setup] Routing: each transit node -> its own spokes' loopbacks..."
+# A spoke's loopback (10.99.0.x, on its own `lo`) is NOT reachable just
+# because the link subnet (10.10.x.x/30) is directly connected -- that only
+# covers the link's own two /30 addresses. Without an explicit /32 per spoke
+# here, the transit node has no route to the spoke's actual identity address
+# and silently drops anything addressed to it (this was a real bug: found by
+# running the migrated topology and seeing every REP_LIST_REQ from every
+# group node time out against every bootstrap -- t1/t2/t3 had routes for
+# each other's spokes but never for their own).
+ip -n ns-bb-t1 route add 10.99.0.101/32 via 10.10.11.1   # b1
+ip -n ns-bb-t1 route add 10.99.0.102/32 via 10.10.12.1   # b2
+ip -n ns-bb-t1 route add 10.99.0.111/32 via 10.10.21.1   # r1
+ip -n ns-bb-t1 route add 10.99.0.112/32 via 10.10.22.1   # m1a
+ip -n ns-bb-t1 route add 10.99.0.192/32 via 10.10.32.1   # z2
+
+ip -n ns-bb-t2 route add 10.99.0.103/32 via 10.10.13.1   # b3
+ip -n ns-bb-t2 route add 10.99.0.113/32 via 10.10.23.1   # m1b
+ip -n ns-bb-t2 route add 10.99.0.121/32 via 10.10.24.1   # r2
+
+ip -n ns-bb-t3 route add 10.99.0.104/32 via 10.10.14.1   # b4
+ip -n ns-bb-t3 route add 10.99.0.105/32 via 10.10.15.1   # b5
+ip -n ns-bb-t3 route add 10.99.0.122/32 via 10.10.25.1   # m2a
+ip -n ns-bb-t3 route add 10.99.0.191/32 via 10.10.31.1   # z1
+
+echo "[backbone-setup] Routing: transit fabric -> every remote loopback via the right triangle edge..."
+# t1's spokes: b1 b2 r1 m1a z2   |  t2's spokes: b3 m1b r2   |  t3's spokes: b4 b5 m2a z1
+# Every pair of transit nodes has a direct link, so routing is always exactly
+# one core hop -- never indirect via the third transit node.
+for lo in 10.99.0.103 10.99.0.113 10.99.0.121; do           # t2's real nodes
+    ip -n ns-bb-t1 route add "${lo}/32" via 10.10.1.2       # via t1-t2
+done
+for lo in 10.99.0.104 10.99.0.105 10.99.0.122 10.99.0.191; do  # t3's real nodes
+    ip -n ns-bb-t1 route add "${lo}/32" via 10.10.3.2       # via t1-t3
+done
+
+for lo in 10.99.0.101 10.99.0.102 10.99.0.111 10.99.0.112 10.99.0.192; do  # t1's real nodes
+    ip -n ns-bb-t2 route add "${lo}/32" via 10.10.1.1       # via t1-t2
+done
+for lo in 10.99.0.104 10.99.0.105 10.99.0.122 10.99.0.191; do  # t3's real nodes
+    ip -n ns-bb-t2 route add "${lo}/32" via 10.10.2.2       # via t2-t3
+done
+
+for lo in 10.99.0.101 10.99.0.102 10.99.0.111 10.99.0.112 10.99.0.192; do  # t1's real nodes
+    ip -n ns-bb-t3 route add "${lo}/32" via 10.10.3.1       # via t1-t3
+done
+for lo in 10.99.0.103 10.99.0.113 10.99.0.121; do           # t2's real nodes
+    ip -n ns-bb-t3 route add "${lo}/32" via 10.10.2.1       # via t2-t3
+done
+
+echo "[backbone-setup] Done."
