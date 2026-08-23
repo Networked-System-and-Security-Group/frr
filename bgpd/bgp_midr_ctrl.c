@@ -46,6 +46,23 @@ static const struct midr_ctrl_retx_params midr_ctrl_retx_default = {
 	.stop_on_signal = true,
 };
 
+/*
+ * ANNOUNCE has no reply to wait for (stop_on_signal=false: sending
+ * params.count times without an answer is a normal finish, not a give-up --
+ * see the retx-timer comment at its stop_on_signal=false branch). A shorter,
+ * more frequent retry than the default budget above, since ANNOUNCE exists
+ * to beat the sender's own EWMA warm-up window (MIDR_JOIN_PROBE_WAIT_SECS):
+ * one lost UDP packet during a cluster's simultaneous-startup burst used to
+ * be permanent (the receiver's pm_is_known_transport() would drop every
+ * subsequent probe as "unknown transport" for the rest of the run, since
+ * nothing ever resent the self-identification that would have fixed it).
+ */
+static const struct midr_ctrl_retx_params midr_ctrl_retx_announce = {
+	.interval_ms = 2000,
+	.count = 3,
+	.stop_on_signal = false,
+};
+
 /* struct midr_ctrl_pending 定义已移至 bgp_midr_ctrl.h（show midr join 要展示
  * 未应答请求），MTYPE 仍留在本文件。 */
 
@@ -199,7 +216,11 @@ static void midr_ctrl_send_req(struct bgp_midr_nds *mi, struct in_addr dst,
 static void midr_ctrl_request_attempt(struct bgp *bgp, struct in_addr dst,
 				      uint8_t type, uint32_t target_group)
 {
-	if (midr_ctrl_is_peer_req_like(type))
+	/* ANNOUNCE stays on the UDP one-way frame (never had a TCP counterpart
+	 * -- it's not a list exchange), so it doesn't belong under
+	 * midr_ctrl_is_peer_req_like()'s "connection-establishing" umbrella;
+	 * routed here explicitly instead of widening that predicate's meaning. */
+	if (midr_ctrl_is_peer_req_like(type) || type == MIDR_CTRL_ANNOUNCE)
 		midr_ctrl_send_req(bgp->midr_nds_info, dst, type, target_group);
 	else
 		midr_ctrl_tcp_client_start(bgp, dst, type, target_group);
@@ -325,17 +346,24 @@ void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp, struct in_addr dst)
 /*
  * New node -> an arbitrary candidate (rep or member): self-announce so the
  * receiver can validate our subsequent PM probes without an explicit
- * request/response round trip. One-way, fire-and-forget — same frame as
- * MIDR_CTRL_ANNOUNCE's existing use from midr_ctrl_recv_member_list(), just
- * exposed for callers outside this file (e.g. midr_join_on_rep_list() in
- * bgp_midr_nds.c, which needs to announce to *every* rep in the directory, not
- * only the bootstrap that already received a REP_LIST_REQ from us).
+ * request/response round trip. One-way, no reply -- but retried up to
+ * midr_ctrl_retx_announce.count times (2s apart) via the same ctrl_pending
+ * queue the request/response messages use, because a single lost UDP packet
+ * here used to be a permanent failure: the receiver never learns our
+ * transport address, so pm_is_known_transport() drops every one of our PM
+ * probes to it for the rest of the run, and REP_PROBE_DONE/MEMBER_PROBE_DONE
+ * evaluate the candidate as having zero data -- indistinguishable from the
+ * candidate not existing. Exposed for callers outside this file (e.g.
+ * midr_join_on_rep_list() in bgp_midr_nds.c, which needs to announce to
+ * *every* rep in the directory, not only the bootstrap that already received
+ * a REP_LIST_REQ from us).
  */
 void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
 {
 	if (!bgp || !bgp->midr_nds_info)
 		return;
-	midr_ctrl_send_req(bgp->midr_nds_info, dst, MIDR_CTRL_ANNOUNCE, 0);
+	midr_ctrl_enqueue_request(bgp, dst, MIDR_CTRL_ANNOUNCE, 0,
+				  &midr_ctrl_retx_announce);
 	MIDR_FLOW_LOG("MIDR ctrl: sent ANNOUNCE to %pI4", &dst);
 }
 
@@ -1089,9 +1117,11 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 		 * MEMBER_LIST_RESP 里间接得知它的），它的 pm_is_known_transport
 		 * 校验会把我们刚发起的探测包当未知来源丢弃。发一个单向 ANNOUNCE
 		 * 自报身份，让它记住我们——不等回复、不触发建连。两条路径的候选
-		 * 都需要，语义相同。
+		 * 都需要，语义相同。走 midr_ctrl_send_announce() 而非直接
+		 * midr_ctrl_send_req()，好让这条也吃到 ANNOUNCE 的重传预算
+		 * （单包丢失不再是永久性的 unknown-transport）。
 		 */
-		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
+		midr_ctrl_send_announce(bgp, items[i].transport);
 	}
 
 	if (is_join_candidate) {
@@ -1563,11 +1593,89 @@ static void midr_ctrl_udp_recv(struct event *t)
 	}
 }
 
-void midr_ctrl_init(struct bgp *bgp)
+/*
+ * Bind to local_transport_addr only — NOT INADDR_ANY — same reasoning as the
+ * PM probe socket (bgp_midr_pm.c): limits the attack surface to the MIDR
+ * loopback interface, and just as importantly for correctness, controls
+ * which *source* address our own outgoing sendto()s carry. An INADDR_ANY
+ * bind leaves that choice to the kernel's route-to-destination lookup,
+ * which for a multi-hop overlay path can pick the sender's point-to-point
+ * link address instead of its advertised transport identity — a source the
+ * transit hops beyond the first one have no route for, so a reverse-path
+ * check (or equivalent) silently drops the packet a hop or two downstream.
+ * This is exactly what happened to MIDR_CTRL_ANNOUNCE from a cross-transit
+ * node in the backbone-topology test (see CLAUDE.md's "a single lost
+ * ANNOUNCE packet" writeup): PM's packets (correctly sourced) arrived, but
+ * every ctrl-channel packet from the same sender to the same destination
+ * never did.
+ *
+ * transport_addr_set is false when midr_ctrl_init() runs (it fires before
+ * the config file is read, same lifecycle constraint PM has), so the actual
+ * open is deferred to midr_ctrl_on_transport_addr_set(), called from the
+ * `midr transport-address` VTY handler once an address exists to bind to.
+ */
+static void midr_ctrl_open_udp_sock(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct sockaddr_in sa = {};
 	int sock;
+
+	if (!mi->transport_addr_set) {
+		zlog_warn("MIDR ctrl: local transport-address not configured; "
+			  "UDP channel deferred until `midr transport-address` is set");
+		return;
+	}
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		zlog_err("MIDR ctrl: UDP socket() failed: %s",
+			 safe_strerror(errno));
+		return;
+	}
+	sockopt_reuseaddr(sock);
+
+	sa.sin_family = AF_INET;
+	sa.sin_addr = mi->local_transport_addr;
+	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		zlog_err("MIDR ctrl: UDP bind(%pI4:%u) failed: %s",
+			 &mi->local_transport_addr, MIDR_CTRL_UDP_PORT,
+			 safe_strerror(errno));
+		close(sock);
+		return;
+	}
+	set_nonblocking(sock);
+	mi->ctrl_sock = sock;
+	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, sock,
+		       &mi->t_ctrl_read);
+
+	MIDR_LOG("MIDR ctrl: peer-request UDP channel ready on %pI4:%u",
+		  &mi->local_transport_addr, MIDR_CTRL_UDP_PORT);
+}
+
+/*
+ * Called by the VTY `midr transport-address` handler after the address is
+ * set — mirrors midr_pm_on_transport_addr_set() (bgp_midr_pm.c). No rescan
+ * needed here the way PM's counterpart does one: nothing enqueues a
+ * ctrl_pending request before an address exists (midr_ctrl_enqueue_request()
+ * itself checks transport_addr_set and warns+bails), so there's no backlog
+ * of silently-dropped sends to retrofit — just the socket to open.
+ */
+void midr_ctrl_on_transport_addr_set(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+
+	if (mi->ctrl_sock < 0)
+		midr_ctrl_open_udp_sock(bgp);
+}
+
+void midr_ctrl_init(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 
 	if (!mi)
 		return;
@@ -1579,30 +1687,7 @@ void midr_ctrl_init(struct bgp *bgp)
 	 * ——UDP bind 失败的早返回不应连带跳过 TCP。 */
 	midr_ctrl_tcp_init(bgp);
 
-	sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		zlog_err("MIDR ctrl: UDP socket() failed: %s",
-			 safe_strerror(errno));
-		return;
-	}
-	sockopt_reuseaddr(sock);
-
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(INADDR_ANY);
-	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
-	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_err("MIDR ctrl: UDP bind(:%u) failed: %s",
-			 MIDR_CTRL_UDP_PORT, safe_strerror(errno));
-		close(sock);
-		return;
-	}
-	set_nonblocking(sock);
-	mi->ctrl_sock = sock;
-	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, sock,
-		       &mi->t_ctrl_read);
-
-	MIDR_LOG("MIDR ctrl: peer-request UDP channel on :%u",
-		  MIDR_CTRL_UDP_PORT);
+	midr_ctrl_open_udp_sock(bgp);
 }
 
 void midr_ctrl_finish(struct bgp *bgp)

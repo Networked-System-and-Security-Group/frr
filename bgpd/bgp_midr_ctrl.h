@@ -222,6 +222,15 @@ extern void midr_ctrl_init(struct bgp *bgp);
 extern void midr_ctrl_finish(struct bgp *bgp);
 
 /*
+ * The ctrl UDP socket binds to local_transport_addr (not INADDR_ANY), same
+ * as the PM probe socket — but midr_ctrl_init() runs before the config file
+ * is read, so transport_addr_set is still false at that point and the open
+ * is deferred. Call this from the `midr transport-address` VTY handler,
+ * mirroring midr_pm_on_transport_addr_set() (bgp_midr_pm.h).
+ */
+extern void midr_ctrl_on_transport_addr_set(struct bgp *bgp);
+
+/*
  * Called by bgp_midr_nds.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
  * a node, after NDS has decided to peer.  Dedups against an existing peer and
  * sends a reverse PEER_REQUEST so the far end peers back.
