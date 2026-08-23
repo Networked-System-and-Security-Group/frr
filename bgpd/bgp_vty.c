@@ -75,7 +75,6 @@
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
-#include "bgpd/bgp_midr_nds.h" /* midr_nds_is_bootstrap()：distribute 命令的引导提示 */
 
 // 自己注册的命令
 
@@ -20517,10 +20516,15 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->enable_distribution = true;
 
 	/*
-	 * Defer the actual export to the keepalive timer (fires within
-	 * MIDR_KEEPALIVE_INTERVAL seconds) to avoid a deep call-chain that
-	 * can overflow the stack when bgp_ls_export_bgp_topology() is invoked
-	 * synchronously during frr.conf loading or VTY processing.
+	 * 本命令**只置开关、不当场导出**：同步调 bgp_ls_export_bgp_topology()
+	 * 会在 frr.conf 加载 / VTY 处理期形成很深的调用链而爆栈。
+	 *
+	 * 真正的导出由 router-id 更新那条路触发（bgpd.c 的 bgp_router_id_set()
+	 * 末尾：enable_distribution 为真即调 export）。
+	 * 〔件②（轮 4）注记：原注释写"defer 到 keepalive 定时器"是不准确的——
+	 * MIDR 的 keepalive 调的是 midr_propagate_self()、只发 Node NLRI，从来
+	 * 不是全量 export；而件② 已把那条自通告线整条删除，keepalive 定时器现在
+	 * 空转。BGP-LS 自身的导出功能不受影响，仍走上面那条 router-id 路径。〕
 	 */
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty,
@@ -20595,7 +20599,7 @@ DEFPY(neighbor_ls_local_link_id,
 
 	/* Re-originate with the new local link ID. */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer, NULL);
+		bgp_ls_originate_bgp_link(bgp, peer);
 
 	return CMD_SUCCESS;
 }
@@ -20628,7 +20632,7 @@ DEFPY(no_neighbor_ls_local_link_id,
 
 	/* Re-originate using the fallback local link ID (ifindex). */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer, NULL);
+		bgp_ls_originate_bgp_link(bgp, peer);
 
 	return CMD_SUCCESS;
 }
@@ -20662,7 +20666,7 @@ DEFPY(neighbor_ls_remote_link_id,
 
 	/* Re-originate with the new remote link ID. */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer, NULL);
+		bgp_ls_originate_bgp_link(bgp, peer);
 
 	return CMD_SUCCESS;
 }
@@ -20695,7 +20699,7 @@ DEFPY(no_neighbor_ls_remote_link_id,
 
 	/* Re-originate using the fallback remote link ID (0). */
 	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		bgp_ls_originate_bgp_link(bgp, peer, NULL);
+		bgp_ls_originate_bgp_link(bgp, peer);
 
 	return CMD_SUCCESS;
 }

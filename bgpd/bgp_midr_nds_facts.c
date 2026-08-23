@@ -16,6 +16,7 @@
 #include "prefix.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_vty.h" /* bgp_config_inprocess()：上报资格守卫的配置期抑制 */
 #include "bgpd/bgp_midr.h"
 #include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_nds_facts.h"
@@ -23,6 +24,31 @@
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NDS_FACTS, "MIDR NDS fact table");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NDS_FACT_LINK, "MIDR NDS link fact");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NDS_SNAPSHOT, "MIDR NDS topology snapshot");
+
+/* ===========================================================================
+ * 上报失败的分档与降噪（轮 4）。返回码语义见原文档 §4.4：
+ *   -EINVAL 我方填错字段 = 程序 bug，重试无用 -> err；其余（队列满 / resync 中 /
+ *   内存不足）下次事件自然重试 -> warn；连续失败降 debug（判据 = pending 位）。
+ * ⚠ 只改级别、**文案一字不动**（测试脚本 grep 日志串）。
+ * =========================================================================*/
+
+#define FACTS_FAIL_LOG(prio, ...)                                              \
+	do {                                                                   \
+		if ((prio) == LOG_ERR)                                         \
+			zlog_err(__VA_ARGS__);                                 \
+		else if ((prio) == LOG_WARNING)                                \
+			zlog_warn(__VA_ARGS__);                                \
+		else                                                           \
+			MIDR_LOG(__VA_ARGS__);                                 \
+	} while (0)
+
+static int facts_fail_prio(int ret, bool was_pending)
+{
+	if (was_pending)
+		return LOG_DEBUG; /* 连续失败：只留首条，其余降噪 */
+
+	return (ret == -EINVAL) ? LOG_ERR : LOG_WARNING;
+}
 
 /* ===========================================================================
  * 生命周期
@@ -162,6 +188,59 @@ struct midr_context *midr_nds_group2_ctx(struct bgp *bgp)
 	return mi->g2_ctx;
 }
 
+/*
+ * version 空间将尽：停止递增、请求 resync，成功后把全部对象 version 归零。
+ * 返回 true = 本次不发（要么已重置、下次事件用新基线发，要么请求失败得等下次）。
+ * 判据与"只有我方发起的 resync 才重置"的理由见头文件 MIDR_NDS_VERSION_HIGH_WATER。
+ */
+static bool facts_version_exhausted(struct bgp *bgp, uint64_t version,
+				    const char *why)
+{
+	struct midr_nds_facts *f = facts_of(bgp);
+	struct midr_context *ctx;
+	struct listnode *node;
+	struct midr_nds_fact_link *fl;
+	int ret;
+
+	if (version < MIDR_NDS_VERSION_HIGH_WATER)
+		return false;
+
+	ctx = midr_nds_group2_ctx(bgp);
+	if (!ctx)
+		return true;
+
+	ret = midr_topology_resync_begin(ctx, MIDR_TOPOLOGY_RESYNC_VERSION_LOST);
+	if (ret) {
+		/* 返回非 0 时不得提交重置后的低 version 事件（§4.5），保持原值
+		 * 等下次事件再试。 */
+		zlog_warn("MIDR facts: version 空间将尽，resync 请求失败 ret=%d (%s)",
+			  ret, why);
+		return true;
+	}
+
+	f->node.version = 0;
+	for (ALL_LIST_ELEMENTS_RO(f->links, node, fl))
+		fl->data.version = 0;
+
+	zlog_warn("MIDR facts: version 空间将尽，已建立新基线（全部对象 version 归零）(%s)",
+		  why);
+	return true;
+}
+
+int midr_nds_facts_report_after_cfg(struct bgp *bgp)
+{
+	midr_nds_report_node(bgp, MIDR_ORIGIN_INIT);
+	return 0;
+}
+
+int midr_nds_facts_report_after_rid(struct bgp *bgp, bool withdraw)
+{
+	(void)withdraw;
+
+	midr_nds_report_node(bgp, MIDR_ORIGIN_INIT);
+	return 0;
+}
+
 void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 {
 	struct bgp_midr_nds *mi;
@@ -176,6 +255,19 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 		return;
 
 	mi = bgp->midr_nds_info;
+
+	/*
+	 * 刷本机在自己节点表里的那条 self 条目（原挂 bgp_ls.c 的 originate 成功
+	 * 分支，随件② 删旧线消失，故迁来此处）。旧挂点留给件② 一并删——双源期两处
+	 * 都在，函数只是刷字段、重复调无害。
+	 *
+	 * ⚠ 必须挂在这里、不能挂函数末尾的成功路径：下面一排抑制 return（引导专职化、
+	 * 群号 0 资格守卫、配置期推迟、幂等短路、upsert 失败）都不该影响本地视图——
+	 * 刷的是"我自己长什么样"，与"这笔要不要报给第二组"无关。挂末尾则引导节点
+	 * （群号恒 0 必被守卫拦）、退网期、配置期三种情况下 self 条目永远停在旧值，
+	 * 而 show midr nodes 与 midr_rep_candidates() 都要读它。
+	 */
+	midr_nds_local_node_update(bgp);
 
 	ctx = midr_nds_group2_ctx(bgp);
 	if (!ctx) {
@@ -192,13 +284,15 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	 * 键取 f->node —— 事实作废时它仍留着上次报出去的那把键，正是对方认得的
 	 * 那个 node_id/version。
 	 *
-	 * LEAVE 无论报没报过都撤（与改造前 midr_propagate_self(LEAVE) 无条件
-	 * withdraw 等价）；事实失效则只在报过时才有东西可撤。两种情况都要求
-	 * node_id 非 0，否则连键都没有。
+	 * LEAVE 无论报没报过都撤（沿用旧线"退网一律 withdraw"的无条件语义）；事实
+	 * 失效则只在报过时才有东西可撤。两种情况都要求 node_id 非 0，否则连键都没有。
 	 */
 	if (reason == MIDR_ORIGIN_LEAVE || !f->node_valid) {
 		if (!f->node.node_id ||
 		    (reason != MIDR_ORIGIN_LEAVE && !f->node_reported))
+			return;
+
+		if (facts_version_exhausted(bgp, f->node.version, why))
 			return;
 
 		/* 见下方 upsert 处的 version 说明：撤销同样要带更高的 version，
@@ -207,12 +301,15 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 		ret = midr_topology_node_withdraw(ctx, f->node.node_id,
 						  f->node.version);
 		if (ret) {
-			zlog_warn("MIDR facts: node_withdraw 失败 ret=%d (%s)",
-				  ret, why);
+			/* 撤销失败不置 pending：那会把本要撤的对象拉回快照。 */
+			FACTS_FAIL_LOG(facts_fail_prio(ret, false),
+				       "MIDR facts: node_withdraw 失败 ret=%d (%s)",
+				       ret, why);
 			return;
 		}
 
 		f->node_reported = false;
+		f->node_pending = false;
 		MIDR_LOG("MIDR facts: node 撤销上报 (%s) node_id=%u version=%" PRIu64,
 			 why, f->node.node_id, f->node.version);
 		return;
@@ -231,15 +328,20 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	 */
 	if (midr_nds_is_bootstrap(bgp)) {
 		if (f->node_reported && f->node.node_id) {
+			if (facts_version_exhausted(bgp, f->node.version, why))
+				return;
+
 			f->node.version++;
 			ret = midr_topology_node_withdraw(ctx, f->node.node_id,
 							  f->node.version);
 			if (ret) {
-				zlog_warn("MIDR facts: 引导节点撤销自身上报失败 ret=%d (%s)",
-					  ret, why);
+				FACTS_FAIL_LOG(facts_fail_prio(ret, false),
+					       "MIDR facts: 引导节点撤销自身上报失败 ret=%d (%s)",
+					       ret, why);
 				return;
 			}
 			f->node_reported = false;
+			f->node_pending = false;
 			MIDR_LOG("MIDR facts: 本机是引导节点，撤销自身上报后闭嘴 (%s)",
 				 why);
 			return;
@@ -256,9 +358,28 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 		return;
 	}
 
+	/*
+	 * 上报资格守卫：未入网的节点不占对方视图。判据 = 运行值群号非 0 ∧ rid 非 0
+	 * （node_valid 已含）∧ 非配置期。**withdraw 侧不设**——撤销任何时候都得发得
+	 * 出去（本守卫在 withdraw 分支之后）。
+	 *
+	 * 群号取运行值 local_group_id：配置命令执行即写运行值、不等 join，未入网的
+	 * 纯默认节点恒为 0，join 落定 0->N 时自然过守卫并触发上报。
+	 */
+	if (!mi->local_group_id) {
+		MIDR_LOG("MIDR facts: 尚未入群（群号 0），node 上报抑制 (%s)", why);
+		return;
+	}
+	if (bgp_config_inprocess()) {
+		MIDR_LOG("MIDR facts: 配置加载中，node 上报推迟到配置读完 (%s)",
+			 why);
+		return;
+	}
+
 	/* 幂等：无实质变化且已报过就不重报。!node_reported 那一半覆盖
-	 * `no midr shutdown` —— 那时身份与下线前完全相同，changed 为假。 */
-	if (!changed && f->node_reported)
+	 * `no midr shutdown` —— 那时身份与下线前完全相同，changed 为假。
+	 * node_pending 那一半覆盖"上次被拒"：事实没变但还欠对方一笔。 */
+	if (!changed && f->node_reported && !f->node_pending)
 		return;
 
 	/*
@@ -272,19 +393,25 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	 * ⚠ 这道闸门在 apply 阶段、不在 validate 阶段，所以 shim 里逐条镜像的
 	 * 校验**照不出来**（shim 无事实表）。轮 2 的 link 上报同理。
 	 */
+	if (facts_version_exhausted(bgp, f->node.version, why))
+		return;
+
 	f->node.version++;
 
 	ret = midr_topology_node_upsert(ctx, &f->node);
 	if (ret) {
-		/* 真实现的返回码语义（轮 0 读码所得）：-EINVAL 校验拒收 /
-		 * -EAGAIN 对方状态机 resync 中拒收 / -ENOSPC 队列满**且对方直接
-		 * 进 OUT_OF_SYNC**。shim 期只会出 0 或 -EINVAL，但按真实现语义
-		 * 至少留一条 warn，别让失败静默。 */
-		zlog_warn("MIDR facts: node_upsert 失败 ret=%d (%s)", ret, why);
+		/* 分档见文件头 facts_fail_prio()。置 pending：既保证被拒的对象
+		 * 仍进快照（否则对方按"缺席=已失效"把我方注销），也当下次失败的
+		 * 降噪记号。 */
+		FACTS_FAIL_LOG(facts_fail_prio(ret, f->node_pending),
+			       "MIDR facts: node_upsert 失败 ret=%d (%s)", ret,
+			       why);
+		f->node_pending = true;
 		return;
 	}
 
 	f->node_reported = true;
+	f->node_pending = false;
 }
 
 /* ===========================================================================
@@ -458,6 +585,20 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 
 	mi = bgp->midr_nds_info;
 
+	/*
+	 * 优雅下线期间不上报链路（与 midr_nds_report_node 那道同款）。
+	 *
+	 * 原先没有这一道，靠的是两件间接事实兜着：退网会拆光 MIDR 会话（下面闸门①
+	 * 恒假）、且全量停探（I-5 驱动源枯竭）。显式一道更稳，也不必再依赖别处的
+	 * 拆会话/停探做得干不干净——退网延时拆会话落地后，"身份已撤、会话还在"的
+	 * 中间态更是必须由本道守住。
+	 */
+	if (mi->shutdown) {
+		MIDR_LOG("MIDR facts: 已优雅下线，link 上报抑制 (%pFX)",
+			 &link->remote_node_id);
+		return;
+	}
+
 	ctx = midr_nds_group2_ctx(bgp);
 	if (!ctx) {
 		zlog_warn("MIDR facts: topology context 不可用，link 上报跳过 (%pFX)",
@@ -573,19 +714,23 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	fl->data.metrics = metrics;
 	fl->data.policy_state = MIDR_POLICY_ALLOWED;
 
+	if (facts_version_exhausted(bgp, fl->data.version, "link upsert"))
+		return;
+
 	/* version 是「上报序号」，发出前递增（理由见 midr_nds_report_node）。 */
 	fl->data.version++;
 
 	ret = midr_topology_link_upsert(ctx, &fl->data);
 	if (ret) {
-		/* -EINVAL 我方填错 / -EAGAIN 对方 resync 中 / -ENOSPC 队列满且
-		 * 对方进 OUT_OF_SYNC。别让失败静默（node 侧同款）。 */
-		zlog_warn("MIDR facts: link_upsert 失败 ret=%d (%pFX)", ret,
-			  &link->remote_node_id);
+		FACTS_FAIL_LOG(facts_fail_prio(ret, fl->pending),
+			       "MIDR facts: link_upsert 失败 ret=%d (%pFX)", ret,
+			       &link->remote_node_id);
+		fl->pending = true;
 		return;
 	}
 
 	fl->reported = true;
+	fl->pending = false;
 }
 
 void midr_nds_report_link_withdraw(struct bgp *bgp,
@@ -622,12 +767,17 @@ void midr_nds_report_link_withdraw(struct bgp *bgp,
 		return; /* 条目留着，等 context 就绪后还能撤 */
 	}
 
+	if (facts_version_exhausted(bgp, fl->data.version, "link withdraw"))
+		return;
+
 	/* 撤销同样要带更高的 version，否则被对方当旧事件静默丢弃。 */
 	fl->data.version++;
 	ret = midr_topology_link_withdraw(ctx, &fl->data.key, fl->data.version);
 	if (ret) {
-		zlog_warn("MIDR facts: link_withdraw 失败 ret=%d (%pFX)", ret,
-			  remote_node_id);
+		/* 撤销失败不置 pending（同 node 侧）。 */
+		FACTS_FAIL_LOG(facts_fail_prio(ret, false),
+			       "MIDR facts: link_withdraw 失败 ret=%d (%pFX)",
+			       ret, remote_node_id);
 		return;
 	}
 
@@ -649,6 +799,7 @@ void midr_nds_report_link_withdraw(struct bgp *bgp,
 	 * reported 位把墓碑滤掉（见 snapshot_link_eligible）。
 	 */
 	fl->reported = false;
+	fl->pending = false;
 
 	MIDR_LOG("MIDR facts: link 撤销上报 (%pFX) version=%" PRIu64,
 		 remote_node_id, fl->data.version);
@@ -696,7 +847,9 @@ static void snapshot_prefix_from_rid(struct prefix *p, uint32_t rid)
 static bool snapshot_node_eligible(struct bgp *bgp,
 				   const struct midr_nds_facts *f)
 {
-	if (!f->node_reported || !f->node_valid)
+	/* pending = 报过但被拒，仍属"当前有效"，必须进快照——缺席会被对方按
+	 * "已失效"生成权威撤销（理由见头文件 pending 位注释）。 */
+	if ((!f->node_reported && !f->node_pending) || !f->node_valid)
 		return false;
 
 	/* 引导专职化 / 优雅下线期间本就不报（与 midr_nds_report_node 同判据）。
@@ -716,8 +869,9 @@ static bool snapshot_link_eligible(struct bgp *bgp,
 {
 	struct prefix remote;
 
-	/* 墓碑（撤过）与从没报过的占位条目都在这一关滤掉。 */
-	if (!fl->reported)
+	/* 墓碑（撤过）与从没报过的占位条目都在这一关滤掉；pending（报过被拒）
+	 * 例外，仍属"当前有效"必须进快照（同 node 侧）。 */
+	if (!fl->reported && !fl->pending)
 		return false;
 
 	/* 闸门③ 键合法（他们 midr_validate_link_update 的第一关）。 */

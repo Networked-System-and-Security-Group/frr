@@ -24,9 +24,11 @@ Z1_TRANSPORT=10.99.0.191; Z1_ASN=65191; Z1_RID=10.0.0.191
 M2A_TRANSPORT=10.99.0.122; M2A_ASN=65122
 Z1_STATIC=10.10.31.2            # z1 的静态过境邻居（t3），不载 LS
 
-PASS=0; FAIL=0
-pass() { echo "  ✓ $1"; PASS=$((PASS+1)); }
-fail() { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
+PASS=0; FAIL=0; NOSAM=0
+pass()  { echo "  ✓ $1"; PASS=$((PASS+1)); }
+fail()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
+# 造不出正样本 —— **不算通过**，单列一档（教训：把 NOSAMPLE 抹平成"全 PASS"）
+nosam() { echo "  ⚠ 没造出场景：$1"; NOSAM=$((NOSAM+1)); }
 die()  { echo "[backbone-shutdown] 前置不满足：$1"; exit 2; }
 
 v()    { docker exec "$1" vtysh -c "$2" 2>/dev/null; }
@@ -191,15 +193,30 @@ done
 [[ "$SUP" -gt 0 ]] && pass "I-3 守卫有正样本：抑制 $SUP 次递交（periodic_sync 被拦下）" \
                    || fail "等满 40s 仍没抓到 I-3 抑制日志"
 
-# ---- 判据 4 补采：收包守卫的正样本 -------------------------------------------
-# ⚠ 为什么要专门造场景：守卫齐备后，退网节点把 MIDR 会话全拆了，而本台子是**真分离**
-# （静态邻居不载 LS），于是退网后根本没有任何 BGP-LS 输入源——收包守卫想触发也没得触发
-# （08-21 实撞：v2 轮 0 条，v1 轮 188 条，差别正是 v1 没有 ctrl 守卫、会话被回配重建了）。
-# 拿正样本必须造一条**退网拆不掉的载 LS 会话**：手工配一条静态多跳邻居并 activate
-# link-state。它不是 `midr session` 建的、不带 OVERLAY 标记，退网不碰它——这恰好就是
-# 这道守卫真正要防的场景（运维自己在静态邻居上开了 LS，退网后 NLRI 照样往里灌）。
+# ---- 判据 4 补采：运维会话不受退网影响 + 退网守卫（正样本已造不出） ----------
+#
+# ⚠ 件②（轮 4）改判，读之前先看这一段，别照旧结论排查：
+#
+# 旧做法（件②之前）：手工配一条静态多跳邻居并 `activate` BGP-LS，让它给退网中的 z1
+# 持续灌 Node NLRI，从而拿到"收包守卫丢弃了 N 份"的正样本。
+#
+# 件②之后**这条路断了，且没有替代**：
+#   1. 我方自有的 Node NLRI 收发线整条删除（originate + 收包挂接都没了）——静态会话
+#      即使 activate 了 (4,8)，线上也不再有任何 MIDR NLRI 流动；
+#   2. 守卫文案在第二组回调壳里原样存在（`MIDR 退网：丢弃收到的远端 Node NLRI`），
+#      但它现在**只由第二组回调驱动**，而回调的数据源是他们的 LSDB、LSDB 靠 (4,9)
+#      MIDR-LS 会话收数据；
+#   3. 而 (4,9) **没有 address-family 配置命令**（只有 `address-family link-state
+#      [link-state]` = (4,8)），只能由 midr_nds_ctrl_setup_overlay_peer() 在建
+#      overlay 会话时用 peer_activate() 打开——退网恰恰把这些会话全拆了（含 MANUAL）。
+#
+# 于是"退网期间还有远端事实送进来"这个场景在当前架构下造不出来，判据降为 nosam。
+# ⚠ **不许把它抹成 PASS**：日志零条既可能是"守卫拦住了"，也可能是"根本没东西进来"，
+# 脚本分不出这两者——这正是判据 6 与补 2-a 当年的教训。
+# 触发重估：第二组若提供 (4,9) 的运维配置入口，或将来支持"退网保留一条只收不发的
+# 会话"，回来把正样本补上。
 echo ""
-echo "[判据 4 补采] 造一条退网也拆不掉的载 LS 静态会话，看收包守卫是否真的丢弃"
+echo "[判据 4 补采] 运维静态会话不受退网影响；退网守卫正样本（件② 后已造不出）"
 DROP0=$(logtail $Z1 "$L_Z1" | grep -c "MIDR 退网：丢弃收到的远端 Node NLRI")
 M1A=clab-midr-backbone-m1a; M1A_TRANSPORT=10.99.0.112; M1A_ASN=65112
 for spec in "$Z1|$Z1_ASN|$M1A_TRANSPORT|$M1A_ASN" "$M1A|$M1A_ASN|$Z1_TRANSPORT|$Z1_ASN"; do
@@ -207,23 +224,21 @@ for spec in "$Z1|$Z1_ASN|$M1A_TRANSPORT|$M1A_ASN" "$M1A|$M1A_ASN|$Z1_TRANSPORT|$
     docker exec "$cc" vtysh -c "configure terminal" -c "router bgp $aa" \
         -c "neighbor $nn remote-as $na" \
         -c "neighbor $nn ebgp-multihop 5" \
-        -c "neighbor $nn update-source lo" \
-        -c "address-family link-state link-state" \
-        -c "neighbor $nn activate" >/dev/null 2>&1
+        -c "neighbor $nn update-source lo" >/dev/null 2>&1
 done
-echo "  已配 z1 <-> m1a 静态多跳 LS 会话（非 midr session，退网不该拆它），等 40s 看效果"
+echo "  已配 z1 <-> m1a 静态多跳会话（非 midr session，退网不该拆它），等 40s 看效果"
 sleep 40
 STATIC_LS=$(v $Z1 "show bgp summary" | grep "^$M1A_TRANSPORT" | grep -cv "Idle\|Active\|Connect")
 DROP1=$(logtail $Z1 "$L_Z1" | grep -c "MIDR 退网：丢弃收到的远端 Node NLRI")
-[[ "$STATIC_LS" -gt 0 ]] && pass "静态 LS 会话已建立且退网没拆它（运维会话不受退网影响）" \
-                         || fail "静态 LS 会话没建起来，判据 4 的正样本无从取得"
+[[ "$STATIC_LS" -gt 0 ]] && pass "静态会话已建立且退网没拆它（运维会话不受退网影响）" \
+                         || fail "静态会话没建起来（这半条判据与 MIDR 无关，纯看 BGP）"
 if [[ "$DROP1" -gt "$DROP0" ]]; then
-    pass "收包守卫有正样本：新丢弃 $((DROP1-DROP0)) 份远端 NLRI（有输入源时确实拦住了）"
+    pass "退网守卫有正样本：新丢弃 $((DROP1-DROP0)) 份远端事实（意外收获，说明确有回调到达）"
 else
-    fail "有了 LS 输入源却没抓到收包守卫日志（守卫可能没生效）"
+    nosam "退网守卫零样本 —— 件② 后无输入源可造（见本段头注释），非守卫失效"
 fi
 N3=$(nodecount $Z1 $Z1_RID)
-[[ "$N3" -eq 0 ]] && pass "灌了 40s NLRI 后节点表仍为空（守卫真的挡住了回灌）" \
+[[ "$N3" -eq 0 ]] && pass "退网后节点表仍为空（无回灌）" \
                   || fail "节点表被灌回 $N3 条"
 # 拆掉这条测试用的静态会话，免得污染后续判据
 for spec in "$Z1|$Z1_ASN|$M1A_TRANSPORT" "$M1A|$M1A_ASN|$Z1_TRANSPORT"; do
@@ -306,6 +321,6 @@ conf $R1 65111 "no midr shutdown" >/dev/null
 
 echo ""
 echo "=============================================================="
-echo " 小结：通过 $PASS 条，失败 $FAIL 条"
+echo " 小结：通过 $PASS 条，失败 $FAIL 条，没造出场景 $NOSAM 条"
 echo "=============================================================="
 [[ "$FAIL" -eq 0 ]]

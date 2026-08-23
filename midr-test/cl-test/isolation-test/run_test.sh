@@ -35,6 +35,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
+# 合栈（对接轮 4）后必需，理由同 growth-test/run_test.sh 同处注释：宿主系统的旧
+# libfrr 缺第二组新加的符号，不指过去 bgpd 起不来、而脚本会 grep 到旧日志报假阳性。
+export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 TESTDIR="$SCRIPT_DIR"
 JOIN_TIMEOUT=150
 ISOLATION_TIMEOUT=150

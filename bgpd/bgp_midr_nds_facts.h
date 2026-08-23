@@ -53,6 +53,18 @@ struct midr_nds_fact_link {
 	/* 已经成功 upsert 过一次。轮 2 用它区分「首次上报」与「更新」，并在链路
 	 * 死掉时决定要不要发 withdraw（没报过就没什么可撤）。 */
 	bool reported;
+
+	/*
+	 * 「想报但被第二组拒了」（upsert 返回非 0）。两个用途：① 快照入选判据
+	 * = reported || pending；② 失败日志降噪的"上次也失败过"记号。成功即清。
+	 *
+	 * ⚠ 必须与 reported 分开：reported 兼着墓碑语义（撤过还没恢复的 link——
+	 * 会话仍 Established、旧 rtt 仍在，三道闸门全过，只有它认得出）和幂等守卫，
+	 * 失败时硬置 reported 会让幂等守卫把该重报的那次吃掉。
+	 * ⚠ **withdraw 失败不置 pending**：那时要的正是"别出现在快照里"，快照缺席
+	 * 恰好等于撤销；置了反而把它拉回快照、抵消撤销。
+	 */
+	bool pending;
 };
 
 /* 本地事实表，挂 bgp->midr_nds_info->facts。 */
@@ -67,6 +79,10 @@ struct midr_nds_facts {
 	 * `no midr shutdown` 时身份与下线前一模一样，只看 node_refresh 的返回值
 	 * 会漏报。 */
 	bool node_reported;
+
+	/* node 侧的「想报但被拒」，语义与 midr_nds_fact_link.pending 完全一致
+	 * （node 恒 1 个，故只需一个位）。 */
+	bool node_pending;
 
 	/* struct midr_nds_fact_link *，出向链路 */
 	struct list *links;
@@ -109,26 +125,22 @@ extern struct midr_context *midr_nds_group2_ctx(struct bgp *bgp);
 
 /*
  * 身份变化点的统一出口：刷新 node 事实 → midr_topology_node_upsert() /
- * _withdraw()。取代原先各处直调 midr_propagate_self()。
+ * _withdraw()。件②（轮 4）删掉自有 BGP-LS 自通告出口后，这是本机身份对外的
+ * **唯一**一条路。
  *
  * 调用点（轮 1 已收编全部 5 处）：midr_nds_set_capability /
  * midr_originate_group_update（即 midr_group_reconverge 第 1 步，手动换组与 I-7
  * JOIN 共用）/ `midr transport-address` 设置与清除 / `midr shutdown` 与
  * `no midr shutdown`。
  *
- * **不走这里的**：keepalive 定时器 —— 它不是身份变化（node_refresh 恒返回
- * false，走这条路等于把 5s 重发静默掐掉），继续直调 midr_propagate_self()。
- *
- * reason 的语义与 midr_propagate_self() 一致：只驱动日志，除了
- * LEAVE -> withdraw、其余 -> upsert。三条不显然的规则：
+ * reason 只驱动日志：除 LEAVE -> withdraw 外一律 upsert。四条不显然的规则：
  *   - 幂等：事实无实质变化且已报过 -> 不重报（Q8 频率控制天然满足）；
  *   - `no midr shutdown`：事实与下线前相同、refresh 返回 false，靠
  *     node_reported 已被 withdraw 复位才得以重报；
- *   - 优雅下线期间的身份变化：事实照更（version 不动），但不上报 —— 守卫在本
- *     函数里，与 midr_propagate_self() 内那道并存（那道守 keepalive 直调路径）。
- *
- * shim 期 upsert/withdraw 内部转调回 midr_propagate_self()，NLRI 照发、行为不
- * 变；轮 4 换第二组真实现后本函数一行不用改。
+ *   - 优雅下线期间的身份变化：事实照更（version 不动），但不上报——守卫在本
+ *     函数里，是出站方向仅剩的两道之一（另一道在 midr_nds_report_link()）；
+ *   - **刷本机 self 条目（midr_nds_local_node_update）挂在本函数最前面**，在所有
+ *     抑制 return 之前：它刷的是本地视图，与"这笔要不要报给第二组"无关。
  */
 extern void midr_nds_report_node(struct bgp *bgp,
 				 enum midr_origin_reason reason);
@@ -238,7 +250,7 @@ extern bool midr_nds_metrics_to_group2(const struct midr_nds_link_metrics *m,
 /*
  * link 上报出口：更新事实表 → midr_topology_link_upsert()。node 侧
  * midr_nds_report_node() 的同层同构物，**取代 I-5 去抖放行后原先直调的 E-1**
- * （shim 期 upsert 内部转调回 E-1，NLRI 照发、行为不变）。
+ * （件② 已删掉那条 E-1 出口，本函数是链路指标对外的唯一一条路）。
  *
  * 唯一调用点 = midr_nds_on_link_update() 里去抖放行处。上层（探测 / I-5 /
  * 去抖）对本函数一无所知：该不该报的判断全在这里。
@@ -261,10 +273,49 @@ extern void midr_nds_report_link(struct bgp *bgp,
  * 这是「链路生死归会话/节点级」的清理路径那一半（另一半是轮 4/5 要挂的
  * peer_status_changed 钩子）。没报过（reported 为假）就没什么可撤，只删条目。
  *
- * ⚠ shim 期它只打日志不发真撤销 —— 旧 E-1 路径本来就没有「撤 Link NLRI」这个
- * 动作，接上去反而改变行为（换壳不改行为是轮 2 的红线）。
+ * ⚠ 历史注记：轮 2/3 的 shim 期它只打日志不发真撤销（旧 E-1 路径本来就没有
+ * 「撤 Link NLRI」这个动作，接上去反而改变行为）。件② 起 shim 不参与编译，
+ * 撤销直接走第二组的 link_withdraw。
  */
 extern void midr_nds_report_link_withdraw(struct bgp *bgp,
 					  const struct prefix *remote_node_id);
+
+/* ===========================================================================
+ * 钩子回调（轮 4：上报资格守卫的配套，注册在 bgp_midr_nds_init）
+ * =========================================================================*/
+
+/*
+ * 配置读完补一笔 node 上报（挂 bgp_config_end），与 report_node 里那道「配置期
+ * 抑制」守卫成对：conf 逐行执行时身份还在拼装（`midr group-id` 可能排在
+ * `midr transport-address` 之前），报出去是半成品。同款先例 = 挂靠推迟。
+ *
+ * ⚠ 注册顺序必须排在 midr_nds_bootstrap_after_cfg **之后**：引导专职化收尾会清
+ * 群代表位/群号，先清完再报，才不会报一份马上作废的身份。
+ */
+extern int midr_nds_facts_report_after_cfg(struct bgp *bgp);
+
+/*
+ * router-id 就绪后重放一笔（挂 bgp_routerid_update）——守卫要求 rid 非 0，之前的
+ * 都被挡下了。withdraw 方向不特殊处理：report_node 走 !node_valid 分支自然发撤销。
+ *
+ * 与第二组同名钩子并存无碍：他们注册更早、回调只排一个 event 就返回，我方这笔
+ * upsert 落进他们的 resync 队列不丢，回放时计一次 ignored_old（内容一致）。
+ */
+extern int midr_nds_facts_report_after_rid(struct bgp *bgp, bool withdraw);
+
+/* ===========================================================================
+ * version 上限守卫（轮 4）
+ *
+ * 协议 §4.5：version 接近 UINT64_MAX 时必须停止递增、触发完整 resync，在新基线上
+ * 恢复。这是协议**唯一**点名要我方调 resync_begin 的场景——另一类"第一组重启"在
+ * 合栈后不成立（同进程同生共死，重启时对方 fact table 也是空的）；队列满/内存不足
+ * 归第二组自己管，我方按 §4.4 只重试。
+ *
+ * ⚠ **只有我方发起的 resync 才重置 version**。对方自己发起的（他们不通知我方）绝不
+ * 能跟着归零：他们按快照里带出的 version 原值建新表，我方继续递增恒大于它；归零反而
+ * 小于表内值、被当旧事件吞掉。`midr shutdown` → `no midr shutdown` 同理（进程没重启、
+ * 对方墓碑还记着撤销时的号）。分界线：**看对方的记忆死没死**。
+ * =========================================================================*/
+#define MIDR_NDS_VERSION_HIGH_WATER (UINT64_MAX - 1024)
 
 #endif /* _FRR_BGP_MIDR_NDS_FACTS_H */

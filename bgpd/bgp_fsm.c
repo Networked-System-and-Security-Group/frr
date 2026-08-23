@@ -2977,7 +2977,7 @@ bgp_establish(struct peer_connection *connection)
 
 	/* Generate Link NLRI for BGP session (local -> peer) */
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
-		if (bgp_ls_originate_bgp_link(bgp, peer, NULL) != 0)
+		if (bgp_ls_originate_bgp_link(bgp, peer) != 0)
 			zlog_warn("BGP-LS: Failed to originate link NLRI for peer %s", peer->host);
 
 	bgp_announce_peer(peer);

@@ -84,6 +84,15 @@ DEFUN(midr_group_id,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
+	/* 群 0 = 「未入网」这一个语义（上报资格守卫拿它当入网判据），不接受当配置值
+	 * 写进来。不做 no form —— "清配置"不留命令语义；内部 config_group_id = 0 的
+	 * 路径不经本命令，不受影响。 */
+	if (gid == 0) {
+		vty_out(vty,
+			"%% 群号 0 保留给「未入网」状态，不得配置——如需退网请用 `midr shutdown`\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
 	midr_nds_set_group_id(bgp, gid);
 
 	vty_out(vty, "MIDR group-id set to %u\n", gid);
@@ -209,14 +218,16 @@ DEFUN(midr_session,
 			vty_out(vty, "%s", MIDR_SESSION_SYMMETRY_HINT);
 			return CMD_SUCCESS;
 		}
-		/* 运维会话占用该地址：拒绝接管（运维优先，绝不动它）。 */
-		if (peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+		/* 运维会话占用该地址：拒绝接管（运维优先，绝不动它）。
+		 * ⚠ 件②（轮 4）迁 MIDR-LS 后**不再复用运维会话**（真分离约定），
+		 * 所以两种情形都只能改地址，区别仅在提示里点明现状。 */
+		if (peer->afc[AFI_BGP_LS][SAFI_MIDR_LS])
 			vty_out(vty,
-				"%% %s 已有运维会话且已激活 link-state，可直接承载 MIDR 拓扑，无需另建\n",
+				"%% %s 已被运维会话占用（该会话已激活 MIDR-LS）；MIDR 不复用运维会话，请改用该节点其它地址\n",
 				argv[2]->arg);
 		else
 			vty_out(vty,
-				"%% %s 已被运维会话占用；拒绝接管（避免砸转发面）。请在原生配置为该邻居激活 link-state 复用现有会话，或改用该节点其它地址\n",
+				"%% %s 已被运维会话占用；拒绝接管（避免砸转发面）。请改用该节点其它地址\n",
 				argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
@@ -798,53 +809,6 @@ DEFUN(no_midr_shutdown,
 }
 
 /* ------------------------------------------------------------------ */
-/* [no] midr keepalive-suppress  —— 隐藏命令，保底轮 2 批 6 的 ④ 保活验证 */
-/* ------------------------------------------------------------------ */
-/*
- * 停掉 MIDR 自建的两个定时器（keepalive 5s 重发自身 NLRI / expire-check 15s
- * 判他人失效），好实测"只靠 BGP 自带 keepalive+holdtime，会话判死与视图清理
- * 还成不成立"——那正是对接轮 4/5 要删掉这两个定时器的前提。
- * 隐藏 = 不进 conf 样板、不写用户文档：这是实验会话手敲的开关，**跑完要 no 回去**
- * （Q4 定案；备选"编译宏"被否——每拨一次要重编重灌全部容器）。
- */
-DEFUN_HIDDEN(midr_keepalive_suppress,
-	     midr_keepalive_suppress_cmd,
-	     "midr keepalive-suppress",
-	     "MIDR configuration\n"
-	     "Suppress MIDR's own keepalive/expire timers (experiment only)\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-
-	if (!bgp->midr_nds_info) {
-		vty_out(vty, "%% MIDR not initialized\n");
-		return CMD_WARNING;
-	}
-
-	midr_nds_set_keepalive_suppress(bgp, true);
-	vty_out(vty, "MIDR: keepalive/expire 定时器已抑制（实验开关，记得 no 回去）\n");
-	return CMD_SUCCESS;
-}
-
-DEFUN_HIDDEN(no_midr_keepalive_suppress,
-	     no_midr_keepalive_suppress_cmd,
-	     "no midr keepalive-suppress",
-	     NO_STR
-	     "MIDR configuration\n"
-	     "Resume MIDR's own keepalive/expire timers\n")
-{
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
-
-	if (!bgp->midr_nds_info) {
-		vty_out(vty, "%% MIDR not initialized\n");
-		return CMD_WARNING;
-	}
-
-	midr_nds_set_keepalive_suppress(bgp, false);
-	vty_out(vty, "MIDR: keepalive/expire 定时器已恢复\n");
-	return CMD_SUCCESS;
-}
-
-/* ------------------------------------------------------------------ */
 /* show midr nodes                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -872,6 +836,24 @@ static const char *midr_caps_str(uint32_t caps, char *buf, size_t len)
  * 张表的过滤视图, 含 expired 条目 (诊断命令要能看见异常; 协议侧 REP_LIST 组
  * 装另用严过滤, 见 midr_rep_candidates)。
  */
+/* 年龄格式化：show midr nodes 的 Age 列与 bootstrap-seeds 共用一把尺。 */
+static void midr_seed_age_str(time_t age, char *buf, size_t len)
+{
+	if (age < 0)
+		snprintf(buf, len, "(未来?)"); /* 钟被调过；只提示不猜 */
+	else if (age < 60)
+		snprintf(buf, len, "%llds", (long long)age);
+	else if (age < 3600)
+		snprintf(buf, len, "%lldm%llds", (long long)(age / 60),
+			 (long long)(age % 60));
+	else if (age < 86400)
+		snprintf(buf, len, "%lldh%lldm", (long long)(age / 3600),
+			 (long long)((age % 3600) / 60));
+	else
+		snprintf(buf, len, "%lldd%lldh", (long long)(age / 86400),
+			 (long long)((age % 86400) / 3600));
+}
+
 static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 				 uint32_t required_caps)
 {
@@ -880,16 +862,15 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 	time_t now = monotime(NULL);
 
 	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
-		"Router-ID", "Transport-Addr", "ASN", "Group-ID", "Status",
+		"Router-ID", "Transport-Addr", "ASN", "Group-ID", "Age",
 		"Capabilities");
 	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
 		"------------------", "------------------", "--------",
 		"----------", "--------", "------------");
 
 	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes, entry) {
-		bool active = entry->is_self ||
-			      (now - entry->last_seen) <= MIDR_NODE_EXPIRE_TIME;
 		char taddr[INET_ADDRSTRLEN];
+		char age[32];
 
 		if ((entry->capabilities & required_caps) != required_caps)
 			continue;
@@ -900,12 +881,20 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 		else
 			snprintf(taddr, sizeof(taddr), "-");
 
+		/* 件④：Age 取代 Status —— 老化判死已删，这里只报"上次收到关于
+		 * 它的消息是多久前"，不含活性含义。 */
+		if (entry->is_self)
+			snprintf(age, sizeof(age), "-");
+		else
+			midr_seed_age_str(now - entry->last_update, age,
+					  sizeof(age));
+
 		vty_out(vty, "%-18pI4 %-18s %-8u %-10u %-8s %s\n",
 			&entry->node_id.u.prefix4,
 			taddr,
 			entry->asn,
 			entry->group_id,
-			active ? "active" : "expired",
+			age,
 			midr_caps_str(entry->capabilities, caps_buf,
 				      sizeof(caps_buf)));
 	}
@@ -1008,23 +997,6 @@ struct midr_seed_show_ctx {
 };
 
 /* 把"距今多久"印成人话（秒/分/时/天），比裸的 epoch 好读得多。 */
-static void midr_seed_age_str(time_t age, char *buf, size_t len)
-{
-	if (age < 0)
-		snprintf(buf, len, "(未来?)"); /* 钟被调过；只提示不猜 */
-	else if (age < 60)
-		snprintf(buf, len, "%llds", (long long)age);
-	else if (age < 3600)
-		snprintf(buf, len, "%lldm%llds", (long long)(age / 60),
-			 (long long)(age % 60));
-	else if (age < 86400)
-		snprintf(buf, len, "%lldh%lldm", (long long)(age / 3600),
-			 (long long)((age % 3600) / 60));
-	else
-		snprintf(buf, len, "%lldd%lldh", (long long)(age / 86400),
-			 (long long)((age % 86400) / 3600));
-}
-
 static void midr_seed_show_cb(const char *transport, uint32_t asn,
 			      const char *rid, time_t last_seen, void *arg)
 {
@@ -1148,11 +1120,11 @@ DEFUN(show_midr_neighbors,
 
 	nodes = &bgp->midr_nds_info->global_view->nodes;
 
-	vty_out(vty, "%-18s %-8s %-14s %-10s %-15s %s\n",
-		"Neighbor", "ASN", "State", "Group-ID", "Origin",
+	vty_out(vty, "%-18s %-8s %-14s %-6s %-10s %-15s %s\n",
+		"Neighbor", "ASN", "State", "LS", "Group-ID", "Origin",
 		"Capabilities");
-	vty_out(vty, "%-18s %-8s %-14s %-10s %-15s %s\n",
-		"------------------", "--------", "--------------",
+	vty_out(vty, "%-18s %-8s %-14s %-6s %-10s %-15s %s\n",
+		"------------------", "--------", "--------------", "------",
 		"----------", "---------------", "------------");
 
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
@@ -1164,15 +1136,14 @@ DEFUN(show_midr_neighbors,
 		char origin[20];
 
 		/*
-		 * 这道过滤按**承载**判、不按**归属**判：列的是"哪些会话在跑 MIDR
-		 * 拓扑情报"，所以复用运维原生会话的那种（没有 OVERLAY 标记但确实
-		 * 载着 LS）也该出现在表里。别拿它当归属判据用——认"这条边是不是
-		 * MIDR 建的"一律走 midr_nds_peer_is_overlay()。
-		 * 〔迁族批待办：过滤改用 OVERLAY 标记、"载不载 MIDR-LS"改成表里一
-		 * 列——一条 MIDR 会话没激活 LS 恰恰是异常、最该被看见，写进过滤条件
-		 * 等于把坏会话藏起来（今天就有这毛病）。〕
+		 * 件②（轮 4）改按**归属**过滤：列的是"MIDR 自己的边"。
+		 *
+		 * 改前按承载判（afc[4][8]），把"载不载 LS"写进了过滤条件——等于把
+		 * 坏会话藏起来：一条 MIDR 会话没激活 LS 恰恰是异常、最该被看见。现在
+		 * 承载降为下面的 LS 列（yes / no），异常一眼可辨。
+		 * 迁族后不再复用运维原生会话（真分离约定），故归属过滤不会漏掉谁。
 		 */
-		if (!peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+		if (!midr_nds_peer_is_overlay(peer))
 			continue;
 
 		any = true;
@@ -1235,8 +1206,11 @@ DEFUN(show_midr_neighbors,
 		else
 			snprintf(origin, sizeof(origin), "-");
 
-		vty_out(vty, "%-18s %-8u %-14s ", nbr_disp, peer->as,
-			state_buf);
+		/* LS 列：这条 MIDR 会话到底载没载 MIDR-LS。no = 异常（会话是
+		 * MIDR 自建的、却没激活拓扑族，拓扑情报根本传不了）。 */
+		vty_out(vty, "%-18s %-8u %-14s %-6s ", nbr_disp, peer->as,
+			state_buf,
+			peer->afc[AFI_BGP_LS][SAFI_MIDR_LS] ? "yes" : "no");
 
 		if (ne) {
 			vty_out(vty, "%-10u %-15s %s\n", ne->group_id, origin,
@@ -1317,11 +1291,74 @@ static const char *midr_join_phase_str(enum midr_join_phase phase)
  * 本机自身的 MIDR 状态。
  *
  * 为什么单开一条命令、而不是从 `show midr nodes` 里看自己（08-13 立）：节点表里
- * 那条"自身条目"是 origination 的**副产品**——只在 bgp_ls_originate_bgp_node()
- * 成功之后才刷新，通告发不出去时（没配 distribute / 退网中 / LS 会话全断）它就
- * 不再更新，"我是谁"这件最基本的事反而在表里查不到。本命令直接读运行态实例
+ * 那条"自身条目"当初是 origination 的**副产品**，通告发不出去时就不再更新，
+ * "我是谁"这件最基本的事反而在表里查不到。本命令直接读运行态实例
  * （bgp->midr_nds_info），与"发不发得出去"彻底解耦。
+ * 〔件②（轮 4）后自身条目改由 midr_nds_report_node() 无条件刷新，那个副作用已
+ * 消失；但本命令"直接读运行态"的定位不变，仍是查身份最可靠的一条。〕
  */
+/*
+ * 对第二组接口的状态汇总（轮 4 联调用）：上行（facts 上报）+ 下行（remote-view
+ * 回调）两个方向各自的账。判据脚本可直接 grep 这些行。
+ */
+DEFUN(show_midr_group2,
+      show_midr_group2_cmd,
+      "show midr group2",
+      SHOW_STR
+      "MIDR information\n"
+      "第二组接口对接状态（上报线 + 远端视图回调）\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct bgp_midr_nds *mi;
+	struct midr_nds_facts *f;
+	struct listnode *node;
+	struct midr_nds_fact_link *fl;
+	uint32_t link_reported = 0, link_pending = 0, link_total = 0;
+
+	if (!bgp || !bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	mi = bgp->midr_nds_info;
+	f = mi->facts;
+
+	vty_out(vty, "MIDR <-> 第二组接口状态\n");
+	vty_out(vty, "  context           : %s\n",
+		mi->g2_ctx ? "已取得" : "未就绪");
+
+	vty_out(vty, "  [上行] 本地事实上报\n");
+	if (!f) {
+		vty_out(vty, "    事实表          : 未就绪\n");
+	} else {
+		for (ALL_LIST_ELEMENTS_RO(f->links, node, fl)) {
+			link_total++;
+			if (fl->reported)
+				link_reported++;
+			if (fl->pending)
+				link_pending++;
+		}
+		vty_out(vty, "    node            : valid=%d reported=%d pending=%d version=%llu\n",
+			f->node_valid, f->node_reported, f->node_pending,
+			(unsigned long long)f->node.version);
+		vty_out(vty, "    link            : 条目 %u（reported %u / pending %u）\n",
+			link_total, link_reported, link_pending);
+		vty_out(vty, "    snapshot_version: %llu\n",
+			(unsigned long long)f->snapshot_version);
+	}
+
+	vty_out(vty, "  [下行] 远端视图回调\n");
+	vty_out(vty, "    回调注册        : %s\n",
+		mi->remote_view_registered ? "已注册" : "未注册");
+	vty_out(vty, "    node 事件       : %llu（update + withdraw）\n",
+		(unsigned long long)mi->remote_node_events);
+	vty_out(vty, "    link 事件       : %llu（本轮只观察不消费）\n",
+		(unsigned long long)mi->remote_link_events);
+	vty_out(vty, "    疑似虚报撤销    : %llu\n",
+		(unsigned long long)mi->remote_suspect_count);
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(show_midr_self,
       show_midr_self_cmd,
       "show midr self",
@@ -1358,15 +1395,142 @@ DEFUN(show_midr_self,
 			      sizeof(caps_buf)));
 	vty_out(vty, "Shutdown          : %s\n", mi->shutdown ? "yes" : "no");
 
-	/*
-	 * BGP-LS 本地拓扑导出开关：直接决定"本机发不发得出去 Node/Link/Prefix
-	 * NLRI"，排查"别人为什么看不到我"时第一眼就该看它。引导也一样要开
-	 * （08-21 起引导照发自身 NLRI，群号恒 0）。
-	 */
-	if (bgp->ls_info && bgp->ls_info->enable_distribution)
-		vty_out(vty, "BGP-LS distribute : enabled（本机 NLRI 正常通告）\n");
+	/* 〔件②（轮 4）删去 BGP-LS distribute 那两行：本机身份不再经自有 BGP-LS
+	 * 通告，该开关与 MIDR 无关了。要看身份报没报出去，查 `show midr group2`
+	 * 的上行段（node valid/reported/version）。〕 */
+
+	return CMD_SUCCESS;
+}
+
+/*
+ * 「我们视角看到的第二组」—— 下行对账，与下面那条上行自检成对。
+ *
+ * 拉一份他们的 remote view 全量快照，与我方节点表逐条 diff：只在两边**不一致**时
+ * 出行（缺、多、字段不同），一致就只报一句总数。用途 = 运行中怀疑漏了增量回调时
+ * 人肉核一次（回调是差分通知，漏一次就永久偏差，光看计数器看不出来）。
+ *
+ * get/release 必须配对：数组是他们分配的，看完还回去。
+ */
+DEFUN(show_midr_group2_remote,
+      show_midr_group2_remote_cmd,
+      "show midr group2-remote",
+      SHOW_STR
+      "MIDR information\n"
+      "Diff the second group's remote view against our node table\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct midr_remote_view_snapshot snap = {};
+	struct midr_context *ctx;
+	struct bgp_midr_nds *mi;
+	size_t i;
+	uint32_t diff = 0, matched = 0;
+	int ret;
+
+	if (!bgp || !bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	mi = bgp->midr_nds_info;
+
+	ctx = midr_nds_group2_ctx(bgp);
+	if (!ctx) {
+		vty_out(vty, "%% 第二组 context 不可用\n");
+		return CMD_WARNING;
+	}
+
+	ret = midr_remote_view_snapshot_get(ctx, &snap);
+	if (ret) {
+		vty_out(vty, "%% remote view 快照不可用: %d%s\n", ret,
+			ret == -EAGAIN ? "（LSDB 尚未就绪，稍后再试）" : "");
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "MIDR 远端视图对账（第二组 %zu node / %zu link，快照版本 %" PRIu64 "）\n",
+		snap.node_count, snap.link_count, snap.snapshot_version);
+
+	for (i = 0; i < snap.node_count; i++) {
+		const struct midr_remote_node_info *rn = &snap.nodes[i];
+		struct midr_node_entry key = {};
+		struct midr_node_entry *e;
+		struct in_addr rid, transport;
+		uint32_t caps;
+		bool has_transport;
+
+		midr_nds_remote_node_decode(rn, &rid, &caps, &transport,
+					    &has_transport);
+		key.node_id.family = AF_INET;
+		key.node_id.prefixlen = IPV4_MAX_BITLEN;
+		key.node_id.u.prefix4 = rid;
+		if (rid.s_addr == bgp->router_id.s_addr)
+			continue; /* 自己那条不参与对账（回调侧本就丢弃） */
+
+		e = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (!e) {
+			vty_out(vty, "  ✗ %pI4 第二组有、我方节点表**缺**（群 %u）\n",
+				&rid, rn->group_id);
+			diff++;
+			continue;
+		}
+		if (e->group_id != rn->group_id) {
+			vty_out(vty, "  ✗ %pI4 群号不一致（我方 %u / 第二组 %u）\n",
+				&rid, e->group_id, rn->group_id);
+			diff++;
+		}
+		if (e->capabilities != caps) {
+			vty_out(vty, "  ✗ %pI4 caps 不一致（我方 0x%x / 第二组 0x%x）\n",
+				&rid, e->capabilities, caps);
+			diff++;
+		}
+		if (has_transport && e->has_transport_addr &&
+		    e->transport_addr.s_addr != transport.s_addr) {
+			vty_out(vty, "  ✗ %pI4 transport 不一致（我方 %pI4 / 第二组 %pI4）\n",
+				&rid, &e->transport_addr, &transport);
+			diff++;
+		}
+		matched++;
+	}
+
+	/* 反向：我方表里有、第二组快照里没有的（回调漏了 withdraw，或引导群 0 在
+	 * 他们侧 pending——后者是预期，日志里会看到群号 0）。 */
+	{
+		struct midr_node_entry *e;
+		uint32_t expected = 0;
+
+		frr_each (midr_node_hash, &mi->global_view->nodes, e) {
+			bool found = false;
+
+			if (e->is_self)
+				continue;
+			for (i = 0; i < snap.node_count && !found; i++)
+				found = (snap.nodes[i].node_id ==
+					 e->node_id.u.prefix4.s_addr);
+			if (found)
+				continue;
+			/*
+			 * 群 0 缺席是**预期**（交接给轮4 §5c-1）：引导群号恒 0，
+			 * 在第二组侧是 pending 不回灌；我方表里有它只因旧 NLRI 线
+			 * 还在跑，件② 删旧线后两边就一致了。单独计数、不算不一致，
+			 * 免得每次刷 5 条 ✗ 把真问题淹掉。
+			 */
+			if (e->group_id == 0) {
+				expected++;
+				continue;
+			}
+			vty_out(vty, "  ✗ %pFX 我方节点表有、第二组**缺**（群 %u）\n",
+				&e->node_id, e->group_id);
+			diff++;
+		}
+		if (expected)
+			vty_out(vty, "  · 群 0 节点 %u 个只在我方表里（引导，第二组侧 pending，预期）\n",
+				expected);
+	}
+
+	midr_remote_view_snapshot_release(ctx, &snap);
+
+	if (!diff)
+		vty_out(vty, "  ✓ 两侧一致（对上 %u 个节点）\n", matched);
 	else
-		vty_out(vty, "BGP-LS distribute : disabled（⚠ 未开启，MIDR 身份无法通告——检查 distribute bgp-fabric-link-state）\n");
+		vty_out(vty, "  共 %u 处不一致\n", diff);
 
 	return CMD_SUCCESS;
 }
@@ -1793,8 +1957,6 @@ void bgp_midr_nds_vty_init(void)
 	install_element(BGP_NODE, &midr_shutdown_cmd);
 	install_element(BGP_NODE, &no_midr_shutdown_cmd);
 	/* 隐藏，批 6 ④ 保活验证专用；随对接轮 4/5 删定时器时一并删。 */
-	install_element(BGP_NODE, &midr_keepalive_suppress_cmd);
-	install_element(BGP_NODE, &no_midr_keepalive_suppress_cmd);
 	install_element(BGP_NODE, &midr_help_cmd);
 	/* `midr help` 也在 vtysh 顶层可用(enable/view),无需进配置态。
 	 * 只装 VIEW_NODE 即可——lib/command.c 的 install_element 对 VIEW_NODE
@@ -1802,6 +1964,7 @@ void bgp_midr_nds_vty_init(void)
 	 * "duplicate install_element call?" 告警。 */
 	install_element(VIEW_NODE, &midr_help_cmd);
 	install_element(VIEW_NODE, &show_midr_self_cmd);
+	install_element(VIEW_NODE, &show_midr_group2_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
 	install_element(VIEW_NODE, &show_midr_reps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);
@@ -1810,4 +1973,5 @@ void bgp_midr_nds_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_join_cmd);
 	/* 临时调试件（对接轮 3）：第二组视角的 snapshot 窗口，轮 5 评估删留。 */
 	install_element(VIEW_NODE, &show_midr_group2_snapshot_cmd);
+	install_element(VIEW_NODE, &show_midr_group2_remote_cmd);
 }

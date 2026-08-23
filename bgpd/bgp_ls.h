@@ -118,8 +118,7 @@ int bgp_ls_withdraw_bgp_prefix(struct bgp *bgp, afi_t afi, safi_t safi, struct b
  */
 
 extern int bgp_ls_originate_bgp_node(struct bgp *bgp);
-extern int bgp_ls_originate_bgp_link(struct bgp *bgp, struct peer *peer,
-				     struct bgp_ls_attr *ls_attr);
+extern int bgp_ls_originate_bgp_link(struct bgp *bgp, struct peer *peer);
 extern int bgp_ls_originate_bgp_prefix(struct bgp *bgp, afi_t afi, safi_t safi,
 				       struct bgp_dest *dest, struct bgp_path_info *path);
 

@@ -321,17 +321,12 @@ static void midr_pm_probe_timer_fn(struct event *t)
  * O(n) — acceptable for a small peer set.
  *
  * A validated packet (REQ or REP) from a known source is itself a liveness
- * signal, same reasoning as I-5's last_seen refresh in
- * midr_nds_on_link_update() (bgp_midr_nds.c) — but that refresh only covers the
- * *prober's* view of a target it successfully probed. A "probe-only" peer
- * that is purely a *responder* (e.g. a rep being probed by a joining node)
- * never goes through that path for the requester's entry in its own
- * global_view: midr_nds_learn_requester()/_learn_member() stamp last_seen
- * once, at seed time, and nothing refreshes it afterwards even while probes
- * keep arriving — so the entry silently expires (MIDR_NODE_EXPIRE_TIME,
- * 15s) mid-test and every subsequent probe from that source gets rejected
- * as "unknown transport", regardless of how recently it last sent one.
- * Refreshing last_seen here, on every validated packet, closes that gap.
+ * signal — refresh last_update so the entry's observation timestamp reflects
+ * reality for "probe-only" responders too (a rep being probed by a joining
+ * node never goes through I-5 for the requester's entry).
+ *
+ * 件④ 起 last_update 只是观测量，不再有老化判死；本刷新保留是为了让
+ * show midr nodes 的 Age 列对这类只应答的对端也说实话。
  */
 static bool pm_is_known_transport(struct bgp_midr_nds *mi, struct in_addr addr)
 {
@@ -342,13 +337,13 @@ static bool pm_is_known_transport(struct bgp_midr_nds *mi, struct in_addr addr)
 			continue;
 		if (entry->has_transport_addr) {
 			if (entry->transport_addr.s_addr == addr.s_addr) {
-				entry->last_seen = monotime(NULL);
+				entry->last_update = monotime(NULL);
 				return true;
 			}
 		} else {
 			if (entry->node_id.family == AF_INET
 			    && entry->node_id.u.prefix4.s_addr == addr.s_addr) {
-				entry->last_seen = monotime(NULL);
+				entry->last_update = monotime(NULL);
 				return true;
 			}
 		}

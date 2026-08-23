@@ -69,10 +69,13 @@ enum midr_node_source {
 
 /* I-2 stop reason */
 enum midr_stop_reason {
+	/* ⚠ 名字是历史；与件④ 删掉的 keepalive/expire 定时器无关，死心与
+	 * 换群清理仍在传它，勿连坐删。 */
 	MIDR_STOP_KEEPALIVE_TIMEOUT = 0,
 	MIDR_STOP_GRACEFUL_SHUTDOWN,
 	MIDR_STOP_ADMIN_DOWN,
 	MIDR_STOP_CLUSTER_CHANGE,
+	MIDR_STOP_SESSION_DOWN, /* 件④：会话掉出 Established */
 };
 
 enum midr_probe_state {

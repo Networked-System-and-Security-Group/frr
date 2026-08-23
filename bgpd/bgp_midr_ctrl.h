@@ -273,8 +273,11 @@ extern void midr_ctrl_on_node_remove(struct bgp *bgp,
  * ——那是运维显式命令、与手配同级；自动路径（挂靠卸任、B1 老化、换台先拆旧）
  * 一律传 false。判据与理由见 midr_try_disconnect 内 α 注释。
  */
+/* reason 透传到 I-2 停探日志（退网传 GRACEFUL_SHUTDOWN，其余会话层拆边传
+ * SESSION_DOWN）。 */
 extern void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
-				       struct in_addr rid, bool force);
+				       struct in_addr rid, bool force,
+				       enum midr_stop_reason reason);
 
 /*
  * Initiate BGP sessions to every non-self node in the given group (used by

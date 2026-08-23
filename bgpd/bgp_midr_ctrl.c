@@ -469,7 +469,8 @@ static void midr_ctrl_drop_half_peer(struct bgp *bgp, struct in_addr transport,
 
 	/* 账销了、会话拆了，节点表那边也得跟着收拾：停探 + 撤链路上报 + 清
 	 * link_entry + 清 is_adjacent，否则 CL 还当它是条好边、PM 还对着它探。 */
-	midr_nds_cleanup_by_transport(bgp, transport);
+	midr_nds_cleanup_by_transport(bgp, transport,
+				      MIDR_STOP_KEEPALIVE_TIMEOUT);
 }
 
 /*
@@ -1672,7 +1673,9 @@ void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 		midr_su_from_in_addr(&local_su, mi->local_transport_addr);
 		peer_update_source_addr_set(peer, &local_su);
 	}
-	peer_activate(peer, AFI_BGP_LS, SAFI_BGP_LS);
+	/* MIDR overlay 会话只载 (4,9) MIDR-LS —— 件②（轮 4）退役了我方自有的
+	 * (4,8) BGP-LS 那一族，拓扑情报全部由第二组编码传播。 */
+	peer_activate(peer, AFI_BGP_LS, SAFI_MIDR_LS);
 	peer_deactivate(peer, AFI_IP, SAFI_UNICAST);
 }
 
@@ -1712,9 +1715,23 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	as_t asn = entry->asn;
 	int ret;
 
-	if (asn == 0) {
-		MIDR_LOG("MIDR ctrl: skipping %pFX — ASN not yet known",
-			 &entry->node_id);
+	/* 轮 4 放宽：不再要求 asn 非 0。建连走 AS_EXTERNAL，只校验"对端 AS ≠ 本机
+	 * AS"、随后用对端 OPEN 的真实 AS 覆盖（bgp_packet.c:2037），传什么都不参与
+	 * 校验；而第二组的 membership 对象不含 ASN，换源后这道守卫会永远挡住建连。
+	 * 真必需的是 transport（建连目标地址）。 */
+
+	/*
+	 * 件②（轮 4）收紧：没有 transport 就**不建连**，不再回落 router-id。
+	 *
+	 * MIDR 节点不配 `midr transport-address` 本身就是运维事故，正确反应是把事故
+	 * 亮出来，而不是静默拿 router-id 顶上去建一条大概率连不通的会话（router-id
+	 * 只是身份，未必可路由——真分离基线下它通常压根不在转发面里）。
+	 * 展示类调用点（show 命令）仍走 midr_node_get_locator 的回落：显示 router-id
+	 * 比显示空白有用。
+	 */
+	if (!entry->has_transport_addr) {
+		zlog_warn("MIDR ctrl: %pFX 没有 transport 地址，不建连——该节点多半漏配了 midr transport-address（router-id 只是身份、未必可路由，不作回落）",
+			  &entry->node_id);
 		return;
 	}
 
@@ -1798,12 +1815,15 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 
 	/*
 	 * S5 第一道去重（⑦）：transport 地址上已有会话。地址被占 = 无法另建（BGP
-	 * 一地址一会话），只能复用或告警——终止 A<->B notify 握手也靠这条 return
-	 * （收到回响 PEER_REQUEST 的一端在此发现已建的 peer 便停发）。按归属分类：
-	 *   - MIDR 自己的：正常复用（重复 connect 很常见）；
-	 *   - 运维的、已激活 LS：借它当 LS 通道，可用，记 log；
-	 *   - 运维的、未激活 LS：拓扑无通道可走、邻接实际不可用，warn 出来——但绝不
-	 *     整形运维会话（那是洞 #3、违反运维优先）。
+	 * 一地址一会话）——终止 A<->B notify 握手也靠这条 return（收到回响
+	 * PEER_REQUEST 的一端在此发现已建的 peer 便停发）。按归属分两类：
+	 *   - MIDR 自己的：正常复用（重复 connect 很常见），沉默；
+	 *   - 运维的：拓扑无通道可走、这条边建不起来，warn 出来——但绝不整形运维
+	 *     会话（那是洞 #3、违反运维优先）。
+	 *
+	 * 〔件②（轮 4）删去原来夹在中间的"运维会话已激活 LS 就借它当 LS 通道"那
+	 * 一支：迁 (4,9) MIDR-LS 后一律自建不复用（真分离约定），该分支机械改族
+	 * 也只是恒假死代码。运维会话无论载不载 LS，处置都是同一句 warn。〕
 	 */
 	{
 		struct peer *occupant = peer_lookup(bgp, &su);
@@ -1811,9 +1831,6 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 		if (occupant) {
 			if (midr_nds_peer_is_overlay(occupant)) {
 				/* MIDR 自己的会话，正常复用（沉默）。 */
-			} else if (occupant->afc[AFI_BGP_LS][SAFI_BGP_LS]) {
-				MIDR_LOG("MIDR ctrl: %pFX transport 地址由已激活 LS 的运维会话占用，借用其为 LS 通道",
-					 &entry->node_id);
 			} else {
 				zlog_warn("MIDR ctrl: %pFX 的 transport 地址上有一条运维会话，MIDR 不整形运维配置、这条边建不起来；请检查该静态邻居是否误用了 transport（loopback）地址——静态会话只应配链路地址",
 					  &entry->node_id);
@@ -1947,7 +1964,8 @@ void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
  * 自动路径一律 false。
  */
 void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
-				struct in_addr rid, bool force)
+				struct in_addr rid, bool force,
+				enum midr_stop_reason reason)
 {
 	struct midr_node_entry e = {};
 
@@ -1965,7 +1983,7 @@ void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
 	/* 拆完会话还要收拾节点表那半边（停探 + 撤链路上报 + 清 link_entry +
 	 * 清 is_adjacent）——临时条目碰不到表里的真条目，不补就留下"标着邻居、
 	 * 边却没了"的幻影。对端是引导时反查落空、天然 no-op。 */
-	midr_nds_cleanup_by_transport(bgp, transport);
+	midr_nds_cleanup_by_transport(bgp, transport, reason);
 }
 
 void midr_mark_topology(struct bgp *bgp, const struct midr_node_entry *entry)

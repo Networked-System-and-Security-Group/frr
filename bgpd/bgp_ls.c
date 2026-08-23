@@ -14,8 +14,6 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_ls_ted.h"
-#include "bgpd/bgp_midr_nds.h"
-#include "bgpd/bgp_midr_tlv.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_route.h"
@@ -768,22 +766,9 @@ int bgp_nlri_parse_ls(struct peer *peer, struct attr *attr, struct bgp_nlri *pac
 				   BGP_ROUTE_NORMAL, NULL, NULL, 0, 0, NULL);
 
 			bgp_dest_unlock_node(dest);
-
-			/* MIDR: update node table for Node NLRIs carrying TLV 1185 */
-			if (nlri->nlri_type == BGP_LS_NLRI_TYPE_NODE
-			    && attr->ls_attr
-			    && CHECK_FLAG(attr->ls_attr->present_tlvs,
-					  BGP_LS_ATTR_MIDR_GROUP_ID_BIT))
-				midr_nds_on_node_nlri(peer->bgp, nlri, attr->ls_attr);
 		} else {
 			bgp_withdraw(peer, &p, 0, packet->afi, packet->safi, ZEBRA_ROUTE_BGP,
 				     BGP_ROUTE_NORMAL, NULL, NULL, 0);
-
-			/* MIDR: graceful departure — a withdrawn Node NLRI means
-			 * that node left; remove it now instead of waiting for the
-			 * expire timer. */
-			if (nlri->nlri_type == BGP_LS_NLRI_TYPE_NODE)
-				midr_nds_on_node_withdraw(peer->bgp, nlri);
 		}
 
 		if (BGP_DEBUG(linkstate, LINKSTATE))
@@ -998,18 +983,6 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 	ls_attr->node_name = XSTRDUP(MTYPE_BGP_LS_ATTR, bgp->peer_self->host);
 	SET_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_NODE_NAME_BIT);
 
-	/* TLV 1185: MIDR Group ID / TLV 1187: MIDR Node Capability /
-	 * TLV 1188: MIDR Transport Address */
-	if (bgp->midr_nds_info) {
-		midr_tlv_set_group_id(ls_attr, bgp->midr_nds_info->local_group_id);
-		midr_tlv_set_node_cap(ls_attr,
-				      bgp->midr_nds_info->local_capabilities,
-				      (uint64_t)monotime(NULL));
-		if (bgp->midr_nds_info->transport_addr_set)
-			midr_tlv_set_transport_addr(
-				ls_attr, bgp->midr_nds_info->local_transport_addr);
-	}
-
 	ret = bgp_ls_update(bgp, nlri, ls_attr);
 	if (ret != 0) {
 		zlog_err("BGP-LS: Failed to originate BGP Node NLRI");
@@ -1021,9 +994,6 @@ int bgp_ls_originate_bgp_node(struct bgp *bgp)
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		zlog_debug("BGP-LS: Originated BGP Node NLRI for AS %u, Router-ID %pI4", bgp->as,
 			   &bgp->router_id);
-
-	/* Keep the local self-entry in the MIDR node table up to date */
-	midr_nds_local_node_update(bgp);
 
 	bgp_ls_attr_free(ls_attr);
 	bgp_ls_nlri_free(nlri);
@@ -1073,8 +1043,7 @@ static struct interface *bgp_ls_get_ifp_from_connection(struct peer_connection *
  * @param peer - BGP peer (remote endpoint of the session)
  * @return 0 on success, -1 on error
  */
-int bgp_ls_originate_bgp_link(struct bgp *bgp, struct peer *peer,
-			      struct bgp_ls_attr *ls_attr)
+int bgp_ls_originate_bgp_link(struct bgp *bgp, struct peer *peer)
 {
 	struct bgp_ls_nlri *nlri;
 	struct peer_connection *connection;
@@ -1167,7 +1136,7 @@ int bgp_ls_originate_bgp_link(struct bgp *bgp, struct peer *peer,
 			 BGP_LS_LINK_DESC_IPV6_INTF_BIT);
 	}
 
-	ret = bgp_ls_update(bgp, nlri, ls_attr);
+	ret = bgp_ls_update(bgp, nlri, NULL);
 	if (ret != 0) {
 		zlog_err("BGP-LS: Failed to originate BGP link NLRI");
 		bgp_ls_nlri_free(nlri);
@@ -1316,7 +1285,7 @@ int bgp_ls_export_bgp_topology(struct bgp *bgp)
 		if (!peer->connection || peer->connection->status != Established)
 			continue;
 
-		if (bgp_ls_originate_bgp_link(bgp, peer, NULL) != 0)
+		if (bgp_ls_originate_bgp_link(bgp, peer) != 0)
 			zlog_warn("BGP-LS: Failed to originate link NLRI for peer %s", peer->host);
 		else
 			nlri_count++;
@@ -1529,39 +1498,10 @@ int bgp_ls_withdraw_bgp_link(struct bgp *bgp, struct peer *peer)
 }
 
 /*
- * Withdraw the locally originated BGP Node NLRI (graceful MIDR shutdown).
- * Builds the same Node descriptor as bgp_ls_originate_bgp_node() so the
- * withdraw matches the originated route, then frees the transient NLRI.
+ * 〔件②（轮 4）删除 bgp_ls_withdraw_bgp_node()：它只为 MIDR 优雅下线而加
+ * （唯一调用者是已删的 midr_propagate_self 的 LEAVE 分支）。退网撤销现在走
+ * midr_nds_report_node(LEAVE) → 第二组的 midr_topology_node_withdraw()。〕
  */
-int bgp_ls_withdraw_bgp_node(struct bgp *bgp)
-{
-	struct bgp_ls_nlri *nlri;
-	int ret;
-
-	if (!bgp || !bgp->ls_info)
-		return 0;
-
-	nlri = bgp_ls_nlri_alloc();
-	nlri->nlri_type = BGP_LS_NLRI_TYPE_NODE;
-	nlri->nlri_data.node.protocol_id = BGP_LS_PROTO_BGP;
-	nlri->nlri_data.node.identifier = bgp->ls_info->instance_id;
-
-	nlri->nlri_data.node.local_node.asn = bgp->as;
-	SET_FLAG(nlri->nlri_data.node.local_node.present_tlvs, BGP_LS_NODE_DESC_AS_BIT);
-
-	nlri->nlri_data.node.local_node.bgp_router_id = bgp->router_id;
-	SET_FLAG(nlri->nlri_data.node.local_node.present_tlvs,
-		 BGP_LS_NODE_DESC_BGP_ROUTER_ID_BIT);
-
-	ret = bgp_ls_withdraw(bgp, nlri);
-
-	if (BGP_DEBUG(linkstate, LINKSTATE))
-		zlog_debug("BGP-LS: Withdrew local BGP Node NLRI (Router-ID %pI4)",
-			   &bgp->router_id);
-
-	bgp_ls_nlri_free(nlri);
-	return ret;
-}
 
 int bgp_ls_withdraw_bgp_prefix(struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *dest,
 			       struct bgp_path_info *path)

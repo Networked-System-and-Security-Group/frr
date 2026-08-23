@@ -545,44 +545,6 @@ int bgp_ls_attr_cmp(const struct bgp_ls_attr *attr1, const struct bgp_ls_attr *a
 			return ret;
 	}
 
-	/* MIDR Group ID */
-	if (CHECK_FLAG(attr1->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT)) {
-		if (attr1->midr_group_id != attr2->midr_group_id)
-			return numcmp(attr1->midr_group_id, attr2->midr_group_id);
-	}
-
-	/* MIDR Transport Address (TLV 1188) — must be part of attribute
-	 * identity.  Otherwise two Node NLRIs from different nodes that differ
-	 * only in transport address compare equal, get interned to the same
-	 * struct attr (keeping a single transport) and are packed into one
-	 * UPDATE, corrupting the per-node locator across the fabric. */
-	if (CHECK_FLAG(attr1->present_tlvs, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
-		ret = IPV4_ADDR_CMP(&attr1->midr_transport_addr,
-				    &attr2->midr_transport_addr);
-		if (ret != 0)
-			return ret;
-	}
-
-	/* MIDR Link Performance */
-	if (CHECK_FLAG(attr1->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT)) {
-		if (attr1->midr_delay_us != attr2->midr_delay_us)
-			return numcmp(attr1->midr_delay_us, attr2->midr_delay_us);
-		if (attr1->midr_loss_rate != attr2->midr_loss_rate)
-			return numcmp(attr1->midr_loss_rate, attr2->midr_loss_rate);
-		if (attr1->midr_bw_score != attr2->midr_bw_score)
-			return numcmp(attr1->midr_bw_score, attr2->midr_bw_score);
-		if (attr1->midr_perf_seqno != attr2->midr_perf_seqno)
-			return numcmp(attr1->midr_perf_seqno, attr2->midr_perf_seqno);
-	}
-
-	/* MIDR Node Capability */
-	if (CHECK_FLAG(attr1->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
-		if (attr1->midr_node_caps != attr2->midr_node_caps)
-			return numcmp(attr1->midr_node_caps, attr2->midr_node_caps);
-		if (attr1->midr_cap_seqno != attr2->midr_cap_seqno)
-			return numcmp(attr1->midr_cap_seqno, attr2->midr_cap_seqno);
-	}
-
 	return 0;
 }
 
@@ -1553,15 +1515,6 @@ unsigned int bgp_ls_attr_hash_key(const struct bgp_ls_attr *attr)
 
 	for (int i = 0; i < attr->mt_id_count; i++)
 		key = jhash_1word(attr->mt_id[i], key);
-
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT))
-		key = jhash_1word(attr->midr_group_id, key);
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT))
-		key = jhash_1word(attr->midr_transport_addr.s_addr, key);
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT))
-		key = jhash_2words(attr->midr_delay_us, attr->midr_loss_rate, key);
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT))
-		key = jhash_1word(attr->midr_node_caps, key);
 
 	return key;
 }
@@ -2880,46 +2833,6 @@ int bgp_ls_encode_attr(struct stream *s, const struct bgp_ls_attr *attr)
 		stream_putc(s, attr->srv6_sid_structure.ln_len);
 		stream_putc(s, attr->srv6_sid_structure.fun_len);
 		stream_putc(s, attr->srv6_sid_structure.arg_len);
-	}
-
-	/* MIDR: Group ID (TLV 1185) */
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT)) {
-		if (STREAM_WRITEABLE(s) < BGP_LS_TLV_HDR_SIZE + BGP_LS_MIDR_GROUP_ID_SIZE)
-			return -1;
-		stream_putw(s, BGP_LS_ATTR_MIDR_GROUP_ID);
-		stream_putw(s, BGP_LS_MIDR_GROUP_ID_SIZE);
-		stream_putl(s, attr->midr_group_id);
-	}
-
-	/* MIDR: Link Performance (TLV 1186) */
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT)) {
-		if (STREAM_WRITEABLE(s) < BGP_LS_TLV_HDR_SIZE + BGP_LS_MIDR_LINK_PERF_SIZE)
-			return -1;
-		stream_putw(s, BGP_LS_ATTR_MIDR_LINK_PERF);
-		stream_putw(s, BGP_LS_MIDR_LINK_PERF_SIZE);
-		stream_putl(s, attr->midr_delay_us);
-		stream_putl(s, attr->midr_loss_rate);
-		stream_putl(s, attr->midr_bw_score);
-		stream_putq(s, attr->midr_perf_seqno);
-	}
-
-	/* MIDR: Node Capability (TLV 1187) */
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
-		if (STREAM_WRITEABLE(s) < BGP_LS_TLV_HDR_SIZE + BGP_LS_MIDR_NODE_CAP_SIZE)
-			return -1;
-		stream_putw(s, BGP_LS_ATTR_MIDR_NODE_CAPABILITY);
-		stream_putw(s, BGP_LS_MIDR_NODE_CAP_SIZE);
-		stream_putl(s, attr->midr_node_caps);
-		stream_putq(s, attr->midr_cap_seqno);
-	}
-
-	/* MIDR: Transport Address (TLV 1188) */
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
-		if (STREAM_WRITEABLE(s) < BGP_LS_TLV_HDR_SIZE + BGP_LS_MIDR_TRANSPORT_ADDR_SIZE)
-			return -1;
-		stream_putw(s, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR);
-		stream_putw(s, BGP_LS_MIDR_TRANSPORT_ADDR_SIZE);
-		stream_put_in_addr(s, &attr->midr_transport_addr);
 	}
 
 	return stream_get_endp(s) - start_pos;
@@ -4471,95 +4384,6 @@ static int parse_srlg(struct stream *s, uint16_t length, struct bgp_ls_attr *att
 }
 
 /*
- * Parse MIDR Group ID TLV (TLV 1185)
- */
-static int parse_midr_group_id(struct stream *s, uint16_t length, struct bgp_ls_attr *attr)
-{
-	if (length != BGP_LS_MIDR_GROUP_ID_SIZE) {
-		flog_warn(EC_BGP_UPDATE_RCV,
-			  "BGP-LS: Invalid MIDR Group ID length (%u)", length);
-		return -1;
-	}
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT)) {
-		flog_warn(EC_BGP_UPDATE_RCV, "BGP-LS: duplicate MIDR Group ID TLV");
-		return -1;
-	}
-	attr->midr_group_id = stream_getl(s);
-	SET_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT);
-	return 0;
-}
-
-/*
- * Parse MIDR Link Performance TLV (TLV 1186)
- */
-static int parse_midr_link_perf(struct stream *s, uint16_t length, struct bgp_ls_attr *attr)
-{
-	if (length != BGP_LS_MIDR_LINK_PERF_SIZE) {
-		flog_warn(EC_BGP_UPDATE_RCV,
-			  "BGP-LS: Invalid MIDR Link Perf length (%u)", length);
-		return -1;
-	}
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT)) {
-		flog_warn(EC_BGP_UPDATE_RCV, "BGP-LS: duplicate MIDR Link Perf TLV");
-		return -1;
-	}
-	attr->midr_delay_us  = stream_getl(s);
-	attr->midr_loss_rate = stream_getl(s);
-	attr->midr_bw_score  = stream_getl(s);
-	attr->midr_perf_seqno = stream_getq(s);
-	SET_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT);
-	return 0;
-}
-
-/*
- * Parse MIDR Node Capability TLV (TLV 1187)
- * 序列号机制：只有新序列号更大时才更新。
- */
-static int parse_midr_node_cap(struct stream *s, uint16_t length, struct bgp_ls_attr *attr)
-{
-	if (length != BGP_LS_MIDR_NODE_CAP_SIZE) {
-		flog_warn(EC_BGP_UPDATE_RCV,
-			  "BGP-LS: Invalid MIDR Node Cap length (%u)", length);
-		return -1;
-	}
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
-		/* 序列号机制：仅当收到的序列号更大时才更新 */
-		uint64_t recv_seqno = stream_getq_from(s, stream_get_getp(s) + 4);		//提前读取序号
-
-		if (recv_seqno <= attr->midr_cap_seqno) {
-			stream_forward_getp(s, length);		//直接跳过
-			return 0;
-		}
-	}
-	attr->midr_node_caps = stream_getl(s);
-	attr->midr_cap_seqno = stream_getq(s);
-	SET_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT);
-	return 0;
-}
-
-/*
- * Parse MIDR Transport Address TLV (TLV 1188)
- */
-static int parse_midr_transport_addr(struct stream *s, uint16_t length,
-				     struct bgp_ls_attr *attr)
-{
-	if (length != BGP_LS_MIDR_TRANSPORT_ADDR_SIZE) {
-		flog_warn(EC_BGP_UPDATE_RCV,
-			  "BGP-LS: Invalid MIDR Transport Address length (%u)",
-			  length);
-		return -1;
-	}
-	if (CHECK_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
-		flog_warn(EC_BGP_UPDATE_RCV,
-			  "BGP-LS: duplicate MIDR Transport Address TLV");
-		return -1;
-	}
-	attr->midr_transport_addr.s_addr = stream_get_ipv4(s);
-	SET_FLAG(attr->present_tlvs, BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT);
-	return 0;
-}
-
-/*
  * Parse Link Name TLV (TLV 1098)
  * RFC 9552 Section 5.3.2.7
  */
@@ -5691,26 +5515,6 @@ int bgp_ls_parse_attr(struct stream *s, uint16_t total_length, struct bgp_ls_att
 				return -1;
 			break;
 
-		case BGP_LS_ATTR_MIDR_GROUP_ID:
-			if (parse_midr_group_id(s, length, attr) < 0)
-				return -1;
-			break;
-
-		case BGP_LS_ATTR_MIDR_LINK_PERF:
-			if (parse_midr_link_perf(s, length, attr) < 0)
-				return -1;
-			break;
-
-		case BGP_LS_ATTR_MIDR_NODE_CAPABILITY:
-			if (parse_midr_node_cap(s, length, attr) < 0)
-				return -1;
-			break;
-
-		case BGP_LS_ATTR_MIDR_TRANSPORT_ADDR:
-			if (parse_midr_transport_addr(s, length, attr) < 0)
-				return -1;
-			break;
-
 		default:
 			if (BGP_DEBUG(update, UPDATE_IN))
 				zlog_debug("BGP-LS: Skipping unrecognized BGP-LS Attribute TLV %u",
@@ -6025,40 +5829,6 @@ struct json_object *bgp_ls_attr_to_json(struct bgp_ls_attr *ls_attr)
 		json_object_int_add(jss, "argLen", ls_attr->srv6_sid_structure.arg_len);
 		json_object_object_add(json_ls_attr, "srv6SidStructure", jss);
 	}
-
-	/* MIDR Group ID (TLV 1185) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT))
-		json_object_int_add(json_ls_attr, "midrGroupId", ls_attr->midr_group_id);
-
-	/* MIDR Link Performance (TLV 1186) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT)) {
-		json_object *jperf = json_object_new_object();
-
-		json_object_int_add(jperf, "delayUs", ls_attr->midr_delay_us);
-		json_object_int_add(jperf, "lossRate", ls_attr->midr_loss_rate);
-		json_object_int_add(jperf, "bwScore", ls_attr->midr_bw_score);
-		json_object_object_add(json_ls_attr, "midrLinkPerf", jperf);
-	}
-
-	/* MIDR Node Capability (TLV 1187) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
-		json_object *jcap = json_object_new_object();
-
-		json_object_int_add(jcap, "capabilities", ls_attr->midr_node_caps);
-		json_object_object_add(json_ls_attr, "midrNodeCap", jcap);
-	}
-
-	/* MIDR Transport Address (TLV 1188) */
-	if (CHECK_FLAG(ls_attr->present_tlvs,
-		       BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
-		char taddr[INET_ADDRSTRLEN];
-
-		inet_ntop(AF_INET, &ls_attr->midr_transport_addr, taddr,
-			  sizeof(taddr));
-		json_object_string_add(json_ls_attr, "midrTransportAddr",
-				       taddr);
-	}
-
 	return json_ls_attr;
 }
 
@@ -6370,35 +6140,6 @@ void bgp_ls_attr_display(struct vty *vty, struct bgp_ls_attr *ls_attr)
 			       ls_attr->srv6_sid_structure.fun_len,
 			       ls_attr->srv6_sid_structure.arg_len);
 	}
-
-	/* MIDR Group ID (TLV 1185) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_GROUP_ID_BIT)) {
-		CHECK_WRAP();
-		col += vty_out(vty, "MIDR Group-ID: %u", ls_attr->midr_group_id);
-	}
-
-	/* MIDR Link Performance (TLV 1186) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_LINK_PERF_BIT)) {
-		CHECK_WRAP();
-		col += vty_out(vty, "MIDR Perf: delay=%uus loss=%uppm bw=%u",
-			       ls_attr->midr_delay_us, ls_attr->midr_loss_rate,
-			       ls_attr->midr_bw_score);
-	}
-
-	/* MIDR Node Capability (TLV 1187) */
-	if (CHECK_FLAG(ls_attr->present_tlvs, BGP_LS_ATTR_MIDR_NODE_CAPABILITY_BIT)) {
-		CHECK_WRAP();
-		col += vty_out(vty, "MIDR Caps: 0x%08x", ls_attr->midr_node_caps);
-	}
-
-	/* MIDR Transport Address (TLV 1188) */
-	if (CHECK_FLAG(ls_attr->present_tlvs,
-		       BGP_LS_ATTR_MIDR_TRANSPORT_ADDR_BIT)) {
-		CHECK_WRAP();
-		col += vty_out(vty, "MIDR Transport: %pI4",
-			       &ls_attr->midr_transport_addr);
-	}
-
 	(void)col; /* Don't complain about last 'col +=' */
 
 #undef CHECK_WRAP

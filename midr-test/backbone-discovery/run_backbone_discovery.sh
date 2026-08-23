@@ -33,6 +33,10 @@ fail()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 nosam() { echo "  ⚠ 没造出场景：$1"; NOSAMPLE=$((NOSAMPLE+1)); }
 
 v()        { docker exec "$1" vtysh -c "$2" 2>/dev/null; }
+# 判据补 2 用它改群号造死心场景。本函数原先缺失（脚本第 276/277 行直接调用了
+# 未定义的 conf，报 "command not found" → 改群号没执行 → 判据补2-a 恒 NOSAMPLE）。
+# 2026-08-22 轮 4 步 0 回归时发现并补上，写法照抄 backbone-shutdown/ 同名函数。
+conf()     { docker exec "$1" vtysh -c "configure terminal" -c "router bgp $2" -c "$3" 2>/dev/null; }
 loglines() { docker exec "$1" sh -c "wc -l < $LOG" 2>/dev/null | tr -d ' '; }
 logtail()  { docker exec "$1" sh -c "tail -n +$2 $LOG" 2>/dev/null; }
 dbgon()    { docker exec "$1" vtysh -c "configure terminal" -c "log file $LOG debugging" \
@@ -46,9 +50,11 @@ for c in $R1 $M1A $M1B $Z1 $R2; do dbgon $c; done
 
 # ---------------------------------------------------------------------------
 # 判据 9（08-21 语义精确化）：退网零实害。
-#   收包侧"同群就建连"保留后，残存 NLRI 仍会触发 r1 建一次边——但真边建不成：
+#   收包侧"同群就建连"保留后，残存条目仍会触发 r1 建一次边——但真边建不成：
 #   z1 侧退网守卫丢弃全部 PEER_REQUEST、无对应 neighbor 配置故会话永停 Active、
 #   PM 来源校验丢探测包。所以判的是"退网侧零反应 + 发起侧的假状态能自愈"。
+#   ⚠ 件② 后残存条目来自第二组 LSDB 的传播窗口（不再是我方 NLRI 表），机理见
+#   记档 41；现象与判据不变。
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 9] z1 退网：退网侧零反应，发起侧假状态自愈"
@@ -174,37 +180,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 判据 6：真死心清位
-#   构造：在 m1a 上拉黑 z1 的 5859（iptables DROP），再让 z1 朝它建连 →
-#   z1 侧 PEER_REQUEST 重传耗尽死心 → z1 节点表里 m1a 的 is_adjacent 应被注销。
+# 〔判据 6「真死心清位」已删除 —— 2026-08-22 轮 4 步 0 回归时定位并拍板〕
+#
+# 它自写出起就从未真正验证过，两处独立缺陷：
+#   ① **构造假设了按设计不存在的行为**：原构造在 m1a 上 iptables 挡 5859，再用
+#      `midr session` 在 z1 上手动建边，指望它发 PEER_REQUEST → 重传耗尽死心。
+#      但 `midr session` 按设计**从不发 PEER_REQUEST**——MANUAL 边的约定是
+#      **两端各配一次**（对端由运维自己敲，故无需 nudge 通知对方；命令回显的
+#      MIDR_SESSION_SYMMETRY_HINT 与记档第 7 条"双端对称执行"即此约定）。
+#      实证：`midr_ctrl_send_peer_request` 全树唯一调用点在 `midr_ctrl_connect`
+#      的 send_nudge 分支（bgp_midr_ctrl.c:1797），而 midr session 命令
+#      （bgp_midr_nds_vty.c）根本不走 midr_ctrl_connect。→ 恒报 NOSAMPLE，
+#      而且看起来像"这次环境没凑巧"，极易被解释过去。
+#   ② **grep 的日志串不存在**：原查 "MIDR 死心：注销"，实际文案是
+#      "MIDR 边注销：…的本群邻居身份已撤"（bgp_midr_nds.c:1055）。即便侥幸造出
+#      场景，第二层判据也会命中 fail 分支，报出**假 FAIL**。
+#
+# 它要验的语义（建连死心 → midr_nds_cleanup_by_transport → 停探 + 清 is_adjacent）
+# **已由下方判据补 2-a 完整覆盖**：那条走真实可达的自动建连路径（改群号 → 重收敛
+# → midr_ctrl_connect 发 PEER_REQUEST → 被两边对挡 → 重传耗尽死心），2026-08-22
+# 已拿到正样本。留一条造不出场景的判据只会每轮产出假 NOSAMPLE、掩盖真问题。
 # ---------------------------------------------------------------------------
-echo
-echo "[判据 6] 真死心清位"
-Z1_BASE=$(loglines $Z1)
-docker exec -u root $M1A iptables -A INPUT -p udp --dport 5859 -j DROP 2>/dev/null \
-  || { nosam "m1a 容器里没有 iptables，判据 6 跳过"; }
-if docker exec -u root $M1A iptables -L INPUT -n 2>/dev/null | grep -q 5859; then
-    # 让 z1 重新朝 m1a 发起一次建连：先拆掉现有边，再触发重收敛
-    docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
-        -c "no midr session $M1A_TRANSPORT" >/dev/null 2>&1
-    docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
-        -c "midr session $M1A_TRANSPORT remote-as 65112" >/dev/null 2>&1
-    echo "  （等重传耗尽死心，3s×5 ≈ 20s）"
-    sleep 30
-    Z1_LOG=$(logtail $Z1 $Z1_BASE)
-    if echo "$Z1_LOG" | grep -q "尝试 .* 次无响应，放弃"; then
-        if echo "$Z1_LOG" | grep -q "MIDR 死心：注销"; then
-            pass "判据6：死心后注销了邻居身份（新增清位日志命中）"
-        else
-            fail "判据6：死心了但没注销邻居身份（清位未生效）"
-        fi
-    else
-        nosam "没等到死心（重传未耗尽）"
-    fi
-    docker exec -u root $M1A iptables -D INPUT -p udp --dport 5859 -j DROP 2>/dev/null
-    docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
-        -c "no midr session $M1A_TRANSPORT" >/dev/null 2>&1
-fi
 
 # ---------------------------------------------------------------------------
 # 判据 7：直连同群双会话（静态 + overlay 并存）
@@ -276,6 +272,7 @@ if docker exec -u root $M1A iptables -L INPUT -n 2>/dev/null | grep -q 5859; the
     conf $M1B 65113 "midr group-id 2"; sleep 6
     conf $M1B 65113 "midr group-id 1"; sleep 30      # 等死心
     if logtail $M1B $M1B_BASE | grep -q "边注销"; then
+        # 本条同时承接原判据 6「真死心清位」的语义（原判据已删，理由见上方留痕注释块）
         pass "判据补2-a：死心后完整清理生效（边注销 = 停探 + 清位）"
     else
         nosam "没等到死心/清理（对挡可能没生效）"

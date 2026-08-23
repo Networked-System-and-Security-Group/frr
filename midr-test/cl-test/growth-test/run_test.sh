@@ -28,6 +28,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
+# 合栈（对接轮 4）后必需：第二组给 lib/libfrr.c 加了新符号（frr_daemon_state_load_status
+# 等），而宿主系统装的是旧 libfrr —— 不指过去，bgpd 起来就 `undefined symbol` 直接死，
+# 而脚本会因为 grep 到上一轮的旧日志报出**假阳性通过**。clab 容器那边是整套换过产物才没事。
+export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for each joiner's JOIN decision
 DO_SETUP=1

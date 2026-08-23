@@ -23,6 +23,8 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_debug.h"
+#include "bgpd/bgp_midr.h" /* 第二组接口结构（remote view 回调与逆换算用） */
+#include "bgpd/bgp_midr_pm.h" /* enum midr_stop_reason（I-2 停探原因） */
 
 /*
  * MIDR 日志两件事，别混：**级别**决定"够不够格写出去"，**频道**决定"这类啰嗦
@@ -63,9 +65,6 @@
 	} while (0)
 
 /* Timer intervals (seconds) */
-#define MIDR_KEEPALIVE_INTERVAL	    5  /* re-originate self Node NLRI */
-#define MIDR_NODE_EXPIRE_TIME	   15  /* mark gone after this long */
-#define MIDR_EXPIRE_CHECK_INTERVAL  5  /* scan period for expired nodes */
 #define MIDR_PERIODIC_SYNC_INTERVAL 30 /* CL periodic re-evaluation */
 /* Consecutive MIDR_PERIODIC_SYNC_INTERVAL ticks of zero established sessions
  * (group members + anchors alike) required before a node is declared
@@ -81,6 +80,14 @@
  * 1-0.95^20 ≈ 0.641 at the old 20s — a wider safety margin between the good-
  * and bad-link RTTs before CL evaluates. */
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
+
+/*
+ * 退网延时拆会话（秒）：`midr shutdown` 先发撤销、隔这么久再拆会话——拆了会话
+ * 就没通道把撤销发出去了（记档 39 的病根）。身份回落/清表/收尾日志仍**当场**做，
+ * 只有拆会话这一步延后。⚠ 判据脚本 backbone-shutdown 敲完命令 sleep 6 再查，
+ * 改大于 6 会让"会话拆净"判据假失败。
+ */
+#define MIDR_SHUTDOWN_TEARDOWN_DELAY 5
 
 /* ---------------------------------------------------------------------------
  * §8.21 指标变化门控（去抖）阈值 —— ⚠ 全部为粗定值，待真实网络跑出数据后校准。
@@ -105,7 +112,6 @@
 					   * RTT 的绝对差免疫开旁路（07-23 实测假
 					   * 触发）。bw 改独立测量后再启用，理由
 					   * 见 bgp_midr_nds.c 判断函数内注释。 */
-#define MIDR_DEBOUNCE_MAX_SILENCE   30	  /* 兜底：距上次发送满此秒数必发一次 */
 
 /* -------------------------------------------------------------------------
  * 挂靠（群代表 → 引导）调参，保底轮 2 批 5。
@@ -177,7 +183,6 @@ struct midr_link_entry {
 	 * 平滑不在这一层：进来的 short_term 已是 PM 侧 EWMA 的产物。
 	 */
 	struct midr_nds_link_metrics sent_metrics; /* 上次发出的指标快照 */
-	time_t last_sent_time;		       /* 上次发出的时刻（兜底周期用） */
 	bool sent_once;			       /* 是否发过（首条必发） */
 };
 
@@ -209,7 +214,12 @@ struct midr_node_entry {
 	 */
 	struct in_addr transport_addr;
 	bool has_transport_addr;
-	time_t last_seen;	/* last keepalive timestamp (local clock) */
+	/*
+	 * 上次收到关于该节点的消息（第二组回调 / 5859 名单 / PM 回包），monotime。
+	 * ⚠ **纯观测量**：件④ 起条目生死归第二组 withdraw 回调，任何判死或过滤
+	 * 都不许读它（`now - last_update > X` 这种判据一律不许再写回来）。
+	 */
+	time_t last_update;
 	/*
 	 * 接口设计文档 §2.3 原有一个 is_group_rep 布尔字段，2026-07-23 裁撤：
 	 * 它与 capabilities 的 GROUP_REP 位是同一事实的两个真值源，而全树只写
@@ -517,32 +527,23 @@ struct bgp_midr_nds {
 	struct in_addr local_transport_addr; /* our reachable locator */
 	bool transport_addr_set;	     /* operator configured one */
 	bool shutdown;			     /* graceful shutdown: stop advertising self */
-	/*
-	 * 保活抑制（保底轮 2 批 6 的 ④ 保活验证专用，隐藏命令
-	 * `[no] midr keepalive-suppress`，不进 conf 样板、不写用户文档）。
-	 * 为真时 keepalive（5s 重发本地 Node NLRI）与 expire-check（15s 判失效）
-	 * 两个定时器都停摆——用来实测"撤掉 MIDR 自建心跳后，BGP 自带的
-	 * keepalive/holdtime 能否独力判死、节点表能否被清理"。
-	 * ⚠ **只加开关、不真删定时器**：真删排在对接轮 4/5（那批把这两个定时器
-	 *   整个删掉，开关跟着消失——别留命令残壳）。实验做完把开关 `no` 回去。
-	 */
-	bool keepalive_suppressed;
-
 	/* === TLV sequence numbers === */
 	uint32_t perf_seqno; /* TLV 1186 seqno */
 	uint32_t cap_seqno;  /* TLV 1187 seqno */
 
 	/* === Timers === */
+	/* ⚠ 件④ 删了 keepalive/expire，**这个不能跟着删**：它还扛着递交 CL、
+	 * 刷种子库、B1 超龄扫描、孤岛自救、补边兜底扫描五件事。 */
 	struct event *t_periodic_sync;	  /* CL periodic re-evaluation */
 	struct event *t_probe_timeout;	  /* PM probe timeout */
-	struct event *t_keepalive;	  /* re-originate self Node NLRI */
-	struct event *t_expire_check;	  /* scan for expired nodes */
 	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
 	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
 	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
 	struct event *t_anchor_probe_done; /* deferred ANCHOR_PROBE_DONE，见 anchor_group_id */
 	struct event *t_bootstrap_boot;	  /* §8.31 一次性种子自举定时器 */
 	struct event *t_attach_reap;	  /* 钩子 (b) 掉线的"下一拍"处理（D4） */
+	struct event *t_session_reap;	  /* 掉沿清账的"下一拍"处理（件④） */
+	struct event *t_shutdown_teardown; /* 退网延时拆会话（见 MIDR_SHUTDOWN_TEARDOWN_DELAY） */
 	/*
 	 * 钩子 (b) 记下的待处理掉线 transport（struct in_addr *；同时掉线最多 K 条）。
 	 * 为什么不在钩子里当场拆：FSM 喊完 peer_status_changed 之后还要回来摸这条
@@ -551,6 +552,22 @@ struct bgp_midr_nds {
 	 * 下一拍事件里再动手（微秒级延迟，行为不变）。
 	 */
 	struct list *attach_down_pending;
+
+	/* 件④：掉沿清账的待处理会话（struct midr_session_down *）。不在钩子里
+	 * 当场拆的理由同上。 */
+	struct list *session_down_pending;
+
+	/*
+	 * === 件③ 第二组 remote-view（轮 4，双源期）===
+	 * remote_withdrawn: 最近被回调撤销的对象（struct midr_remote_withdrawn *），
+	 *   用于"虚报观察"——撤销后短窗内同对象又 update 就计一笔。它只是探针：
+	 *   我方按 07-30 定案走纯 BGP 判活、不为虚报预建缓冲，先看频率高不高。
+	 */
+	struct list *remote_withdrawn;
+	bool remote_view_registered;   /* 回调已注册（幂等闸，见 register 函数） */
+	uint64_t remote_node_events;   /* node 回调到达数（update + withdraw） */
+	uint64_t remote_link_events;   /* link 回调到达数（本轮只观察不消费） */
+	uint64_t remote_suspect_count; /* 疑似虚报撤销（撤后短窗内又 update） */
 
 	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
 	struct list *bootstrap_list;	/* 候选引导节点（struct midr_bootstrap_entry），
@@ -639,14 +656,31 @@ extern void bgp_midr_nds_finish(struct bgp *bgp);
  * NDS node table (migrated from the old bgp_midr_node.c)
  * =========================================================================*/
 
-/* Receive entry: update/insert from a Node NLRI (called from bgp_ls.c).
- * 传播面单点 (2/3) —— 收包入口 backend 替换边界; 完整说明见 bgp_midr_nds.c 定义处。 */
-extern void midr_nds_on_node_nlri(struct bgp *bgp, struct bgp_ls_nlri *nlri,
-				  struct bgp_ls_attr *ls_attr);
+/* 〔件②（轮 4）删除 midr_nds_on_node_nlri() / midr_nds_on_node_withdraw()：
+ * 节点表不再从我方自有的 BGP-LS 收包路径进料，唯一数据源是第二组的 remote-view
+ * 回调（bgp_midr_nds.c 文件末尾）。〕 */
 
-/* Remove entry on a Node NLRI WITHDRAW */
-extern void midr_nds_on_node_withdraw(struct bgp *bgp,
-				      struct bgp_ls_nlri *nlri);
+/*
+ * 下行逆换算单一出口（第二组 remote 结构 → 我方条目字段）：增量回调与
+ * `show midr group2-remote` 对账共用，口径只此一份。
+ */
+extern void midr_nds_remote_node_decode(const struct midr_remote_node_info *node,
+					struct in_addr *rid, uint32_t *caps,
+					struct in_addr *transport,
+					bool *has_transport);
+
+/* 收包侧反应链（数据源无关）：第二组 remote-view 回调进来后走这条。 */
+extern void midr_nds_node_react(struct bgp *bgp, struct midr_node_entry *entry,
+				bool is_new, bool changed, bool group_changed,
+				uint32_t prev_gid);
+
+/* 虚报观察：被 remote-view 回调撤销过的对象，撤销时刻记一笔（墙钟无关，用
+ * monotime）。撤后 MIDR_REMOTE_SUSPECT_WINDOW 内同对象又 update 即计一次疑似虚报。 */
+struct midr_remote_withdrawn {
+	struct in_addr rid;
+	time_t at;
+};
+#define MIDR_REMOTE_SUSPECT_WINDOW 30
 
 /* 把一个群成员（MEMBER_LIST_RESP）灌入 global_view、标记邻居并 I-1 探测 */
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
@@ -665,9 +699,11 @@ extern void midr_nds_adopt_group_peer(struct bgp *bgp, struct in_addr rid,
 				      uint32_t group_id);
 
 /* 反面：一条边没了之后按 transport 反查节点表做完整清理（停探 + 撤链路上报 +
- * 清 link_entry + 清 is_adjacent，不拆会话）。死心与拆边两处共用。 */
+ * 清 link_entry + 清 is_adjacent，不拆会话）。死心与拆边两处共用。
+ * reason 只透传给 I-2 停探进日志。 */
 extern void midr_nds_cleanup_by_transport(struct bgp *bgp,
-					  struct in_addr transport);
+					  struct in_addr transport,
+					  enum midr_stop_reason reason);
 
 /*
  * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时，为请求方灌入一条最小 global_view
@@ -712,35 +748,24 @@ extern unsigned int midr_nds_shutdown_enter(struct bgp *bgp);
 extern bool midr_nds_shutdown_exit(struct bgp *bgp);
 
 /*
- * Single entry point for advertising/withdrawing our own Node NLRI to the
- * fabric.  Centralises the shutdown guard and debug logging that were
- * previously scattered across every bgp_ls_originate_bgp_node() call site.
- * The reason only drives logging (and future differentiation); it does not
- * change semantics, except LEAVE -> withdraw and everything else -> originate.
+ * 上报原因：只驱动日志（"这笔身份变化因何而起"），不改变语义。
  *
- * 传播面单点 (1/3) —— 自通告出口 backend 替换边界; 完整三点说明见
- * bgp_midr_nds.c 的 midr_propagate_self() 定义处。
- *
- * ⚠ 轮 1（对接第二组）起，**身份变化点不再直调本函数**，改经
- * midr_nds_report_node()（bgp_midr_nds_facts.h）走事实表 + node_upsert；
- * shim 期 upsert 内部转调回本函数，NLRI 照发。现在仍直调本函数的只剩
- * keepalive 定时器（它不是身份变化）与 shim 自己。
+ * 唯一消费者是 midr_nds_report_node()（bgp_midr_nds_facts.h）——件②（轮 4）删掉
+ * 自有 BGP-LS 自通告出口 midr_propagate_self() 之后，身份上报只剩事实表 +
+ * 第二组 node_upsert/_withdraw 这一条路。
  */
 enum midr_origin_reason {
 	MIDR_ORIGIN_INIT,
-	MIDR_ORIGIN_KEEPALIVE,
 	MIDR_ORIGIN_GROUP_UPDATE,
 	MIDR_ORIGIN_CAP_UPDATE,
 	MIDR_ORIGIN_TRANSPORT_UPDATE,
 	MIDR_ORIGIN_REJOIN,	/* re-advertise after `no midr shutdown` */
 	MIDR_ORIGIN_LEAVE,	/* withdraw (graceful shutdown / leave) */
-	/* 轮 1：shim 的 midr_topology_node_upsert() 转调进来时用它 —— 日志里一眼
-	 * 看出这条 origination 走的是新上报路径。轮 4 换第二组真实现后，本值随
-	 * shim 一起消失。 */
+	/* 轮 1 shim 转调专用。shim 已不参与编译（件②只摘 subdir.am 编译行、文件
+	 * 留树），本值随轮 5 删 shim 文件时一起删。 */
 	MIDR_ORIGIN_TOPOLOGY_UPSERT,
 	/* reserved for the future node-failure-forwarding module */
 };
-extern void midr_propagate_self(struct bgp *bgp, enum midr_origin_reason reason);
 extern const char *midr_origin_reason_str(enum midr_origin_reason reason);
 
 /* ===========================================================================
@@ -845,13 +870,6 @@ extern void midr_nds_bootstrap_learn(struct bgp *bgp, struct in_addr transport,
  */
 extern void midr_nds_bootstrap_list_begin(struct bgp *bgp);
 
-/*
- * 开/关保活抑制（批 6 ④ 保活验证）：on = 停 keepalive 与 expire-check 两个
- * 定时器；off = 立即重新武装，并补发一次本地 Node NLRI（免得等满一个周期，
- * 抑制期间对端已把我们 expire 掉的话要尽快回到视野）。
- */
-extern void midr_nds_set_keepalive_suppress(struct bgp *bgp, bool on);
-
 /* 一份名单收完后的汇总回调（src = 应答方，count = 条目数）。批 5 在此接
  * "哈希顺次取 K 台挂靠"。 */
 extern void midr_nds_on_bootstrap_list(struct bgp *bgp, struct in_addr src,
@@ -900,19 +918,12 @@ extern bool midr_nds_is_bootstrap(struct bgp *bgp);
  *      不记对端身份）；
  *   ② 会话台账 reason ∈ {BACKBONE, ATTACH} —— 自动建的保底边一律有账，按条目
  *      里的 remote_rid 认人（不用 transport 反查，省一次节点表查询）；
- *   ③ 节点表条目带 BOOTSTRAP 位 —— 08-21 起引导照发 Node NLRI，本条实际可命中
- *      （在此之前引导进不了节点表，这条恒假）。
+ *   ③ 节点表条目带 BOOTSTRAP 位 —— ⚠ **件②（轮 4）起恒假**：换第二组数据源后
+ *      引导（群号 0）在他们侧是 pending、不回灌，节点表里没有引导条目。①② 足以
+ *      兜住，本条留着当将来引导进视图时的自动兜底。
  */
 extern bool midr_nds_link_is_backbone(struct bgp *bgp,
 				      const struct prefix *remote_node_id);
-
-/*
- * shim 专用（轮 4 随 bgp_midr_group2_shim.c 一并删除）：按对端 router-id 反查
- * link_entry 并调 E-1 发 Link NLRI。存在的理由 = E-1 与 global_view 查找都是
- * bgp_midr_nds.c 的 static，而 shim 手上只有 uint32 形式的 rid。
- */
-extern void midr_nds_e1_write_by_rid(struct bgp *bgp, uint32_t remote_rid,
-				     uint64_t seqno);
 
 /*
  * 把"引导节点该有的样子"坐实（幂等；非引导直接返回）：清群代表位、清群号、

@@ -84,11 +84,10 @@ static int midr_tier1_parse_observed_asns(struct vty *vty,
 	as_t *asns;
 	int i;
 
-	for (i = start_idx; i < argc; i++) {
-		if (!strcmp(argv[i]->arg, "json"))
-			continue;
+	/* 唯一调用者 show_midr_tier1 的命令串已无 [json] 选项（理由见该 DEFUN 头部
+	 * 注释），故不再需要跳过 "json" token。 */
+	for (i = start_idx; i < argc; i++)
 		count++;
-	}
 
 	if (!count) {
 		vty_out(vty, "%% At least one observed ASN is required\n");
@@ -105,9 +104,6 @@ static int midr_tier1_parse_observed_asns(struct vty *vty,
 	for (i = start_idx; i < argc; i++) {
 		unsigned long long asn;
 		char *endp = NULL;
-
-		if (!strcmp(argv[i]->arg, "json"))
-			continue;
 
 		errno = 0;
 		asn = strtoull(argv[i]->arg, &endp, 10);
@@ -985,15 +981,20 @@ DEFUN(show_midr_tier1_job,
 
 DEFUN(show_midr_tier1,
       show_midr_tier1_cmd,
-      "show midr tier1 <A.B.C.D|X:X::X:X> observed-as-path (0-4294967295)... [json]",
+      /* ⚠ 本命令**不提供 [json] 选项**，勿再加回：FRR 命令语法不允许可变数量
+       * 参数（`...`）之后再跟可选参数，加上就会在编 vtysh 时报
+       * `cmd_yyerror: FATAL parse error`，该命令进不了 vtysh 命令表 = 功能等于
+       * 没上线（编译本身能过，所以极易漏掉）。2026-08-22 与命令作者 wlk 确认后
+       * 删除（原 [json] 系 codex 整理时误加、未加测试）。要 JSON 输出请用
+       * `show midr tier1 <target> [refresh] [json]`（无 `...`，语法合法）。 */
+      "show midr tier1 <A.B.C.D|X:X::X:X> observed-as-path (0-4294967295)...",
       SHOW_STR
       "MIDR overlay routing\n"
       "Check whether an observed underlay path crosses Tier-1 ASNs\n"
       "Target IPv4 node\n"
       "Target IPv6 node\n"
       "Use a manually observed traceroute/IP-to-ASN sequence\n"
-      "Observed ASN sequence; use 0 for unmapped traceroute hops\n"
-      JSON_STR)
+      "Observed ASN sequence; use 0 for unmapped traceroute hops\n")
 {
 	const int idx_target = 3;
 	const int idx_asn = 5;
@@ -1009,7 +1010,6 @@ DEFUN(show_midr_tier1,
 	};
 	as_t *observed_asns = NULL;
 	size_t observed_asn_count = 0;
-	bool uj = use_json(argc, argv);
 	int ret;
 
 	if (!midr_vty_target_parse(vty, target, &target_prefix))
@@ -1029,10 +1029,7 @@ DEFUN(show_midr_tier1,
 		XFREE(MTYPE_TMP, observed_asns);
 		return CMD_WARNING;
 	}
-	if (uj)
-		midr_tier1_vty_json(vty, target, &result, &observation, NULL);
-	else
-		midr_tier1_vty_text(vty, target, &result, &observation, NULL);
+	midr_tier1_vty_text(vty, target, &result, &observation, NULL);
 	XFREE(MTYPE_TMP, observed_asns);
 	return CMD_SUCCESS;
 }
