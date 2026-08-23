@@ -1564,7 +1564,11 @@ int bgp_open_option_parse(struct peer_connection *connection, uint16_t length, i
 		    && !peer->afc_nego[AFI_IP6][SAFI_ENCAP]
 		    && !peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC]
 		    && !peer->afc_nego[AFI_L2VPN][SAFI_EVPN]
-		    && !peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS]) {
+		    && !peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS]
+		    /* (4,9) MIDR-LS：与 peer_active() 那处同源的漏登记，见
+		     * bgpd.c 的 peer_active()。件② 撤掉 (4,8) 后 MIDR overlay
+		     * 会话只协商这一个族，不认它会误报"无共同地址族"并 NOTIFY。 */
+		    && !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS]) {
 			flog_err(EC_BGP_PKT_OPEN,
 				 "%s [Error] Configured AFI/SAFIs do not overlap with received MP capabilities",
 				 peer->host);

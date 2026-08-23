@@ -5146,7 +5146,11 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 	    || peer->afc[AFI_IP6][SAFI_ENCAP]
 	    || peer->afc[AFI_IP6][SAFI_FLOWSPEC]
 	    || peer->afc[AFI_L2VPN][SAFI_EVPN]
-	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS]
+	    /* (4,9) MIDR-LS：第二组加该族时漏在此处登记。件②（轮 4）撤掉 (4,8)
+	     * 之后 MIDR overlay 会话只剩这一个族，不认它就等于"没有任何激活地址
+	     * 族" → FSM 压根不启动、peer 永远 Idle（Opens Sent 恒 0）。 */
+	    || peer->afc[AFI_BGP_LS][SAFI_MIDR_LS])
 		return BGP_PEER_ACTIVE;
 
 	return BGP_PEER_AF_UNCONFIGURED;
