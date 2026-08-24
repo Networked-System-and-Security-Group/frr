@@ -1,0 +1,13 @@
+state:             IDENTITY_RESTART
+reason:            none
+owner:             9.9.9.9
+provider:          unavailable
+active facts:      0 nodes, 0 links
+tombstones:        0 nodes, 0 links
+identity restarts: 1
+% MIDR node upsert failed: -11
+enqueued:       1
+processed:      1
+rejected-sync:  1
+pending queue:  0
+!9.9.9.9 group 900 policy allowed version 1 active

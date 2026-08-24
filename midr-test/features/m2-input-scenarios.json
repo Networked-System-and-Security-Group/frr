@@ -1,0 +1,22 @@
+[
+  {
+    "id": "M2-INPUT-001",
+    "description": "atomic Snapshot and concurrent increment"
+  },
+  {
+    "id": "M2-INPUT-002",
+    "description": "Provider EAGAIN retry without a state gap"
+  },
+  {
+    "id": "M2-INPUT-003",
+    "description": "invalid Snapshot atomic rollback"
+  },
+  {
+    "id": "M2-INPUT-004",
+    "description": "Resync queue overflow rollback"
+  },
+  {
+    "id": "M2-INPUT-005",
+    "description": "Router-ID identity restart"
+  }
+]

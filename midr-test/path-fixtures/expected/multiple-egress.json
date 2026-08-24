@@ -1,0 +1,56 @@
+{
+  "generation": 1,
+  "local_node_id": "1.1.1.1",
+  "local_group_id": 100,
+  "ready": true,
+  "sync_reason_flags": 0,
+  "nodes": [
+    {"node_id": "1.1.1.1", "group_id": 100, "cap_flags": 0, "policy_tags": 0},
+    {"node_id": "2.2.2.2", "group_id": 100, "cap_flags": 0, "policy_tags": 0}
+  ],
+  "intra_links": [],
+  "egress_links": [
+    {
+      "local": "1.1.1.1",
+      "remote": "3.3.3.3",
+      "local_group_id": 100,
+      "remote_group_id": 200,
+      "link_id": 100,
+      "cost": 50,
+      "policy_tags": 0,
+      "local_address": "2001:db8:13::1",
+      "remote_address": "2001:db8:13::3",
+      "local_ifindex": 10
+    },
+    {
+      "local": "1.1.1.1",
+      "remote": "4.4.4.4",
+      "local_group_id": 100,
+      "remote_group_id": 200,
+      "link_id": 102,
+      "cost": 30,
+      "policy_tags": 0,
+      "local_address": "10.0.14.1",
+      "remote_address": "10.0.14.4",
+      "local_ifindex": 11
+    },
+    {
+      "local": "2.2.2.2",
+      "remote": "4.4.4.4",
+      "local_group_id": 100,
+      "remote_group_id": 200,
+      "link_id": 101,
+      "cost": 20,
+      "policy_tags": 0,
+      "local_address": "10.0.24.2",
+      "remote_address": "10.0.24.4",
+      "local_ifindex": 0
+    }
+  ],
+  "node_prefixes": [],
+  "group_edges": [
+    {"source_group_id": 100, "target_group_id": 200, "aggregate_cost": 20}
+  ],
+  "prefix_groups": [],
+  "pending": {"links": 0, "node_prefixes": 0, "prefix_groups": 0}
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "M5-PROP-001",
+    "scenario": "line",
+    "description": "multi-hop line propagation"
+  },
+  {
+    "id": "M5-PROP-002",
+    "scenario": "withdraw",
+    "description": "hop-by-hop MP_UNREACH withdrawal"
+  },
+  {
+    "id": "M5-PROP-003",
+    "scenario": "scope",
+    "description": "intra-group and global scope enforcement"
+  },
+  {
+    "id": "M5-PROP-004",
+    "scenario": "triangle",
+    "description": "alternate path convergence and loop prevention"
+  },
+  {
+    "id": "M5-PROP-005",
+    "scenario": "eor-timeout",
+    "description": "EoR timeout and late recovery"
+  },
+  {
+    "id": "M5-PROP-006",
+    "scenario": "route-refresh",
+    "description": "Route Refresh table replay"
+  }
+]

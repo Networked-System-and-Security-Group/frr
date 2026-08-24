@@ -1,0 +1,29 @@
+schema_version: 1
+local_node_id: 1.1.1.1
+local_group_id: 100
+
+nodes:
+  - {node_id: 3.3.3.3, group_id: 200}
+  - {node_id: 1.1.1.1, group_id: 100}
+  - {node_id: 2.2.2.2, group_id: 100}
+
+links:
+  - local: 2.2.2.2
+    remote: 3.3.3.3
+    link_id: 20
+    local_address: 10.0.23.2
+    remote_address: 10.0.23.3
+    cost: 30
+  - local: 1.1.1.1
+    remote: 2.2.2.2
+    link_id: 10
+    local_address: 10.0.12.1
+    remote_address: 10.0.12.2
+    cost: 20
+    local_ifindex: 3
+
+node_prefixes:
+  - {prefix: 203.0.113.0/24, node_id: 3.3.3.3}
+
+prefix_groups:
+  - {prefix: 203.0.113.0/24, group_id: 200}

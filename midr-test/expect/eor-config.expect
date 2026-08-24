@@ -1,0 +1,5 @@
+MIDR synchronization:
+state:              LOCAL_WAIT
+EoR timeout:        60 seconds
+EoR timeout:        5 seconds
+midr eor-timeout 5

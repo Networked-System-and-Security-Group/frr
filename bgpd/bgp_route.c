@@ -69,6 +69,9 @@
 #include "bgpd/bgp_bfd.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_lsdb.h"
+#include "bgpd/bgp_midr_private.h"
 
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/rfapi_backend.h"
@@ -123,6 +126,15 @@ DEFINE_HOOK(bgp_route_update,
 	    (struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *bn,
 	     struct bgp_path_info *old_route, struct bgp_path_info *new_route),
 	    (bgp, afi, safi, bn, old_route, new_route));
+
+void bgp_midr_rib_route_update_notify(
+	struct bgp *bgp, struct bgp_dest *dest,
+	struct bgp_path_info *old_selected,
+	struct bgp_path_info *new_selected)
+{
+	hook_call(bgp_route_update, bgp, AFI_BGP_LS, SAFI_MIDR_LS,
+		  dest, old_selected, new_selected);
+}
 
 /* Extern from bgp_dump.c */
 extern const char *bgp_origin_str[];
@@ -2451,6 +2463,18 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 		if (!bgp_addpath_capable(pi, peer, afi, safi))
 			return false;
 
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+		struct peer *target = SUBGRP_PFIRST(subgrp)->peer;
+		bool eligible;
+
+		eligible = bgp && bgp->midr_info &&
+			   midr_lsdb_export_eligible(&bgp->midr_info->ctx, dest,
+						     pi, target);
+		if (eligible)
+			*attr = *piattr;
+		return eligible;
+	}
+
 	/* Aggregate-address suppress check. */
 	if (bgp_path_suppressed(pi) && !UNSUPPRESS_MAP_NAME(filter))
 		return false;
@@ -4145,6 +4169,10 @@ void bgp_process_main_one(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, saf
 	}
 
 	/* Best path selection. */
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+		bgp_midr_rib_process_main(bgp, dest);
+		return;
+	}
 	bgp_best_selection(bgp, dest, &bgp->maxpaths[afi][safi], &old_and_new,
 			   afi, safi);
 	old_select = old_and_new.old;
@@ -14721,6 +14749,7 @@ const struct prefix_rd *bgp_rd_from_dest(const struct bgp_dest *dest,
 	case SAFI_EVPN:
 		return (struct prefix_rd *)(bgp_dest_get_prefix(dest));
 	case SAFI_BGP_LS:
+	case SAFI_MIDR_LS:
 	case SAFI_UNSPEC:
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:

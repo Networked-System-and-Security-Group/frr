@@ -1,0 +1,32 @@
+[
+  {
+    "id": "M6-PFX-001",
+    "command": ["tests/bgpd/test_midr_prefix"],
+    "expect": "MIDR prefix contributor tests passed",
+    "description": "prefix policy and contributor component coverage"
+  },
+  {
+    "id": "M6-PFX-002",
+    "command": ["midr-test/run-m5-multinode.sh", "prefix"],
+    "expect": "PASS: MIDR M5 rootless prefix",
+    "description": "Node Prefix and Group Prefix propagation"
+  },
+  {
+    "id": "M6-PFX-003",
+    "command": ["midr-test/run-m5-multinode.sh", "prefix-withdraw"],
+    "expect": "PASS: MIDR M5 rootless prefix-withdraw",
+    "description": "last-contributor hop-by-hop withdrawal"
+  },
+  {
+    "id": "M6-PFX-004",
+    "command": ["midr-test/run-m5-multinode.sh", "prefix-takeover"],
+    "expect": "PASS: MIDR M5 rootless prefix-takeover",
+    "description": "representative takeover and usable gate"
+  },
+  {
+    "id": "M6-PFX-005",
+    "command": ["tests/bgpd/test_midr_prefix"],
+    "expect": "MIDR prefix contributor tests passed",
+    "description": "Prefix OUT_OF_SYNC withdrawal and recovery"
+  }
+]

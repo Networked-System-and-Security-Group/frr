@@ -67,6 +67,10 @@ static struct zapi_route g_last_api;
 static uint8_t g_last_cmd;
 static int g_send_count = 0;
 
+extern enum zclient_send_status
+__wrap_zclient_route_send(uint8_t cmd, struct zclient *z,
+			  struct zapi_route *api);
+
 enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
 	struct zclient *z, struct zapi_route *api) {
 	g_last_cmd = cmd;
@@ -107,7 +111,7 @@ static struct bgp_midr_dp *get_dp(struct bgp *bgp) {
 }
 static int pending_count(struct bgp *bgp) {
 	struct bgp_midr_dp *dp = get_dp(bgp);
-	return (dp && dp->pending_ops) ? listcount(dp->pending_ops) : -1;
+	return (dp && dp->pending_ops) ? (int)listcount(dp->pending_ops) : -1;
 }
 
 /* installed_has now checks by (prefix, instance) */

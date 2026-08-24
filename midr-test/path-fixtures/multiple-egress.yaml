@@ -1,0 +1,34 @@
+schema_version: 1
+local_node_id: 1.1.1.1
+local_group_id: 100
+
+nodes:
+  - {node_id: 4.4.4.4, group_id: 200}
+  - {node_id: 2.2.2.2, group_id: 100}
+  - {node_id: 3.3.3.3, group_id: 200}
+  - {node_id: 1.1.1.1, group_id: 100}
+
+links:
+  - local: 1.1.1.1
+    remote: 3.3.3.3
+    link_id: 100
+    local_address: 2001:db8:13::1
+    remote_address: 2001:db8:13::3
+    cost: 50
+    local_ifindex: 10
+  - local: 2.2.2.2
+    remote: 4.4.4.4
+    link_id: 101
+    local_address: 10.0.24.2
+    remote_address: 10.0.24.4
+    cost: 20
+  - local: 1.1.1.1
+    remote: 4.4.4.4
+    link_id: 102
+    local_address: 10.0.14.1
+    remote_address: 10.0.14.4
+    cost: 30
+    local_ifindex: 11
+
+node_prefixes: []
+prefix_groups: []

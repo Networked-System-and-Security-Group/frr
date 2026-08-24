@@ -219,6 +219,11 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 							       "capabilityErrorMultiProtocolSafi",
 							       "BGP-LS");
 					break;
+				case SAFI_MIDR_LS:
+					json_object_string_add(json_cap,
+							       "capabilityErrorMultiProtocolSafi",
+							       "MIDR-LS");
+					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
 					json_object_int_add(
@@ -273,6 +278,9 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 					break;
 				case SAFI_BGP_LS:
 					vty_out(vty, "SAFI BGP-LS");
+					break;
+				case SAFI_MIDR_LS:
+					vty_out(vty, "SAFI MIDR-LS");
 					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:

@@ -1,0 +1,9 @@
+MIDR prefix input:
+  state:             READY
+ midr group-prefix takeover-delay-ms 2500
+  midr prefix-export max-as-path-length 2
+  midr prefix-export route-map EXPORT-MIDR-V4
+  midr prefix-export max-as-path-length 3
+  midr prefix-export route-map EXPORT-MIDR-V6
+!% Unknown command
+!% Ambiguous command

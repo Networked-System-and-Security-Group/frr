@@ -434,7 +434,7 @@ static unsigned int updgrp_hash_key_make(const void *p)
 	 * - peers that negotiated ORF
 	 * - maximum-prefix-out is set
 	 */
-	if (CHECK_FLAG(peer->flags, PEER_FLAG_LONESOUL)
+	if (safi == SAFI_MIDR_LS || CHECK_FLAG(peer->flags, PEER_FLAG_LONESOUL)
 	    || CHECK_FLAG(peer->af_cap[afi][safi], PEER_CAP_ORF_PREFIX_SM_RCV)
 	    || CHECK_FLAG(peer->af_flags[afi][safi], PEER_FLAG_MAX_PREFIX_OUT))
 		key = jhash_1word(jhash(peer->host, strlen(peer->host), SEED2),
@@ -578,6 +578,9 @@ static bool updgrp_hash_cmp(const void *p1, const void *p2)
 	pe2 = grp2->conf;
 	afi = grp1->afi;
 	safi = grp1->safi;
+	if (safi == SAFI_MIDR_LS &&
+	    !sockunion_same(&pe1->connection->su, &pe2->connection->su))
+		return false;
 	flags1 = pe1->af_flags[afi][safi];
 	flags2 = pe2->af_flags[afi][safi];
 	fl1 = &pe1->filter[afi][safi];

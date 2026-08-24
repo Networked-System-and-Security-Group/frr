@@ -44,6 +44,26 @@ EXTRA_DIST += tests/bgpd/test_ecommunity.py
 
 
 if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_spf
+endif
+tests_bgpd_test_midr_spf_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_spf_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_spf_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_spf_SOURCES = tests/bgpd/test_midr_spf.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_spf_install
+endif
+tests_bgpd_test_midr_spf_install_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_spf_install_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_spf_install_LDFLAGS = -Wl,--wrap=zclient_route_send
+tests_bgpd_test_midr_spf_install_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_spf_install_SOURCES = \
+	tests/bgpd/test_midr_spf_install.c
+
+
+if BGPD
 check_PROGRAMS += tests/bgpd/test_mp_attr
 endif
 tests_bgpd_test_mp_attr_CFLAGS = $(TESTS_CFLAGS)
@@ -76,5 +96,170 @@ check_PROGRAMS += tests/bgpd/test_midr_zebra
 endif
 tests_bgpd_test_midr_zebra_CFLAGS = $(TESTS_CFLAGS)
 tests_bgpd_test_midr_zebra_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_zebra_LDFLAGS = -Wl,--wrap=zclient_route_send
 tests_bgpd_test_midr_zebra_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_midr_zebra_SOURCES = tests/bgpd/test_midr_zebra.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_input
+endif
+tests_bgpd_test_midr_input_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_input_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_input_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_input_SOURCES = tests/bgpd/test_midr_input.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_ls_object
+endif
+tests_bgpd_test_midr_ls_object_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_ls_object_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_ls_object_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_ls_object_SOURCES = tests/bgpd/test_midr_ls_object.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_sequence
+endif
+tests_bgpd_test_midr_sequence_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_sequence_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_sequence_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_sequence_SOURCES = tests/bgpd/test_midr_sequence.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_cost
+endif
+tests_bgpd_test_midr_cost_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_cost_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_cost_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_cost_SOURCES = tests/bgpd/test_midr_cost.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_codec
+endif
+tests_bgpd_test_midr_codec_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_codec_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_codec_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_codec_SOURCES = tests/bgpd/test_midr_codec.c
+
+EXTRA_DIST += tests/bgpd/fuzz_midr_codec.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_safi
+endif
+tests_bgpd_test_midr_safi_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_safi_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_safi_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_safi_SOURCES = tests/bgpd/test_midr_safi.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_attr
+endif
+tests_bgpd_test_midr_attr_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_attr_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_attr_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_attr_SOURCES = tests/bgpd/test_midr_attr.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_packet
+endif
+tests_bgpd_test_midr_packet_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_packet_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_packet_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_packet_SOURCES = tests/bgpd/test_midr_packet.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_rib
+endif
+tests_bgpd_test_midr_rib_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_rib_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_rib_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_rib_SOURCES = tests/bgpd/test_midr_rib.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_scope
+endif
+tests_bgpd_test_midr_scope_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_scope_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_scope_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_scope_SOURCES = tests/bgpd/test_midr_scope.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_owned
+endif
+tests_bgpd_test_midr_owned_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_owned_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_owned_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_owned_SOURCES = tests/bgpd/test_midr_owned.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_prefix
+endif
+tests_bgpd_test_midr_prefix_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_prefix_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_prefix_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_prefix_SOURCES = tests/bgpd/test_midr_prefix.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_lsdb
+endif
+tests_bgpd_test_midr_lsdb_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_lsdb_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_lsdb_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_lsdb_SOURCES = \
+	tests/bgpd/test_midr_lsdb.c \
+	tests/bgpd/midr_ted_mock_provider.c \
+	tests/bgpd/test_midr_ted_consumer.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_resync
+endif
+tests_bgpd_test_midr_resync_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_resync_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_resync_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_resync_SOURCES = tests/bgpd/test_midr_resync.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_sync
+endif
+tests_bgpd_test_midr_sync_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_sync_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_sync_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_sync_SOURCES = tests/bgpd/test_midr_sync.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_ted
+endif
+tests_bgpd_test_midr_ted_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_ted_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_ted_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_ted_SOURCES = \
+	tests/bgpd/test_midr_ted.c \
+	tests/bgpd/test_midr_ted_consumer.c
+EXTRA_DIST += tests/bgpd/test_midr_ted_consumer.h
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_ted_fixture
+endif
+tests_bgpd_test_midr_ted_fixture_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_ted_fixture_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_ted_fixture_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_ted_fixture_SOURCES = \
+	tests/bgpd/test_midr_ted_fixture.c \
+	tests/bgpd/midr_ted_mock_provider.c
+EXTRA_DIST += tests/bgpd/midr_ted_mock_provider.h

@@ -107,6 +107,7 @@ enum bgp_af_index {
 	BGP_AF_IPV4_FLOWSPEC,
 	BGP_AF_IPV6_FLOWSPEC,
 	BGP_AF_BGP_LS,
+	BGP_AF_MIDR_LS,
 	BGP_AF_MAX
 };
 
@@ -835,6 +836,9 @@ struct bgp {
 
 	/* BGP-LS specific data */
 	struct bgp_ls *ls_info;
+
+	/* MIDR specific data */
+	struct bgp_midr *midr_info;
 
 	/* BGP table route-map.  */
 	struct bgp_rmap table_map[AFI_MAX][SAFI_MAX];
@@ -3004,6 +3008,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV4_FLOWSPEC;
 		case SAFI_BGP_LS:
+		case SAFI_MIDR_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3025,6 +3030,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV6_FLOWSPEC;
 		case SAFI_BGP_LS:
+		case SAFI_MIDR_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3036,6 +3042,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_EVPN:
 			return BGP_AF_L2VPN_EVPN;
 		case SAFI_BGP_LS:
+		case SAFI_MIDR_LS:
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_LABELED_UNICAST:
@@ -3051,6 +3058,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 		switch (safi) {
 		case SAFI_BGP_LS:
 			return BGP_AF_BGP_LS;
+		case SAFI_MIDR_LS:
+			return BGP_AF_MIDR_LS;
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_LABELED_UNICAST:

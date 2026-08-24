@@ -1,0 +1,6 @@
+1.1.1.1 group 600 transport ipv6 2001:db8::1 policy allowed version 6 active
+1.1.1.1 -> 2.2.2.2 id 6 local-address ipv6 2001:db8::1 remote-address ipv6 2001:db8::2 ifindex 0 rtt-us 600 loss-ppm 60 available-bandwidth-kbps 6000 policy allowed version 6 active
+  enqueued:       2
+  processed:      2
+!% MIDR node upsert failed
+!% MIDR link upsert failed
