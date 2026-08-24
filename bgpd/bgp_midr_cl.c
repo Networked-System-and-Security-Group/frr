@@ -674,6 +674,26 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		}
 		break;
 
+	case MIDR_TRIGGER_GROUP_ID_COLLISION:
+		/*
+		 * NDS 已经判过输赢（midr_group_collision_check()），只在本机是
+		 * 输的一方时才会收到这个 trigger。动作与 ISOLATED 完全一样——
+		 * 丢弃当前群身份、从引导候选清单重新走一遍加入流程，理由也一样：
+		 * 这不是链路质量判断，PERIODIC_SYNC 的 LEAVE 逻辑不会替我们处理
+		 * 这种情况。
+		 */
+		{
+			struct midr_cluster_decision d = {};
+
+			d.decision_type = MIDR_DECISION_RECONNECT;
+			d.old_group_id = mi->local_group_id;
+			d.new_group_id = 0;
+			MIDR_FLOW_LOG("MIDR CL: GROUP_ID_COLLISION — 群 %u 号撞车且本机应让号，RECONNECT",
+				      mi->local_group_id);
+			midr_nds_on_cluster_decision(bgp, &d);
+		}
+		break;
+
 	case MIDR_TRIGGER_CAPABILITY_UPDATE:
 		/*
 		 * 能力更新：节点通过 TLV 1187 变更能力时触发。

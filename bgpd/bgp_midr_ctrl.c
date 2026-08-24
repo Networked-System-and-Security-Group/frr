@@ -46,6 +46,23 @@ static const struct midr_ctrl_retx_params midr_ctrl_retx_default = {
 	.stop_on_signal = true,
 };
 
+/*
+ * ANNOUNCE has no reply to wait for (stop_on_signal=false: sending
+ * params.count times without an answer is a normal finish, not a give-up --
+ * see the retx-timer comment at its stop_on_signal=false branch). A shorter,
+ * more frequent retry than the default budget above, since ANNOUNCE exists
+ * to beat the sender's own EWMA warm-up window (MIDR_JOIN_PROBE_WAIT_SECS):
+ * one lost UDP packet during a cluster's simultaneous-startup burst used to
+ * be permanent (the receiver's pm_is_known_transport() would drop every
+ * subsequent probe as "unknown transport" for the rest of the run, since
+ * nothing ever resent the self-identification that would have fixed it).
+ */
+static const struct midr_ctrl_retx_params midr_ctrl_retx_announce = {
+	.interval_ms = 2000,
+	.count = 3,
+	.stop_on_signal = false,
+};
+
 /* struct midr_ctrl_pending 定义已移至 bgp_midr_ctrl.h（show midr join 要展示
  * 未应答请求），MTYPE 仍留在本文件。 */
 
@@ -123,6 +140,10 @@ const char *midr_ctrl_msg_type_str(uint8_t type)
 		return "BOOTSTRAP_LIST_RESP";
 	case MIDR_CTRL_ATTACH_REQUEST:
 		return "ATTACH_REQUEST";
+	case MIDR_CTRL_GROUP_ALLOC_REQ:
+		return "GROUP_ALLOC_REQ";
+	case MIDR_CTRL_GROUP_ALLOC_RESP:
+		return "GROUP_ALLOC_RESP";
 	default:
 		return "UNKNOWN";
 	}
@@ -199,7 +220,11 @@ static void midr_ctrl_send_req(struct bgp_midr_nds *mi, struct in_addr dst,
 static void midr_ctrl_request_attempt(struct bgp *bgp, struct in_addr dst,
 				      uint8_t type, uint32_t target_group)
 {
-	if (midr_ctrl_is_peer_req_like(type))
+	/* ANNOUNCE stays on the UDP one-way frame (never had a TCP counterpart
+	 * -- it's not a list exchange), so it doesn't belong under
+	 * midr_ctrl_is_peer_req_like()'s "connection-establishing" umbrella;
+	 * routed here explicitly instead of widening that predicate's meaning. */
+	if (midr_ctrl_is_peer_req_like(type) || type == MIDR_CTRL_ANNOUNCE)
 		midr_ctrl_send_req(bgp->midr_nds_info, dst, type, target_group);
 	else
 		midr_ctrl_tcp_client_start(bgp, dst, type, target_group);
@@ -322,20 +347,39 @@ void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp, struct in_addr dst)
 	MIDR_FLOW_LOG("MIDR ctrl: sent BOOTSTRAP_LIST_REQ to %pI4", &dst);
 }
 
+/* New node -> the network's elected allocator bootstrap: ask for an
+ * authoritative new group id before settling a CREATE. See the
+ * MIDR_CTRL_GROUP_ALLOC_REQ enum comment (bgp_midr_ctrl.h) for why. */
+void midr_ctrl_send_group_alloc_request(struct bgp *bgp, struct in_addr dst)
+{
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	midr_ctrl_enqueue_request(bgp, dst, MIDR_CTRL_GROUP_ALLOC_REQ, 0,
+				  &midr_ctrl_retx_default);
+	MIDR_FLOW_LOG("MIDR ctrl: sent GROUP_ALLOC_REQ to %pI4", &dst);
+}
+
 /*
  * New node -> an arbitrary candidate (rep or member): self-announce so the
  * receiver can validate our subsequent PM probes without an explicit
- * request/response round trip. One-way, fire-and-forget — same frame as
- * MIDR_CTRL_ANNOUNCE's existing use from midr_ctrl_recv_member_list(), just
- * exposed for callers outside this file (e.g. midr_join_on_rep_list() in
- * bgp_midr_nds.c, which needs to announce to *every* rep in the directory, not
- * only the bootstrap that already received a REP_LIST_REQ from us).
+ * request/response round trip. One-way, no reply -- but retried up to
+ * midr_ctrl_retx_announce.count times (2s apart) via the same ctrl_pending
+ * queue the request/response messages use, because a single lost UDP packet
+ * here used to be a permanent failure: the receiver never learns our
+ * transport address, so pm_is_known_transport() drops every one of our PM
+ * probes to it for the rest of the run, and REP_PROBE_DONE/MEMBER_PROBE_DONE
+ * evaluate the candidate as having zero data -- indistinguishable from the
+ * candidate not existing. Exposed for callers outside this file (e.g.
+ * midr_join_on_rep_list() in bgp_midr_nds.c, which needs to announce to
+ * *every* rep in the directory, not only the bootstrap that already received
+ * a REP_LIST_REQ from us).
  */
 void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst)
 {
 	if (!bgp || !bgp->midr_nds_info)
 		return;
-	midr_ctrl_send_req(bgp->midr_nds_info, dst, MIDR_CTRL_ANNOUNCE, 0);
+	midr_ctrl_enqueue_request(bgp, dst, MIDR_CTRL_ANNOUNCE, 0,
+				  &midr_ctrl_retx_announce);
 	MIDR_FLOW_LOG("MIDR ctrl: sent ANNOUNCE to %pI4", &dst);
 }
 
@@ -489,6 +533,8 @@ static void midr_ctrl_retx_timer(struct event *t)
 	bool rep_gave_up = false;
 	struct in_addr blist_failed = { 0 }; /* 本轮死心的 BOOTSTRAP_LIST_REQ 目标 */
 	bool blist_gave_up = false;
+	bool galloc_gave_up = false; /* 本轮死心的 GROUP_ALLOC_REQ——目标固定为
+				      * 唯一发号引导，不用像 rep/blist 那样带地址 */
 	bool attach_gave_up = false; /* 本轮有挂靠死心 → 循环外重挑（D2） */
 	/* 死者所在批次，决定重挑从哪一批继续（批 6 的 A-3）。一拍里多条挂靠同时
 	 * 死心时以最后一条为准：重挑一次补齐所有缺口，而 SECOND 只在第一批已试尽
@@ -562,6 +608,11 @@ static void midr_ctrl_retx_timer(struct event *t)
 				blist_failed = p->target_transport;
 				blist_gave_up = true;
 			}
+			/* 发号引导问不到：没有候补名单可换（只信任那一台确定性选出
+			 * 的分配者），直接回落本地估算，见
+			 * midr_nds_group_alloc_failed()。 */
+			if (p->type == MIDR_CTRL_GROUP_ALLOC_REQ)
+				galloc_gave_up = true;
 			/*
 			 * 死心拆除（方案定稿结论 23，08-11 批 2）：PEER_REQUEST
 			 * 死心 = 对端始终没回配，本机当初为它预配的**半边 peer**
@@ -621,6 +672,9 @@ static void midr_ctrl_retx_timer(struct event *t)
 	/* 同理放循环外：回调会向下一个候选发请求、往 ctrl_pending 追加条目。 */
 	if (blist_gave_up)
 		midr_nds_bootstrap_list_failed(bgp, blist_failed);
+	/* 发号请求死心 → 直接回落本地估算完成落定（无候补池，见上）。 */
+	if (galloc_gave_up)
+		midr_nds_group_alloc_failed(bgp);
 	/* 挂靠死心的换台（D2）。同样放循环外，且必须排在下面重挂重试定时器**之前**
 	 * ——新发出的 ATTACH_REQUEST 才能被这一轮的定时器武装上重传。
 	 * 判据（是代表 ∧ ATTACH 账不足 K ∧ 还有没盖章的候选）全在 pick 内部。 */
@@ -931,6 +985,68 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 	return s;
 }
 
+/*
+ * Allocator side: hand out the next group id from a monotonic counter.
+ * Seeded lazily (on first request, not at ctrl-init) from a scan of this
+ * bootstrap's own node table — the same cl_max_group_id() computation CL
+ * does locally, just run here where the view is far more complete than any
+ * freshly-joining node's. From then on we only ever increment, never
+ * re-scan: a group can still be momentarily invisible in global_view due to
+ * NLRI propagation lag, so re-deriving the baseline on every request could
+ * hand out a number that collides with one already granted a moment ago.
+ *
+ * Any bootstrap answers if asked (no local election check here) — refusing
+ * would just make the requester time out and fall back anyway, no safety
+ * gained. The correctness property this protocol leans on is "only one
+ * process is ever actually asked" (every node computes the same elected
+ * allocator independently, see midr_nds_pick_group_allocator() in
+ * bgp_midr_nds.c), not "only one process is capable of answering".
+ */
+static struct stream *midr_ctrl_build_group_alloc_resp(struct bgp *bgp,
+							struct in_addr dst)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct stream *s;
+	struct midr_ctrl_group_alloc_item item;
+	uint32_t gid;
+
+	if (!(mi->local_capabilities & MIDR_CAP_BOOTSTRAP)) {
+		MIDR_LOG("MIDR ctrl: ignoring GROUP_ALLOC_REQ from %pI4 (caps 0x%x — not a bootstrap)",
+			 &dst, mi->local_capabilities);
+		return NULL;
+	}
+
+	if (!mi->group_alloc_seeded) {
+		struct list *nodes = midr_nds_cl_nodes_getter(mi->global_view);
+		struct listnode *n;
+		struct midr_node_entry *entry;
+		uint32_t max_id = 0;
+
+		for (ALL_LIST_ELEMENTS_RO(nodes, n, entry))
+			if (entry->group_id > max_id)
+				max_id = entry->group_id;
+		list_delete(&nodes);
+
+		mi->group_alloc_next = max_id + 1;
+		mi->group_alloc_seeded = true;
+		MIDR_LOG("MIDR ctrl: group-id 发号器起播，起始值 %u（本机节点表当前最大群号 %u）",
+			 mi->group_alloc_next, max_id);
+	}
+
+	gid = mi->group_alloc_next++;
+
+	s = stream_new(sizeof(struct midr_ctrl_list_hdr) + sizeof(item));
+	stream_putc(s, MIDR_CTRL_MSG_VERSION);
+	stream_putc(s, MIDR_CTRL_GROUP_ALLOC_RESP);
+	stream_putw(s, 1); /* count，恒为 1 */
+	item.group_id = htonl(gid);
+	stream_put(s, &item, sizeof(item));
+
+	MIDR_FLOW_LOG("MIDR ctrl: GROUP_ALLOC_REQ from %pI4 — 分配群 %u",
+		      &dst, gid);
+	return s;
+}
+
 /* 代表侧：收下一份活引导名单——逐条吸收（候选池 + 种子库），再交 NDS 汇总。 */
 static void midr_ctrl_recv_bootstrap_list(struct bgp *bgp, const uint8_t *buf,
 					  ssize_t n, struct in_addr src)
@@ -966,6 +1082,44 @@ static void midr_ctrl_recv_bootstrap_list(struct bgp *bgp, const uint8_t *buf,
 					 items[i].rid);
 
 	midr_nds_on_bootstrap_list(bgp, src, count);
+}
+
+/* Requester side: unpack the allocated id and hand it to NDS to finish the
+ * CREATE that's been waiting on it. Malformed/zero replies are treated the
+ * same as a give-up — NDS falls back to its own local estimate either way. */
+static void midr_ctrl_recv_group_alloc(struct bgp *bgp, const uint8_t *buf,
+				       ssize_t n, struct in_addr src)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	const struct midr_ctrl_list_hdr *hdr =
+		(const struct midr_ctrl_list_hdr *)buf;
+	const struct midr_ctrl_group_alloc_item *item;
+	uint16_t count;
+	uint32_t gid;
+
+	if (n < (ssize_t)sizeof(*hdr))
+		return;
+	count = ntohs(hdr->count);
+	if (count != 1 ||
+	    n != (ssize_t)(sizeof(*hdr) + sizeof(struct midr_ctrl_group_alloc_item))) {
+		MIDR_LOG("MIDR ctrl: GROUP_ALLOC_RESP malformed (count=%u len=%zd) from %pI4 — dropping",
+			 count, n, &src);
+		return;
+	}
+	item = (const struct midr_ctrl_group_alloc_item *)(buf + sizeof(*hdr));
+	gid = ntohl(item->group_id);
+
+	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_GROUP_ALLOC_REQ);
+
+	if (gid == 0) {
+		zlog_warn("MIDR ctrl: GROUP_ALLOC_RESP from %pI4 returned 群 0（非法）——回退本地估算",
+			  &src);
+		midr_nds_group_alloc_failed(bgp);
+		return;
+	}
+
+	MIDR_FLOW_LOG("MIDR ctrl: GROUP_ALLOC_RESP from %pI4 — 分得群 %u", &src, gid);
+	midr_nds_group_alloc_done(bgp, gid);
 }
 
 /* New node: store the bootstrap's rep directory, then run join stage 1. */
@@ -1090,9 +1244,11 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 		 * MEMBER_LIST_RESP 里间接得知它的），它的 pm_is_known_transport
 		 * 校验会把我们刚发起的探测包当未知来源丢弃。发一个单向 ANNOUNCE
 		 * 自报身份，让它记住我们——不等回复、不触发建连。两条路径的候选
-		 * 都需要，语义相同。
+		 * 都需要，语义相同。走 midr_ctrl_send_announce() 而非直接
+		 * midr_ctrl_send_req()，好让这条也吃到 ANNOUNCE 的重传预算
+		 * （单包丢失不再是永久性的 unknown-transport）。
 		 */
-		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
+		midr_ctrl_send_announce(bgp, items[i].transport);
 	}
 
 	if (is_join_candidate) {
@@ -1223,6 +1379,11 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 		MIDR_FLOW_LOG("MIDR ctrl: BOOTSTRAP_LIST_REQ from %pI4 — replying with live bootstrap list",
 			      &msg.requester_transport);
 		return midr_ctrl_build_bootstrap_list(bgp, remote);
+	case MIDR_CTRL_GROUP_ALLOC_REQ:
+		/* 闸门同 BOOTSTRAP_LIST_REQ：只有引导节点答，理由见
+		 * midr_ctrl_build_group_alloc_resp() 头注释。不学请求方身份——
+		 * 这条路径之后没有 PM 探测要放行。 */
+		return midr_ctrl_build_group_alloc_resp(bgp, remote);
 	default:
 		MIDR_LOG("MIDR ctrl: TCP unexpected request type %u from %pI4",
 			 msg.type, &remote);
@@ -1283,6 +1444,14 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 			return;
 		}
 		midr_ctrl_recv_bootstrap_list(bgp, payload, (ssize_t)len, src);
+		break;
+	case MIDR_CTRL_GROUP_ALLOC_RESP:
+		if (req_type != MIDR_CTRL_GROUP_ALLOC_REQ) {
+			MIDR_LOG("MIDR ctrl: GROUP_ALLOC_RESP but our request was type %u — dropping",
+				 req_type);
+			return;
+		}
+		midr_ctrl_recv_group_alloc(bgp, payload, (ssize_t)len, src);
 		break;
 	default:
 		MIDR_LOG("MIDR ctrl: TCP unexpected response type %u", hdr->type);
@@ -1564,11 +1733,89 @@ static void midr_ctrl_udp_recv(struct event *t)
 	}
 }
 
-void midr_ctrl_init(struct bgp *bgp)
+/*
+ * Bind to local_transport_addr only — NOT INADDR_ANY — same reasoning as the
+ * PM probe socket (bgp_midr_pm.c): limits the attack surface to the MIDR
+ * loopback interface, and just as importantly for correctness, controls
+ * which *source* address our own outgoing sendto()s carry. An INADDR_ANY
+ * bind leaves that choice to the kernel's route-to-destination lookup,
+ * which for a multi-hop overlay path can pick the sender's point-to-point
+ * link address instead of its advertised transport identity — a source the
+ * transit hops beyond the first one have no route for, so a reverse-path
+ * check (or equivalent) silently drops the packet a hop or two downstream.
+ * This is exactly what happened to MIDR_CTRL_ANNOUNCE from a cross-transit
+ * node in the backbone-topology test (see CLAUDE.md's "a single lost
+ * ANNOUNCE packet" writeup): PM's packets (correctly sourced) arrived, but
+ * every ctrl-channel packet from the same sender to the same destination
+ * never did.
+ *
+ * transport_addr_set is false when midr_ctrl_init() runs (it fires before
+ * the config file is read, same lifecycle constraint PM has), so the actual
+ * open is deferred to midr_ctrl_on_transport_addr_set(), called from the
+ * `midr transport-address` VTY handler once an address exists to bind to.
+ */
+static void midr_ctrl_open_udp_sock(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct sockaddr_in sa = {};
 	int sock;
+
+	if (!mi->transport_addr_set) {
+		zlog_warn("MIDR ctrl: local transport-address not configured; "
+			  "UDP channel deferred until `midr transport-address` is set");
+		return;
+	}
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		zlog_err("MIDR ctrl: UDP socket() failed: %s",
+			 safe_strerror(errno));
+		return;
+	}
+	sockopt_reuseaddr(sock);
+
+	sa.sin_family = AF_INET;
+	sa.sin_addr = mi->local_transport_addr;
+	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
+	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		zlog_err("MIDR ctrl: UDP bind(%pI4:%u) failed: %s",
+			 &mi->local_transport_addr, MIDR_CTRL_UDP_PORT,
+			 safe_strerror(errno));
+		close(sock);
+		return;
+	}
+	set_nonblocking(sock);
+	mi->ctrl_sock = sock;
+	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, sock,
+		       &mi->t_ctrl_read);
+
+	MIDR_LOG("MIDR ctrl: peer-request UDP channel ready on %pI4:%u",
+		  &mi->local_transport_addr, MIDR_CTRL_UDP_PORT);
+}
+
+/*
+ * Called by the VTY `midr transport-address` handler after the address is
+ * set — mirrors midr_pm_on_transport_addr_set() (bgp_midr_pm.c). No rescan
+ * needed here the way PM's counterpart does one: nothing enqueues a
+ * ctrl_pending request before an address exists (midr_ctrl_enqueue_request()
+ * itself checks transport_addr_set and warns+bails), so there's no backlog
+ * of silently-dropped sends to retrofit — just the socket to open.
+ */
+void midr_ctrl_on_transport_addr_set(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+
+	if (mi->ctrl_sock < 0)
+		midr_ctrl_open_udp_sock(bgp);
+}
+
+void midr_ctrl_init(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 
 	if (!mi)
 		return;
@@ -1580,30 +1827,7 @@ void midr_ctrl_init(struct bgp *bgp)
 	 * ——UDP bind 失败的早返回不应连带跳过 TCP。 */
 	midr_ctrl_tcp_init(bgp);
 
-	sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		zlog_err("MIDR ctrl: UDP socket() failed: %s",
-			 safe_strerror(errno));
-		return;
-	}
-	sockopt_reuseaddr(sock);
-
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(INADDR_ANY);
-	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
-	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_err("MIDR ctrl: UDP bind(:%u) failed: %s",
-			 MIDR_CTRL_UDP_PORT, safe_strerror(errno));
-		close(sock);
-		return;
-	}
-	set_nonblocking(sock);
-	mi->ctrl_sock = sock;
-	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, sock,
-		       &mi->t_ctrl_read);
-
-	MIDR_LOG("MIDR ctrl: peer-request UDP channel on :%u",
-		  MIDR_CTRL_UDP_PORT);
+	midr_ctrl_open_udp_sock(bgp);
 }
 
 void midr_ctrl_finish(struct bgp *bgp)

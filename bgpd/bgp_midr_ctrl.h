@@ -104,6 +104,47 @@ enum midr_ctrl_msg_type {
 	 * 换二进制（先例：协议 v2）。
 	 */
 	MIDR_CTRL_ATTACH_REQUEST = 10,
+	/*
+	 * Group-id allocation, collision-avoidance for CREATE (2026-08-23).
+	 *
+	 * CREATE currently picks new_group_id = (max group_id this node has
+	 * seen so far) + 1 — computed purely from the joining node's own,
+	 * still-thin global_view. Two nodes joining around the same time,
+	 * neither yet visible to the other, can independently compute the
+	 * identical "next" number and each self-appoint as rep of a
+	 * same-numbered but disjoint group (see CLAUDE.md's group-id
+	 * collision writeup).
+	 *
+	 * Fix: before settling a CREATE whose id wasn't pinned by
+	 * config_group_id, ask a bootstrap for an authoritative one instead
+	 * of trusting the local guess. Every node already has the full
+	 * bootstrap candidate list configured (`midr bootstrap` to all
+	 * bootstraps), so every node can deterministically agree on the same
+	 * *single* allocator without any extra coordination: the candidate
+	 * with the numerically smallest router-id (same "pick one by a
+	 * stable total order everyone can compute independently" pattern
+	 * already used for attach-target selection). That one bootstrap
+	 * hands out a monotonically increasing counter, seeded on first use
+	 * from a scan of its own (much more complete) node table — as long
+	 * as only that one process ever increments it, the numbers it hands
+	 * out can't collide, the same reason a database auto-increment
+	 * column or a DHCP server's lease pool doesn't.
+	 *
+	 * REQ reuses the standard 20B request frame (target_group unused,
+	 * 0); routed over TCP like REP_LIST/MEMBER_LIST/BOOTSTRAP_LIST (a
+	 * real answer is needed, so this needs reliable delivery, unlike
+	 * ANNOUNCE's fire-and-forget). RESP reuses the list_hdr + item
+	 * framing with a single struct midr_ctrl_group_alloc_item (below).
+	 *
+	 * If the allocator is unreachable (all retries exhausted), the
+	 * requester falls back to its own local guess and logs a warning —
+	 * availability over strict correctness, matching this protocol's
+	 * existing failure philosophy elsewhere (e.g. BOOTSTRAP_LIST_REQ).
+	 * A rare residual collision in that degraded path is still possible;
+	 * see the CL-side detection/repair mechanism this pairs with.
+	 */
+	MIDR_CTRL_GROUP_ALLOC_REQ = 11,
+	MIDR_CTRL_GROUP_ALLOC_RESP = 12,
 };
 
 /*
@@ -170,6 +211,14 @@ struct midr_ctrl_member_item {
 	uint32_t group_id;
 };
 
+/* GROUP_ALLOC_RESP item, 4 bytes, network byte order. Always exactly one
+ * item (count=1) — the response has nothing list-shaped about it, but reuses
+ * the same list_hdr + item framing as every other TCP response here rather
+ * than inventing a one-off shape. */
+struct midr_ctrl_group_alloc_item {
+	uint32_t group_id;
+};
+
 /*
  * 重传参数——每个入队点自带一份，不再吃全局硬编码（小整理批参数化）。
  *   interval_ms    重传间隔（毫秒）
@@ -220,6 +269,15 @@ extern const char *midr_ctrl_msg_type_str(uint8_t type);
 /* Open / close the control-channel UDP socket (called from bgp_midr_nds_init/finish). */
 extern void midr_ctrl_init(struct bgp *bgp);
 extern void midr_ctrl_finish(struct bgp *bgp);
+
+/*
+ * The ctrl UDP socket binds to local_transport_addr (not INADDR_ANY), same
+ * as the PM probe socket — but midr_ctrl_init() runs before the config file
+ * is read, so transport_addr_set is still false at that point and the open
+ * is deferred. Call this from the `midr transport-address` VTY handler,
+ * mirroring midr_pm_on_transport_addr_set() (bgp_midr_pm.h).
+ */
+extern void midr_ctrl_on_transport_addr_set(struct bgp *bgp);
 
 /*
  * Called by bgp_midr_nds.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
@@ -309,6 +367,18 @@ extern void midr_ctrl_send_member_request(struct bgp *bgp,
  */
 extern void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp,
 						  struct in_addr dst);
+
+/*
+ * New node -> the network's elected group-id allocator bootstrap: ask for an
+ * authoritative id before settling a CREATE (GROUP_ALLOC_REQ, TCP + ctrl_pending
+ * retry, same shape as BOOTSTRAP_LIST_REQ). Caller = NDS's
+ * midr_nds_on_cluster_decision() CREATE branch. Completion (id received) and
+ * give-up (retries exhausted) both funnel back into NDS via
+ * midr_nds_group_alloc_done() / midr_nds_group_alloc_failed() — see the
+ * MIDR_CTRL_GROUP_ALLOC_REQ enum comment above for the full rationale.
+ */
+extern void midr_ctrl_send_group_alloc_request(struct bgp *bgp,
+					       struct in_addr dst);
 
 /*
  * 改一条**在途请求**的剩余重传次数（保底轮 2 批 6）。

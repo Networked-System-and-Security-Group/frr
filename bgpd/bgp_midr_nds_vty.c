@@ -704,6 +704,10 @@ DEFUN(midr_transport_address,
 	 * this command is processed. */
 	midr_pm_on_transport_addr_set(bgp);
 
+	/* Same deferred-open lifecycle for the ctrl UDP channel (bind needs an
+	 * address to bind to, and midr_ctrl_init() also runs before this). */
+	midr_ctrl_on_transport_addr_set(bgp);
+
 	vty_out(vty, "MIDR transport-address set to %s\n", argv[2]->arg);
 	return CMD_SUCCESS;
 }
