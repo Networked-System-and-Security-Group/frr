@@ -58,27 +58,33 @@ static int run_cmd(const char *fmt, ...)
 static int ip_route_has(const char *prefix)
 {
 	char cmd[256];
+	FILE *fp;
+	int status;
+
 	snprintf(cmd, sizeof(cmd),
-		 "ip route show %s 2>/dev/null | grep -v '^$' | wc -l", prefix);
-	FILE *fp = popen(cmd, "r");
-	if (!fp) return 0;
-	int n = 0;
-	fscanf(fp, "%d", &n);
-	pclose(fp);
-	return n > 0;
+		 "ip route show %s 2>/dev/null | grep -q 'via %s dev %s'", prefix,
+		 TEST_NEXTHOP, DUMMY_IF);
+	fp = popen(cmd, "r");
+	if (!fp)
+		return 0;
+	status = pclose(fp);
+	return status == 0;
 }
 
 static int ip_route6_has(const char *prefix)
 {
 	char cmd[256];
+	FILE *fp;
+	int status;
+
 	snprintf(cmd, sizeof(cmd),
-		 "ip -6 route show %s 2>/dev/null | grep -v '^$' | wc -l", prefix);
-	FILE *fp = popen(cmd, "r");
-	if (!fp) return 0;
-	int n = 0;
-	fscanf(fp, "%d", &n);
-	pclose(fp);
-	return n > 0;
+		 "ip -6 route show %s 2>/dev/null | grep -q 'via %s dev %s'", prefix,
+		 TEST_NEXTHOP6, DUMMY_IF);
+	fp = popen(cmd, "r");
+	if (!fp)
+		return 0;
+	status = pclose(fp);
+	return status == 0;
 }
 
 /* ------------------------------------------------------------------ */

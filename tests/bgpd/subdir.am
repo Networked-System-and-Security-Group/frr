@@ -64,6 +64,16 @@ tests_bgpd_test_midr_spf_install_SOURCES = \
 
 
 if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_spf_pipeline
+endif
+tests_bgpd_test_midr_spf_pipeline_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_spf_pipeline_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_spf_pipeline_LDFLAGS = -Wl,--wrap=zclient_route_send
+tests_bgpd_test_midr_spf_pipeline_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_spf_pipeline_SOURCES = tests/bgpd/test_midr_spf_pipeline.c
+
+
+if BGPD
 check_PROGRAMS += tests/bgpd/test_mp_attr
 endif
 tests_bgpd_test_mp_attr_CFLAGS = $(TESTS_CFLAGS)
@@ -99,6 +109,15 @@ tests_bgpd_test_midr_zebra_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_midr_zebra_LDFLAGS = -Wl,--wrap=zclient_route_send
 tests_bgpd_test_midr_zebra_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_midr_zebra_SOURCES = tests/bgpd/test_midr_zebra.c
+
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_zebra_e2e
+endif
+tests_bgpd_test_midr_zebra_e2e_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_zebra_e2e_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_zebra_e2e_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_zebra_e2e_SOURCES = tests/bgpd/test_midr_zebra_e2e.c
 
 
 if BGPD

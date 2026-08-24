@@ -14,9 +14,25 @@ echo "============================================"
 echo "  Test 04: E2E ZAPI Route Test"
 echo "============================================"
 
-CONTAINER=${FRR_CONTAINER:-frr-ubuntu24-ymy}
-FRR_DIR=${FRR_DIR:-/home/frr/frr}
-TEST_BIN="/tmp/test_e2e_zapi"
+CONTAINER=${FRR_CONTAINER:-midr-lixiao-integration-20260825}
+FRR_DIR=${FRR_DIR:-/workspace/frr}
+ZEBRA_SOCKET=${ZEBRA_SOCKET:-/var/run/frr/zserv.api}
+TEST_BIN="${TEST_BIN:-$FRR_DIR/tests/bgpd/test_midr_zebra_e2e}"
+ZEBRA_BIN="${ZEBRA_BIN:-$FRR_DIR/zebra/zebra}"
+ZEBRA_VTY_SOCKET="${ZEBRA_VTY_SOCKET:-/tmp/midr-zebra-vty}"
+ZEBRA_LOG="${ZEBRA_LOG:-/tmp/midr-zebra.log}"
+
+cleanup() {
+	sudo docker exec -u 0 "$CONTAINER" bash -c "
+        pkill -9 zebra 2>/dev/null || true
+        rm -f '$ZEBRA_LOG'
+        rm -rf '$ZEBRA_VTY_SOCKET'
+        ip route del 10.254.1.0/24 proto 199 2>/dev/null || true
+        ip -6 route del 2001:db8:dead::/48 proto 199 2>/dev/null || true
+        ip link del dummy0 2>/dev/null || true
+	" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # Step 1: Ensure bgpd compiled
 log_info "Step 1: Ensure bgpd compiled..."
@@ -30,13 +46,7 @@ log_pass "bgpd compiled"
 log_info "Step 2: Compile E2E test..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
 cd $FRR_DIR
-rm -f $TEST_BIN
-gcc -std=gnu11 -w -g -O0 -include config.h \
-  -I lib -I bgpd -I . \
-  \$(pkg-config --cflags libyang 2>/dev/null) \
-  -o $TEST_BIN tests/bgpd/test_midr_zebra_e2e.c bgpd/bgp_midr_zebra.o \
-  -L lib/.libs -lfrr \
-  -lcap -lcrypt -ljson-c -lrt -lpthread -lsqlite3 -lresolv -ldl -lm -lfl -lyang 2>&1
+make tests/bgpd/test_midr_zebra_e2e -j\$(nproc) 2>&1 | tail -20
 " || { log_fail "Compile failed"; exit 1; }
 log_pass "Binary compiled"
 
@@ -44,25 +54,34 @@ log_pass "Binary compiled"
 log_info "Step 3: Start zebra daemon..."
 sudo docker exec -u 0 "$CONTAINER" bash -c "
 pkill -9 zebra 2>/dev/null || true
-sleep 1
-echo -e 'bgpd=no\nzebra=yes\nstaticd=no\nospfd=no\nisisd=no\nripd=no' > /etc/frr/daemons
-/usr/lib/frr/zebra -d -u frr -g frr --limit-fds 100000 2>&1 || true
+rm -f '$ZEBRA_SOCKET' '$ZEBRA_LOG'
+rm -rf '$ZEBRA_VTY_SOCKET'
+mkdir -p \"\$(dirname '$ZEBRA_SOCKET')\"
+mkdir -p '$ZEBRA_VTY_SOCKET'
+mkdir -p '$FRR_DIR/var/run/frr' '$FRR_DIR/var/lib/frr' /usr/local/var/run/frr /usr/local/var/lib/frr
+"
+sudo docker exec -d -u 0 "$CONTAINER" bash -lc "
+exec env LD_LIBRARY_PATH=$FRR_DIR/lib/.libs '$ZEBRA_BIN' -f /dev/null \\
+  -z '$ZEBRA_SOCKET' --vty_socket '$ZEBRA_VTY_SOCKET' \\
+  -u root -g root --limit-fds 100000 >'$ZEBRA_LOG' 2>&1
+"
+sudo docker exec -u 0 "$CONTAINER" bash -c "
 sleep 3
 " 2>&1
 
 # Wait for zebra socket
 for i in $(seq 1 20); do
-    if sudo docker exec "$CONTAINER" test -S /var/run/frr/zserv.api 2>/dev/null; then
+    if sudo docker exec "$CONTAINER" test -S "$ZEBRA_SOCKET" 2>/dev/null; then
         log_pass "zebra ready (${i}s)"
         break
     fi
     sleep 1
 done
-sudo docker exec "$CONTAINER" test -S /var/run/frr/zserv.api || { log_fail "zebra socket not ready"; exit 1; }
+sudo docker exec "$CONTAINER" test -S "$ZEBRA_SOCKET" || { log_fail "zebra socket not ready"; exit 1; }
 
 # Step 4: Run E2E test
 log_info "Step 4: Run E2E ZAPI test..."
-OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=$FRR_DIR/lib/.libs $TEST_BIN /var/run/frr/zserv.api" 2>&1)
+OUTPUT=$(sudo docker exec -u 0 "$CONTAINER" bash -c "LD_LIBRARY_PATH=$FRR_DIR/lib/.libs $TEST_BIN '$ZEBRA_SOCKET'" 2>&1)
 echo "$OUTPUT"
 
 # Step 5: Parse results
@@ -92,12 +111,8 @@ fi
 
 # Step 6: Cleanup
 log_info "Step 5: Cleanup..."
-sudo docker exec -u 0 "$CONTAINER" bash -c "
-pkill -9 zebra 2>/dev/null || true
-rm -f $TEST_BIN
-ip route del 10.254.1.0/24 proto 199 2>/dev/null || true
-ip link del dummy0 2>/dev/null || true
-" 2>/dev/null || true
+cleanup
+trap - EXIT
 log_pass "Cleanup done"
 
 # Summary
