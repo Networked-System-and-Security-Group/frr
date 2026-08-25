@@ -1229,7 +1229,7 @@ DEFUN(show_midr_neighbors,
 			 * no-nlri **不等于故障**：专职引导节点按设计就不发 Node NLRI
 			 * （保底轮 2 批 5 起），指向引导的边一律长这样；对端不是 MIDR
 			 * 节点、或刚建连尚未收敛，也都会落到这一档。要判它是不是问题，
-			 * 看同一行的 Origin（BACKBONE/ATTACH = 指向引导，属预期）。
+			 * 看同一行的 Origin（ATTACH = 指向引导，属预期）。
 			 */
 			const char *why = peer->connection->status == Established
 						  ? "no-nlri"
@@ -1543,7 +1543,12 @@ DEFUN(show_midr_group2_remote,
  * 节点**信息 —— 本机 1 个 Node + 本机全部出向 Link，不是组内也不是全网（全网
  * 视图走反方向的 remote view 接口，第二组实现）。
  *
- * ⚠ 临时调试件，轮 5 收尾时评估删留（记档不做清单）。
+ * 长期诊断命令（轮 5 复核定案，原登记为"临时调试件"）：它是**唯一**能看见
+ * provider 返回码的地方 —— 自检失败整份 -EAGAIN、router-id 为 0 返 -EAGAIN、
+ * 满格丢包转 withdraw，这三个取舍都只有这里观察得到。
+ * ⚠ 与第二组的 `show midr owned` 不重叠：那条答"对方 LSDB 里现在有我什么"
+ * （事实到达之后），本条答"我方现在会给出什么"（事实发出之前）。排查
+ * "我方以为报了、对方却没有"时两条一起看，才分得清是发送侧还是接收侧。
  */
 DEFUN(show_midr_group2_snapshot,
       show_midr_group2_snapshot_cmd,
@@ -1971,7 +1976,7 @@ void bgp_midr_nds_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_bootstrap_seeds_cmd);
 	install_element(VIEW_NODE, &show_midr_neighbors_cmd);
 	install_element(VIEW_NODE, &show_midr_join_cmd);
-	/* 临时调试件（对接轮 3）：第二组视角的 snapshot 窗口，轮 5 评估删留。 */
+	/* 第二组视角的 snapshot 窗口（长期诊断命令，见函数头注释）。 */
 	install_element(VIEW_NODE, &show_midr_group2_snapshot_cmd);
 	install_element(VIEW_NODE, &show_midr_group2_remote_cmd);
 }

@@ -11,9 +11,8 @@
  *
  * ⊕ 2026-08-22（对接轮 4 步 0）**已合栈**：他们的实现文件（bgp_midr.c /
  * bgp_midr_input.c / bgp_midr_lsdb.c 等 31 个）已进树，本头文件的原型从此有真
- * 实现顶着。我方假实现 bgp_midr_group2_shim.c **已从 subdir.am 摘除**（同名同
- * 签名，不摘则重复符号链接失败）；文件本身保留在树里，把那行翻回来即可重编回
- * shim 做 A/B 对照，轮 5 评估删除。
+ * 实现顶着。我方轮 1–3 用的假实现（bgp_midr_group2_shim.c）已随轮 5 清理批
+ * 删除 —— 合栈后同名同签名会重复符号，且它调的旧出口件② 已删、留着也编不过。
  *
  * 一个例外：midr_topology_snapshot_get/release 是 **provider 方向**，由我方实现
  * （轮 3，在 bgp_midr_nds_facts.c）。他们树中那两个带 __attribute__((weak))

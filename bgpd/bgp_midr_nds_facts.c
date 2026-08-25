@@ -624,9 +624,9 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	 * 即自动关 distribute"，而那道判据长在 bgp_ls_originate_bgp_node() 里、
 	 * 只把守**旧 NLRI 通道**；轮 4 换第二组真实现后，上报走的是他们的 API、
 	 * 根本不路过 originate，那个开关就管不着了。所以守卫必须落在**我方上报
-	 * 出口**（并且不能写进 bgp_midr_group2_shim.c —— 那个文件轮 4 整份删除）。
+	 * 出口**。
 	 *
-	 * 判据见 midr_nds_link_is_backbone()：台账 BACKBONE/ATTACH ∪ 引导候选池
+	 * 判据见 midr_nds_link_is_backbone()：台账 ATTACH ∪ 引导候选池
 	 * rid ∪ 节点表 BOOTSTRAP 位。已在《致第二组-引导节点豁免与确认》§2 向
 	 * 对方预告过"连引导的链路我方主动不上报"。
 	 */
@@ -808,9 +808,8 @@ void midr_nds_report_link_withdraw(struct bgp *bgp,
 /* ===========================================================================
  * snapshot provider（轮 3）—— **反方向**：我方实现、第二组调用
  *
- * 原型在 bgp_midr.h（拷自第二组），故本文件不再声明。它**不在**
- * bgp_midr_group2_shim.c 里 —— 那个文件装的是"他们实现、我方调用"的假实现、
- * 轮 4 整份删除；snapshot 是 provider 方向，是我方长期件。他们树里那两个带
+ * 原型在 bgp_midr.h（拷自第二组），故本文件不再声明。snapshot 是 provider
+ * 方向（他们调、我方实现），与其余接口相反。他们树里那两个带
  * __attribute__((weak))（bgp_midr_input.c:111/122，返回 -ENOSYS），我方的强定义
  * 会覆盖它们，合树不会出现重复符号。
  *

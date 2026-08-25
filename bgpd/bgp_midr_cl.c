@@ -203,14 +203,15 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
 		struct midr_link_entry *link;
 
-		/* 过渡（REP_LIST rid 栏上线, dual-ctx 根治配套）：目录条目带真名
-		 * 时探测键=rid, 先按真名查; 无数据（rid=0 的旧占位路径）退回按
-		 * transport 查——旧行为一行不破。CL owner 可按自己想要的形态改写。 */
-		link = NULL;
-		if (r->rep_rid.s_addr != INADDR_ANY)
-			link = cl_find_link_by_ipv4(gv, &r->rep_rid);
-		if (!cl_link_has_data(link))
-			link = cl_find_link_by_ipv4(gv, &r->rep_transport);
+		/* 探测键 = rid：目录条目恒带真名（REP_LIST 的 rid 栏自协议 v2 起
+		 * 必填）。rid 为 0 = 条目不完整，跳过。
+		 * 〔轮 5 清理：删掉了"查不到就回落按 transport 查"那半——手配目录
+		 *   路径 2026-08-11 已删除，目录只剩从节点表推导这一个来源，rid 恒
+		 *   非 0，回落永不命中。留着反而会在真出现 rid=0 时静默改用另一个
+		 *   键，不如直接跳过来得容易发现。〕 */
+		if (r->rep_rid.s_addr == INADDR_ANY)
+			continue;
+		link = cl_find_link_by_ipv4(gv, &r->rep_rid);
 		if (!cl_link_has_data(link))
 			continue;
 

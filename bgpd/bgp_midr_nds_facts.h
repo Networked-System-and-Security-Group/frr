@@ -29,8 +29,8 @@
  * 表项直接用第二组的 struct midr_node_update / midr_link_update 存，省掉一层
  * 转换：upsert 时整体递交，snapshot 时整体拷出。
  *
- * ⚠ 与 bgp_midr_group2_shim.c 的分工：那个文件是第二组接口的**假实现**、轮 4
- * 整份删除；本文件是我方长期件，删 shim 不会带走它。
+ * 本文件是我方长期件（轮 1–3 那个假实现 bgp_midr_group2_shim.c 已于轮 5 删除，
+ * 两者无关）。
  */
 
 #ifndef _FRR_BGP_MIDR_NDS_FACTS_H
