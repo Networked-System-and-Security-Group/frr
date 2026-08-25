@@ -32,17 +32,33 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
+VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+PYTHON_BIN="${MIDR_PYTHON_BIN:-python3}"
 export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this test with sudo: sudo ./run_test.sh" >&2
     exit 2
 fi
-if [[ ! -x "$BGPD" ]]; then
-    echo "Missing bgpd binary: $BGPD" >&2
+for binary in "$BGPD" "$VTYSH"; do
+    if [[ ! -x "$binary" ]]; then
+        echo "Missing executable: $binary" >&2
+        exit 2
+    fi
+done
+for command_name in ip tc "$PYTHON_BIN"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Missing command: $command_name" >&2
+        exit 2
+    fi
+done
+mkdir -p /tmp/midr-matplotlib
+if ! MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" -c \
+    'import matplotlib, numpy' >/dev/null 2>&1; then
+    echo "Missing Python packages: matplotlib and numpy are required." >&2
     exit 2
 fi
 
@@ -89,6 +105,8 @@ sleep 1
 
 # ---- 1. Network setup -------------------------------------------------------
 if [[ "$DO_SETUP" -eq 1 ]]; then
+    echo "[run_test] Removing stale CL test processes and namespaces..."
+    bash "$TESTDIR/teardown.sh"
     echo "[run_test] Setting up network namespaces..."
     bash "$TESTDIR/setup.sh"
 fi
@@ -135,7 +153,7 @@ wait_rep_directory() {
     local node="$1" want="$2" timeout=90 elapsed=0 got=0
     echo "[run_test] Waiting for $node's rep directory to list $want rep(s)..."
     while [[ $elapsed -lt $timeout ]]; do
-        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-cl-vty/$node" \
+        got=$("$VTYSH" --vty_socket "/tmp/midr-cl-vty/$node" \
                   -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
         if [[ "$got" -ge "$want" ]]; then
             echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
@@ -156,7 +174,7 @@ wait_group_members() {
     local node="$1" gid="$2" want="$3" timeout=200 elapsed=0 got=0
     echo "[run_test] Waiting for $node to know $want group-$gid member(s)..."
     while [[ $elapsed -lt $timeout ]]; do
-        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-cl-vty/$node" \
+        got=$("$VTYSH" --vty_socket "/tmp/midr-cl-vty/$node" \
                   -c 'show midr nodes' 2>/dev/null \
                   | awk -v g="$gid" '$1 ~ /^10\.0\./ && $4 == g' | wc -l)
         if [[ "$got" -ge "$want" ]]; then
@@ -232,9 +250,15 @@ echo ""
 result_rc=0
 bash "$TESTDIR/check_result.sh" || result_rc=$?
 
+echo "[run_test] Stopping CL test processes before plotting..."
+if ! bash "$TESTDIR/teardown.sh"; then
+    echo "[run_test] Failed to stop the testbed; retrying through the exit trap." >&2
+    exit 1
+fi
+trap - EXIT
+
 plot_rc=0
-mkdir -p /tmp/midr-matplotlib
-MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_cl.py" \
+MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$TESTDIR/plot_cl.py" \
     "$TESTDIR/logs/bgpd-newnode.log" --output "$TESTDIR/cl_results.png" || plot_rc=$?
 chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
 chmod a+r "$TESTDIR/cl_results.png" 2>/dev/null || true
