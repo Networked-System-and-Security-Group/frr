@@ -20,6 +20,7 @@ set -u
 R1=clab-midr-backbone-r1        # 群 1 代表（手配群号 1 + GROUP_REP + 挂靠边）
 M1A=clab-midr-backbone-m1a      # 群 1 普通成员
 M1B=clab-midr-backbone-m1b      # 群 1 普通成员
+M2A=clab-midr-backbone-m2a      # Group 2 member
 Z1=clab-midr-backbone-z1        # 无配置群号、靠引导 join 的节点（判据 1/2/9 主角）
 R2=clab-midr-backbone-r2        # 群 2 代表（判据 4/5 的锚点边一端）
 LOG=/etc/frr/logs/frr.log
@@ -41,9 +42,10 @@ v()        { docker exec "$1" vtysh -c "$2" 2>/dev/null; }
 # 2026-08-22 轮 4 步 0 回归时发现并补上，写法照抄 backbone-shutdown/ 同名函数。
 conf()     { docker exec "$1" vtysh -c "configure terminal" -c "router bgp $2" -c "$3" 2>/dev/null; }
 loglines() { docker exec "$1" sh -c "wc -l < $LOG" 2>/dev/null | tr -d ' '; }
-logtail()  { docker exec "$1" sh -c "tail -n +$2 $LOG" 2>/dev/null; }
-dbgon()    { docker exec "$1" vtysh -c "configure terminal" -c "log file $LOG debugging" \
+logtail()  { docker exec "$1" sh -c "tail -n +$(( $2 + 1 )) $LOG" 2>/dev/null; }
+dbgon()    { docker exec "$1" vtysh -c "configure terminal" \
                 -c "debug bgp midr" -c "debug bgp midr discovery" >/dev/null 2>&1; }
+groupid()  { v "$1" "show midr self" | awk -F: '/^Group-ID/{gsub(/ /,"",$2);print $2}'; }
 
 remove_fault_rule() {
     local container="$1" source="$2" protocol="$3" port="$4"
@@ -104,7 +106,25 @@ echo "=============================================================="
 echo " 发现链专题判据 —— 15 节点骨干台子（真多跳 / 真分离）"
 echo "=============================================================="
 
-for c in $R1 $M1A $M1B $Z1 $R2; do dbgon $c; done
+for c in $R1 $M1A $M1B $Z1 $R2 $M2A; do dbgon $c; done
+
+INITIAL_GROUP=$(groupid "$Z1")
+case "$INITIAL_GROUP" in
+    1) INITIAL_OBSERVERS=($R1 $M1A $M1B clab-midr-backbone-z2) ;;
+    2) INITIAL_OBSERVERS=($R2 $M2A) ;;
+    *) echo "  z1 is not in group 1 or 2 before the discovery test" >&2; exit 1 ;;
+esac
+declare -A INITIAL_BASE
+INITIAL_PEERS=()
+for c in "${INITIAL_OBSERVERS[@]}"; do
+    if v "$c" "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q Established; then
+        INITIAL_PEERS+=("$c")
+    fi
+done
+if [ "${#INITIAL_PEERS[@]}" -eq 0 ]; then
+    echo "  no group $INITIAL_GROUP member has an Established session to z1" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 判据 9（08-21 语义精确化）：退网零实害。
@@ -116,16 +136,24 @@ for c in $R1 $M1A $M1B $Z1 $R2; do dbgon $c; done
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 9] z1 退网：退网侧零反应，发起侧假状态自愈"
-R1_BASE=$(loglines $R1); Z1_BASE=$(loglines $Z1)
+for c in "${INITIAL_OBSERVERS[@]}"; do INITIAL_BASE[$c]=$(loglines "$c"); done
+Z1_BASE=$(loglines $Z1)
 if docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
     -c "midr shutdown" >/dev/null 2>&1; then
     Z1_SHUTDOWN=1
 fi
 sleep 45
-R1_LOG=$(logtail $R1 $R1_BASE); Z1_LOG=$(logtail $Z1 $Z1_BASE)
+Z1_LOG=$(logtail $Z1 $Z1_BASE)
+SHUTDOWN_ACTOR=""
+for c in "${INITIAL_OBSERVERS[@]}"; do
+    NODE_LOG=$(logtail "$c" "${INITIAL_BASE[$c]}")
+    if echo "$NODE_LOG" | grep -q "removing peer\|node gone\|MIDR CL: NODE_CHANGE"; then
+        SHUTDOWN_ACTOR="$c"
+        break
+    fi
+done
 
-if echo "$R1_LOG" | grep -q "removing peer\|node gone\|MIDR CL: NODE_CHANGE"; then
-    # z1 侧：必须零反应（只丢弃、不回配）
+if [ -n "$SHUTDOWN_ACTOR" ]; then
     if echo "$Z1_LOG" | grep -q "退网：丢弃控制通道"; then
         if echo "$Z1_LOG" | grep -q "peering back"; then
             fail "判据9-a：z1 退网后仍回配了（应一律丢弃）"
@@ -135,19 +163,28 @@ if echo "$R1_LOG" | grep -q "removing peer\|node gone\|MIDR CL: NODE_CHANGE"; th
     else
         nosam "z1 侧没收到任何控制消息（没造出'对端来敲门'的场景）"
     fi
-    # r1 侧：会话不得 Established；且假状态要自愈
-    if v $R1 "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q Established; then
-        fail "判据9-b：r1 与已退网的 z1 竟建成了 Established 会话"
-    else
-        pass "判据9-b：r1 侧无 Established（会话建不成，符合预期）"
-    fi
-    if v $R1 "show midr nodes" | grep -q "$Z1_RID"; then
-        fail "判据9-c：45s 后 r1 节点表里仍有 z1 条目（未自愈）"
-    else
-        pass "判据9-c：z1 条目已随 expire 清除，终态干净"
-    fi
 else
-    nosam "r1 日志里没看到处理 z1 离开的痕迹（z1 可能本就不在其视图）"
+    nosam "群 $INITIAL_GROUP 的老成员日志里没看到触发退网侧控制消息的场景"
+fi
+STALE_SESSION=""
+STALE_NODE=""
+for c in "${INITIAL_OBSERVERS[@]}"; do
+    if v "$c" "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q Established; then
+        STALE_SESSION="$c"
+    fi
+    if v "$c" "show midr nodes" | grep -q "$Z1_RID"; then
+        STALE_NODE="$c"
+    fi
+done
+if [ -n "$STALE_SESSION" ]; then
+    fail "判据9-b：${STALE_SESSION##*-} 与已退网的 z1 竟建成了 Established 会话"
+else
+    pass "判据9-b：群 $INITIAL_GROUP 的老成员侧无 Established（会话建不成，符合预期）"
+fi
+if [ -n "$STALE_NODE" ]; then
+    fail "判据9-c：45s 后 ${STALE_NODE##*-} 节点表里仍有 z1 条目（未自愈）"
+else
+    pass "判据9-c：群 $INITIAL_GROUP 的老成员已随 expire 清除 z1 条目，终态干净"
 fi
 
 # 恢复 z1
@@ -164,49 +201,85 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 1+2] z1 重新入群：老成员经回配置位 + 起探"
-R1_BASE=$(loglines $R1); M1A_BASE=$(loglines $M1A)
+declare -A OBS_BASE
+OBSERVERS=($R1 $M1A $M1B $R2 $M2A clab-midr-backbone-z2)
+for c in "${OBSERVERS[@]}"; do OBS_BASE[$c]=$(loglines "$c"); done
 if ! restart_node "$Z1"; then
     echo "  z1 restart failed" >&2
     exit 1
 fi
 dbgon $Z1
-echo "  （z1 已重启，等 join 两段热身 ~150s）"
-sleep 165
-
-R1_LOG=$(logtail $R1 $R1_BASE)
-M1A_LOG=$(logtail $M1A $M1A_BASE)
+echo "  （z1 已重启，等待 join 完成）"
+T0=$(date +%s); REJOIN_GROUP=0
+while [ $(( $(date +%s) - T0 )) -le 240 ]; do
+    REJOIN_GROUP=$(groupid "$Z1")
+    [ "${REJOIN_GROUP:-0}" != 0 ] && break
+    sleep 5
+done
+if [ "${REJOIN_GROUP:-0}" = 0 ]; then
+    echo "  z1 did not join any group within 240s" >&2
+    exit 1
+fi
+case "$REJOIN_GROUP" in
+    1) GROUP_OBSERVERS=($R1 $M1A $M1B clab-midr-backbone-z2) ;;
+    2) GROUP_OBSERVERS=($R2 $M2A) ;;
+    *) echo "  z1 joined unexpected group $REJOIN_GROUP" >&2; exit 1 ;;
+esac
+echo "  z1 joined group $REJOIN_GROUP in $(( $(date +%s) - T0 ))s"
+SESSION_NODE=""; T1=$(date +%s)
+while [ $(( $(date +%s) - T1 )) -le 30 ]; do
+    for c in "${GROUP_OBSERVERS[@]}"; do
+        if v "$c" "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q "Established.*SAME_GROUP"; then
+            SESSION_NODE="$c"
+            break 2
+        fi
+    done
+    sleep 2
+done
+RESPONDER=""; PROBER=""; LEAVE_NODE=""; SENT_TOTAL=0; STORM_NODE=""
+for c in "${GROUP_OBSERVERS[@]}"; do
+    NODE_LOG=$(logtail "$c" "${OBS_BASE[$c]}")
+    if [ -z "$RESPONDER" ] && echo "$NODE_LOG" | grep -q "PEER_REQUEST from rid $Z1_RID.*peering back"; then
+        RESPONDER="$c"
+    fi
+    if [ -z "$PROBER" ] && echo "$NODE_LOG" | grep -q "start probing $Z1_RID"; then
+        PROBER="$c"
+    fi
+    if [ -z "$LEAVE_NODE" ] && echo "$NODE_LOG" | grep -q "LEAVE"; then
+        LEAVE_NODE="$c"
+    fi
+    NODE_SENT=$(echo "$NODE_LOG" | grep -c "sent PEER_REQUEST to $Z1_TRANSPORT")
+    SENT_TOTAL=$((SENT_TOTAL+NODE_SENT))
+    [ "$NODE_SENT" -gt 5 ] && STORM_NODE="$c"
+done
 
 # 1) 回配路径确实跑了（是谁干的）
-if echo "$R1_LOG" | grep -q "PEER_REQUEST from rid $Z1_RID.*peering back"; then
-    pass "判据1-a：r1 收到 z1 的 PEER_REQUEST 并走回配路（peering back）"
-elif echo "$R1_LOG" | grep -q "peering back"; then
-    pass "判据1-a：r1 走了回配路（peering back，未匹配到 z1 rid 字样但路径成立）"
+if [ -n "$RESPONDER" ]; then
+    pass "判据1-a：${RESPONDER##*-} 收到 z1 的 PEER_REQUEST 并走回配路（peering back）"
 else
-    nosam "r1 日志里没有 'peering back' —— 回配路没被触发"
+    nosam "群 $REJOIN_GROUP 的老成员日志里没有 'peering back' —— 回配路没被触发"
 fi
 
 # 2) 结果：z1 在 r1 的台账里是 SAME_GROUP，且会话 Established
-if v $R1 "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q "SAME_GROUP"; then
-    pass "判据1-b：r1 台账里 z1 记为 SAME_GROUP 且已建会话"
+if [ -n "$SESSION_NODE" ]; then
+    pass "判据1-b：${SESSION_NODE##*-} 台账里 z1 记为 SAME_GROUP 且已建会话"
 else
-    fail "判据1-b：r1 台账里没有 z1 的 SAME_GROUP 条目"
-    v $R1 "show midr neighbors" | sed 's/^/      /'
+    fail "判据1-b：群 $REJOIN_GROUP 的老成员台账里没有 z1 的 SAME_GROUP 条目"
+    v "${GROUP_OBSERVERS[0]}" "show midr neighbors" | sed 's/^/      /'
 fi
 
 # 3) 老成员对新成员起探（判据 2 的核心：删探测 A 后唯一来源就是回配）
-if echo "$R1_LOG" | grep -q "start probing $Z1_RID"; then
-    pass "判据2-a：r1 对 z1 起探（PM I-1 start probing，回配路触发）"
+if [ -n "$PROBER" ]; then
+    pass "判据2-a：${PROBER##*-} 对 z1 起探（PM I-1 start probing，回配路触发）"
 else
-    fail "判据2-a：r1 没有对 z1 起探 —— 回配没接上，periodic_sync 将误判 LEAVE"
-    echo "$R1_LOG" | grep "start probing" | tail -3 | sed 's/^/      /'
+    fail "判据2-a：群 $REJOIN_GROUP 的老成员没有对 z1 起探 —— 回配没接上"
 fi
 
 # 4) 不误判 LEAVE（散群风险的直接反证）
-if echo "$R1_LOG" | grep -q "LEAVE"; then
-    fail "判据2-b：r1 出现 LEAVE 决策 —— 散群风险成真"
-    echo "$R1_LOG" | grep "LEAVE" | tail -3 | sed 's/^/      /'
+if [ -n "$LEAVE_NODE" ]; then
+    fail "判据2-b：${LEAVE_NODE##*-} 出现 LEAVE 决策 —— 散群风险成真"
 else
-    pass "判据2-b：r1 无 LEAVE 决策（群未散）"
+    pass "判据2-b：群 $REJOIN_GROUP 的老成员无 LEAVE 决策（群未散）"
 fi
 
 # ---------------------------------------------------------------------------
@@ -216,13 +289,12 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 3] 无 nudge 风暴"
-SENT=$(echo "$R1_LOG" | grep -c "sent PEER_REQUEST to $Z1_TRANSPORT")
-if [ "$SENT" -eq 0 ]; then
-    pass "判据3：r1 未朝 z1 发 PEER_REQUEST（回配路刹车生效，不回声）"
-elif [ "$SENT" -le 5 ]; then
-    pass "判据3：r1 朝 z1 发了 $SENT 条 PEER_REQUEST（≤ 重传预算 5，非风暴）"
+if [ -n "$STORM_NODE" ]; then
+    fail "判据3：${STORM_NODE##*-} 朝 z1 发出超过 5 条 PEER_REQUEST —— 疑似回声风暴"
+elif [ "$SENT_TOTAL" -eq 0 ]; then
+    pass "判据3：老成员未朝 z1 回发 PEER_REQUEST（回配路刹车生效）"
 else
-    fail "判据3：r1 朝 z1 发了 $SENT 条 PEER_REQUEST —— 疑似回声风暴"
+    pass "判据3：老成员共发 $SENT_TOTAL 条 PEER_REQUEST，单节点均未超过重传预算 5"
 fi
 
 # ---------------------------------------------------------------------------
@@ -341,13 +413,22 @@ if docker exec -u root $M1A iptables -C INPUT -s 10.99.0.113 \
     -p udp --dport 5859 -j DROP >/dev/null 2>&1; then
     GROUP_CHANGED=1
     conf $M1B 65113 "midr group-id 2"; sleep 6
+    v "$M1A" "clear bgp 10.99.0.113" >/dev/null 2>&1
+    v "$M1B" "clear bgp 10.99.0.112" >/dev/null 2>&1
     if conf $M1B 65113 "midr group-id 1"; then GROUP_CHANGED=0; fi
-    sleep 30      # 等死心
-    if logtail $M1B $M1B_BASE | grep -q "边注销"; then
+    DEAD=0; T0=$(date +%s)
+    while [ $(( $(date +%s) - T0 )) -le 60 ]; do
+        DEAD_LOG=$(logtail $M1B $M1B_BASE)
+        if echo "$DEAD_LOG" | grep -q "重传 5 次无回应\|尝试 5 次无响应"; then
+            DEAD=1; break
+        fi
+        sleep 3
+    done
+    if [ "$DEAD" -eq 1 ] && echo "$DEAD_LOG" | grep -q "边注销"; then
         # 本条同时承接原判据 6「真死心清位」的语义（原判据已删，理由见上方留痕注释块）
         pass "判据补2-a：死心后完整清理生效（边注销 = 停探 + 清位）"
     else
-        nosam "没等到死心/清理（对挡可能没生效）"
+        nosam "60s 内没同时观察到重传死心与边注销（对挡可能没生效）"
     fi
     # 放开网络，看兜底能否自愈
     clear_fault_rules

@@ -117,8 +117,6 @@ def main():
     cycles = []
     for node in ("z1", "z2"):
         cycles.extend(parse_cycles(Path(args.log_dir) / node / "frr.log", node))
-    if not cycles:
-        raise SystemExit("No completed JOIN cycle found in z1/z2 logs")
 
     fig = plt.figure(figsize=(26, 15.5))
     grid = fig.add_gridspec(1, 2, width_ratios=(1.18, 1), wspace=0.20)
@@ -127,31 +125,37 @@ def main():
     fig.suptitle("MIDR Discovery Chain — Real Multi-hop Integration Results",
                  fontweight="bold", y=0.985)
 
-    y_positions = list(range(len(cycles)))[::-1]
-    max_time = 1.0
-    for y, (cycle_label, cycle) in zip(y_positions, cycles):
-        join_time = cycle["events"]["JOIN complete"]
-        max_time = max(max_time, join_time)
-        timeline_ax.hlines(y, 0, join_time, color="#9aa5b1", linewidth=4,
-                           alpha=0.7)
-        for label, _, color, marker in EVENTS:
-            if label not in cycle["events"]:
-                continue
-            elapsed = cycle["events"][label]
-            timeline_ax.scatter(elapsed, y, s=230 if marker != "*" else 360,
-                                color=color, marker=marker, zorder=3,
-                                label=label)
-        timeline_ax.text(join_time + 3, y, f"JOIN {int(join_time)}s",
-                         va="center", fontsize=20, color="#176b38",
-                         fontweight="bold")
+    if cycles:
+        y_positions = list(range(len(cycles)))[::-1]
+        max_time = 1.0
+        for y, (cycle_label, cycle) in zip(y_positions, cycles):
+            join_time = cycle["events"]["JOIN complete"]
+            max_time = max(max_time, join_time)
+            timeline_ax.hlines(y, 0, join_time, color="#9aa5b1", linewidth=4,
+                               alpha=0.7)
+            for label, _, color, marker in EVENTS:
+                if label not in cycle["events"]:
+                    continue
+                elapsed = cycle["events"][label]
+                timeline_ax.scatter(elapsed, y, s=230 if marker != "*" else 360,
+                                    color=color, marker=marker, zorder=3,
+                                    label=label)
+            timeline_ax.text(join_time + 3, y, f"JOIN {int(join_time)}s",
+                             va="center", fontsize=20, color="#176b38",
+                             fontweight="bold")
 
-    handles, labels = timeline_ax.get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    timeline_ax.legend(unique.values(), unique.keys(), loc="upper left",
-                       ncol=2)
-    timeline_ax.set_yticks(y_positions, [label for label, _ in cycles])
-    timeline_ax.set_xlim(-3, max_time + 38)
-    timeline_ax.set_ylim(-0.7, len(cycles) - 0.3)
+        handles, labels = timeline_ax.get_legend_handles_labels()
+        unique = dict(zip(labels, handles))
+        timeline_ax.legend(unique.values(), unique.keys(), loc="upper left",
+                           ncol=2)
+        timeline_ax.set_yticks(y_positions, [label for label, _ in cycles])
+        timeline_ax.set_xlim(-3, max_time + 38)
+        timeline_ax.set_ylim(-0.7, len(cycles) - 0.3)
+    else:
+        timeline_ax.text(0.5, 0.5, "No completed JOIN cycle found",
+                         transform=timeline_ax.transAxes, ha="center", va="center",
+                         fontsize=24, color="#b42318", fontweight="bold")
+        timeline_ax.set_yticks([])
     timeline_ax.set_xlabel("Seconds since bgpd startup")
     timeline_ax.set_title("RTT-to-JOIN timeline", fontweight="bold", pad=18)
     timeline_ax.grid(axis="x", alpha=0.28)

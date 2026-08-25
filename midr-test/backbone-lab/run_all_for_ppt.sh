@@ -316,7 +316,6 @@ start_node() {
     wait_for_bgpd "$node"
     if [[ "$PHASE" == "discovery" ]]; then
         docker exec "$PREFIX-$node" vtysh -c 'configure terminal' \
-            -c 'log file /etc/frr/logs/frr.log debugging' \
             -c 'debug bgp midr' -c 'debug bgp midr discovery' \
             >/dev/null 2>&1 || true
     fi
