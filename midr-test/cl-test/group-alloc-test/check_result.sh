@@ -89,7 +89,8 @@ elif [[ "$SCENARIO" == "repair" ]]; then
         if [[ -n "$y_joined_gid" && "$y_joined_gid" == "$x_first_gid" ]]; then
             echo "PASS: y ended up JOINing x's group $x_first_gid directly -- network self-healed into one group"
         elif [[ -n "$y_final_gid" && "$y_final_gid" != "$x_first_gid" ]]; then
-            echo "PASS: y re-created a fresh, different group ($y_final_gid, != x's $x_first_gid) after yielding -- no more collision"
+            echo "FAIL: y created a different group ($y_final_gid) instead of JOINing x's group $x_first_gid"
+            FAILED=1
         else
             echo "FAIL: y never settled on a resolved state distinct from the collision -- see logs/bgpd-y.log for what actually happened after RECONNECT"
             FAILED=1
