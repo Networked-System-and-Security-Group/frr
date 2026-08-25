@@ -25,8 +25,15 @@ for node in j1 j2 j3; do
     if [[ -n "$join_line" ]]; then
         echo "  PASS: $join_line"
     elif [[ -n "$create_line" ]]; then
-        echo "  FAIL: $node fell back to CREATE instead of JOIN — threshold cap not working"
+        # 别直接归咎阈值封顶：拿不到代表目录同样走 CREATE，且更常见。
+        # 先看 create_line 是哪一种——"无可用群代表"= 目录空，与阈值无关。
+        echo "  FAIL: $node fell back to CREATE instead of JOIN"
         echo "        $create_line"
+        if [[ "$create_line" == *"无可用群代表"* ]]; then
+            echo "        ↳ 目录空，不是阈值问题：查引导有没有学到代表（show midr reps）"
+        else
+            echo "        ↳ 探到了代表但没入群：查好链路数与 min(5, 已知成员数) 阈值"
+        fi
         FAILED=1
     else
         echo "  FAIL: no JOIN or CREATE decision found — $node never reached MEMBER_PROBE_DONE"

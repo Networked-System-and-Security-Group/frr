@@ -100,32 +100,89 @@ wait_for_join() {
     return 1
 }
 
+# 等引导把远端视图回调注册上。件②（对接轮 4）之后引导的代表目录只能由第二组的
+# 回调来灌，而该回调挂在 bgp_config_end 上 —— 裸 bgpd（-f 读配置）不触发这个钩子
+# （它由 vtysh 下发配置时发的 XFRR_end_configuration 触发），只能靠 periodic_sync
+# 每 30s 兜底重试补上。原先这里死等 15s 短于 30s，joiner 必然撞空目录、CREATE
+# 自建群。判据一律换成轮询真实状态，照 docs/midr-backbone运行手册.md §3.0 的规矩。
+wait_bootstrap_ready() {
+    local node="$1" timeout=90 elapsed=0
+    echo "[growth-run_test] Waiting for $node's remote-view callback registration..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "已向第二组注册 node/link 回调" \
+             "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
+            echo "  ✓ $node ready at t=${elapsed}s"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "  ✗ $node never registered its remote-view callback within ${timeout}s"
+    return 1
+}
+
+# 等引导目录里真的出现 N 个代表 —— 这才是 joiner 能 JOIN 而不是 CREATE 的前置条件。
+wait_rep_directory() {
+    local node="$1" want="$2" timeout=90 elapsed=0 got=0
+    echo "[growth-run_test] Waiting for $node's rep directory to list $want rep(s)..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-gr-vty/$node" \
+                  -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  ✗ $node's directory still lists $got/$want rep(s) after ${timeout}s"
+    return 1
+}
+
+# 等群代表的节点表里真的涨到 N 个本群成员（含它自己）。下一个 joiner 问它要成员表
+# 时拿到几条、CL 的 min(5, 已知成员数) 阈值算成几，全看这个数——所以等它，而不是
+# 等一个"应该够了吧"的秒数。
+wait_group_members() {
+    local node="$1" gid="$2" want="$3" timeout=90 elapsed=0 got=0
+    echo "[growth-run_test] Waiting for $node to know $want group-$gid member(s)..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-gr-vty/$node" \
+                  -c 'show midr nodes' 2>/dev/null \
+                  | awk -v g="$gid" '$1 ~ /^10\.0\./ && $4 == g' | wc -l)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $node knows $got group-$gid member(s) at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  ✗ $node still knows only $got/$want group-$gid member(s) after ${timeout}s"
+    return 1
+}
+
 # 【我方适配】原版只有 4 个节点、r 兼任引导；本仓库引导与群代表硬互斥，故先起
 # 专职引导 b，再起 r。r 是 GROUP_REP，挂靠钩子会自动把它挂到 b 上（活引导只有
-# 一台，K=2 不足会降级运行并告警，属预期）；b 由此从 r 的 Node NLRI 学到
+# 一台，K=2 不足会降级运行并告警，属预期）；b 由此经第二组回调学到 r 的
 # GROUP_REP 位，推导出代表目录，才能应答 joiner 的 REP_LIST_REQ。
 echo "[growth-run_test] Starting b (dedicated bootstrap)..."
 start_node b
-sleep 3
+wait_bootstrap_ready b || true
 
 echo "[growth-run_test] Starting r (group-1 rep, 1 member so far)..."
 start_node r
-echo "[growth-run_test] Waiting 15s for r to attach to b (so b can serve the rep directory)..."
-sleep 15
+wait_rep_directory b 1 || true
 
 echo "[growth-run_test] Starting j1 (group 1 has 1 known member: r)..."
 start_node j1
 wait_for_join j1 || true
 
-echo "[growth-run_test] Waiting 10s for j1's group change to reach r via BGP-LS..."
-sleep 10
+wait_group_members r 1 2 || true
 
 echo "[growth-run_test] Starting j2 (group 1 should now have 2 known members: r, j1)..."
 start_node j2
 wait_for_join j2 || true
 
-echo "[growth-run_test] Waiting 10s for j2's group change to reach r via BGP-LS..."
-sleep 10
+wait_group_members r 1 3 || true
 
 echo "[growth-run_test] Starting j3 (group 1 should now have 3 known members: r, j1, j2)..."
 start_node j3

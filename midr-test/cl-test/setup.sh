@@ -42,6 +42,7 @@ ip netns exec ns-hub sysctl -qw net.ipv4.ip_forward=1
 
 declare -A HUBIP
 declare -A NODEIP
+declare -A LOIP
 declare -A DELAY
 HUBIP=( [g1a]=10.10.11.1  [g1b]=10.10.12.1  [g1c]=10.10.13.1
         [g1d]=10.10.14.1  [g1e]=10.10.15.1
@@ -53,6 +54,14 @@ NODEIP=( [g1a]=10.10.11.2  [g1b]=10.10.12.2  [g1c]=10.10.13.2
          [g2a]=10.10.21.2  [g2b]=10.10.22.2
          [g3a]=10.10.31.2  [g3b]=10.10.32.2
          [newnode]=10.10.99.2 )
+# transport 专用 loopback（= 各节点 router-id）。必须与上面的链路地址分开：
+# 静态邻居用链路地址、MIDR overlay 用 transport，同址会让 overlay 撞⑦归属守卫
+# （"transport 地址上有一条运维会话，MIDR 不整形运维配置"）而永远建不起来。
+LOIP=( [g1a]=10.0.11.1  [g1b]=10.0.12.1  [g1c]=10.0.13.1
+       [g1d]=10.0.14.1  [g1e]=10.0.15.1
+       [g2a]=10.0.21.1  [g2b]=10.0.22.1
+       [g3a]=10.0.31.1  [g3b]=10.0.32.1
+       [newnode]=10.0.99.1 )
 DELAY=( [g1a]=3ms [g1b]=3ms [g1c]=3ms [g1d]=3ms [g1e]=3ms
         [g2a]=50ms [g2b]=50ms
         [g3a]=6ms [g3b]=6ms
@@ -63,6 +72,7 @@ for node in "${NODES[@]}"; do
     nv="v-${node}-n"   # node-side veth
     h_ip="${HUBIP[$node]}"
     n_ip="${NODEIP[$node]}"
+    lo_ip="${LOIP[$node]}"
     delay="${DELAY[$node]}"
 
     # Create veth pair in hub ns, move node end to node ns
@@ -75,7 +85,12 @@ for node in "${NODES[@]}"; do
     ip -n "ns-$node" addr add "${n_ip}/30" dev "$nv"
     ip -n "ns-$node" link set "$nv" up
     ip -n "ns-$node" link set lo up
+    ip -n "ns-$node" addr add "${lo_ip}/32" dev lo
     ip -n "ns-$node" route add default via "$h_ip"
+
+    # hub 侧回程：到该节点 loopback 走它的链路地址。节点之间靠默认路由 → hub
+    # → 这条路由互访 transport。netem 仍加在同一条 veth 上，故延迟照样生效。
+    ip netns exec ns-hub ip route add "${lo_ip}/32" via "$n_ip"
 
     # Apply one-way delay on hub egress toward this node
     if [[ "$delay" != "0ms" ]]; then
