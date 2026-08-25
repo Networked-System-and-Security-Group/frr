@@ -82,10 +82,25 @@ struct midr_owned_store {
 	bool reconciling;
 	bool representative_committed;
 	bool takeover_delay_elapsed;
+	bool local_member_active;
 	uint32_t pending_domains;
 	uint64_t sequence_failures;
 	uint64_t fightbacks;
 };
+
+static bool midr_owned_local_member_active(struct midr_owned_store *store)
+{
+	struct midr_node_update node;
+	bool active;
+
+	if (!store || !store->ctx || !store->owner_node_id)
+		return false;
+	if (midr_local_fact_node_get(store->ctx, store->owner_node_id, &node,
+				     &active) != 0)
+		return false;
+	return active && node.group_id &&
+	       node.policy_state == MIDR_POLICY_ALLOWED;
+}
 
 static unsigned int midr_owned_hash_key(const void *arg)
 {
@@ -365,6 +380,12 @@ static int midr_owned_publish_link(struct midr_owned_store *store,
 	uint32_t cost;
 	int ret;
 
+	if (!midr_owned_local_member_active(store)) {
+		midr_owned_path_withdraw(store, entry);
+		entry->suppressed = false;
+		return 0;
+	}
+
 	ret = midr_cost_from_metrics(&entry->latest_link.metrics, &cost);
 	if (ret)
 		return ret;
@@ -412,9 +433,11 @@ static int midr_owned_link_fact(const struct midr_link_update *link, void *arg)
 	entry->seen = true;
 	entry->local_ifindex = link->local_ifindex;
 	entry->latest_link = *link;
-	if (link->policy_state == MIDR_POLICY_BLOCKED) {
+	if (link->policy_state == MIDR_POLICY_BLOCKED ||
+	    !midr_owned_local_member_active(store)) {
 		event_cancel(&entry->timer);
 		midr_owned_path_withdraw(store, entry);
+		entry->suppressed = false;
 		return 0;
 	}
 
@@ -565,9 +588,11 @@ static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t doma
 						     midr_owned_link_fact,
 						     store);
 		}
-		if (store->ready && CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_NODE_PREFIX))
+		if (store->ready && midr_owned_local_member_active(store) &&
+		    CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_NODE_PREFIX))
 			(void)midr_prefix_contributor_foreach(ctx, midr_owned_node_prefix, store);
-		if (store->ready && store->representative_committed &&
+		if (store->ready && midr_owned_local_member_active(store) &&
+		    store->representative_committed &&
 		    CHECK_FLAG(domains, MIDR_OWNED_DOMAIN_GROUP_PREFIX))
 			(void)midr_lsdb_local_group_prefix_foreach(ctx, midr_owned_group_prefix,
 								   store);
@@ -579,7 +604,27 @@ static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t doma
 
 void midr_owned_reconcile(struct midr_context *ctx)
 {
-	midr_owned_reconcile_domains(ctx, MIDR_OWNED_DOMAIN_TOPOLOGY);
+	struct midr_owned_store *store;
+	uint32_t domains = MIDR_OWNED_DOMAIN_TOPOLOGY;
+	bool active;
+
+	if (!ctx || !ctx->owned_store)
+		return;
+	store = ctx->owned_store;
+	active = midr_owned_local_member_active(store);
+	if (active != store->local_member_active) {
+		store->local_member_active = active;
+		if (!active) {
+			event_cancel(&store->takeover_timer);
+			store->representative_group_id = 0;
+			store->representative_candidate = 0;
+			store->representative_committed = false;
+			store->takeover_delay_elapsed = false;
+		}
+		domains |= MIDR_OWNED_DOMAIN_NODE_PREFIX |
+			   MIDR_OWNED_DOMAIN_GROUP_PREFIX;
+	}
+	midr_owned_reconcile_domains(ctx, domains);
 }
 
 void midr_owned_prefix_reconcile(struct midr_context *ctx)
@@ -706,6 +751,7 @@ void midr_owned_identity_withdraw(struct midr_context *ctx)
 	store->representative_candidate = 0;
 	store->representative_committed = false;
 	store->takeover_delay_elapsed = false;
+	store->local_member_active = false;
 	memset(&store->allocator, 0, sizeof(store->allocator));
 	midr_owned_input_state_changed(ctx);
 }
@@ -724,6 +770,7 @@ void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id)
 	store->representative_candidate = 0;
 	store->representative_committed = false;
 	store->takeover_delay_elapsed = false;
+	store->local_member_active = false;
 	(void)midr_owned_allocator_start(store, node_id);
 	if (node_id && !store->ready)
 		midr_owned_schedule_sequence_retry(store);

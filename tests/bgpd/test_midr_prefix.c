@@ -520,6 +520,55 @@ static void test_as_path_limit(void)
 	test_attr_fini(&two_hop_attr);
 }
 
+static void test_group_zero_node_prefix_gate(void)
+{
+	struct prefix prefix = text_prefix("192.0.2.128/25");
+	struct bgp_dest *dest = prefix_dest(&prefix);
+	struct attr attr;
+	struct bgp_path_info path;
+	struct midr_node_update node = {
+		.node_id = bgp->router_id.s_addr,
+		.policy_state = MIDR_POLICY_ALLOWED,
+	};
+
+	test_attr_init(&attr, 0);
+	path = path_info(&attr, ZEBRA_ROUTE_CONNECT, BGP_ROUTE_REDISTRIBUTE,
+			 BGP_PATH_VALID | BGP_PATH_SELECTED);
+	install_path(dest, &path);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+
+	node.version = 2;
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert(midr_prefix_rescan(ctx) == 0);
+	assert(contributor_count() == 1);
+	assert_node_prefix_missing(&prefix);
+
+	node.group_id = 10;
+	node.version = 3;
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert(node_prefix_sequence(&prefix) > 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(group_prefix_sequence(&prefix, 10) > 0);
+
+	node.group_id = 0;
+	node.version = 4;
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert_node_prefix_missing(&prefix);
+	assert_group_prefix_missing(&prefix, 10);
+
+	remove_paths(dest);
+	assert(midr_prefix_rescan(ctx) == 0);
+	test_attr_fini(&attr);
+	node.group_id = 10;
+	node.version = 5;
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+}
+
 static void test_validation_and_lifecycle(void)
 {
 	struct midr_prefix_status status;
@@ -614,6 +663,7 @@ int main(void)
 	test_route_types_and_optional_deny_policy();
 	test_ipv6_and_default_route();
 	test_as_path_limit();
+	test_group_zero_node_prefix_gate();
 	test_validation_and_lifecycle();
 	test_out_of_sync_and_recovery();
 
