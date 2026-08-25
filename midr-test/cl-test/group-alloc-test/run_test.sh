@@ -37,6 +37,24 @@ BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
 TESTDIR="$SCRIPT_DIR"
 SCENARIO="both"
 
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run this test with sudo: sudo ./run_test.sh --scenario both" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" ]]; then
+    echo "Missing bgpd binary: $BGPD" >&2
+    exit 2
+fi
+
+# bgpd/.libs/bgpd is the real binary (bgpd/bgpd is just a libtool wrapper
+# script that sets this up automatically -- we bypass it to run the binary
+# directly under `ip netns exec`, so we must set this ourselves). Without
+# it, the dynamic loader falls back to the system search path and can pick
+# up a stale, previously-`make install`-ed libfrr.so.0 instead of the one
+# actually built from this source tree, causing spurious
+# "undefined symbol" crashes on start that look nothing like a real bug.
+export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs:${LD_LIBRARY_PATH:-}"
+
 cd "$TESTDIR"
 
 for arg in "$@"; do
@@ -46,9 +64,18 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[ga-run_test] Interrupted."; exit 1' INT TERM
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo "[ga-run_test] Interrupted."; exit 130' INT TERM
 
 mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/group_alloc_results.png"
+rm -rf "$TESTDIR/logs-prevent" "$TESTDIR/logs-repair"
 
 start_node() {
     local node="$1"
@@ -90,6 +117,22 @@ log_lines_now() {
     [[ -f "$log" ]] && wc -l < "$log" || echo 0
 }
 
+wait_bootstrap_ready() {
+    local node="$1" timeout=90 elapsed=0
+    echo "[ga-run_test] Waiting for $node's remote-view callback registration..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "已向第二组注册 node/link 回调" \
+             "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
+            echo "  $node ready at t=${elapsed}s"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "  $node did not register its remote-view callback within ${timeout}s"
+    return 1
+}
+
 kill_stale() {
     shopt -s nullglob
     for pidfile in /tmp/bgpd-ga-*.pid; do
@@ -116,8 +159,8 @@ run_prevent() {
 
     echo "[ga-run_test] Starting b1, b2, b3..."
     for b in b1 b2 b3; do start_node "$b"; done
-    echo "[ga-run_test] Waiting 15s for the bootstrap mesh to establish..."
-    sleep 15
+    for b in b1 b2 b3; do wait_bootstrap_ready "$b"; done
+    sleep 5
 
     echo "[ga-run_test] Starting x and y at the same instant..."
     x_marker=$(log_lines_now x); y_marker=$(log_lines_now y)
@@ -128,6 +171,10 @@ run_prevent() {
     wait_for_log y "MIDR I-7：CREATE 落定群" 100 "CREATE settle" "$y_marker" || true
 
     chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    # logs/ gets wiped at the start of the *next* scenario -- preserve this
+    # one's under its own name so plot_group_alloc.py can chart both
+    # scenarios from a single run of this script.
+    rm -rf "$TESTDIR/logs-prevent" && cp -r "$TESTDIR/logs" "$TESTDIR/logs-prevent"
 
     echo ""
     local rc=0
@@ -151,8 +198,8 @@ run_repair() {
 
     echo "[ga-run_test] Starting b2, b3 only (b1 stays down)..."
     for b in b2 b3; do start_node "$b"; done
-    echo "[ga-run_test] Waiting 15s for the (partial) bootstrap mesh to establish..."
-    sleep 15
+    for b in b2 b3; do wait_bootstrap_ready "$b"; done
+    sleep 5
 
     echo "[ga-run_test] Starting x and y at the same instant..."
     x_marker=$(log_lines_now x); y_marker=$(log_lines_now y)
@@ -186,6 +233,7 @@ run_repair() {
     wait_for_log y "MIDR CL: MEMBER_PROBE_DONE → JOIN 群\|MIDR I-7：CREATE 落定群" 250 "final resolution" "$y_post_reconnect_marker" || true
 
     chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    rm -rf "$TESTDIR/logs-repair" && cp -r "$TESTDIR/logs" "$TESTDIR/logs-repair"
 
     echo ""
     local rc=0
@@ -214,4 +262,13 @@ else
 fi
 echo "########################################################"
 
-exit "$overall_rc"
+plot_rc=0
+mkdir -p /tmp/midr-matplotlib
+MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_group_alloc.py" \
+    --prevent-dir "$TESTDIR/logs-prevent" --repair-dir "$TESTDIR/logs-repair" \
+    --output "$TESTDIR/group_alloc_results.png" || plot_rc=$?
+chmod a+r "$TESTDIR/group_alloc_results.png" 2>/dev/null || true
+
+if [[ "$overall_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+    exit 1
+fi

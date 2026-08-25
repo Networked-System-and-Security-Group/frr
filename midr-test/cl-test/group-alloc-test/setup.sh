@@ -28,7 +28,17 @@ set -e
 echo "[ga-setup] Creating namespaces..."
 NODES=(b1 b2 b3 x y)
 for n in "${NODES[@]}"; do
-    ip netns add "ns-ga-$n" 2>/dev/null || { ip netns del "ns-ga-$n"; ip netns add "ns-ga-$n"; }
+    # Always delete-then-add unconditionally, never rely on `ip netns add`
+    # failing to detect a stale namespace -- a namespace can still exist
+    # (and keep its old interfaces, including a stale "eth1"/"ethN" that
+    # collides with this run's rename step below) even when `add` doesn't
+    # error, e.g. right after a previous run's bgpd was killed but the
+    # kernel hasn't fully released the namespace yet. Observed directly:
+    # "RTNETLINK answers: Device or resource busy" during interface rename,
+    # followed by a spoke silently ending up with no working default route
+    # for the rest of that run.
+    ip netns del "ns-ga-$n" 2>/dev/null || true
+    ip netns add "ns-ga-$n"
     ip -n "ns-ga-$n" link set lo up
 done
 
@@ -54,17 +64,39 @@ for i in 1 2 3 4; do
     hip="10.10.55.$((sub+1))"; sip="10.10.55.$((sub+2))"
 
     ip -n ns-ga-b2 link add "$hv" type veth peer name "$sv" netns "ns-ga-$spoke"
-    ip -n ns-ga-b2 addr add "${hip}/30" dev "$hv"
-    ip -n ns-ga-b2 link set "$hv" up
-    ip -n "ns-ga-$spoke" addr add "${sip}/30" dev "$sv"
-    ip -n "ns-ga-$spoke" link set "$sv" up
 
-    ip netns exec ns-ga-b2 tc qdisc add dev "$hv" root netem delay "$delay" rate "$bw"
-    ip netns exec "ns-ga-$spoke" tc qdisc add dev "$sv" root netem delay "$delay" rate "$bw"
+    # Rename *before* addressing/bringing the link up, not after: renaming
+    # an interface that's already UP raced "Device or resource busy" on
+    # this kernel (observed directly -- the loop died on the very first
+    # rename, leaving b2 with a stray "vga0h" and every later link never
+    # even created). Renaming a freshly-created, still-DOWN veth doesn't
+    # hit this.
+    ip -n ns-ga-b2 link set "$hv" name "eth${i}"
+    ip -n "ns-ga-$spoke" link set "$sv" name eth1
 
-    printf "  b2 -- %-3s  %-15s  %-15s  delay=%s bw=%s\n" "$spoke" "${hip}/30" "${sip}/30" "$delay" "$bw"
+    ip -n ns-ga-b2 addr add "${hip}/30" dev "eth${i}"
+    ip -n ns-ga-b2 link set "eth${i}" up
+    ip -n "ns-ga-$spoke" addr add "${sip}/30" dev eth1
+    ip -n "ns-ga-$spoke" link set eth1 up
+
+    ip netns exec ns-ga-b2 tc qdisc add dev "eth${i}" root netem delay "$delay" rate "$bw"
+    ip netns exec "ns-ga-$spoke" tc qdisc add dev eth1 root netem delay "$delay" rate "$bw"
+
+    printf "  b2 (eth%d) -- %-3s (eth1)  %-15s  %-15s  delay=%s bw=%s\n" \
+        "$i" "$spoke" "${hip}/30" "${sip}/30" "$delay" "$bw"
 done
 
+# Kernel-level static routing (unchanged from before the stage1/stage2
+# integration): every node runs bgpd with -Z (--no_zebra, see run_test.sh),
+# so BGP-learned routes are never installed into the kernel FIB regardless
+# of what the frr.conf files now do -- actual packet delivery still depends
+# entirely on these routes. The frr.conf files additionally configure a real
+# underlay eBGP session per link (redistribute connected) purely so group2's
+# Link NLRI generation sees a proper interface-adjacent peer (see CLAUDE.md:
+# without one it fails with "missing local link-id and interface" and the
+# MIDR overlay attach session drops) -- that BGP session carries no kernel
+# routing consequence here, it's a second, independent mechanism layered on
+# top of the same physical links.
 echo "[ga-setup] Routing: spokes -> default via b2..."
 declare -A UPLINK_VIA=( [b1]=10.10.55.1 [b3]=10.10.55.5 [x]=10.10.55.9 [y]=10.10.55.13 )
 for spoke in b1 b3 x y; do
