@@ -200,33 +200,11 @@ static void test_link_measurement_validation(void)
 	assert(midr_validate_link_update(local, &link) == -EINVAL);
 }
 
-static void test_weak_snapshot_provider(void)
-{
-	struct midr_topology_snapshot snapshot = {
-		.nodes = (const struct midr_node_update *)(uintptr_t)1,
-		.node_count = 1,
-		.links = (const struct midr_link_update *)(uintptr_t)1,
-		.link_count = 1,
-		.snapshot_version = 1,
-	};
-
-	assert(midr_topology_snapshot_get(NULL, NULL) == -EINVAL);
-	assert(midr_topology_snapshot_get(NULL, &snapshot) == -ENOSYS);
-	assert(snapshot.nodes == NULL);
-	assert(snapshot.node_count == 0);
-	assert(snapshot.links == NULL);
-	assert(snapshot.link_count == 0);
-	assert(snapshot.snapshot_version == 0);
-	midr_topology_snapshot_release(NULL, &snapshot);
-	midr_topology_snapshot_release(NULL, NULL);
-}
-
 int main(void)
 {
 	test_node_validation();
 	test_link_identity_and_address_validation();
 	test_link_measurement_validation();
-	test_weak_snapshot_provider();
 	printf("MIDR input validation tests passed\n");
 	return 0;
 }

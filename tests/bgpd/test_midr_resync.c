@@ -103,11 +103,8 @@ static void provider_reset(uint32_t owner, uint32_t group_id, uint64_t object_ve
 	provider.snapshot_version = snapshot_version;
 }
 
-/*
- * This strong test definition must override the weak standalone Provider in
- * bgp_midr_input.c. Successful snapshot tests also serve as the link check.
- */
-int midr_topology_snapshot_get(struct midr_context *ctx, struct midr_topology_snapshot *snapshot)
+static int test_snapshot_get(struct midr_context *ctx,
+			     struct midr_topology_snapshot *snapshot)
 {
 	void (*during_get)(struct midr_context *ctx);
 
@@ -133,8 +130,8 @@ int midr_topology_snapshot_get(struct midr_context *ctx, struct midr_topology_sn
 	return 0;
 }
 
-void midr_topology_snapshot_release(struct midr_context *ctx,
-				    struct midr_topology_snapshot *snapshot)
+static void test_snapshot_release(struct midr_context *ctx,
+				  struct midr_topology_snapshot *snapshot)
 {
 	assert(ctx != NULL);
 	assert(snapshot != NULL);
@@ -185,6 +182,8 @@ static void env_init(struct test_env *env, uint32_t owner)
 
 	assert(midr_input_init(env->ctx) == 0);
 	assert(midr_input_init(env->ctx) == -EALREADY);
+	assert(midr_input_test_set_snapshot_provider(
+		       env->ctx, test_snapshot_get, test_snapshot_release) == 0);
 	status = input_status(env->ctx);
 	assert(status.state == MIDR_INPUT_RESYNCING);
 	midr_input_test_resync_now(env->ctx);
@@ -568,6 +567,8 @@ static void test_provider_unavailable_paths(void)
 	env.bgp.midr_info = &env.midr;
 	env.ctx = &env.midr.ctx;
 	assert(midr_input_init(env.ctx) == 0);
+	assert(midr_input_test_set_snapshot_provider(
+		       env.ctx, test_snapshot_get, test_snapshot_release) == 0);
 	midr_input_test_resync_now(env.ctx);
 	status = input_status(env.ctx);
 	assert(status.state == MIDR_INPUT_NORMAL);
@@ -706,6 +707,8 @@ static void test_router_id_initial_establishment(void)
 	env.bgp.midr_info = &env.midr;
 	env.ctx = &env.midr.ctx;
 	assert(midr_input_init(env.ctx) == 0);
+	assert(midr_input_test_set_snapshot_provider(
+		       env.ctx, test_snapshot_get, test_snapshot_release) == 0);
 	assert(input_status(env.ctx).state == MIDR_INPUT_IDENTITY_RESTART);
 
 	env.bgp.router_id.s_addr = owner;
@@ -766,6 +769,8 @@ static void test_private_api_validation(void)
 	assert(midr_local_fact_node_get(NULL, owner, &node, &active) == -ENOENT);
 	assert(midr_local_fact_link_get(NULL, &link.key, &link, &active) == -ENOENT);
 	assert(midr_input_test_set_queue_limits(NULL, 1, 1) == -ENOENT);
+	assert(midr_input_test_set_snapshot_provider(NULL, test_snapshot_get,
+						     test_snapshot_release) == -ENOENT);
 	midr_input_test_resync_now(NULL);
 	midr_topology_process_pending(NULL);
 	midr_input_finish(NULL);
@@ -794,6 +799,10 @@ static void test_private_api_validation(void)
 	assert(midr_local_fact_link_get(env.ctx, &link.key, &link, NULL) == -EINVAL);
 	assert(midr_input_test_set_queue_limits(env.ctx, 0, 1) == -EINVAL);
 	assert(midr_input_test_set_queue_limits(env.ctx, 1, 0) == -EINVAL);
+	assert(midr_input_test_set_snapshot_provider(env.ctx, NULL,
+						     test_snapshot_release) == -EINVAL);
+	assert(midr_input_test_set_snapshot_provider(env.ctx, test_snapshot_get,
+						     NULL) == -EINVAL);
 	assert(midr_topology_resync_begin(env.ctx, (enum midr_topology_resync_reason)99) ==
 	       -EINVAL);
 

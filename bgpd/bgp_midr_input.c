@@ -76,6 +76,8 @@ struct midr_fact_table {
 
 struct midr_input_store {
 	struct midr_context *ctx;
+	midr_topology_snapshot_get_cb snapshot_get;
+	midr_topology_snapshot_release_cb snapshot_release;
 	struct midr_fact_table *active;
 	struct list *normal_queue;
 	struct list *resync_queue;
@@ -502,10 +504,10 @@ static void midr_input_resync_step(struct midr_input_store *store)
 	if (midr_process_queue(store, store->normal_queue, store->active))
 		midr_owned_reconcile(store->ctx);
 
-	ret = midr_topology_snapshot_get(store->ctx, &snapshot);
+	ret = store->snapshot_get(store->ctx, &snapshot);
 	if (store->state != MIDR_INPUT_RESYNCING) {
 		if (!ret)
-			midr_topology_snapshot_release(store->ctx, &snapshot);
+			store->snapshot_release(store->ctx, &snapshot);
 		return;
 	}
 	if (ret == -ENOSYS) {
@@ -536,7 +538,7 @@ static void midr_input_resync_step(struct midr_input_store *store)
 	ret = midr_snapshot_to_fact_table(store, &snapshot, &staging);
 	if (!ret)
 		(void)midr_process_queue(store, store->resync_queue, staging);
-	midr_topology_snapshot_release(store->ctx, &snapshot);
+	store->snapshot_release(store->ctx, &snapshot);
 	if (ret) {
 		store->resync_failures++;
 		midr_fact_table_free(&staging);
@@ -668,6 +670,8 @@ int midr_input_init(struct midr_context *ctx)
 
 	store = XCALLOC(MTYPE_MIDR_INPUT, sizeof(*store));
 	store->ctx = ctx;
+	store->snapshot_get = midr_topology_snapshot_get;
+	store->snapshot_release = midr_topology_snapshot_release;
 	store->active = midr_fact_table_new();
 	store->normal_queue = list_new();
 	store->normal_queue->del = midr_event_free;
@@ -1042,6 +1046,19 @@ int midr_input_test_set_queue_limits(struct midr_context *ctx, size_t normal_lim
 
 	ctx->input_store->normal_queue_limit = normal_limit;
 	ctx->input_store->resync_queue_limit = resync_limit;
+	return 0;
+}
+
+int midr_input_test_set_snapshot_provider(
+	struct midr_context *ctx, midr_topology_snapshot_get_cb snapshot_get,
+	midr_topology_snapshot_release_cb snapshot_release)
+{
+	if (!ctx || !ctx->input_store)
+		return -ENOENT;
+	if (!snapshot_get || !snapshot_release)
+		return -EINVAL;
+	ctx->input_store->snapshot_get = snapshot_get;
+	ctx->input_store->snapshot_release = snapshot_release;
 	return 0;
 }
 
