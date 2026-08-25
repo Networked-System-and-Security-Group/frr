@@ -77,6 +77,8 @@ cleanup() {
     local rc=$?
     trap - EXIT
     bash "$TESTDIR/teardown.sh" || true
+    chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    chmod a+r "$TESTDIR/cl_results.png" 2>/dev/null || true
     exit "$rc"
 }
 trap cleanup EXIT
