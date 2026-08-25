@@ -6,7 +6,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TOPOLOGY="$SCRIPT_DIR/midr-backbone.clab.yaml"
-CHECK_SCRIPT="$REPO_ROOT/midr-test/backbone-group2/run_dual_source_check.sh"
+GROUP2_CHECK="$REPO_ROOT/midr-test/backbone-group2/run_dual_source_check.sh"
+DISCOVERY_CHECK="$REPO_ROOT/midr-test/backbone-discovery/run_backbone_discovery.sh"
 PYTHON_BIN="${MIDR_PYTHON_BIN:-${CONDA_PREFIX:-}/bin/python}"
 OUTPUT_UID="${SUDO_UID:-$(stat -c %u "$REPO_ROOT")}"
 OUTPUT_GID="${SUDO_GID:-$(stat -c %g "$REPO_ROOT")}"
@@ -25,6 +26,7 @@ STARTED=0
 usage() {
     echo "Usage: sudo env MIDR_PYTHON_BIN=/path/to/python $0 [options]"
     echo "  --phase group2       Run the Part 2.2 Group2 integration test"
+    echo "  --phase discovery    Run the Part 2.3 discovery-chain test"
     echo "  --base-timeout SEC   Base convergence timeout (default: $BASE_TIMEOUT)"
     echo "  --join-timeout SEC   Final convergence timeout (default: $JOIN_TIMEOUT)"
 }
@@ -55,9 +57,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$PHASE" != "group2" ]]; then
-    echo "Only --phase group2 is available in this test step." >&2
+if [[ "$PHASE" != "group2" && "$PHASE" != "discovery" ]]; then
+    echo "Phase must be group2 or discovery." >&2
     exit 2
+fi
+if [[ "$PHASE" == "group2" ]]; then
+    RUN_LOG="$SCRIPT_DIR/run-group2.log"
+    CHECK_LOG="$SCRIPT_DIR/group2_check.log"
+    HEALTH_LOG="$SCRIPT_DIR/group2_health.log"
+    RESULT_IMAGE="$SCRIPT_DIR/group2_results.png"
+    CHECK_SCRIPT="$GROUP2_CHECK"
+    PLOT_SCRIPT="$SCRIPT_DIR/plot_group2_health.py"
+    PART_LABEL="Part 2.2: Group2 reporting and accounting integration"
+else
+    RUN_LOG="$SCRIPT_DIR/run-discovery.log"
+    CHECK_LOG="$SCRIPT_DIR/discovery_check.log"
+    HEALTH_LOG="$SCRIPT_DIR/discovery_baseline.log"
+    RESULT_IMAGE="$SCRIPT_DIR/discovery_results.png"
+    CHECK_SCRIPT="$DISCOVERY_CHECK"
+    PLOT_SCRIPT="$SCRIPT_DIR/plot_backbone_discovery.py"
+    PART_LABEL="Part 2.3: discovery chain and recovery integration"
 fi
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this script with sudo; it manages containerlab and Docker." >&2
@@ -84,7 +103,7 @@ for file in \
     /usr/lib/x86_64-linux-gnu/libunwind.so.8.0.1 \
     /usr/lib/x86_64-linux-gnu/libyang.so.2.41.0 \
     "$CHECK_SCRIPT" \
-    "$SCRIPT_DIR/plot_group2_health.py"; do
+    "$PLOT_SCRIPT"; do
     [[ -e "$file" ]] || {
         echo "Missing required artifact: $file" >&2
         exit 2
@@ -152,33 +171,32 @@ cleanup() {
         stop_all
     fi
     restore_host_permissions
-    if [[ -s "$SCRIPT_DIR/group2_health.log" && \
-          ! -f "$SCRIPT_DIR/group2_results.png" ]]; then
-        MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" \
-            "$SCRIPT_DIR/plot_group2_health.py" \
-            --samples "$SCRIPT_DIR/group2_health.log" \
-            --check-log "$SCRIPT_DIR/group2_check.log" \
-            --output "$SCRIPT_DIR/group2_results.png" || true
+    if [[ "$PHASE" == "group2" && -s "$HEALTH_LOG" && \
+          ! -f "$RESULT_IMAGE" ]]; then
+        MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$PLOT_SCRIPT" \
+            --samples "$HEALTH_LOG" --check-log "$CHECK_LOG" \
+            --output "$RESULT_IMAGE" || true
+    elif [[ "$PHASE" == "discovery" && -s "$CHECK_LOG" && \
+            ! -f "$RESULT_IMAGE" ]]; then
+        MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$PLOT_SCRIPT" \
+            --log-dir "$SCRIPT_DIR/logs-backbone" --check-log "$CHECK_LOG" \
+            --output "$RESULT_IMAGE" || true
     fi
     chmod -R a+rX "$SCRIPT_DIR/logs-backbone" 2>/dev/null || true
-    chmod a+r "$SCRIPT_DIR/run-group2.log" \
-        "$SCRIPT_DIR/group2_check.log" \
-        "$SCRIPT_DIR/group2_health.log" \
-        "$SCRIPT_DIR/group2_results.png" 2>/dev/null || true
-    chown "$OUTPUT_UID:$OUTPUT_GID" "$SCRIPT_DIR/run-group2.log" \
-        "$SCRIPT_DIR/group2_check.log" \
-        "$SCRIPT_DIR/group2_health.log" \
-        "$SCRIPT_DIR/group2_results.png" 2>/dev/null || true
+    chmod a+r "$RUN_LOG" "$CHECK_LOG" "$HEALTH_LOG" "$RESULT_IMAGE" \
+        2>/dev/null || true
+    chown "$OUTPUT_UID:$OUTPUT_GID" "$RUN_LOG" "$CHECK_LOG" \
+        "$HEALTH_LOG" "$RESULT_IMAGE" 2>/dev/null || true
     exit "$rc"
 }
 trap cleanup EXIT
 trap 'echo "[backbone] Interrupted; stopping this experiment now."; exit 130' INT TERM
 
 cd "$SCRIPT_DIR"
-rm -f run-group2.log group2_check.log group2_health.log group2_results.png
-exec > >(tee run-group2.log) 2>&1
+rm -f "$RUN_LOG" "$CHECK_LOG" "$HEALTH_LOG" "$RESULT_IMAGE"
+exec > >(tee "$RUN_LOG") 2>&1
 
-echo "[backbone] Part 2.2: Group2 reporting and accounting integration"
+echo "[backbone] $PART_LABEL"
 echo "[backbone] Python: $PYTHON_BIN"
 
 STARTED=1
@@ -258,7 +276,7 @@ sample_once() {
             "$(number_or_missing "$node_pending")" \
             "$(number_or_missing "$link_reported")" \
             "$(number_or_missing "$owned")" \
-            "$(number_or_missing "$group")" >> group2_health.log
+            "$(number_or_missing "$group")" >> "$HEALTH_LOG"
     done
 }
 
@@ -270,8 +288,8 @@ sample_loop() {
 }
 
 echo 'elapsed,node,node_reported,node_pending,link_reported,owned_links,group_id' \
-    > group2_health.log
-: > group2_check.log
+    > "$HEALTH_LOG"
+: > "$CHECK_LOG"
 SAMPLE_START=$(date +%s)
 export SAMPLE_START
 sample_loop &
@@ -296,6 +314,12 @@ start_node() {
     echo "  starting $node"
     docker exec -u root "$PREFIX-$node" /usr/lib/frr/frrinit.sh start >/dev/null
     wait_for_bgpd "$node"
+    if [[ "$PHASE" == "discovery" ]]; then
+        docker exec "$PREFIX-$node" vtysh -c 'configure terminal' \
+            -c 'log file /etc/frr/logs/frr.log debugging' \
+            -c 'debug bgp midr' -c 'debug bgp midr discovery' \
+            >/dev/null 2>&1 || true
+    fi
     sleep 2
 }
 
@@ -363,23 +387,32 @@ fi
 
 stop_sampler
 sample_once
-echo "[backbone] Running G1-G8 integration criteria..."
 set +e
-GROUP2_HEALTH_LOG="$SCRIPT_DIR/group2_health.log" \
-    bash "$CHECK_SCRIPT" | tee group2_check.log
-check_rc=${PIPESTATUS[0]}
+if [[ "$PHASE" == "group2" ]]; then
+    echo "[backbone] Running G1-G8 integration criteria..."
+    GROUP2_HEALTH_LOG="$HEALTH_LOG" bash "$CHECK_SCRIPT" | tee "$CHECK_LOG"
+    check_rc=${PIPESTATUS[0]}
+else
+    echo "[backbone] Running the 18 discovery-chain criteria..."
+    bash "$CHECK_SCRIPT" | tee "$CHECK_LOG"
+    check_rc=${PIPESTATUS[0]}
+fi
 set -e
 
 echo "[backbone] Rendering the PPT result figure..."
-MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" \
-    "$SCRIPT_DIR/plot_group2_health.py" \
-    --samples group2_health.log \
-    --check-log group2_check.log \
-    --output group2_results.png
+if [[ "$PHASE" == "group2" ]]; then
+    MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$PLOT_SCRIPT" \
+        --samples "$HEALTH_LOG" --check-log "$CHECK_LOG" \
+        --output "$RESULT_IMAGE"
+else
+    MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$PLOT_SCRIPT" \
+        --log-dir "$SCRIPT_DIR/logs-backbone" --check-log "$CHECK_LOG" \
+        --output "$RESULT_IMAGE"
+fi
 
 if [[ "$check_rc" -ne 0 ]]; then
-    echo "[backbone] Group2 criteria failed; see group2_check.log." >&2
+    echo "[backbone] $PHASE criteria did not pass; see $CHECK_LOG." >&2
     exit "$check_rc"
 fi
-echo "[backbone] PASS: Group2 integration criteria contain no failures."
-echo "[backbone] Figure: $SCRIPT_DIR/group2_results.png"
+echo "[backbone] PASS: $PHASE integration criteria passed."
+echo "[backbone] Figure: $RESULT_IMAGE"

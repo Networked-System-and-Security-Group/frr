@@ -28,6 +28,9 @@ Z1_TRANSPORT=10.99.0.191; Z1_RID=10.0.0.191
 M1A_TRANSPORT=10.99.0.112; M1A_RID=10.0.0.112
 
 PASS=0; FAIL=0; NOSAMPLE=0
+Z1_SHUTDOWN=0
+GROUP_CHANGED=0
+FAULT_RULES=0
 pass()  { echo "  ✓ $1"; PASS=$((PASS+1)); }
 fail()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 nosam() { echo "  ⚠ 没造出场景：$1"; NOSAMPLE=$((NOSAMPLE+1)); }
@@ -41,6 +44,61 @@ loglines() { docker exec "$1" sh -c "wc -l < $LOG" 2>/dev/null | tr -d ' '; }
 logtail()  { docker exec "$1" sh -c "tail -n +$2 $LOG" 2>/dev/null; }
 dbgon()    { docker exec "$1" vtysh -c "configure terminal" -c "log file $LOG debugging" \
                 -c "debug bgp midr" -c "debug bgp midr discovery" >/dev/null 2>&1; }
+
+remove_fault_rule() {
+    local container="$1" source="$2" protocol="$3" port="$4"
+    while docker exec -u root "$container" iptables -C INPUT -s "$source" \
+        -p "$protocol" --dport "$port" -j DROP >/dev/null 2>&1; do
+        docker exec -u root "$container" iptables -D INPUT -s "$source" \
+            -p "$protocol" --dport "$port" -j DROP >/dev/null 2>&1 || break
+    done
+}
+
+clear_fault_rules() {
+    remove_fault_rule "$M1A" 10.99.0.113 tcp 179
+    remove_fault_rule "$M1A" 10.99.0.113 udp 5859
+    remove_fault_rule "$M1B" 10.99.0.112 tcp 179
+    remove_fault_rule "$M1B" 10.99.0.112 udp 5859
+    FAULT_RULES=0
+}
+
+restore_test_state() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if [ "$FAULT_RULES" -eq 1 ]; then clear_fault_rules; fi
+    if [ "$GROUP_CHANGED" -eq 1 ]; then
+        conf "$M1B" 65113 "midr group-id 1" >/dev/null 2>&1 || true
+    fi
+    if [ "$Z1_SHUTDOWN" -eq 1 ]; then
+        conf "$Z1" 65191 "no midr shutdown" >/dev/null 2>&1 || true
+    fi
+    exit "$rc"
+}
+
+restart_node() {
+    local container="$1" elapsed=0
+    timeout 15s docker exec -u root "$container" \
+        /usr/lib/frr/frrinit.sh stop >/dev/null 2>&1 || true
+    docker exec -u root "$container" sh -c \
+        'pkill -9 -x watchfrr 2>/dev/null || true
+         pkill -9 -x bgpd 2>/dev/null || true
+         pkill -9 -x zebra 2>/dev/null || true
+         pkill -9 -x staticd 2>/dev/null || true
+         pkill -9 -x mgmtd 2>/dev/null || true
+         rm -f /var/run/frr/*.pid /var/run/frr/*.vty' >/dev/null 2>&1 || true
+    docker exec -u root "$container" /usr/lib/frr/frrinit.sh start >/dev/null 2>&1 || return 1
+    while [ "$elapsed" -lt 45 ]; do
+        if docker exec "$container" vtysh -c "show bgp summary" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed+2))
+    done
+    return 1
+}
+
+trap restore_test_state EXIT
+trap 'exit 130' INT TERM
 
 echo "=============================================================="
 echo " 发现链专题判据 —— 15 节点骨干台子（真多跳 / 真分离）"
@@ -59,7 +117,10 @@ for c in $R1 $M1A $M1B $Z1 $R2; do dbgon $c; done
 echo
 echo "[判据 9] z1 退网：退网侧零反应，发起侧假状态自愈"
 R1_BASE=$(loglines $R1); Z1_BASE=$(loglines $Z1)
-docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" -c "midr shutdown" >/dev/null 2>&1
+if docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
+    -c "midr shutdown" >/dev/null 2>&1; then
+    Z1_SHUTDOWN=1
+fi
 sleep 45
 R1_LOG=$(logtail $R1 $R1_BASE); Z1_LOG=$(logtail $Z1 $Z1_BASE)
 
@@ -90,7 +151,10 @@ else
 fi
 
 # 恢复 z1
-docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" -c "no midr shutdown" >/dev/null 2>&1
+if docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
+    -c "no midr shutdown" >/dev/null 2>&1; then
+    Z1_SHUTDOWN=0
+fi
 
 # ---------------------------------------------------------------------------
 # 判据 1 + 2：回配置位 + 老成员起探（本批核心）
@@ -101,10 +165,13 @@ docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" -c "no midr 
 echo
 echo "[判据 1+2] z1 重新入群：老成员经回配置位 + 起探"
 R1_BASE=$(loglines $R1); M1A_BASE=$(loglines $M1A)
-docker exec -u root $Z1 /usr/lib/frr/frrinit.sh restart >/dev/null 2>&1
+if ! restart_node "$Z1"; then
+    echo "  z1 restart failed" >&2
+    exit 1
+fi
+dbgon $Z1
 echo "  （z1 已重启，等 join 两段热身 ~150s）"
 sleep 165
-dbgon $Z1
 
 R1_LOG=$(logtail $R1 $R1_BASE)
 M1A_LOG=$(logtail $M1A $M1A_BASE)
@@ -263,14 +330,19 @@ done
 echo
 echo "[判据 补2] 死锁自愈（两边对挡 179+5859 → 恢复）"
 M1B_BASE=$(loglines $M1B)
+clear_fault_rules
+FAULT_RULES=1
 for r in "$M1A:10.99.0.113" "$M1B:10.99.0.112"; do
     c=${r%%:*}; s=${r##*:}
     docker exec -u root $c iptables -A INPUT -s $s -p tcp --dport 179 -j DROP 2>/dev/null
     docker exec -u root $c iptables -A INPUT -s $s -p udp --dport 5859 -j DROP 2>/dev/null
 done
-if docker exec -u root $M1A iptables -L INPUT -n 2>/dev/null | grep -q 5859; then
+if docker exec -u root $M1A iptables -C INPUT -s 10.99.0.113 \
+    -p udp --dport 5859 -j DROP >/dev/null 2>&1; then
+    GROUP_CHANGED=1
     conf $M1B 65113 "midr group-id 2"; sleep 6
-    conf $M1B 65113 "midr group-id 1"; sleep 30      # 等死心
+    if conf $M1B 65113 "midr group-id 1"; then GROUP_CHANGED=0; fi
+    sleep 30      # 等死心
     if logtail $M1B $M1B_BASE | grep -q "边注销"; then
         # 本条同时承接原判据 6「真死心清位」的语义（原判据已删，理由见上方留痕注释块）
         pass "判据补2-a：死心后完整清理生效（边注销 = 停探 + 清位）"
@@ -278,8 +350,7 @@ if docker exec -u root $M1A iptables -L INPUT -n 2>/dev/null | grep -q 5859; the
         nosam "没等到死心/清理（对挡可能没生效）"
     fi
     # 放开网络，看兜底能否自愈
-    docker exec -u root $M1A iptables -F INPUT 2>/dev/null
-    docker exec -u root $M1B iptables -F INPUT 2>/dev/null
+    clear_fault_rules
     T0=$(date +%s); OK=0
     while [ $(( $(date +%s) - T0 )) -le 90 ]; do
         v $M1B "show midr neighbors" | grep "10.99.0.112" | grep -q Established && { OK=1; break; }
@@ -292,6 +363,7 @@ if docker exec -u root $M1A iptables -L INPUT -n 2>/dev/null | grep -q 5859; the
         fail "判据补2-b：90s 未自愈 —— 兜底扫描没起作用"
     fi
 else
+    clear_fault_rules
     nosam "容器里没有 iptables，判据补2 跳过"
 fi
 
