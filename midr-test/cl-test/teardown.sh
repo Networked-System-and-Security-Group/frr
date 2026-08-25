@@ -40,5 +40,3 @@ ip netns del ns-hub 2>/dev/null || true
 
 rm -rf /tmp/midr-cl-vty
 echo "[teardown] Done."
-
-rm logs/*.log

@@ -35,6 +35,16 @@ BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run this test with sudo: sudo ./run_test.sh" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" ]]; then
+    echo "Missing bgpd binary: $BGPD" >&2
+    exit 2
+fi
 
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
 # so bgpd must be launched with TESTDIR as its cwd.
@@ -47,7 +57,14 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[run_test] Interrupted."; exit 1' INT TERM
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo "[run_test] Interrupted."; exit 130' INT TERM
 
 # ---- 0. Reap any stale bgpd instances left running by a previous, ----------
 #         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
@@ -78,6 +95,7 @@ fi
 
 # ---- 2. Create log and VTY dirs ---------------------------------------------
 mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/logs"/*.log "$TESTDIR/cl_results.png"
 rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
 
 # ---- 3. 分阶段启动 ----------------------------------------------------------
@@ -154,16 +172,16 @@ wait_group_members() {
 
 echo "[run_test] Stage 1/4: bootstrap (g1a)..."
 start_node g1a
-wait_bootstrap_ready g1a || true
+wait_bootstrap_ready g1a
 
 echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
 for node in g1b g2a g3a; do start_node "$node"; sleep 1; done
-wait_rep_directory g1a 3 || true
+wait_rep_directory g1a 3
 
 echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
 for node in g1c g1d g1e g2b g3b; do start_node "$node"; sleep 1; done
 # 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
-wait_group_members g1b 1 4 || true
+wait_group_members g1b 1 4
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
 echo "[run_test] Stage 4/4: newnode (join flow will begin automatically)..."
@@ -211,4 +229,16 @@ fi
 
 # ---- 6. Show result summary -------------------------------------------------
 echo ""
-bash "$TESTDIR/check_result.sh"
+result_rc=0
+bash "$TESTDIR/check_result.sh" || result_rc=$?
+
+plot_rc=0
+mkdir -p /tmp/midr-matplotlib
+MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_cl.py" \
+    "$TESTDIR/logs/bgpd-newnode.log" --output "$TESTDIR/cl_results.png" || plot_rc=$?
+chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+chmod a+r "$TESTDIR/cl_results.png" 2>/dev/null || true
+
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+    exit 1
+fi

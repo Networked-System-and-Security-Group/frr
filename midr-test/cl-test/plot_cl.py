@@ -18,12 +18,9 @@ and g2a probed simultaneously, with g2a's RTT sitting well above the
 threshold; phase 2 (MEMBER probing) shows g1a-g1e probed simultaneously, all
 converging below the threshold, ending in JOIN.
 
-Node IDs differ between phases (this test's fixed 10-node topology,
-midr-test/cl-test/configs/*.conf): phase 1 probes a rep by its transport
-address (e.g. g1a=10.10.11.2, g2a=10.10.21.2); phase 2 probes members by
-their router-id (e.g. g1a=10.0.11.1, g1b=10.0.12.1, ...). Both IDs for the
-same physical node are mapped to one label (e.g. "g1a") below so the legend
-shows node names instead of IP addresses that "don't line up" across phases.
+The fixed topology uses 10.10.x addresses for underlay links and 10.0.x
+loopbacks for MIDR transport. The transport address also matches the router
+ID, so candidate samples map directly to stable node labels.
 
 Note: lt_loss (and st_loss) in the log are already one-way loss estimates —
 bgpd's probe is a round trip, so it converts the measured bidirectional
@@ -60,21 +57,16 @@ plt.rcParams.update({
 
 RTT_THRESHOLD_MS = 20.0
 
-# Fixed topology of midr-test/cl-test (see configs/*.conf): map both the
-# transport-address ID used while probing a rep (phase 1) and the router-id
-# used while probing a member (phase 2) to the same node label.
+# Fixed transport/router-ID mapping for midr-test/cl-test/configs/*.conf.
 IP_TO_NAME = {
-    "10.10.11.2": "g1a",  # group-1 rep, probed by transport addr (phase 1)
-    "10.10.21.2": "g2a",  # group-2 rep, probed by transport addr (phase 1)
-    "10.10.31.2": "g3a",  # group-3 rep, probed by transport addr (phase 1)
-    "10.0.11.1":  "g1a",  # group-1 member, probed by router-id (phase 2)
+    "10.0.11.1":  "g1a",
     "10.0.12.1":  "g1b",
     "10.0.13.1":  "g1c",
     "10.0.14.1":  "g1d",
     "10.0.15.1":  "g1e",
     "10.0.21.1":  "g2a",
     "10.0.22.1":  "g2b",
-    "10.0.31.1":  "g3a",  # group-3 anchor candidate, probed by router-id (anchor phase)
+    "10.0.31.1":  "g3a",
     "10.0.32.1":  "g3b",
 }
 
@@ -123,7 +115,8 @@ def parse_log(path):
             if m:
                 ts = parse_ts(m.group(1))
                 rec = RECOMMEND_PAT.search(line)
-                detail = f"RECOMMEND 群{rec.group(1)}@{node_label(rec.group(2))}" if rec else line.strip()
+                detail = (f"RECOMMEND group{rec.group(1)}@{node_label(rec.group(2))}"
+                          if rec else "REP_PROBE_DONE")
                 events.append((ts, "REP_PROBE_DONE", detail))
                 continue
 
@@ -133,11 +126,11 @@ def parse_log(path):
                 j = JOIN_PAT.search(line)
                 c = CREATE_PAT.search(line)
                 if j:
-                    detail = f"JOIN 群{j.group(1)}（{j.group(2)} 条好链路）"
+                    detail = f"JOIN group{j.group(1)} ({j.group(2)} good links)"
                 elif c:
-                    detail = f"CREATE 新群{c.group(1)}"
+                    detail = f"CREATE group{c.group(1)}"
                 else:
-                    detail = line.strip()
+                    detail = "MEMBER_PROBE_DONE"
                 events.append((ts, "MEMBER_PROBE_DONE", detail))
 
     return series, events
@@ -152,7 +145,7 @@ def plot(series, events, output):
     t0 = min(all_ts)
 
     fig, ax0 = plt.subplots(figsize=(20, 11))
-    fig.suptitle("MIDR CL — 分群决策测试结果（候选节点长期 RTT）", fontsize=32, fontweight="bold")
+    fig.suptitle("MIDR CL — Clustering Decision Test (Candidate Long-Term RTT)", fontsize=32, fontweight="bold")
 
     colors = plt.cm.tab10.colors
     for i, (label, s) in enumerate(sorted(series.items())):
@@ -162,10 +155,10 @@ def plot(series, events, output):
         ax0.plot(t_rel, rtt, color=color, label=label, marker="o", ms=6, alpha=0.9)
 
     ax0.axhline(RTT_THRESHOLD_MS, color="black", ls=":", lw=2.6,
-                label=f"入群阈值 {RTT_THRESHOLD_MS:.0f} ms")
-    ax0.set_ylabel("长期 RTT (ms)")
-    ax0.set_xlabel("实验时间 (s)")
-    ax0.set_title("阶段一：探测 g1a/g2a（群代表）；阶段二：探测 g1a–g1e（群成员）")
+                label=f"JOIN threshold {RTT_THRESHOLD_MS:.0f} ms")
+    ax0.set_ylabel("Long-term RTT (ms)")
+    ax0.set_xlabel("Experiment time (s)")
+    ax0.set_title("Phase 1: rank group representatives; Phase 2: validate group-1 members")
     ax0.grid(True, alpha=0.3)
 
     # ── decision markers ──
@@ -180,7 +173,7 @@ def plot(series, events, output):
         t_rel = (t - t0).total_seconds()
         color, _ = marker_style.get(kind, ("gray", ":"))
         ax0.text(t_rel, ymax * 0.95, f" {detail}", rotation=90, va="top",
-                  ha="left", fontsize=18, color=color, fontweight="bold")
+                  ha="left", fontsize=22, color=color, fontweight="bold")
 
     ax0.legend(loc="upper left", ncol=2)
 
