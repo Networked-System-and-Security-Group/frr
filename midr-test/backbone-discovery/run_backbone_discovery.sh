@@ -113,12 +113,20 @@ echo "=============================================================="
 for c in $R1 $M1A $M1B $Z1 $R2 $M2A; do dbgon $c; done
 
 INITIAL_GROUP=$(groupid "$Z1")
+# Complete wire-format PEER_REQUEST frames from the group representatives.
 case "$INITIAL_GROUP" in
-    1) INITIAL_OBSERVERS=($R1 $M1A $M1B clab-midr-backbone-z2) ;;
-    2) INITIAL_OBSERVERS=($R2 $M2A) ;;
+    1)
+        INITIAL_OBSERVERS=($R1 $M1A $M1B clab-midr-backbone-z2)
+        TEST_SOURCE=$R1
+        TEST_FRAME='\x03\x01\x00\x00\x0a\x00\x00\x6f\x0a\x63\x00\x6f\x00\x00\xfe\x57\x00\x00\x00\x01'
+        ;;
+    2)
+        INITIAL_OBSERVERS=($R2 $M2A)
+        TEST_SOURCE=$R2
+        TEST_FRAME='\x03\x01\x00\x00\x0a\x00\x00\x79\x0a\x63\x00\x79\x00\x00\xfe\x61\x00\x00\x00\x02'
+        ;;
     *) echo "  z1 is not in group 1 or 2 before the discovery test" >&2; exit 1 ;;
 esac
-declare -A INITIAL_BASE
 INITIAL_PEERS=()
 for c in "${INITIAL_OBSERVERS[@]}"; do
     if v "$c" "show midr neighbors" | grep "$Z1_TRANSPORT" | grep -q Established; then
@@ -140,35 +148,33 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 9] z1 退网：退网侧零反应，发起侧假状态自愈"
-for c in "${INITIAL_OBSERVERS[@]}"; do INITIAL_BASE[$c]=$(loglines "$c"); done
 Z1_BASE=$(loglines $Z1)
 if docker exec $Z1 vtysh -c "configure terminal" -c "router bgp 65191" \
     -c "midr shutdown" >/dev/null 2>&1; then
     Z1_SHUTDOWN=1
 fi
+INJECTED=0
+for attempt in 1 2 3; do
+    if docker exec "$TEST_SOURCE" bash -c \
+        'printf "%b" "$1" > "/dev/udp/$2/5859"' \
+        _ "$TEST_FRAME" "$Z1_TRANSPORT"; then
+        INJECTED=$((INJECTED+1))
+    fi
+    sleep 1
+done
 sleep 45
 Z1_LOG=$(logtail $Z1 $Z1_BASE)
-SHUTDOWN_ACTOR=""
-for c in "${INITIAL_OBSERVERS[@]}"; do
-    NODE_LOG=$(logtail "$c" "${INITIAL_BASE[$c]}")
-    if echo "$NODE_LOG" | grep -q "removing peer\|node gone\|MIDR CL: NODE_CHANGE"; then
-        SHUTDOWN_ACTOR="$c"
-        break
-    fi
-done
 
-if [ -n "$SHUTDOWN_ACTOR" ]; then
-    if echo "$Z1_LOG" | grep -q "退网：丢弃控制通道"; then
-        if echo "$Z1_LOG" | grep -q "peering back"; then
-            fail "判据9-a：z1 退网后仍回配了（应一律丢弃）"
-        else
-            pass "判据9-a：z1 侧零反应（守卫丢弃 $(echo "$Z1_LOG" | grep -c '退网：丢弃控制通道') 条，无回配）"
-        fi
+if echo "$Z1_LOG" | grep -q "退网：丢弃控制通道 UDP 消息 type=1"; then
+    if echo "$Z1_LOG" | grep -q "peering back"; then
+        fail "判据9-a：z1 退网后仍回配了（应一律丢弃）"
     else
-        nosam "z1 侧没收到任何控制消息（没造出'对端来敲门'的场景）"
+        pass "判据9-a：z1 守卫丢弃 $(echo "$Z1_LOG" | grep -c '退网：丢弃控制通道 UDP 消息 type=1') 条 PEER_REQUEST，无回配"
     fi
+elif [ "$INJECTED" -eq 0 ]; then
+    nosam "群 $INITIAL_GROUP 代表未能发送测试 PEER_REQUEST"
 else
-    nosam "群 $INITIAL_GROUP 的老成员日志里没看到触发退网侧控制消息的场景"
+    fail "判据9-a：已发送 $INJECTED 条 PEER_REQUEST，但 z1 退网守卫没有记录丢弃"
 fi
 STALE_SESSION=""
 STALE_NODE=""
