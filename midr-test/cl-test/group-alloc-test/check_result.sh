@@ -54,9 +54,8 @@ elif [[ "$SCENARIO" == "repair" ]]; then
         echo "FAIL: one or both nodes never reached a CREATE settle -- check logs/bgpd-{x,y}.log"
         FAILED=1
     elif [[ "$x_first_gid" != "$y_first_gid" ]]; then
-        echo "INFO: x and y did not actually collide this run ($x_first_gid vs $y_first_gid) -- layer 1's fallback path"
-        echo "      didn't produce identical estimates this time (timing-dependent). Nothing for layer 2 to repair;"
-        echo "      re-run if you specifically want to exercise the repair path."
+        echo "FAIL: x and y did not collide ($x_first_gid vs $y_first_gid), so the repair path was not exercised"
+        FAILED=1
     else
         echo "Collision precondition confirmed: both settled on group $x_first_gid independently."
         echo ""

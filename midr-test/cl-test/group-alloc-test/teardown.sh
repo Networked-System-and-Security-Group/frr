@@ -2,7 +2,7 @@
 # teardown.sh — kill bgpd processes and remove group-alloc-test namespaces.
 set -e
 
-NODES=(b1 b2 b3 x y)
+NODES=(x y b3 b2 b1)
 
 echo "[ga-teardown] Killing bgpd instances..."
 for node in "${NODES[@]}"; do
@@ -34,4 +34,5 @@ for node in "${NODES[@]}"; do
 done
 
 rm -rf /tmp/midr-ga-vty
+rm -rf /tmp/midr-ga-state
 echo "[ga-teardown] Done. (logs left in place)"

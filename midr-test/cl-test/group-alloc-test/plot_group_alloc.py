@@ -158,7 +158,10 @@ def plot_scenario(ax, logdir, title):
                         arrowprops=dict(arrowstyle="-", color=color, lw=1, alpha=0.6))
 
     ax.set_yticks([0, 1])
-    ax.set_yticklabels(list(rows.keys()))
+    ax.set_yticklabels([
+        "y (router-id 10.0.5.12)",
+        "x (router-id 10.0.5.11)",
+    ])
     ax.set_xlabel("Experiment time (s)")
     ax.set_title(title)
     ax.set_ylim(-1.1, 2.1)

@@ -36,6 +36,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
 TESTDIR="$SCRIPT_DIR"
 SCENARIO="both"
+PYTHON_BIN="${MIDR_PYTHON_BIN:-python3}"
+declare -A BG_PIDS=()
+declare -A EXPECTED_STOPS=()
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this test with sudo: sudo ./run_test.sh --scenario both" >&2
@@ -43,6 +46,18 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 if [[ ! -x "$BGPD" ]]; then
     echo "Missing bgpd binary: $BGPD" >&2
+    exit 2
+fi
+for command_name in ip tc tee "$PYTHON_BIN"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Missing command: $command_name" >&2
+        exit 2
+    fi
+done
+mkdir -p /tmp/midr-matplotlib
+if ! MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" -c \
+    'import matplotlib' >/dev/null 2>&1; then
+    echo "Missing Python package: matplotlib is required." >&2
     exit 2
 fi
 
@@ -67,15 +82,55 @@ done
 cleanup() {
     local rc=$?
     trap - EXIT
+    for node in "${!BG_PIDS[@]}"; do
+        EXPECTED_STOPS[$node]=1
+    done
     bash "$TESTDIR/teardown.sh" || true
+    wait_for_nodes || true
+    chmod -R a+rX "$TESTDIR/logs" "$TESTDIR/logs-prevent" \
+        "$TESTDIR/logs-repair" 2>/dev/null || true
+    chmod a+r "$TESTDIR"/run*.log "$TESTDIR/group_alloc_results.png" \
+        2>/dev/null || true
     exit "$rc"
 }
 trap cleanup EXIT
 trap 'echo "[ga-run_test] Interrupted."; exit 130' INT TERM
 
 mkdir -p "$TESTDIR/logs"
-rm -f "$TESTDIR/group_alloc_results.png"
+rm -f "$TESTDIR/run.log" "$TESTDIR/run-prevent.log" \
+    "$TESTDIR/run-repair.log" "$TESTDIR/group_alloc_results.png"
 rm -rf "$TESTDIR/logs-prevent" "$TESTDIR/logs-repair"
+exec > >(tee "$TESTDIR/run.log") 2>&1
+
+wait_for_nodes() {
+    local failed=0 node rc
+    for node in "${!BG_PIDS[@]}"; do
+        if wait "${BG_PIDS[$node]}"; then
+            continue
+        else
+            rc=$?
+            if [[ "${EXPECTED_STOPS[$node]:-0}" -eq 1 && \
+                  ( "$rc" -eq 137 || "$rc" -eq 143 ) ]]; then
+                continue
+            fi
+            echo "[ga-run_test] $node exited abnormally (status $rc)." >&2
+            failed=1
+        fi
+    done
+    BG_PIDS=()
+    EXPECTED_STOPS=()
+    return "$failed"
+}
+
+stop_nodes() {
+    local failed=0 node
+    for node in "${!BG_PIDS[@]}"; do
+        EXPECTED_STOPS[$node]=1
+    done
+    bash "$TESTDIR/teardown.sh" || failed=1
+    wait_for_nodes || failed=1
+    return "$failed"
+}
 
 start_node() {
     local node="$1"
@@ -84,8 +139,10 @@ start_node() {
         -f "$TESTDIR/configs/bgpd-${node}.conf" \
         -Z -S \
         -i "/tmp/bgpd-ga-${node}.pid" \
+        --db_file "/tmp/midr-ga-state/bgpd-${node}.db" \
         --vty_socket "/tmp/midr-ga-vty/$node" \
         --log-level debug &
+    BG_PIDS[$node]="$!"
     echo "  started bgpd for $node (bg pid $!)"
 }
 
@@ -152,10 +209,12 @@ run_prevent() {
     echo "# Scenario: prevent (layer 1 -- all 3 bootstraps up)"
     echo "########################################################"
 
-    kill_stale; sleep 1
-    bash "$TESTDIR/setup.sh"
+    kill_stale
+    bash "$TESTDIR/teardown.sh"
     rm -f "$TESTDIR/logs"/*.log
     rm -rf /tmp/midr-ga-vty && mkdir -p /tmp/midr-ga-vty
+    rm -rf /tmp/midr-ga-state && mkdir -p /tmp/midr-ga-state
+    bash "$TESTDIR/setup.sh"
 
     echo "[ga-run_test] Starting b1, b2, b3..."
     for b in b1 b2 b3; do start_node "$b"; done
@@ -170,17 +229,16 @@ run_prevent() {
     wait_for_log x "MIDR I-7：CREATE 落定群" 100 "CREATE settle" "$x_marker" || true
     wait_for_log y "MIDR I-7：CREATE 落定群" 100 "CREATE settle" "$y_marker" || true
 
+    echo ""
+    local rc=0
+    bash "$TESTDIR/check_result.sh" prevent || rc=$?
+
+    stop_nodes || rc=1
     chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
     # logs/ gets wiped at the start of the *next* scenario -- preserve this
     # one's under its own name so plot_group_alloc.py can chart both
     # scenarios from a single run of this script.
     rm -rf "$TESTDIR/logs-prevent" && cp -r "$TESTDIR/logs" "$TESTDIR/logs-prevent"
-
-    echo ""
-    local rc=0
-    bash "$TESTDIR/check_result.sh" prevent || rc=$?
-
-    bash "$TESTDIR/teardown.sh"
     return $rc
 }
 
@@ -191,10 +249,12 @@ run_repair() {
     echo "#           forcing layer 1's fallback path)"
     echo "########################################################"
 
-    kill_stale; sleep 1
-    bash "$TESTDIR/setup.sh"
+    kill_stale
+    bash "$TESTDIR/teardown.sh"
     rm -f "$TESTDIR/logs"/*.log
     rm -rf /tmp/midr-ga-vty && mkdir -p /tmp/midr-ga-vty
+    rm -rf /tmp/midr-ga-state && mkdir -p /tmp/midr-ga-state
+    bash "$TESTDIR/setup.sh"
 
     echo "[ga-run_test] Starting b2, b3 only (b1 stays down)..."
     for b in b2 b3; do start_node "$b"; done
@@ -212,7 +272,10 @@ run_repair() {
     wait_for_log y "MIDR I-7：CREATE 落定群" 100 "first CREATE settle" "$y_marker" || true
 
     echo "[ga-run_test] Waiting for layer 2 to detect the collision (y should yield)..."
-    wait_for_log y "MIDR CL: GROUP_ID_COLLISION" 90 "collision detected" "$y_marker" || true
+    collision_seen=0
+    if wait_for_log y "MIDR CL: GROUP_ID_COLLISION" 90 "collision detected" "$y_marker"; then
+        collision_seen=1
+    fi
 
     # Marker taken from the GROUP_ID_COLLISION line itself, not a separate
     # log_lines_now (wc -l) call taken right after -- that raced behind the
@@ -225,32 +288,33 @@ run_repair() {
     # marker from the same successful match sidesteps whatever caused that
     # gap entirely: if grep -n found this line, the file on disk
     # unambiguously contains it.
-    y_post_reconnect_marker=$(grep -n "MIDR CL: GROUP_ID_COLLISION" "$TESTDIR/logs/bgpd-y.log" | tail -1 | cut -d: -f1)
-    y_post_reconnect_marker=$((y_post_reconnect_marker + 1))
-    echo "[ga-run_test] Waiting for y to finish rejoining (RECONNECT restarts the full"
-    echo "              join flow -- another full REP_PROBE_DONE + possibly"
-    echo "              MEMBER_PROBE_DONE warm-up cycle, budget ~250s)..."
-    wait_for_log y "MIDR CL: MEMBER_PROBE_DONE → JOIN 群\|MIDR I-7：CREATE 落定群" 250 "final resolution" "$y_post_reconnect_marker" || true
-
-    chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
-    rm -rf "$TESTDIR/logs-repair" && cp -r "$TESTDIR/logs" "$TESTDIR/logs-repair"
+    if [[ "$collision_seen" -eq 1 ]]; then
+        y_post_reconnect_marker=$(grep -n "MIDR CL: GROUP_ID_COLLISION" "$TESTDIR/logs/bgpd-y.log" | tail -1 | cut -d: -f1)
+        y_post_reconnect_marker=$((y_post_reconnect_marker + 1))
+        echo "[ga-run_test] Waiting for y to finish rejoining (RECONNECT restarts the full"
+        echo "              join flow -- another full REP_PROBE_DONE + possibly"
+        echo "              MEMBER_PROBE_DONE warm-up cycle, budget ~250s)..."
+        wait_for_log y "MIDR CL: MEMBER_PROBE_DONE → JOIN 群\|MIDR I-7：CREATE 落定群" 250 "final resolution" "$y_post_reconnect_marker" || true
+    fi
 
     echo ""
     local rc=0
     bash "$TESTDIR/check_result.sh" repair || rc=$?
 
-    bash "$TESTDIR/teardown.sh"
+    stop_nodes || rc=1
+    chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    rm -rf "$TESTDIR/logs-repair" && cp -r "$TESTDIR/logs" "$TESTDIR/logs-repair"
     return $rc
 }
 
 overall_rc=0
 
 if [[ "$SCENARIO" == "prevent" || "$SCENARIO" == "both" ]]; then
-    run_prevent || overall_rc=1
+    run_prevent > >(tee "$TESTDIR/run-prevent.log") 2>&1 || overall_rc=1
 fi
 
 if [[ "$SCENARIO" == "repair" || "$SCENARIO" == "both" ]]; then
-    run_repair || overall_rc=1
+    run_repair > >(tee "$TESTDIR/run-repair.log") 2>&1 || overall_rc=1
 fi
 
 echo ""
@@ -262,12 +326,14 @@ else
 fi
 echo "########################################################"
 
+trap - EXIT
 plot_rc=0
 mkdir -p /tmp/midr-matplotlib
-MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_group_alloc.py" \
+MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$TESTDIR/plot_group_alloc.py" \
     --prevent-dir "$TESTDIR/logs-prevent" --repair-dir "$TESTDIR/logs-repair" \
     --output "$TESTDIR/group_alloc_results.png" || plot_rc=$?
 chmod a+r "$TESTDIR/group_alloc_results.png" 2>/dev/null || true
+chmod a+r "$TESTDIR"/run*.log 2>/dev/null || true
 
 if [[ "$overall_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
     exit 1
