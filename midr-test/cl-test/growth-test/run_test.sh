@@ -183,27 +183,27 @@ wait_group_members() {
 # GROUP_REP 位，推导出代表目录，才能应答 joiner 的 REP_LIST_REQ。
 echo "[growth-run_test] Starting b (dedicated bootstrap)..."
 start_node b
-wait_bootstrap_ready b || true
+wait_bootstrap_ready b
 
 echo "[growth-run_test] Starting r (group-1 rep, 1 member so far)..."
 start_node r
-wait_rep_directory b 1 || true
+wait_rep_directory b 1
 
 echo "[growth-run_test] Starting j1 (group 1 has 1 known member: r)..."
 start_node j1
-wait_for_join j1 || true
+wait_for_join j1
 
-wait_group_members r 1 2 || true
+wait_group_members r 1 2
 
 echo "[growth-run_test] Starting j2 (group 1 should now have 2 known members: r, j1)..."
 start_node j2
-wait_for_join j2 || true
+wait_for_join j2
 
-wait_group_members r 1 3 || true
+wait_group_members r 1 3
 
 echo "[growth-run_test] Starting j3 (group 1 should now have 3 known members: r, j1, j2)..."
 start_node j3
-wait_for_join j3 || true
+wait_for_join j3
 
 # Logs were written as root; open them up so a non-root reader can inspect
 # results afterward without an extra manual chmod step.
