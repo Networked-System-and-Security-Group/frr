@@ -148,14 +148,25 @@ def plot_scenario(ax, logdir, title):
                 stack = 0
             last_t = t_rel
             color, marker = KIND_STYLE[kind]
-            ax.scatter([t_rel], [y], color=color, marker=marker, s=260, zorder=3,
+            marker_y = y
+            if y == 0 and kind == "collision":
+                marker_y += 0.09
+            elif y == 0 and kind == "reconnect":
+                marker_y -= 0.09
+            ax.scatter([t_rel], [marker_y], color=color, marker=marker, s=260, zorder=3,
                        edgecolors="black", linewidths=0.8)
-            dy = (18 + stack * 60) if y == 1 else -(30 + stack * 60)
-            dx = 10 + stack * 130
-            ax.annotate(f"{detail}\n(t={t_rel:.0f}s)", (t_rel, y), xytext=(dx, dy),
+            if y == 1:
+                dx, dy = 10, 18 + stack * 60
+            else:
+                dx, dy = {
+                    "settle": (10, -55),
+                    "collision": (10, 42),
+                    "reconnect": (10, -110),
+                    "join": (10, -45),
+                }[kind]
+            ax.annotate(f"{detail}\n(t={t_rel:.0f}s)", (t_rel, marker_y), xytext=(dx, dy),
                         textcoords="offset points", fontsize=20, color=color,
-                        fontweight="bold", ha="left",
-                        arrowprops=dict(arrowstyle="-", color=color, lw=1, alpha=0.6))
+                        fontweight="bold", ha="left")
 
     ax.set_yticks([0, 1])
     ax.set_yticklabels([
@@ -164,7 +175,7 @@ def plot_scenario(ax, logdir, title):
     ])
     ax.set_xlabel("Experiment time (s)")
     ax.set_title(title)
-    ax.set_ylim(-1.1, 2.1)
+    ax.set_ylim(-1.5, 2.1)
     ax.margins(x=0.08)
     ax.grid(True, axis="x", alpha=0.3)
 
