@@ -155,6 +155,7 @@ mkdir -p "$TESTDIR/logs"
 rm -f "$TESTDIR/logs"/*.log \
     "$TESTDIR/isolation_results.png"
 rm -rf /tmp/midr-iso-vty && mkdir -p /tmp/midr-iso-vty
+rm -rf /tmp/midr-iso-state && mkdir -p /tmp/midr-iso-state
 
 start_node() {
     local node="$1"
@@ -163,6 +164,7 @@ start_node() {
         -f "$TESTDIR/configs/bgpd-${node}.conf" \
         -Z -S \
         -i "/tmp/bgpd-iso-${node}.pid" \
+        --db_file "/tmp/midr-iso-state/bgpd-${node}.db" \
         --vty_socket "/tmp/midr-iso-vty/$node" \
         --log-level debug &
     BG_PIDS[$node]="$!"

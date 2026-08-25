@@ -50,4 +50,5 @@ done
 ip netns del ns-iso-hub 2>/dev/null || true
 
 rm -rf /tmp/midr-iso-vty
+rm -rf /tmp/midr-iso-state
 echo "[iso-teardown] Done. (logs left in place — remove logs/*.log manually if desired)"
