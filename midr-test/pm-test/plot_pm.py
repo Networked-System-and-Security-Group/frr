@@ -3,8 +3,8 @@
 Plot MIDR PM metrics from bgpd debug log.
 
 Usage:
-    python3 plot_pm.py /tmp/bgpd-a.log [--output pm_results.png]
-    python3 plot_pm.py /tmp/bgpd-a.log --iperf-start 30 --iperf-duration 30
+    python3 plot_pm.py bgpd-a.log [--output pm_results.png]
+    python3 plot_pm.py bgpd-a.log --iperf-start 30 --iperf-duration 30
 
 Parses two log patterns:
   1. "MIDR PM: reply from X rtt=Yus"        -> raw RTT per probe
@@ -39,15 +39,15 @@ import matplotlib.gridspec as gridspec
 
 # ── Slide-friendly font scale ────────────────────────────────────────────────
 plt.rcParams.update({
-    "font.size": 28,
-    "font.sans-serif": ["WenQuanYi Zen Hei", "Noto Sans CJK SC", "DejaVu Sans"],
+    "font.size": 22,
+    "font.sans-serif": ["DejaVu Sans"],
     "axes.unicode_minus": False,
-    "axes.titlesize": 32,
-    "axes.labelsize": 30,
-    "xtick.labelsize": 28,
-    "ytick.labelsize": 28,
-    "legend.fontsize": 28,
-    "figure.titlesize": 32,
+    "axes.titlesize": 26,
+    "axes.labelsize": 24,
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+    "legend.fontsize": 20,
+    "figure.titlesize": 30,
     "axes.linewidth": 1.8,
     "lines.linewidth": 2.8,
 })
@@ -59,6 +59,7 @@ I5_PAT  = re.compile(
     TS_PAT + r'.*MIDR PM I-5: node=([\d./]+) status=(\d+) failures=(\d+) '
              r'st_rtt_us=(\d+) st_loss=([\d.]+) st_bw=(\d+) '
              r'lt_rtt_us=(\d+) lt_loss=([\d.]+) lt_bw=(\d+)')
+IPERF_PAT = re.compile(TS_PAT + r'.*MIDR PM TEST: iperf (START|END)')
 
 def parse_ts(s):
     return datetime.strptime(s, "%Y/%m/%d %H:%M:%S.%f")
@@ -69,9 +70,14 @@ def parse_log(path):
     i5_st_rtt, i5_st_loss, i5_st_bw = [], [], []
     i5_lt_rtt, i5_lt_loss, i5_lt_bw = [], [], []
     i5_status, i5_failures = [], []
+    iperf_markers = {}
 
     with open(path) as f:
         for line in f:
+            m = IPERF_PAT.search(line)
+            if m:
+                iperf_markers[m.group(2).lower()] = parse_ts(m.group(1))
+                continue
             m = RTT_PAT.search(line)
             if m:
                 raw_ts.append(parse_ts(m.group(1)))
@@ -98,6 +104,7 @@ def parse_log(path):
         "i5_st_rtt": i5_st_rtt, "i5_st_loss": i5_st_loss, "i5_st_bw": i5_st_bw,
         "i5_lt_rtt": i5_lt_rtt, "i5_lt_loss": i5_lt_loss, "i5_lt_bw": i5_lt_bw,
         "i5_status": i5_status, "i5_failures": i5_failures,
+        "iperf_markers": iperf_markers,
     }
 
 def relative_secs(ts_list, t0):
@@ -109,8 +116,8 @@ def shade_iperf_window(ax, start, duration):
         return
     ax.axvspan(start, start + duration, color="purple", alpha=0.12, zorder=0)
     ymin, ymax = ax.get_ylim()
-    ax.text(start + duration / 2.0, ymax * 0.96, "iperf UDP 打满链路",
-            ha="center", va="top", fontsize=14, color="purple",
+    ax.text(start + duration / 2.0, ymax * 0.96, "10 Mbps UDP load",
+            ha="center", va="top", fontsize=22, color="purple",
             fontweight="bold")
     ax.set_ylim(ymin, ymax)
 
@@ -128,41 +135,47 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     i5_t    = np.array(relative_secs(data["i5_ts"],  t0))
     raw_rtt = np.array(data["raw_rtt"])
 
+    markers = data["iperf_markers"]
+    if "start" in markers:
+        iperf_start = (markers["start"] - t0).total_seconds()
+    if "start" in markers and "end" in markers:
+        iperf_duration = (markers["end"] - markers["start"]).total_seconds()
+
     # Large canvas: designed to fill a 16:9 beamer frame at full size.
-    fig = plt.figure(figsize=(20, 16))
-    fig.suptitle("MIDR PM — 链路性能测量结果", fontsize=36, fontweight="bold")
+    fig = plt.figure(figsize=(20, 14))
+    fig.suptitle("MIDR PM — Link Performance Measurement", fontsize=30, fontweight="bold")
     gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.5, wspace=0.3)
 
     ax0 = fig.add_subplot(gs[0, :])
-    ax0.scatter(raw_t, raw_rtt, s=10, alpha=0.5, color="steelblue", label="原始 RTT")
+    ax0.scatter(raw_t, raw_rtt, s=10, alpha=0.5, color="steelblue", label="Raw RTT")
     if len(i5_t):
-        ax0.plot(i5_t, data["i5_st_rtt"], color="orange", label="短期 EWMA (α=0.2)")
-        ax0.plot(i5_t, data["i5_lt_rtt"], color="red", ls="--", label="长期 EWMA (α=0.05)")
+        ax0.plot(i5_t, data["i5_st_rtt"], color="orange", label="Short-term EWMA (α=0.2)")
+        ax0.plot(i5_t, data["i5_lt_rtt"], color="red", ls="--", label="Long-term EWMA (α=0.05)")
     ax0.set_ylabel("RTT (ms)")
-    ax0.set_xlabel("实验时间 (s)")
-    ax0.set_title("往返时延 RTT")
+    ax0.set_xlabel("Experiment time (s)")
+    ax0.set_title("Round-Trip Time")
     shade_iperf_window(ax0, iperf_start, iperf_duration)
     ax0.legend(loc="upper right")
     ax0.grid(True, alpha=0.3)
 
     ax1 = fig.add_subplot(gs[1, 0])
     if len(i5_t):
-        ax1.plot(i5_t, data["i5_st_loss"], color="orange", label="短期（滑动窗口）")
-        ax1.plot(i5_t, data["i5_lt_loss"], color="red", ls="--", label="长期 EWMA")
-    ax1.set_ylabel("丢包率 (%)")
-    ax1.set_xlabel("实验时间 (s)")
-    ax1.set_title("丢包率")
+        ax1.plot(i5_t, data["i5_st_loss"], color="orange", label="Short-term (sliding window)")
+        ax1.plot(i5_t, data["i5_lt_loss"], color="red", ls="--", label="Long-term EWMA")
+    ax1.set_ylabel("Loss rate (%)")
+    ax1.set_xlabel("Experiment time (s)")
+    ax1.set_title("Packet Loss Rate")
     shade_iperf_window(ax1, iperf_start, iperf_duration)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
     ax2 = fig.add_subplot(gs[1, 1])
     if len(i5_t):
-        ax2.plot(i5_t, data["i5_st_bw"], color="green", label="短期 bw_score")
-        ax2.plot(i5_t, data["i5_lt_bw"], color="darkgreen", ls="--", label="长期 bw_score")
-    ax2.set_ylabel("带宽分数")
-    ax2.set_xlabel("实验时间 (s)")
-    ax2.set_title(r"带宽分数")
+        ax2.plot(i5_t, data["i5_st_bw"], color="green", label="Short-term bw_score")
+        ax2.plot(i5_t, data["i5_lt_bw"], color="darkgreen", ls="--", label="Long-term bw_score")
+    ax2.set_ylabel("Bandwidth score")
+    ax2.set_xlabel("Experiment time (s)")
+    ax2.set_title(r"Bandwidth Score")
     shade_iperf_window(ax2, iperf_start, iperf_duration)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
@@ -170,10 +183,10 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax3 = fig.add_subplot(gs[2, 0])
     if len(i5_t):
         ax3.step(i5_t, data["i5_failures"], color="red", where="post", lw=2.6)
-        ax3.axhline(3, color="gray", ls=":", lw=2, label="快速探测阈值")
-    ax3.set_ylabel("连续失败次数")
-    ax3.set_xlabel("实验时间 (s)")
-    ax3.set_title("探测失败计数")
+        ax3.axhline(3, color="gray", ls=":", lw=2, label="Fast-probe threshold")
+    ax3.set_ylabel("Consecutive failures")
+    ax3.set_xlabel("Experiment time (s)")
+    ax3.set_title("Probe Failure Count")
     shade_iperf_window(ax3, iperf_start, iperf_duration)
     ax3.legend()
     ax3.grid(True, alpha=0.3)
@@ -192,10 +205,11 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
                             label=status_labels.get(prev_status, "?"))
                 seg_start = t
                 prev_status = s
-    ax4.set_ylabel("链路状态")
-    ax4.set_xlabel("实验时间 (s)")
-    ax4.set_title("链路状态时间线")
+    ax4.set_ylabel("Link status")
+    ax4.set_xlabel("Experiment time (s)")
+    ax4.set_title("Link Status Timeline")
     ax4.set_yticks([])
+    shade_iperf_window(ax4, iperf_start, iperf_duration)
     handles, labels = ax4.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax4.legend(by_label.values(), by_label.keys())

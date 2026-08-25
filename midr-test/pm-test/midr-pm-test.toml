@@ -6,12 +6,12 @@ mode = "Isolated"
 left_veth_count = 1
 right_veth_count = 1
 
-# HTTP API for runtime link condition changes (§6.2 of testing guide)
+# HTTP API for runtime link condition changes.
 [http]
 enable = true
 port = 8086
 
-# ── Uplink cells (ns-left → ns-right) ─────────────────────────────────────────
+# Uplink cells (ns-left to ns-right).
 [cells.up_bw]
 type = "Bw"
 bw_type = "NetworkLayer"
@@ -29,7 +29,7 @@ delay = "20ms"
 type = "Loss"
 pattern = [0.05]
 
-# ── Downlink cells (ns-right → ns-left) ───────────────────────────────────────
+# Downlink cells (ns-right to ns-left).
 [cells.dn_bw]
 type = "Bw"
 bw_type = "NetworkLayer"
@@ -47,7 +47,7 @@ delay = "20ms"
 type = "Loss"
 pattern = [0.05]
 
-# ── Wiring: uplink left→right, downlink right→left ─────────────────────────────
+# Wire the uplink left-to-right and the downlink right-to-left.
 [links]
 left     = "up_bw"
 up_bw    = "up_delay"
@@ -59,7 +59,7 @@ dn_loss  = "dn_delay"
 dn_delay = "dn_bw"
 dn_bw    = "left"
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+# Namespace commands.
 [commands]
 left  = ["bash", "start-node-a.sh"]
 right = ["bash", "start-node-b.sh"]
