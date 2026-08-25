@@ -136,10 +136,23 @@ def main():
     link_elapsed, link_data = aggregate(
         rows, LINK_NODES, ("link_reported", "owned"))
     link_minutes = link_elapsed / 60.0
-    draw_line(link_ax, link_minutes, link_data["link_reported"],
-              "Locally reported links", "#6a3d9a", "o")
-    draw_line(link_ax, link_minutes, link_data["owned"],
-              "Group2-owned links", "#33a02c", "s")
+    exact_match = np.allclose(link_data["link_reported"], link_data["owned"],
+                              equal_nan=True)
+    if exact_match:
+        draw_line(link_ax, link_minutes, link_data["link_reported"],
+                  "Reported = Group2-owned", "#238b45", "o")
+        valid = link_data["link_reported"][~np.isnan(link_data["link_reported"])]
+        if valid.size:
+            link_ax.text(0.97, 0.10, f"Final account: {int(valid[-1])} = {int(valid[-1])}",
+                         transform=link_ax.transAxes, ha="right", va="bottom",
+                         fontsize=21, color="#176b38", fontweight="bold",
+                         bbox={"boxstyle": "round,pad=0.35", "facecolor": "#d8f3dc",
+                               "edgecolor": "#238b45"})
+    else:
+        draw_line(link_ax, link_minutes, link_data["link_reported"],
+                  "Locally reported links", "#6a3d9a", "o")
+        draw_line(link_ax, link_minutes, link_data["owned"],
+                  "Group2-owned links", "#33a02c", "s")
     link_ax.set_title("Link-account convergence (r1, m1a, m1b)",
                       fontweight="bold")
     link_ax.set_xlabel("Elapsed time (minutes)")

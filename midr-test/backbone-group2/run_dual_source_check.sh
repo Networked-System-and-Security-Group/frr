@@ -16,6 +16,7 @@ fail() { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 nosam() { echo "  ⚠ 没造出场景：$1"; NOSAM=$((NOSAM+1)); }
 
 C=clab-midr-backbone
+HEALTH_LOG=${GROUP2_HEALTH_LOG:-}
 v() { docker exec $1 vtysh -c "$2" 2>/dev/null; }
 g2() { v $1 "show midr group2"; }
 # 取 show midr group2 里某个数字字段
@@ -175,8 +176,22 @@ SUPPRESS=$(for c in $C-z1 $C-z2; do
                docker exec $c grep -c "尚未入群（群号 0），node 上报抑制" \
                    /etc/frr/logs/frr.log 2>/dev/null || echo 0
            done | awk '{s+=$1} END {print s+0}')
+SAMPLED=0
+if [ -f "$HEALTH_LOG" ]; then
+    for node in z1 z2; do
+        if awk -F, -v node="$node" '
+            NR > 1 && $2 == node && $3 == 0 && $7 == 0 { zero_window = 1 }
+            NR > 1 && $2 == node && zero_window && $3 == 1 && $7 > 0 { joined = 1 }
+            END { exit joined ? 0 : 1 }
+        ' "$HEALTH_LOG"; then
+            SAMPLED=$((SAMPLED+1))
+        fi
+    done
+fi
 if [ "$JOINED" -eq 2 ] && [ "$SUPPRESS" -gt 0 ]; then
     pass "判据G8：z1/z2 均已入群，且窗口期上报确被守卫抑制（$SUPPRESS 次）"
+elif [ "$JOINED" -eq 2 ] && [ "$SAMPLED" -eq 2 ]; then
+    pass "判据G8：z1/z2 均经历群号 0 上报抑制窗口，随后成功入群并上报"
 elif [ "$JOINED" -eq 2 ]; then
     nosam "z1/z2 均已入群，但抑制日志取不到（debug 未开），窗口存在性无法反证"
 else

@@ -8,6 +8,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TOPOLOGY="$SCRIPT_DIR/midr-backbone.clab.yaml"
 CHECK_SCRIPT="$REPO_ROOT/midr-test/backbone-group2/run_dual_source_check.sh"
 PYTHON_BIN="${MIDR_PYTHON_BIN:-${CONDA_PREFIX:-}/bin/python}"
+OUTPUT_UID="${SUDO_UID:-$(stat -c %u "$REPO_ROOT")}"
+OUTPUT_GID="${SUDO_GID:-$(stat -c %g "$REPO_ROOT")}"
 BASE_TIMEOUT=360
 JOIN_TIMEOUT=420
 PHASE=group2
@@ -115,8 +117,23 @@ stop_all() {
     local node
     echo "[backbone] Stopping all FRR daemons..."
     for node in "${REVERSE_NODES[@]}"; do
+        if container_exists "$node"; then
+            timeout 5s docker exec -u root "$PREFIX-$node" \
+                pkill -STOP -x bgpd >/dev/null 2>&1 || true
+        fi
+    done
+    for node in "${REVERSE_NODES[@]}"; do
         force_stop_node "$node"
     done
+}
+
+restore_host_permissions() {
+    find "$SCRIPT_DIR/configs-backbone" -name frr.conf -exec \
+        chown "$OUTPUT_UID:$OUTPUT_GID" {} + 2>/dev/null || true
+    find "$SCRIPT_DIR/configs-backbone" -name frr.conf -exec \
+        chmod 0644 {} + 2>/dev/null || true
+    chown -R "$OUTPUT_UID:$OUTPUT_GID" "$SCRIPT_DIR/logs-backbone" \
+        2>/dev/null || true
 }
 
 stop_sampler() {
@@ -134,6 +151,7 @@ cleanup() {
     if [[ "$STARTED" -eq 1 ]]; then
         stop_all
     fi
+    restore_host_permissions
     if [[ -s "$SCRIPT_DIR/group2_health.log" && \
           ! -f "$SCRIPT_DIR/group2_results.png" ]]; then
         MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" \
@@ -144,6 +162,10 @@ cleanup() {
     fi
     chmod -R a+rX "$SCRIPT_DIR/logs-backbone" 2>/dev/null || true
     chmod a+r "$SCRIPT_DIR/run-group2.log" \
+        "$SCRIPT_DIR/group2_check.log" \
+        "$SCRIPT_DIR/group2_health.log" \
+        "$SCRIPT_DIR/group2_results.png" 2>/dev/null || true
+    chown "$OUTPUT_UID:$OUTPUT_GID" "$SCRIPT_DIR/run-group2.log" \
         "$SCRIPT_DIR/group2_check.log" \
         "$SCRIPT_DIR/group2_health.log" \
         "$SCRIPT_DIR/group2_results.png" 2>/dev/null || true
@@ -198,6 +220,9 @@ for node in "${NODES[@]}"; do
     docker exec -u root "$container" sh -c \
         'ln -sf libunwind.so.8.0.1 /lib/x86_64-linux-gnu/libunwind.so.8
          ln -sf libyang.so.2.41.0 /lib/x86_64-linux-gnu/libyang.so.2
+         touch /etc/frr/vtysh.conf
+         chown frr:frr /etc/frr/vtysh.conf
+         chmod 0640 /etc/frr/vtysh.conf
          ldconfig' >/dev/null
     for daemon in zebra bgpd staticd mgmtd watchfrr; do
         docker cp "$REPO_ROOT/$daemon/.libs/$daemon" \
@@ -218,7 +243,7 @@ number_or_missing() {
 }
 
 sample_once() {
-    local elapsed node output node_reported node_pending link_reported owned
+    local elapsed node output node_reported node_pending link_reported owned group
     elapsed=$(( $(date +%s) - SAMPLE_START ))
     for node in "${MEMBERS[@]}"; do
         output="$(vty "$node" 'show midr group2' || true)"
@@ -226,12 +251,14 @@ sample_once() {
         node_pending="$(sed -n 's/.*node.*pending=\([0-9][0-9]*\).*/\1/p' <<<"$output" | head -1)"
         link_reported="$(sed -n 's/.*link.*reported \([0-9][0-9]*\).*/\1/p' <<<"$output" | head -1)"
         owned="$(vty "$node" 'show midr owned' 2>/dev/null | sed -n 's/^[[:space:]]*links:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1 || true)"
-        printf '%s,%s,%s,%s,%s,%s\n' \
+        group="$(vty "$node" 'show midr self' 2>/dev/null | awk -F: '/^Group-ID/{gsub(/[[:space:]]/,"",$2); print $2}' || true)"
+        printf '%s,%s,%s,%s,%s,%s,%s\n' \
             "$elapsed" "$node" \
             "$(number_or_missing "$node_reported")" \
             "$(number_or_missing "$node_pending")" \
             "$(number_or_missing "$link_reported")" \
-            "$(number_or_missing "$owned")" >> group2_health.log
+            "$(number_or_missing "$owned")" \
+            "$(number_or_missing "$group")" >> group2_health.log
     done
 }
 
@@ -242,7 +269,7 @@ sample_loop() {
     done
 }
 
-echo 'elapsed,node,node_reported,node_pending,link_reported,owned_links' \
+echo 'elapsed,node,node_reported,node_pending,link_reported,owned_links,group_id' \
     > group2_health.log
 : > group2_check.log
 SAMPLE_START=$(date +%s)
@@ -338,7 +365,8 @@ sample_once
 stop_sampler
 echo "[backbone] Running G1-G8 integration criteria..."
 set +e
-bash "$CHECK_SCRIPT" | tee group2_check.log
+GROUP2_HEALTH_LOG="$SCRIPT_DIR/group2_health.log" \
+    bash "$CHECK_SCRIPT" | tee group2_check.log
 check_rc=${PIPESTATUS[0]}
 set -e
 
