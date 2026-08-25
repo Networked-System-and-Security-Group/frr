@@ -97,3 +97,5 @@ fi
 
 echo ""
 echo "Logs are in: $LOGDIR/"
+
+exit "$FAILED"

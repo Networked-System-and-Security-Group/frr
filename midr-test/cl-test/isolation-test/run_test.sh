@@ -45,6 +45,15 @@ REJOIN_TIMEOUT=30
 FALLBACK_TIMEOUT=150
 DO_SETUP=1
 
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run this test with sudo: sudo ./run_test.sh" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" ]]; then
+    echo "Missing bgpd binary: $BGPD" >&2
+    exit 2
+fi
+
 cd "$TESTDIR"
 
 for arg in "$@"; do
@@ -54,7 +63,14 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[iso-run_test] Interrupted."; exit 1' INT TERM
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo "[iso-run_test] Interrupted."; exit 130' INT TERM
 
 echo "[iso-run_test] Checking for stale bgpd instances from a previous run..."
 shopt -s nullglob
@@ -75,6 +91,8 @@ if [[ "$DO_SETUP" -eq 1 ]]; then
 fi
 
 mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/logs"/*.log "$TESTDIR/logs/.kill_marker" \
+    "$TESTDIR/isolation_results.png"
 rm -rf /tmp/midr-iso-vty && mkdir -p /tmp/midr-iso-vty
 
 start_node() {
@@ -160,19 +178,19 @@ wait_rep_directory() {
 
 echo "[iso-run_test] Starting a (bootstrap)..."
 start_node a
-wait_bootstrap_ready a || true
+wait_bootstrap_ready a
 
 echo "[iso-run_test] Starting d and e (singleton reps)..."
 start_node d
 start_node e
-wait_rep_directory a 2 || true
+wait_rep_directory a 2
 
 echo "[iso-run_test] Starting f (join flow begins automatically)..."
 start_node f
 sleep 2  # let the log file get created before we start tailing it from line 1
 
-wait_for_log "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" 1 || true
-wait_for_log "MIDR I-7：ANCHOR " 30 "ANCHOR" 1 || true
+wait_for_log "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" 1
+wait_for_log "MIDR I-7：ANCHOR " 30 "ANCHOR" 1
 
 echo "[iso-run_test] Waiting 5s for sessions to settle before killing d and e..."
 sleep 5
@@ -199,4 +217,16 @@ wait_for_log "CREATE 新群" "$FALLBACK_TIMEOUT" "fallback CREATE (d/e both dead
 chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
 
 echo ""
-bash "$TESTDIR/check_result.sh"
+result_rc=0
+bash "$TESTDIR/check_result.sh" || result_rc=$?
+
+plot_rc=0
+mkdir -p /tmp/midr-matplotlib
+MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_isolation.py" \
+    "$TESTDIR/logs/bgpd-f.log" --since-line "$kill_marker" \
+    --output "$TESTDIR/isolation_results.png" || plot_rc=$?
+chmod a+r "$TESTDIR/isolation_results.png" 2>/dev/null || true
+
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+    exit 1
+fi
