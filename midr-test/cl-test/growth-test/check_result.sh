@@ -10,7 +10,9 @@ echo ""
 
 FAILED=0
 
+expected=0
 for node in j1 j2 j3; do
+    expected=$((expected + 1))
     log="$LOGDIR/bgpd-${node}.log"
     echo "--- $node ---"
     if [[ ! -f "$log" ]]; then
@@ -22,8 +24,14 @@ for node in j1 j2 j3; do
     join_line=$(grep "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$log" 2>/dev/null | tail -1 || true)
     create_line=$(grep "MIDR CL:.*CREATE 新群" "$log" 2>/dev/null | tail -1 || true)
 
-    if [[ -n "$join_line" ]]; then
+    expected_text="JOIN 群 1（${expected}/${expected} 条好链路，认识 ${expected} 个成员）"
+    if [[ -n "$join_line" && "$join_line" == *"$expected_text"* ]]; then
         echo "  PASS: $join_line"
+    elif [[ -n "$join_line" ]]; then
+        echo "  FAIL: $node JOIN evidence does not match the expected group/count progression"
+        echo "        expected: $expected_text"
+        echo "        observed: $join_line"
+        FAILED=1
     elif [[ -n "$create_line" ]]; then
         # 别直接归咎阈值封顶：拿不到代表目录同样走 CREATE，且更常见。
         # 先看 create_line 是哪一种——"无可用群代表"= 目录空，与阈值无关。

@@ -28,6 +28,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
+VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
 # 合栈（对接轮 4）后必需：第二组给 lib/libfrr.c 加了新符号（frr_daemon_state_load_status
 # 等），而宿主系统装的是旧 libfrr —— 不指过去，bgpd 起来就 `undefined symbol` 直接死，
 # 而脚本会因为 grep 到上一轮的旧日志报出**假阳性通过**。clab 容器那边是整套换过产物才没事。
@@ -35,13 +36,30 @@ export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for each joiner's JOIN decision
 DO_SETUP=1
+PYTHON_BIN="${MIDR_PYTHON_BIN:-python3}"
+declare -A BG_PIDS=()
+declare -A EXPECTED_STOPS=()
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this test with sudo: sudo ./run_test.sh" >&2
     exit 2
 fi
-if [[ ! -x "$BGPD" ]]; then
-    echo "Missing bgpd binary: $BGPD" >&2
+for binary in "$BGPD" "$VTYSH"; do
+    if [[ ! -x "$binary" ]]; then
+        echo "Missing executable: $binary" >&2
+        exit 2
+    fi
+done
+for command_name in ip tc tee "$PYTHON_BIN"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Missing command: $command_name" >&2
+        exit 2
+    fi
+done
+mkdir -p /tmp/midr-matplotlib
+if ! MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" -c \
+    'import matplotlib, numpy' >/dev/null 2>&1; then
+    echo "Missing Python packages: matplotlib and numpy are required." >&2
     exit 2
 fi
 
@@ -57,11 +75,54 @@ done
 cleanup() {
     local rc=$?
     trap - EXIT
+    for node in "${!BG_PIDS[@]}"; do
+        EXPECTED_STOPS[$node]=1
+    done
     bash "$TESTDIR/teardown.sh" || true
+    wait_for_nodes || true
+    chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    chmod a+r "$TESTDIR/run.log" "$TESTDIR/growth_results.png" \
+        2>/dev/null || true
     exit "$rc"
 }
 trap cleanup EXIT
 trap 'echo "[growth-run_test] Interrupted."; exit 130' INT TERM
+
+rm -f "$TESTDIR/run.log"
+exec > >(tee "$TESTDIR/run.log") 2>&1
+
+wait_for_nodes() {
+    local failed=0 node rc
+    for node in "${!BG_PIDS[@]}"; do
+        if wait "${BG_PIDS[$node]}"; then
+            continue
+        else
+            rc=$?
+            if [[ "${EXPECTED_STOPS[$node]:-0}" -eq 1 && \
+                  ( "$rc" -eq 137 || "$rc" -eq 143 ) ]]; then
+                continue
+            fi
+            echo "[growth-run_test] $node exited abnormally (status $rc)." >&2
+            failed=1
+        fi
+    done
+    BG_PIDS=()
+    EXPECTED_STOPS=()
+    return "$failed"
+}
+
+stop_nodes() {
+    local failed=0 node
+    for node in "${!BG_PIDS[@]}"; do
+        EXPECTED_STOPS[$node]=1
+    done
+    bash "$TESTDIR/teardown.sh" || failed=1
+    wait_for_nodes || failed=1
+    return "$failed"
+}
+
+mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/logs"/*.log "$TESTDIR/growth_results.png"
 
 echo "[growth-run_test] Checking for stale bgpd instances from a previous run..."
 shopt -s nullglob
@@ -77,13 +138,14 @@ shopt -u nullglob
 sleep 1
 
 if [[ "$DO_SETUP" -eq 1 ]]; then
+    echo "[growth-run_test] Removing stale growth-test processes and namespaces..."
+    bash "$TESTDIR/teardown.sh"
     echo "[growth-run_test] Setting up network namespaces..."
     bash "$TESTDIR/setup.sh"
 fi
 
-mkdir -p "$TESTDIR/logs"
-rm -f "$TESTDIR/logs"/*.log "$TESTDIR/growth_results.png"
 rm -rf /tmp/midr-gr-vty && mkdir -p /tmp/midr-gr-vty
+rm -rf /tmp/midr-gr-state && mkdir -p /tmp/midr-gr-state
 
 start_node() {
     local node="$1"
@@ -92,8 +154,10 @@ start_node() {
         -f "$TESTDIR/configs/bgpd-${node}.conf" \
         -Z -S \
         -i "/tmp/bgpd-gr-${node}.pid" \
+        --db_file "/tmp/midr-gr-state/bgpd-${node}.db" \
         --vty_socket "/tmp/midr-gr-vty/$node" \
         --log-level debug &
+    BG_PIDS[$node]="$!"
     echo "  started bgpd for $node (bg pid $!)"
 }
 
@@ -143,7 +207,7 @@ wait_rep_directory() {
     local node="$1" want="$2" timeout=90 elapsed=0 got=0
     echo "[growth-run_test] Waiting for $node's rep directory to list $want rep(s)..."
     while [[ $elapsed -lt $timeout ]]; do
-        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-gr-vty/$node" \
+        got=$("$VTYSH" --vty_socket "/tmp/midr-gr-vty/$node" \
                   -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
         if [[ "$got" -ge "$want" ]]; then
             echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
@@ -163,7 +227,7 @@ wait_group_members() {
     local node="$1" gid="$2" want="$3" timeout=90 elapsed=0 got=0
     echo "[growth-run_test] Waiting for $node to know $want group-$gid member(s)..."
     while [[ $elapsed -lt $timeout ]]; do
-        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-gr-vty/$node" \
+        got=$("$VTYSH" --vty_socket "/tmp/midr-gr-vty/$node" \
                   -c 'show midr nodes' 2>/dev/null \
                   | awk -v g="$gid" '$1 ~ /^10\.0\./ && $4 == g' | wc -l)
         if [[ "$got" -ge "$want" ]]; then
@@ -204,6 +268,7 @@ wait_group_members r 1 3
 echo "[growth-run_test] Starting j3 (group 1 should now have 3 known members: r, j1, j2)..."
 start_node j3
 wait_for_join j3
+wait_group_members r 1 4
 
 # Logs were written as root; open them up so a non-root reader can inspect
 # results afterward without an extra manual chmod step.
@@ -213,12 +278,18 @@ echo ""
 result_rc=0
 bash "$TESTDIR/check_result.sh" || result_rc=$?
 
+echo "[growth-run_test] Stopping growth-test processes before plotting..."
+shutdown_rc=0
+stop_nodes || shutdown_rc=1
+trap - EXIT
+
 plot_rc=0
 mkdir -p /tmp/midr-matplotlib
-MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_growth.py" \
+MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$TESTDIR/plot_growth.py" \
     --log-dir "$TESTDIR/logs" --output "$TESTDIR/growth_results.png" || plot_rc=$?
 chmod a+r "$TESTDIR/growth_results.png" 2>/dev/null || true
+chmod a+r "$TESTDIR/run.log" 2>/dev/null || true
 
-if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 || "$shutdown_rc" -ne 0 ]]; then
     exit 1
 fi

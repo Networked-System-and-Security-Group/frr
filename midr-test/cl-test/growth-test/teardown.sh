@@ -2,7 +2,7 @@
 # teardown.sh — Kill bgpd processes and remove growth-test namespaces.
 set -e
 
-NODES=(b r j1 j2 j3)
+NODES=(j3 j2 j1 r b)
 
 echo "[growth-teardown] Killing bgpd instances..."
 for node in "${NODES[@]}"; do
@@ -37,4 +37,5 @@ done
 ip netns del ns-gr-hub 2>/dev/null || true
 
 rm -rf /tmp/midr-gr-vty
+rm -rf /tmp/midr-gr-state
 echo "[growth-teardown] Done. (logs left in place — remove logs/*.log manually if desired)"
