@@ -11,6 +11,5 @@ links:
     local_address: 10.0.12.1
     remote_address: 2001:db8:12::2
     cost: 10
-    available_bandwidth_kbps: 1000
 node_prefixes: []
 prefix_groups: []

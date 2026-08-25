@@ -15,7 +15,6 @@ links:
     local_address: 2001:db8:13::1
     remote_address: 2001:db8:13::3
     cost: 50
-    available_bandwidth_kbps: 70000
     local_ifindex: 10
   - local: 2.2.2.2
     remote: 4.4.4.4
@@ -23,14 +22,12 @@ links:
     local_address: 10.0.24.2
     remote_address: 10.0.24.4
     cost: 20
-    available_bandwidth_kbps: 60000
   - local: 1.1.1.1
     remote: 4.4.4.4
     link_id: 102
     local_address: 10.0.14.1
     remote_address: 10.0.14.4
     cost: 30
-    available_bandwidth_kbps: 65000
     local_ifindex: 11
 
 node_prefixes: []

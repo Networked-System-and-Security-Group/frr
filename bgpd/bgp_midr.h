@@ -126,7 +126,7 @@ struct midr_remote_link_info {
 	struct midr_link_key key;
 	struct ipaddr link_local_address;
 	struct ipaddr link_remote_address;
-	struct midr_link_metrics metrics;
+	uint32_t canonical_cost;
 	uint64_t policy_tags;
 	uint64_t ls_sequence;
 };

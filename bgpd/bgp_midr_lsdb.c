@@ -15,7 +15,6 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_attr.h"
-#include "bgpd/bgp_midr_cost.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_prefix.h"
@@ -439,17 +438,14 @@ static void midr_lsdb_derive_entry(struct hash_bucket *bucket, void *arg)
 		else if (!remote_membership)
 			entry->pending_reason =
 				MIDR_LSDB_PENDING_REMOTE_MEMBERSHIP;
-		else if (midr_cost_from_metrics(
-				 &entry->object.payload.link.metrics,
-				 &entry->canonical_cost) != 0)
-			entry->pending_reason =
-				MIDR_LSDB_PENDING_REMOTE_MEMBERSHIP;
 		else {
 			uint32_t local_group =
 				local_membership->object.payload.membership.group_id;
 			uint32_t remote_group =
 				remote_membership->object.payload.membership.group_id;
 
+			entry->canonical_cost =
+				entry->object.payload.link.canonical_cost;
 			if (local_group == remote_group) {
 				entry->scope = MIDR_LSDB_SCOPE_INTRA_GROUP;
 				entry->scope_group_id = local_group;
@@ -600,9 +596,6 @@ static void midr_lsdb_add_ted_entry(struct hash_bucket *bucket, void *arg)
 				entry->object.key.u.link.remote_node_id,
 			.link_id = entry->object.key.u.link.link_id,
 			.canonical_cost = entry->canonical_cost,
-			.available_bandwidth_kbps =
-				entry->object.payload.link.metrics
-					.available_bandwidth_kbps,
 			.policy_tags = entry->object.policy_tags,
 			.link_local_address =
 				entry->object.payload.link
@@ -962,23 +955,8 @@ static void midr_lsdb_remote_update_iter(struct hash_bucket *bucket,
 			.link_remote_address =
 				entry->object.payload.link
 					.link_remote_address,
-			.metrics =
-				{
-					.has_rtt_us = true,
-					.rtt_us =
-						entry->object.payload.link
-							.metrics.rtt_us,
-					.has_loss_ppm = true,
-					.loss_ppm =
-						entry->object.payload.link
-							.metrics.loss_ppm,
-					.has_available_bandwidth_kbps =
-						true,
-					.available_bandwidth_kbps =
-						entry->object.payload.link
-							.metrics
-							.available_bandwidth_kbps,
-				},
+			.canonical_cost =
+				entry->object.payload.link.canonical_cost,
 			.policy_tags = entry->object.policy_tags,
 			.ls_sequence = entry->object.ls_sequence,
 		};
@@ -1255,25 +1233,9 @@ static void midr_lsdb_remote_fill_iter(struct hash_bucket *bucket,
 				.link_remote_address =
 					entry->object.payload.link
 						.link_remote_address,
-				.metrics =
-					{
-						.has_rtt_us = true,
-						.rtt_us =
-							entry->object.payload
-								.link.metrics
-								.rtt_us,
-						.has_loss_ppm = true,
-						.loss_ppm =
-							entry->object.payload
-								.link.metrics
-								.loss_ppm,
-						.has_available_bandwidth_kbps =
-							true,
-						.available_bandwidth_kbps =
-							entry->object.payload
-								.link.metrics
-								.available_bandwidth_kbps,
-					},
+				.canonical_cost =
+					entry->object.payload.link
+						.canonical_cost,
 				.policy_tags = entry->object.policy_tags,
 				.ls_sequence = entry->object.ls_sequence,
 			};

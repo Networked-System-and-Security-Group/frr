@@ -172,23 +172,15 @@ static struct midr_ls_object remote_link(uint64_t sequence)
 					},
 			},
 		.ls_sequence = sequence,
-		.payload.link =
-			{
-				.link_local_address =
-					ip_address("198.51.100.2"),
-				.link_remote_address =
-					ip_address("198.51.100.1"),
-				.metrics =
-					{
-						.present_flags =
-							MIDR_METRIC_REQUIRED_MASK,
-						.rtt_us = 1200,
-						.loss_ppm = 200,
-						.available_bandwidth_kbps =
-							90000,
-					},
-			},
-	};
+			.payload.link =
+				{
+					.link_local_address =
+						ip_address("198.51.100.2"),
+					.link_remote_address =
+						ip_address("198.51.100.1"),
+					.canonical_cost = 65,
+				},
+		};
 }
 
 static struct midr_ls_object remote_node_prefix(uint64_t sequence)
@@ -318,7 +310,6 @@ static void assert_link_same(const struct midr_ted_link *left, const struct midr
 	assert(left->remote_group_id == right->remote_group_id);
 	assert(left->link_id == right->link_id);
 	assert(left->canonical_cost == right->canonical_cost);
-	assert(left->available_bandwidth_kbps == right->available_bandwidth_kbps);
 	assert(left->policy_tags == right->policy_tags);
 	assert(ipaddr_cmp(&left->link_local_address, &right->link_local_address) == 0);
 	assert(ipaddr_cmp(&left->link_remote_address, &right->link_remote_address) == 0);
@@ -330,21 +321,20 @@ static void assert_mock_matches_real(const struct midr_ted_snapshot *real,
 {
 	char path[] = "/tmp/midr-m4-mock-XXXXXX";
 	char error[256];
-	struct midr_ls_metrics local_metrics = {
-		.present_flags = MIDR_METRIC_REQUIRED_MASK,
+	struct midr_link_metrics local_metrics = {
+		.has_rtt_us = true,
 		.rtt_us = 1000,
+		.has_loss_ppm = true,
 		.loss_ppm = 100,
+		.has_available_bandwidth_kbps = true,
 		.available_bandwidth_kbps = 100000,
 	};
 	const struct midr_ted_snapshot *mock = NULL;
 	FILE *file;
 	uint32_t local_cost;
-	uint32_t remote_cost;
 	int fd;
 
 	assert(midr_cost_from_metrics(&local_metrics, &local_cost) == 0);
-	assert(midr_cost_from_metrics(&remote_link_object->payload.link.metrics, &remote_cost) ==
-	       0);
 	fd = mkstemp(path);
 	assert(fd >= 0);
 	file = fdopen(fd, "w");
@@ -360,25 +350,24 @@ static void assert_mock_matches_real(const struct midr_ted_snapshot *real,
 		       "{\"node_id\":\"10.0.0.2\",\"group_id\":20,"
 		       "\"cap_flags\":0,\"policy_tags\":0}],"
 		       "\"links\":["
-		       "{\"local\":\"10.0.0.1\",\"remote\":\"10.0.0.2\","
-		       "\"link_id\":1,\"local_address\":\"198.51.100.1\","
-		       "\"remote_address\":\"198.51.100.2\",\"cost\":%u,"
-		       "\"available_bandwidth_kbps\":100000,"
-		       "\"local_ifindex\":9,\"policy_tags\":0},"
-		       "{\"local\":\"10.0.0.2\",\"remote\":\"10.0.0.1\","
-		       "\"link_id\":2,\"local_address\":\"198.51.100.2\","
-		       "\"remote_address\":\"198.51.100.1\",\"cost\":%u,"
-		       "\"available_bandwidth_kbps\":90000,"
-		       "\"local_ifindex\":0,\"policy_tags\":0}],"
+			       "{\"local\":\"10.0.0.1\",\"remote\":\"10.0.0.2\","
+			       "\"link_id\":1,\"local_address\":\"198.51.100.1\","
+			       "\"remote_address\":\"198.51.100.2\",\"cost\":%u,"
+			       "\"local_ifindex\":9,\"policy_tags\":0},"
+			       "{\"local\":\"10.0.0.2\",\"remote\":\"10.0.0.1\","
+			       "\"link_id\":2,\"local_address\":\"198.51.100.2\","
+			       "\"remote_address\":\"198.51.100.1\",\"cost\":%u,"
+			       "\"local_ifindex\":0,\"policy_tags\":0}],"
 		       "\"node_prefixes\":["
 		       "{\"prefix\":\"192.0.2.0/24\","
 		       "\"node_id\":\"10.0.0.1\"},"
 		       "{\"prefix\":\"203.0.113.0/24\","
 		       "\"node_id\":\"10.0.0.2\"}],"
-		       "\"prefix_groups\":["
-		       "{\"prefix\":\"198.18.0.0/15\",\"group_id\":20}]"
-		       "}",
-		       local_cost, remote_cost) > 0);
+			       "\"prefix_groups\":["
+			       "{\"prefix\":\"198.18.0.0/15\",\"group_id\":20}]"
+			       "}",
+			       local_cost,
+			       remote_link_object->payload.link.canonical_cost) > 0);
 	assert(fclose(file) == 0);
 	assert(midr_ted_mock_provider_publish_file(ctx, path, error, sizeof(error)) == 0);
 	assert(unlink(path) == 0);

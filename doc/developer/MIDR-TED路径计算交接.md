@@ -25,7 +25,7 @@
 
 `group_edges(G1,G2)` 与 `group_edges(G2,G1)` 是两个独立条目，各自取该方向所有 usable inter-group Link 的最小 `canonical_cost`。Link 不自动生成反向边。
 
-`local_ifindex` 只对本节点 originate 的 Link 有本地意义；远端 Link 为 `0`。Router-ID 保持 FRR 网络字节序，group、link、cost 和 count 为主机字节序。
+每条 Link 直接携带 owner 已计算的 `canonical_cost`，路径计算侧不读取或重新计算 RTT、loss、bandwidth。`local_ifindex` 只对本节点 originate 的 Link 有本地意义；远端 Link 为 `0`。Router-ID 保持 FRR 网络字节序，group、link、cost 和 count 为主机字节序。
 
 ## 3. 获取与释放
 
@@ -89,7 +89,7 @@ Callback 只通知 generation 和变化分类，不借出 snapshot，也不应�
 
 群内 SPF 使用 `nodes` 和 `intra_links`。到其他 group 的下一跳候选来自 `egress_links`；Group-level 计算使用 `group_edges`。目标 Prefix 先通过 `prefix_groups` 得到一个或多个目标 group，再根据目标 group 和 `node_prefixes` 选择相应层级的计算过程。
 
-传播侧不提供 SPF、不调度计算、不安装路由，也不发送 ZAPI。路径计算侧未来安装的所有 MIDR 路由必须标记 `ZEBRA_ROUTE_MIDR`；传播侧 PFX-01 会在 route-map 前硬排除该 provenance，防止计算结果反馈成为新的 Contributor。
+传播侧不提供 SPF、不调度计算、不安装路由，也不发送 ZAPI。路径计算侧未来安装的所有 MIDR 路由必须标记 `ZEBRA_ROUTE_MIDR`，以支持来源显示、管理距离以及后续 route add/delete 匹配；PFX-01 不再按该 route type 设置特殊硬过滤。
 
 ## 6. 可执行参考
 

@@ -17,7 +17,6 @@ struct midr_ted_link_input {
 	uint32_t remote_node_id;
 	uint64_t link_id;
 	uint32_t canonical_cost;
-	uint32_t available_bandwidth_kbps;
 	uint64_t policy_tags;
 	struct ipaddr link_local_address;
 	struct ipaddr link_remote_address;

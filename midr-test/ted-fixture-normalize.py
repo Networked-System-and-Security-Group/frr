@@ -156,7 +156,6 @@ def normalize_links(values, local_node_id, node_ids):
                 "local_address",
                 "remote_address",
                 "cost",
-                "available_bandwidth_kbps",
             },
             {"local_ifindex", "policy_tags"},
             where,
@@ -199,12 +198,6 @@ def normalize_links(values, local_node_id, node_ids):
                 "remote_address": str(remote_address),
                 "cost": parse_int(
                     raw["cost"], 1, UINT32_MAX - 1, f"{where}.cost"
-                ),
-                "available_bandwidth_kbps": parse_int(
-                    raw["available_bandwidth_kbps"],
-                    1,
-                    UINT32_MAX,
-                    f"{where}.available_bandwidth_kbps",
                 ),
                 "local_ifindex": local_ifindex,
                 "policy_tags": parse_int(

@@ -14,6 +14,7 @@
 #include "routemap.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_prefix.h"
@@ -88,13 +89,31 @@ static struct bgp_dest *prefix_dest(const struct prefix *prefix)
 	return bgp_node_get(bgp->rib[afi][SAFI_UNICAST], prefix);
 }
 
-static struct bgp_path_info path_info(uint8_t type, uint8_t subtype, uint32_t flags)
+static void test_attr_init(struct attr *attr, unsigned int as_path_hops)
 {
-	static struct attr attr;
+	struct aspath *parsed;
+	unsigned int i;
+
+	memset(attr, 0, sizeof(*attr));
+	parsed = aspath_empty_get();
+	assert(parsed);
+	for (i = 0; i < as_path_hops; i++)
+		parsed = aspath_add_seq(parsed, 65100 + i);
+	attr->aspath = aspath_intern(parsed);
+}
+
+static void test_attr_fini(struct attr *attr)
+{
+	aspath_unintern(&attr->aspath);
+}
+
+static struct bgp_path_info path_info(struct attr *attr, uint8_t type, uint8_t subtype,
+				     uint32_t flags)
+{
 
 	return (struct bgp_path_info){
 		.peer = bgp->peer_self,
-		.attr = &attr,
+		.attr = attr,
 		.type = type,
 		.sub_type = subtype,
 		.flags = flags,
@@ -275,12 +294,12 @@ static struct midr_ls_object remote_node_prefix(struct peer *peer, const struct 
 	return object;
 }
 
-static void test_default_deny_and_network(void)
+static void test_optional_policy_and_prefix_lifecycle(void)
 {
 	struct prefix prefix = text_prefix("192.0.2.0/24");
 	struct bgp_dest *dest = prefix_dest(&prefix);
-	struct bgp_path_info path = path_info(ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
-					      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	struct attr attr;
+	struct bgp_path_info path;
 	uint64_t generation;
 	uint64_t group_sequence;
 	uint64_t sequence;
@@ -289,9 +308,13 @@ static void test_default_deny_and_network(void)
 	struct peer *lower_peer;
 	struct peer *higher_peer;
 
+	test_attr_init(&attr, 0);
+	path = path_info(&attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
+			 BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(dest, &path);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_NETWORK, true) == 0);
-	assert(contributor_count() == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_rescan(ctx) == 0);
+	assert(contributor_count() == 1);
 
 	assert(midr_prefix_route_map_set(ctx, AFI_IP, "MISSING") == 0);
 	assert(contributor_count() == 0);
@@ -363,42 +386,54 @@ static void test_default_deny_and_network(void)
 	midr_prefix_route_changed(ctx, AFI_IP, SAFI_UNICAST, dest, &path, &path);
 	assert(contributor_count() == 0);
 
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
 	remove_paths(dest);
+	test_attr_fini(&attr);
 }
 
-static void test_connected_static_and_midr_feedback(void)
+static void test_route_types_and_optional_deny_policy(void)
 {
 	struct prefix connected_prefix = text_prefix("198.51.100.0/24");
 	struct prefix static_prefix = text_prefix("203.0.113.0/24");
 	struct bgp_dest *connected_dest = prefix_dest(&connected_prefix);
 	struct bgp_dest *static_dest = prefix_dest(&static_prefix);
-	struct bgp_path_info connected = path_info(ZEBRA_ROUTE_CONNECT, BGP_ROUTE_REDISTRIBUTE,
-						   BGP_PATH_VALID | BGP_PATH_SELECTED);
-	struct bgp_path_info static_route = path_info(ZEBRA_ROUTE_STATIC, BGP_ROUTE_REDISTRIBUTE,
-						      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	struct attr connected_attr;
+	struct attr static_attr;
+	struct bgp_path_info connected;
+	struct bgp_path_info static_route;
 	struct midr_prefix_status status;
 
+	test_attr_init(&connected_attr, 0);
+	test_attr_init(&static_attr, 0);
+	connected = path_info(&connected_attr, ZEBRA_ROUTE_CONNECT,
+			      BGP_ROUTE_REDISTRIBUTE,
+			      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	static_route = path_info(&static_attr, ZEBRA_ROUTE_STATIC,
+				 BGP_ROUTE_REDISTRIBUTE,
+				 BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(connected_dest, &connected);
 	install_path(static_dest, &static_route);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_NETWORK, false) == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_CONNECTED, true) == 0);
-	assert(contributor_count() == 1);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_STATIC, true) == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_rescan(ctx) == 0);
 	assert(contributor_count() == 2);
 
 	static_route.type = ZEBRA_ROUTE_MIDR;
 	midr_prefix_route_changed(ctx, AFI_IP, SAFI_UNICAST, static_dest, &static_route,
 				  &static_route);
-	assert(contributor_count() == 1);
+	assert(contributor_count() == 2);
 	assert(midr_prefix_status_get(ctx, &status) == 0);
-	assert(status.rejected_midr > 0);
+	assert(status.rejected_as_path == 0);
 
 	create_route_map("DENY-V4", RMAP_DENY);
 	assert(midr_prefix_route_map_set(ctx, AFI_IP, "DENY-V4") == 0);
 	assert(contributor_count() == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(contributor_count() == 2);
 
 	remove_paths(connected_dest);
 	remove_paths(static_dest);
+	test_attr_fini(&connected_attr);
+	test_attr_fini(&static_attr);
 }
 
 static void test_ipv6_and_default_route(void)
@@ -407,48 +442,82 @@ static void test_ipv6_and_default_route(void)
 	struct prefix default_route = text_prefix("0.0.0.0/0");
 	struct bgp_dest *ipv6_dest = prefix_dest(&ipv6);
 	struct bgp_dest *default_dest = prefix_dest(&default_route);
-	struct bgp_path_info ipv6_path = path_info(ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
-						   BGP_PATH_VALID | BGP_PATH_SELECTED);
-	struct bgp_path_info default_path = path_info(ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
-						      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	struct attr ipv6_attr;
+	struct attr default_attr;
+	struct bgp_path_info ipv6_path;
+	struct bgp_path_info default_path;
 
+	test_attr_init(&ipv6_attr, 1);
+	test_attr_init(&default_attr, 1);
+	ipv6_path = path_info(&ipv6_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
+			      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	default_path = path_info(&default_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
+				 BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(ipv6_dest, &ipv6_path);
 	install_path(default_dest, &default_path);
-	create_route_map("PERMIT-V6", RMAP_PERMIT);
-	assert(midr_prefix_route_map_set(ctx, AFI_IP6, "PERMIT-V6") == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP6, MIDR_PREFIX_SOURCE_NETWORK, true) == 0);
-	assert(contributor_count() == 1);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP6) == 0);
+	assert(midr_prefix_rescan(ctx) == 0);
+	assert(contributor_count() == 2);
 
-	assert(midr_prefix_route_map_set(ctx, AFI_IP, "PERMIT-V4") == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_NETWORK, true) == 0);
+	assert(midr_prefix_route_map_set(ctx, AFI_IP, "DENY-V4") == 0);
+	assert(contributor_count() == 1);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
 	assert(contributor_count() == 2);
 
 	remove_paths(ipv6_dest);
 	remove_paths(default_dest);
+	test_attr_fini(&ipv6_attr);
+	test_attr_fini(&default_attr);
 }
 
-static void test_external_peer_source(void)
+static void test_as_path_limit(void)
 {
-	struct prefix prefix = text_prefix("172.16.0.0/12");
-	struct bgp_dest *dest = prefix_dest(&prefix);
-	struct bgp_path_info path = path_info(ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
-					      BGP_PATH_VALID | BGP_PATH_SELECTED);
-	struct peer *peer = peer_create_accept(bgp, NULL);
+	struct prefix one_hop_prefix = text_prefix("172.16.0.0/16");
+	struct prefix two_hop_prefix = text_prefix("172.17.0.0/16");
+	struct bgp_dest *one_hop_dest = prefix_dest(&one_hop_prefix);
+	struct bgp_dest *two_hop_dest = prefix_dest(&two_hop_prefix);
+	struct attr one_hop_attr;
+	struct attr two_hop_attr;
+	struct bgp_path_info one_hop;
+	struct bgp_path_info two_hop;
+	struct midr_prefix_status status;
 
-	assert(peer);
-	peer->remote_id.s_addr = router_id("10.0.0.9");
-	path.peer = peer;
-	install_path(dest, &path);
-	assert(midr_prefix_route_map_set(ctx, AFI_IP, "PERMIT-V4") == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_NETWORK, false) == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_CONNECTED, false) == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_STATIC, false) == 0);
-	assert(contributor_count() == 0);
-	assert(midr_prefix_external_peer_set(ctx, peer, AFI_IP, true) == 0);
+	test_attr_init(&one_hop_attr, 1);
+	test_attr_init(&two_hop_attr, 2);
+	one_hop = path_info(&one_hop_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
+			    BGP_PATH_VALID | BGP_PATH_SELECTED);
+	two_hop = path_info(&two_hop_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
+			    BGP_PATH_VALID | BGP_PATH_SELECTED);
+	install_path(one_hop_dest, &one_hop);
+	install_path(two_hop_dest, &two_hop);
+
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP) == 1);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP6) == 1);
+	assert(midr_prefix_rescan(ctx) == 0);
+	assert(aspath_count_hops(one_hop.attr->aspath) == 1);
+	assert(aspath_count_hops(two_hop.attr->aspath) == 2);
 	assert(contributor_count() == 1);
-	assert(midr_prefix_external_peer_set(ctx, peer, AFI_IP, false) == 0);
-	assert(contributor_count() == 0);
-	remove_paths(dest);
+	assert(midr_prefix_status_get(ctx, &status) == 0);
+	assert(status.rejected_as_path > 0);
+
+	assert(midr_prefix_max_as_path_length_set(ctx, AFI_IP, 2) == 0);
+	assert(contributor_count() == 2);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP) == 2);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP6) == 1);
+
+	assert(midr_prefix_max_as_path_length_set(ctx, AFI_IP6, 3) == 0);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP6) == 3);
+	assert(midr_prefix_max_as_path_length_unset(ctx, AFI_IP) == 0);
+	assert(contributor_count() == 1);
+	assert(midr_prefix_max_as_path_length(ctx, AFI_IP) == 1);
+	assert(midr_prefix_max_as_path_length_unset(ctx, AFI_IP6) == 0);
+
+	remove_paths(one_hop_dest);
+	remove_paths(two_hop_dest);
+	test_attr_fini(&one_hop_attr);
+	test_attr_fini(&two_hop_attr);
 }
 
 static void test_validation_and_lifecycle(void)
@@ -458,11 +527,10 @@ static void test_validation_and_lifecycle(void)
 	assert(midr_prefix_route_map_set(NULL, AFI_IP, "X") == -ENOENT);
 	assert(midr_prefix_route_map_set(ctx, AFI_UNSPEC, "X") == -EINVAL);
 	assert(midr_prefix_route_map_set(ctx, AFI_IP, "") == -EINVAL);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, 0, true) == -EINVAL);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP,
-					    MIDR_PREFIX_SOURCE_NETWORK |
-						    MIDR_PREFIX_SOURCE_CONNECTED,
-					    true) == -EINVAL);
+	assert(midr_prefix_max_as_path_length_set(NULL, AFI_IP, 1) == -ENOENT);
+	assert(midr_prefix_max_as_path_length_set(ctx, AFI_UNSPEC, 1) == -EINVAL);
+	assert(midr_prefix_max_as_path_length_unset(NULL, AFI_IP) == -ENOENT);
+	assert(midr_prefix_max_as_path_length_unset(ctx, AFI_UNSPEC) == -EINVAL);
 	assert(midr_prefix_status_get(ctx, NULL) == -EINVAL);
 	assert(midr_prefix_init(ctx) == -EALREADY);
 	assert(midr_prefix_rescan(ctx) == 0);
@@ -474,14 +542,17 @@ static void test_out_of_sync_and_recovery(void)
 {
 	struct prefix prefix = text_prefix("100.64.0.0/10");
 	struct bgp_dest *dest = prefix_dest(&prefix);
-	struct bgp_path_info path = path_info(ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
-					      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	struct attr attr;
+	struct bgp_path_info path;
 	struct midr_prefix_status prefix_status;
 	struct midr_ted_status ted_status;
 
+	test_attr_init(&attr, 0);
+	path = path_info(&attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
+			 BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(dest, &path);
-	assert(midr_prefix_route_map_set(ctx, AFI_IP, "PERMIT-V4") == 0);
-	assert(midr_prefix_local_source_set(ctx, AFI_IP, MIDR_PREFIX_SOURCE_NETWORK, true) == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_rescan(ctx) == 0);
 	assert(node_prefix_sequence(&prefix) > 0);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_test_process(ctx) == 0);
@@ -507,6 +578,7 @@ static void test_out_of_sync_and_recovery(void)
 
 	remove_paths(dest);
 	assert(midr_prefix_rescan(ctx) == 0);
+	test_attr_fini(&attr);
 }
 
 int main(void)
@@ -538,10 +610,10 @@ int main(void)
 	midr_topology_process_pending(ctx);
 	assert(midr_lsdb_test_process(ctx) == 0);
 
-	test_default_deny_and_network();
-	test_connected_static_and_midr_feedback();
+	test_optional_policy_and_prefix_lifecycle();
+	test_route_types_and_optional_deny_policy();
 	test_ipv6_and_default_route();
-	test_external_peer_source();
+	test_as_path_limit();
 	test_validation_and_lifecycle();
 	test_out_of_sync_and_recovery();
 

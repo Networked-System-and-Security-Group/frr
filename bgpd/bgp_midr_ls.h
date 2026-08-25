@@ -19,12 +19,6 @@
 
 #define MIDR_PROPAGATION_PATH_MAX_NODES 512U
 
-#define MIDR_METRIC_PRESENT_RTT 0x00000001U
-#define MIDR_METRIC_PRESENT_LOSS 0x00000002U
-#define MIDR_METRIC_PRESENT_AVAILABLE_BW 0x00000004U
-#define MIDR_METRIC_REQUIRED_MASK                                                                 \
-	(MIDR_METRIC_PRESENT_RTT | MIDR_METRIC_PRESENT_LOSS | MIDR_METRIC_PRESENT_AVAILABLE_BW)
-
 enum midr_nlri_type {
 	MIDR_NLRI_TYPE_RESERVED = 0,
 	MIDR_NLRI_TYPE_MEMBERSHIP = 1,
@@ -41,7 +35,7 @@ enum midr_ls_tlv_type {
 	MIDR_LS_TLV_CAP_FLAGS = 102,
 	MIDR_LS_TLV_LINK_LOCAL_ADDRESS = 200,
 	MIDR_LS_TLV_LINK_REMOTE_ADDRESS = 201,
-	MIDR_LS_TLV_LINK_METRICS = 202,
+	MIDR_LS_TLV_LINK_CANONICAL_COST = 202,
 };
 
 struct midr_ls_prefix_key {
@@ -66,13 +60,6 @@ struct midr_ls_object_key {
 	} u;
 };
 
-struct midr_ls_metrics {
-	uint32_t present_flags;
-	uint32_t rtt_us;
-	uint32_t loss_ppm;
-	uint32_t available_bandwidth_kbps;
-};
-
 struct midr_ls_membership_payload {
 	uint32_t group_id;
 	bool has_transport_address;
@@ -83,7 +70,7 @@ struct midr_ls_membership_payload {
 struct midr_ls_link_payload {
 	struct ipaddr link_local_address;
 	struct ipaddr link_remote_address;
-	struct midr_ls_metrics metrics;
+	uint32_t canonical_cost;
 };
 
 struct midr_ls_object {
