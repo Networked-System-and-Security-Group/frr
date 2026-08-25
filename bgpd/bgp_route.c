@@ -8029,10 +8029,15 @@ bool bgp_outbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 	 * 【MIDR 改动】MIDR overlay 会话视同已有策略。
 	 *
 	 * RFC 8212 防的是"没配策略就把路由泄露给外部"。MIDR overlay 会话是本项目
-	 * 代码自建的管理面会话：只载 BGP-LS 拓扑情报、不喂转发面（建连整形已撤
-	 * FRR 自动附送的 IPv4 单播，见 midr_nds_ctrl_setup_overlay_peer）、不出本
-	 * 管理域，本就不在这条规矩的射程内；而它们没有、也不该有 frr.conf 里的
-	 * 策略配置（peer 是运行时 peer_create 出来的）。
+	 * 代码自建的管理面会话：只载 MIDR-LS 拓扑情报（件② 起是 (4,9)，此前是
+	 * (4,8) BGP-LS）、不喂转发面（建连整形已撤 FRR 自动附送的 IPv4 单播，见
+	 * midr_nds_ctrl_setup_overlay_peer）、不出本管理域，本就不在这条规矩的
+	 * 射程内；而它们没有、也不该有 frr.conf 里的策略配置（peer 是运行时
+	 * peer_create 出来的）。
+	 *
+	 * ⚠ 判据认的是 peer 上的标记、与地址族无关，所以件② 换族（(4,8)→(4,9)）
+	 * 后照常生效 —— 这也正是当初否掉"程序化建 route-map"那条路的红利：
+	 * route-map 绑在具体 AF 上，换族时还得跟着改一遍。
 	 *
 	 * 取舍与另两条被否的实现路（程序化建 route-map）见
 	 * docs/decisions/midr-8212-overlay-policy.md。

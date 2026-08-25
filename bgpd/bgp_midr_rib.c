@@ -190,12 +190,13 @@ midr_rib_attributes_from_object(const struct midr_ls_object *object,
 		attributes->present |=
 			MIDR_LS_ATTR_HAS_LINK_LOCAL_ADDRESS |
 			MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS |
-			MIDR_LS_ATTR_HAS_LINK_METRICS;
+			MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;
 		attributes->link_local_address =
 			object->payload.link.link_local_address;
 		attributes->link_remote_address =
 			object->payload.link.link_remote_address;
-		attributes->link_metrics = object->payload.link.metrics;
+		attributes->link_canonical_cost =
+			object->payload.link.canonical_cost;
 		break;
 	case MIDR_NLRI_TYPE_NODE_PREFIX:
 	case MIDR_NLRI_TYPE_GROUP_PREFIX:

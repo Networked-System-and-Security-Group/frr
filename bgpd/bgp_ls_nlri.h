@@ -358,12 +358,6 @@ enum bgp_ls_attr_tlv {
 #define BGP_LS_MAX_LINK_NAME_LEN 255	/* Maximum link name length */
 #define BGP_LS_MAX_SRV6_SIDS	 256	/* Maximum SRv6 SIDs per TLV type */
 
-/* MIDR capability bits */
-#define MIDR_CAP_SRV6	   (1U << 0)
-#define MIDR_CAP_ROUTING   (1U << 1)
-#define MIDR_CAP_BOOTSTRAP (1U << 2) /* 引导节点 */
-#define MIDR_CAP_GROUP_REP (1U << 3) /* 群代表 */
-
 /*
  * Bit positions for attribute presence bitmasks
  */

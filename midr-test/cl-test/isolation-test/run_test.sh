@@ -117,11 +117,55 @@ log_lines_now() {
     [[ -f "$log" ]] && wc -l < "$log" || echo 0
 }
 
-echo "[iso-run_test] Starting a (bootstrap), d and e (singleton reps)..."
+# 起引导 a，等它把远端视图回调注册上再起代表。件②（对接轮 4）之后 a 的代表目录
+# 只能由第二组回调来灌，而该回调挂在 bgp_config_end 上 —— 裸 bgpd（-f 读配置）不
+# 触发这个钩子（它由 vtysh 下发配置时发的 XFRR_end_configuration 触发），只能靠
+# periodic_sync 每 30s 兜底重试补上。原先这里死等 10s 短于 30s，f 必然撞空目录、
+# CREATE 自建群并自任代表，于是 Phase 1/2 全废（自任代表后 PERIODIC_SYNC 直接
+# "本节点是群代表，跳过退群判定"，孤岛检测一行都执行不到）。
+# 判据一律换成轮询真实状态，照 docs/midr-backbone运行手册.md §3.0 的规矩。
+wait_bootstrap_ready() {
+    local node="$1" timeout=90 elapsed=0
+    echo "[iso-run_test] Waiting for $node's remote-view callback registration..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "已向第二组注册 node/link 回调" \
+             "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
+            echo "  ✓ $node ready at t=${elapsed}s"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "  ✗ $node never registered its remote-view callback within ${timeout}s"
+    return 1
+}
+
+# 等 a 的目录里真的出现 d、e 两个代表 —— f 能 JOIN 而不是 CREATE 的前置条件。
+wait_rep_directory() {
+    local node="$1" want="$2" timeout=90 elapsed=0 got=0
+    echo "[iso-run_test] Waiting for $node's rep directory to list $want rep(s)..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-iso-vty/$node" \
+                  -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  ✗ $node's directory still lists $got/$want rep(s) after ${timeout}s"
+    return 1
+}
+
+echo "[iso-run_test] Starting a (bootstrap)..."
 start_node a
+wait_bootstrap_ready a || true
+
+echo "[iso-run_test] Starting d and e (singleton reps)..."
 start_node d
 start_node e
-sleep 10
+wait_rep_directory a 2 || true
 
 echo "[iso-run_test] Starting f (join flow begins automatically)..."
 start_node f
@@ -135,6 +179,8 @@ sleep 5
 
 echo "[iso-run_test] Killing d and e -- f should now have zero established sessions..."
 kill_marker=$(log_lines_now)
+# 落盘给 check_result.sh：kill 之后才算数的判据要按它卡行号
+echo "$kill_marker" > "$TESTDIR/logs/.kill_marker"
 for node in d e; do
     pidfile="/tmp/bgpd-iso-${node}.pid"
     pid=$(cat "$pidfile" 2>/dev/null || true)

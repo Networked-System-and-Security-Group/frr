@@ -80,10 +80,13 @@ fi
 mkdir -p "$TESTDIR/logs"
 rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
 
-# ---- 3. Start group nodes first (groups 1, 2, 3) ----------------------------
-NODES=(g1a g1b g1c g1d g1e g2a g2b g3a g3b)
-echo "[run_test] Starting group nodes..."
-for node in "${NODES[@]}"; do
+# ---- 3. 分阶段启动 ----------------------------------------------------------
+# 按依赖链 引导 → 代表 → 成员 → 新节点（docs/midr-backbone运行手册.md §3.2），
+# 每级之间等**真实收敛判据**、不等固定秒数。原先 9 台齐起 + 死等 15s 两条都违反：
+# 引导的代表目录由第二组回调灌，而该回调挂在 bgp_config_end 上、裸 bgpd 不触发
+# （靠 periodic_sync 每 30s 兜底），15s 内目录必空 → 人人 CREATE 自建群、群号乱套。
+start_node() {
+    local node="$1"
     mkdir -p "/tmp/midr-cl-vty/$node"
     ip netns exec "ns-$node" "$BGPD" \
         -f "$TESTDIR/configs/bgpd-${node}.conf" \
@@ -92,21 +95,79 @@ for node in "${NODES[@]}"; do
         --vty_socket "/tmp/midr-cl-vty/$node" \
         --log-level debug &
     echo "  started bgpd for $node (bg pid $!)"
-done
+}
 
-echo "[run_test] Waiting 15 s for group BGP-LS sessions to establish..."
-sleep 15
+wait_bootstrap_ready() {
+    local node="$1" timeout=90 elapsed=0
+    echo "[run_test] Waiting for $node's remote-view callback registration..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "已向第二组注册 node/link 回调" \
+             "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
+            echo "  ✓ $node ready at t=${elapsed}s"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "  ✗ $node never registered its remote-view callback within ${timeout}s"
+    return 1
+}
+
+wait_rep_directory() {
+    local node="$1" want="$2" timeout=90 elapsed=0 got=0
+    echo "[run_test] Waiting for $node's rep directory to list $want rep(s)..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-cl-vty/$node" \
+                  -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  ✗ $node's directory still lists $got/$want rep(s) after ${timeout}s"
+    return 1
+}
+
+# 等各群代表认齐本群成员——newnode 问它要成员表时拿到几条、CL 的
+# min(5, 已知成员数) 阈值算成几，全看这个数。
+# timeout 要盖住成员自己那趟 join：REP 60s + MEMBER 60s 两段 EWMA 热身 ≈125s，
+# 再留出并发起动的余量。设 120s 会差十几秒（2026-08-25 实测卡在 2/4）。
+wait_group_members() {
+    local node="$1" gid="$2" want="$3" timeout=200 elapsed=0 got=0
+    echo "[run_test] Waiting for $node to know $want group-$gid member(s)..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$REPO_ROOT/vtysh/.libs/vtysh" --vty_socket "/tmp/midr-cl-vty/$node" \
+                  -c 'show midr nodes' 2>/dev/null \
+                  | awk -v g="$gid" '$1 ~ /^10\.0\./ && $4 == g' | wc -l)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $node knows $got group-$gid member(s) at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  ✗ $node still knows only $got/$want group-$gid member(s) after ${timeout}s"
+    return 1
+}
+
+echo "[run_test] Stage 1/4: bootstrap (g1a)..."
+start_node g1a
+wait_bootstrap_ready g1a || true
+
+echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
+for node in g1b g2a g3a; do start_node "$node"; sleep 1; done
+wait_rep_directory g1a 3 || true
+
+echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
+for node in g1c g1d g1e g2b g3b; do start_node "$node"; sleep 1; done
+# 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
+wait_group_members g1b 1 4 || true
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
-echo "[run_test] Starting newnode (join flow will begin automatically)..."
-mkdir -p /tmp/midr-cl-vty/newnode
-ip netns exec ns-newnode "$BGPD" \
-    -f "$TESTDIR/configs/bgpd-newnode.conf" \
-    -Z -S \
-    -i /tmp/bgpd-cl-newnode.pid \
-    --vty_socket /tmp/midr-cl-vty/newnode \
-    --log-level debug &
-echo "  started newnode bgpd (bg pid $!)"
+echo "[run_test] Stage 4/4: newnode (join flow will begin automatically)..."
+start_node newnode
 
 # ---- 5. Wait for JOIN decision in newnode's log -----------------------------
 LOG="$TESTDIR/logs/bgpd-newnode.log"

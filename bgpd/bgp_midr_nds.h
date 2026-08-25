@@ -66,6 +66,30 @@
 
 /* Timer intervals (seconds) */
 #define MIDR_PERIODIC_SYNC_INTERVAL 30 /* CL periodic re-evaluation */
+
+/*
+ * MIDR overlay 会话的 BGP timers（轮 5，成员死亡共振实验后加）。
+ *
+ * ⚠ 临时缓解、非长久之计（用户 08-24 拍板）。这是帕累托取舍：holdtime 长 =
+ * 抗物理链路震荡但死亡通知慢（默认 180s），短 = 秒级感知但链路抖动时会误拆。
+ * 15s 复刻的是旧 expire 的灵敏度——件④ 把活性判定交给 BGP 之后，若沿用出厂
+ * 默认 180s，"死成员留在 CL 分母里"的窗口会从 15s 拉到 180s，periodic_sync
+ * （30s 一拍）必撞 → 全群成员各自独立判 3/4 < 阈值 → 集体 LEAVE → 碎群
+ * （08-24 拔线实验实测，群 1 碎成 2+1+1）。根治在 CL 判据加固（滞回/
+ * 阻尼/分母摘除死链），归 CL owner，知会档第 20 件。
+ * 只作用于 MIDR 自建的 overlay 会话；静态 underlay 会话不动。
+ */
+#define MIDR_OVERLAY_KEEPALIVE 5
+#define MIDR_OVERLAY_HOLDTIME  15
+
+/*
+ * 节点能力位（node->capabilities）。轮 5 从 bgp_ls_nlri.h 搬来 —— 件② 删掉
+ * MIDR 自有的 BGP-LS TLV 之后，它们与 BGP-LS 再无关系，只是 MIDR 的身份标记。
+ */
+#define MIDR_CAP_SRV6	   (1U << 0)
+#define MIDR_CAP_ROUTING   (1U << 1)
+#define MIDR_CAP_BOOTSTRAP (1U << 2) /* 引导节点 */
+#define MIDR_CAP_GROUP_REP (1U << 3) /* 群代表 */
 /* Consecutive MIDR_PERIODIC_SYNC_INTERVAL ticks of zero established sessions
  * (group members + anchors alike) required before a node is declared
  * isolated and restarts the join flow. At 2 ticks / 30s cadence this is a 60s
@@ -474,7 +498,6 @@ struct midr_context;
  */
 enum midr_session_reason {
 	MIDR_SESSION_SAME_GROUP = 0, /* 同群自动互联 */
-	MIDR_SESSION_BACKBONE,	     /* 引导↔引导骨干互连（本轮手工，见 Q7） */
 	MIDR_SESSION_ATTACH,	     /* 群代表挂靠引导 */
 	MIDR_SESSION_CL_ANCHOR,	     /* CL 群间锚点（I-7 ANCHOR）决策 */
 	MIDR_SESSION_MANUAL,	     /* 运维 `midr session` 手配 */
@@ -587,6 +610,8 @@ struct bgp_midr_nds {
 	 */
 	struct list *remote_withdrawn;
 	bool remote_view_registered;   /* 回调已注册（幂等闸，见 register 函数） */
+	bool remote_view_reg_failed;   /* 注册失败过（只为日志降噪：首次 warn，
+					* 之后 periodic_sync 每拍重试压成 debug） */
 	uint64_t remote_node_events;   /* node 回调到达数（update + withdraw） */
 	uint64_t remote_link_events;   /* link 回调到达数（本轮只观察不消费） */
 	uint64_t remote_suspect_count; /* 疑似虚报撤销（撤后短窗内又 update） */
@@ -801,9 +826,6 @@ enum midr_origin_reason {
 	MIDR_ORIGIN_TRANSPORT_UPDATE,
 	MIDR_ORIGIN_REJOIN,	/* re-advertise after `no midr shutdown` */
 	MIDR_ORIGIN_LEAVE,	/* withdraw (graceful shutdown / leave) */
-	/* 轮 1 shim 转调专用。shim 已不参与编译（件②只摘 subdir.am 编译行、文件
-	 * 留树），本值随轮 5 删 shim 文件时一起删。 */
-	MIDR_ORIGIN_TOPOLOGY_UPSERT,
 	/* reserved for the future node-failure-forwarding module */
 };
 extern const char *midr_origin_reason_str(enum midr_origin_reason reason);
@@ -956,7 +978,7 @@ extern bool midr_nds_is_bootstrap(struct bgp *bgp);
  *   ① 引导候选池按 rid 命中 —— 不依赖 NLRI 传播时机（引导刚起、链路没通时节点表
  *      里还没有它），也正好补上台账认不出的 MANUAL 盲区（台账只记"运维手配"、
  *      不记对端身份）；
- *   ② 会话台账 reason ∈ {BACKBONE, ATTACH} —— 自动建的保底边一律有账，按条目
+ *   ② 会话台账 reason == ATTACH —— 自动建的保底边一律有账，按条目
  *      里的 remote_rid 认人（不用 transport 反查，省一次节点表查询）；
  *   ③ 节点表条目带 BOOTSTRAP 位 —— ⚠ **件②（轮 4）起恒假**：换第二组数据源后
  *      引导（群号 0）在他们侧是 pending、不回灌，节点表里没有引导条目。①② 足以

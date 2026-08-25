@@ -67,10 +67,13 @@ else
     VTY_DIR="/tmp/midr-cl-vty/newnode"
     established="?"
     if [[ -x "$VTYSH" && -d "$VTY_DIR" ]]; then
-        # show midr neighbors 列序：Neighbor ASN State Group-ID Origin Capabilities
+        # 列序：Neighbor ASN State LS Group-ID Origin Capabilities —— Origin 是第 6 列。
+        # 原先注释漏了 LS 列、按 $5 取，恒不匹配 → 锚点全 Established 也报 0
+        # （2026-08-25 实撞：4 条 CL_ANCHOR 全 Established，判据仍 FAIL）。
+        # 不按列号数，直接认字段，免得再随列变动失效。
         established=$("$VTYSH" --vty_socket "$VTY_DIR" \
             -c "show midr neighbors" 2>/dev/null \
-            | awk '$3=="Established" && $5=="CL_ANCHOR"' | wc -l)
+            | awk '/Established/ && /CL_ANCHOR/' | wc -l)
     fi
 
     if [[ "$established" == "?" ]]; then

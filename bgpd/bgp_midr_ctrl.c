@@ -1891,6 +1891,8 @@ void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 	SET_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY);
 
 	peer_ebgp_multihop_set(peer, MAXTTL);
+	/* 死亡感知 15s（复刻旧 expire 灵敏度）。定位与取舍见宏定义处注释。 */
+	peer_timers_set(peer, MIDR_OVERLAY_KEEPALIVE, MIDR_OVERLAY_HOLDTIME);
 	if (mi && mi->transport_addr_set) {
 		union sockunion local_su;
 

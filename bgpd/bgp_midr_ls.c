@@ -121,8 +121,7 @@ static int midr_ls_link_validate(const struct midr_ls_link_payload *link)
 	    link->link_local_address.ipa_type != link->link_remote_address.ipa_type)
 		return -EINVAL;
 
-	if (link->metrics.present_flags != MIDR_METRIC_REQUIRED_MASK || !link->metrics.rtt_us ||
-	    !link->metrics.available_bandwidth_kbps || link->metrics.loss_ppm >= 1000000U)
+	if (!link->canonical_cost || link->canonical_cost == UINT32_MAX)
 		return -EINVAL;
 
 	return 0;
@@ -243,10 +242,7 @@ static bool midr_ls_link_same(const struct midr_ls_link_payload *a,
 {
 	return ipaddr_cmp(&a->link_local_address, &b->link_local_address) == 0 &&
 	       ipaddr_cmp(&a->link_remote_address, &b->link_remote_address) == 0 &&
-	       a->metrics.present_flags == b->metrics.present_flags &&
-	       a->metrics.rtt_us == b->metrics.rtt_us &&
-	       a->metrics.loss_ppm == b->metrics.loss_ppm &&
-	       a->metrics.available_bandwidth_kbps == b->metrics.available_bandwidth_kbps;
+	       a->canonical_cost == b->canonical_cost;
 }
 
 bool midr_ls_object_same(const struct midr_ls_object *a, const struct midr_ls_object *b)

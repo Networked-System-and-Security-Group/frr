@@ -99,15 +99,7 @@ static struct midr_ls_object link_object(uint32_t local_node_id, uint32_t remote
 					ip_address("198.51.100.1"),
 				.link_remote_address =
 					ip_address("198.51.100.2"),
-				.metrics =
-					{
-						.present_flags =
-							MIDR_METRIC_REQUIRED_MASK,
-						.rtt_us = 1000,
-						.loss_ppm = 100,
-						.available_bandwidth_kbps =
-							100000,
-					},
+				.canonical_cost = 250,
 			},
 	};
 }

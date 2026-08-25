@@ -345,8 +345,6 @@ const char *midr_session_reason_str(enum midr_session_reason reason)
 	switch (reason) {
 	case MIDR_SESSION_SAME_GROUP:
 		return "SAME_GROUP";
-	case MIDR_SESSION_BACKBONE:
-		return "BACKBONE";
 	case MIDR_SESSION_ATTACH:
 		return "ATTACH";
 	case MIDR_SESSION_CL_ANCHOR:
@@ -1198,8 +1196,7 @@ bool midr_nds_link_is_backbone(struct bgp *bgp,
 	if (mi->session_ledger)
 		for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, led))
 			if (led->remote_rid.s_addr == rid &&
-			    (led->reason == MIDR_SESSION_BACKBONE ||
-			     led->reason == MIDR_SESSION_ATTACH))
+			    led->reason == MIDR_SESSION_ATTACH)
 				return true;
 
 	/* ③ 节点表条目带 BOOTSTRAP 位（兜底，正常查不到）。 */
@@ -1437,6 +1434,37 @@ static uint32_t midr_group_reconverge(struct bgp *bgp, uint32_t new_gid)
 	struct midr_rep_entry *r;
 	uint32_t connected = 0, detached = 0, reps_stopped = 0;
 
+	/*
+	 * 0. 落到无群（new_gid==0，即 I-7 的 LEAVE / RECONNECT）时先卸任群代表。
+	 *
+	 * 群代表是**这个群的**代表，群都退了角色不能跟着节点走。放在改群号之前，
+	 * 卸任才随下面那笔通告一起发出去。
+	 *
+	 * 不卸的后果 08-24 拔线实验实测过一整条链：隔离期自任代表的成员恢复后
+	 * LEAVE，GROUP_REP 残留 → 它以"群 1 代表"身份进了引导的 rep 目录 → 新节点
+	 * 被推荐到这个假代表 → 向它要成员表要不到（它自己群号已是 0，应答闸门不
+	 * 放行）→ **join 死锁**，卡在无群状态出不来。
+	 *
+	 * ⚠ 口径与 midr shutdown 的卸任一致（同样不可逆、同样 warn 提示重敲）——
+	 *   两条路径对同一件事只能有一种做法。
+	 *
+	 * ⚠ BOOTSTRAP 位**只报不清**：引导群号恒 0（bootstrap_enforce 强制），根本
+	 *   不该走到这里；而它是**配置角色**（`midr role bootstrap`），清了不可逆
+	 *   且静默——全网少一个引导候选却无人知晓，比留着更糟。故照
+	 *   midr_nds_set_capability() 里那条留证的同款做法只报错、不动位。
+	 */
+	if (new_gid == 0 && old_gid != 0) {
+		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
+			zlog_warn("MIDR：退出群 %u 同时卸任群代表（角色属于该群，不随节点走）——如仍需要请重敲 `midr role group-rep`",
+				  old_gid);
+			midr_nds_set_capability(bgp, mi->local_capabilities &
+							     ~MIDR_CAP_GROUP_REP);
+		}
+		if (mi->local_capabilities & MIDR_CAP_BOOTSTRAP)
+			zlog_err("MIDR：引导节点竟走到退群路径（群 %u，caps 0x%x）——引导群号本应恒 0，请查是哪条路径给它置了群号；BOOTSTRAP 位保留不动",
+				 old_gid, mi->local_capabilities);
+	}
+
 	/* 1. 改群号 + 重通告（先于建连）。 */
 	midr_originate_group_update(bgp, new_gid, old_gid);
 
@@ -1624,8 +1652,6 @@ const char *midr_origin_reason_str(enum midr_origin_reason reason)
 		return "rejoin";
 	case MIDR_ORIGIN_LEAVE:
 		return "leave";
-	case MIDR_ORIGIN_TOPOLOGY_UPSERT:
-		return "topology-upsert";
 	}
 	return "unknown";
 }
@@ -1828,11 +1854,28 @@ static void midr_group_collision_check(struct bgp *bgp)
 	}
 }
 
+/* 注册函数定义在文件后半（回调实现旁边），periodic_sync 的兜底重试要用。 */
+static void midr_nds_remote_view_register(struct bgp *bgp);
+
 static void midr_periodic_sync_timer(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_node_entry *entry;
+
+	/*
+	 * 件③ 回调注册的兜底重试（轮 5 补）。
+	 *
+	 * 注册原本只有两次机会：init 那次**必然失败**（我方 init 跑在 bgp_create()
+	 * 执行期间，默认实例还没挂上去，取不到 ctx）、bgp_config_end 那次通常成功。
+	 * 万一 config_end 也失败（ctx 未就绪、或对方 register 返回非 0），此前**再
+	 * 没有人试第二次** —— 件③ 整条下行链哑掉：节点表永远空、谁都学不到，而且
+	 * 是**静默的**（只有一条 warn + `show midr group2` 里的"未注册"）。
+	 *
+	 * 函数内有幂等闸（remote_view_registered），注册成功后这里就是一次空调用；
+	 * 放在最前面是因为它是其余一切下行数据的前提。
+	 */
+	midr_nds_remote_view_register(bgp);
 
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_PERIODIC_SYNC);
 
@@ -4908,8 +4951,8 @@ static void midr_nds_remote_link_update(const struct midr_remote_link_info *link
 	local.s_addr = link->key.local_node_id;
 	remote.s_addr = link->key.remote_node_id;
 	bgp->midr_nds_info->remote_link_events++;
-	MIDR_LOG("MIDR 远端视图：link %pI4 -> %pI4 rtt=%uus loss=%uppm（本轮只观察）",
-		 &local, &remote, link->metrics.rtt_us, link->metrics.loss_ppm);
+	MIDR_LOG("MIDR 远端视图：link %pI4 -> %pI4 cost=%u（本轮只观察）",
+		 &local, &remote, link->canonical_cost);
 }
 
 static void midr_nds_remote_link_withdraw(const struct midr_link_key *key,
@@ -4940,7 +4983,12 @@ static void midr_nds_remote_link_withdraw(const struct midr_link_key *key,
  * 回调注册。幂等，可多次调 —— 因为 bgp_midr_nds_init 那一刻**取不到 ctx**：
  * midr_context_get_default() 走的是 bgp_get_default()，而我方 init 在 bgp_create()
  * 执行期间跑，默认实例那时还没挂上去（他们自己的 init 不受影响，用的是传入的
- * bgp 参数）。所以 init 试一次（将来若早就绪即生效），配置读完再补一次。
+ * bgp 参数）。
+ *
+ * 三个时机：① init 试一次（将来若早就绪即生效，现在必失败）；② bgp_config_end
+ * 补一次（正常路径靠它成功）；③ periodic_sync 每拍兜底重试（轮 5 补）——②
+ * 若也失败，此前再没有人试第二次，件③ 整条下行链会**静默**哑掉（节点表永远空
+ * 却不报错）。有幂等闸，成功之后 ③ 就是空调用。
  */
 static void midr_nds_remote_view_register(struct bgp *bgp)
 {
@@ -4966,11 +5014,21 @@ static void midr_nds_remote_view_register(struct bgp *bgp)
 
 	ret = midr_remote_view_callbacks_register(ctx, &cbs);
 	if (ret) {
-		zlog_warn("MIDR 远端视图：回调注册失败 ret=%d", ret);
+		/* 首次出声即可：periodic_sync 每 30s 重试一次，全打成 warn 会刷屏。
+		 * 后续失败压到 debug，运维侧看 `show midr group2` 的"未注册"。 */
+		if (!mi->remote_view_reg_failed) {
+			mi->remote_view_reg_failed = true;
+			zlog_warn("MIDR 远端视图：回调注册失败 ret=%d —— 已转入每 %d 秒重试，期间本机学不到任何远端节点（`show midr group2` 可查）",
+				  ret, MIDR_PERIODIC_SYNC_INTERVAL);
+		} else {
+			MIDR_LOG("MIDR 远端视图：回调注册重试仍失败 ret=%d", ret);
+		}
 		return;
 	}
 
 	mi->remote_view_registered = true;
+	if (mi->remote_view_reg_failed)
+		zlog_warn("MIDR 远端视图：回调注册在重试中恢复成功 —— 此前失败期间学到的远端信息可能不全");
 	zlog_info("MIDR 远端视图：已向第二组注册 node/link 回调（双源期，与 Node NLRI 并存）");
 }
 

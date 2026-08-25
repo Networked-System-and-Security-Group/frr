@@ -50,10 +50,7 @@ midr_ls_attributes_hash(const struct midr_ls_attributes *attributes)
 	MIDR_MIX((uint32_t)attributes->cap_flags);
 	MIDR_MIX(ipaddr_hash(&attributes->link_local_address));
 	MIDR_MIX(ipaddr_hash(&attributes->link_remote_address));
-	MIDR_MIX(attributes->link_metrics.present_flags);
-	MIDR_MIX(attributes->link_metrics.rtt_us);
-	MIDR_MIX(attributes->link_metrics.loss_ppm);
-	MIDR_MIX(attributes->link_metrics.available_bandwidth_kbps);
+	MIDR_MIX(attributes->link_canonical_cost);
 #undef MIDR_MIX
 	return key;
 }
@@ -72,12 +69,7 @@ midr_ls_attributes_same(const struct midr_ls_attributes *a,
 				 &b->link_local_address)
 	       && ipaddr_is_same(&a->link_remote_address,
 				 &b->link_remote_address)
-	       && a->link_metrics.present_flags
-			  == b->link_metrics.present_flags
-	       && a->link_metrics.rtt_us == b->link_metrics.rtt_us
-	       && a->link_metrics.loss_ppm == b->link_metrics.loss_ppm
-	       && a->link_metrics.available_bandwidth_kbps
-			  == b->link_metrics.available_bandwidth_kbps;
+	       && a->link_canonical_cost == b->link_canonical_cost;
 }
 
 unsigned int

@@ -57,19 +57,11 @@ static struct midr_ls_object link_object(void)
 		.policy_tags = 9,
 		.payload.link =
 			{
-				.link_local_address =
-					ip_address("192.0.2.1"),
-				.link_remote_address =
-					ip_address("192.0.2.2"),
-				.metrics =
-					{
-						.present_flags =
-							MIDR_METRIC_REQUIRED_MASK,
-						.rtt_us = 1000,
-						.loss_ppm = 100,
-						.available_bandwidth_kbps =
-							100000,
-					},
+					.link_local_address =
+						ip_address("192.0.2.1"),
+					.link_remote_address =
+						ip_address("192.0.2.2"),
+					.canonical_cost = 250,
 			},
 	};
 }
@@ -91,7 +83,8 @@ static void test_ls_attr_decode_and_intern(void)
 	value = bgp_midr_ls_attr_value(attr.midr_ls);
 	assert(value->ls_sequence == object.ls_sequence);
 	assert(value->policy_tags == object.policy_tags);
-	assert(value->link_metrics.rtt_us == object.payload.link.metrics.rtt_us);
+	assert(value->link_canonical_cost ==
+	       object.payload.link.canonical_cost);
 
 	first = bgp_midr_ls_attr_intern(value);
 	second = bgp_midr_ls_attr_intern(value);
@@ -198,15 +191,9 @@ static void test_container_guards_and_comparisons(void)
 		.cap_flags = 4,
 		.link_local_address = ip_address("198.51.100.1"),
 		.link_remote_address = ip_address("198.51.100.2"),
-		.link_metrics =
-			{
-				.present_flags = MIDR_METRIC_REQUIRED_MASK,
-				.rtt_us = 1000,
-				.loss_ppm = 10,
-				.available_bandwidth_kbps = 100000,
-			},
+		.link_canonical_cost = 250,
 	};
-	struct midr_ls_attributes variants[12];
+	struct midr_ls_attributes variants[9];
 	struct bgp_midr_ls_attr *base_attr;
 	struct midr_propagation_path first = {};
 	struct midr_propagation_path second = {};
@@ -224,10 +211,7 @@ static void test_container_guards_and_comparisons(void)
 	variants[5].cap_flags++;
 	variants[6].link_local_address = ip_address("198.51.100.9");
 	variants[7].link_remote_address = ip_address("198.51.100.10");
-	variants[8].link_metrics.present_flags = 0;
-	variants[9].link_metrics.rtt_us++;
-	variants[10].link_metrics.loss_ppm++;
-	variants[11].link_metrics.available_bandwidth_kbps++;
+	variants[8].link_canonical_cost++;
 
 	assert(bgp_midr_ls_attr_hash_key(NULL) == 0);
 	assert(bgp_midr_ls_attr_same(NULL, NULL));
