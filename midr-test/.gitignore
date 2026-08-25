@@ -1,4 +1,5 @@
 *.log
+pm-test/logs/
 *.png
 # 第二组测试脚手架的运行产物（合栈时并入，来源 c344e40ba1）
 /run/

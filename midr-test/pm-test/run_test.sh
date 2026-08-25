@@ -101,8 +101,37 @@ if [ -z "$OUTPUT" ]; then
     fi
 fi
 
-rm -f "$SCRIPT_DIR/bgpd-a.log" "$SCRIPT_DIR/bgpd-b.log" \
-      "$SCRIPT_DIR/rattan.log" "$SCRIPT_DIR/midr-pm-test.rtl" "$OUTPUT"
+if [ "$IPERF_ENABLE" = "1" ]; then
+    SCENARIO=iperf
+else
+    SCENARIO=baseline
+fi
+LOG_DIR="$SCRIPT_DIR/logs/$SCENARIO"
+mkdir -p "$LOG_DIR"
+find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -delete
+
+RUNTIME_ARTIFACTS=(
+    bgpd-a.log
+    bgpd-b.log
+    iperf-client.log
+    iperf-server.log
+    midr-pm-test.flow
+    midr-pm-test.rtl
+)
+for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+    rm -f "$SCRIPT_DIR/$artifact"
+done
+rm -f "$OUTPUT"
+
+archive_runtime_artifacts() {
+    local artifact
+    for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+        if [ -e "$SCRIPT_DIR/$artifact" ]; then
+            mv -f "$SCRIPT_DIR/$artifact" "$LOG_DIR/$artifact"
+        fi
+    done
+    chmod -R a+rX "$LOG_DIR"
+}
 
 if [ "$IPERF_ENABLE" = "1" ]; then
     echo "[run_test] iperf3 UDP ON: client starts at t+${IPERF_START_TIME}s, runs for ${IPERF_DURATION}s at ${IPERF_BANDWIDTH}bps"
@@ -111,6 +140,7 @@ else
 fi
 echo "[run_test] config: $CONFIG"
 echo "[run_test] rattan: $RATTAN_BIN"
+echo "[run_test] logs: $LOG_DIR"
 runner_status=0
 tee_status=0
 set +e
@@ -126,31 +156,32 @@ if [ -n "$DURATION" ]; then
     # (tearing down namespaces, stopping bgpd) runs normally; force-kill
     # only if it hasn't exited 10s after that.
     timeout --signal=INT --kill-after=10 "$DURATION" \
-        "$RATTAN_BIN" run -c "$CONFIG" --left-stdout --right-stdout 2>&1 \
-        | tee "$SCRIPT_DIR/rattan.log"
+        "$RATTAN_BIN" run -c "$CONFIG" --left-stdout --right-stdout \
+        --left-stderr --right-stderr 2>&1 | tee "$LOG_DIR/rattan.log"
     pipeline_status=("${PIPESTATUS[@]}")
     runner_status=${pipeline_status[0]}
     tee_status=${pipeline_status[1]}
 else
-    "$RATTAN_BIN" run -c "$CONFIG" --left-stdout --right-stdout 2>&1 \
-        | tee "$SCRIPT_DIR/rattan.log"
+    "$RATTAN_BIN" run -c "$CONFIG" --left-stdout --right-stdout \
+        --left-stderr --right-stderr 2>&1 | tee "$LOG_DIR/rattan.log"
     pipeline_status=("${PIPESTATUS[@]}")
     runner_status=${pipeline_status[0]}
     tee_status=${pipeline_status[1]}
 fi
 set -e
+archive_runtime_artifacts
 
 if [ "$tee_status" -ne 0 ]; then
-    echo "ERROR: failed to save Rattan output (status $tee_status)." >&2
+    echo "ERROR: failed to save Rattan output (status $tee_status); logs: $LOG_DIR" >&2
     exit "$tee_status"
 fi
 if [ "$runner_status" -ne 0 ] && [ "$runner_status" -ne 124 ]; then
-    echo "ERROR: Rattan failed with status $runner_status." >&2
+    echo "ERROR: Rattan failed with status $runner_status; logs: $LOG_DIR" >&2
     exit "$runner_status"
 fi
 
-check_args=("$SCRIPT_DIR/bgpd-a.log")
-plot_args=("$SCRIPT_DIR/bgpd-a.log" --output "$OUTPUT")
+check_args=("$LOG_DIR/bgpd-a.log")
+plot_args=("$LOG_DIR/bgpd-a.log" --output "$OUTPUT")
 if [ "$IPERF_ENABLE" = "1" ]; then
     check_args+=(--iperf)
     plot_args+=(--iperf-start "$IPERF_START_TIME" --iperf-duration "$IPERF_DURATION")
@@ -158,4 +189,6 @@ fi
 
 python3 "$SCRIPT_DIR/check_result.py" "${check_args[@]}"
 python3 "$SCRIPT_DIR/plot_pm.py" "${plot_args[@]}"
+chmod a+r "$OUTPUT"
 echo "[run_test] PASS: $OUTPUT"
+echo "[run_test] logs: $LOG_DIR"
