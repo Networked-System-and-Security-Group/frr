@@ -2764,7 +2764,8 @@ int peer_activate(struct peer *peer, afi_t afi, safi_t safi)
 	 * activated for BGP-LS. This allows BGP to receive IGP topology
 	 * updates from ISIS/OSPF for distribution to BGP-LS peers.
 	 */
-	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS && !bgp_ls_is_registered(bgp)) {
+	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS
+	    && !bgp_option_check(BGP_OPT_NO_ZEBRA) && !bgp_ls_is_registered(bgp)) {
 		if (!bgp_ls_register(bgp)) {
 			zlog_err("BGP-LS: Failed to register with link-state database for instance %s",
 				 bgp->name_pretty);

@@ -2975,6 +2975,10 @@ bgp_establish(struct peer_connection *connection)
 					 PEER_STATUS_ORF_WAIT_REFRESH);
 	}
 
+	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+		if (bgp_ls_originate_bgp_node(bgp) != 0)
+			zlog_warn("BGP-LS: Failed to originate local BGP node NLRI");
+
 	/* Generate Link NLRI for BGP session (local -> peer) */
 	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
 		if (bgp_ls_originate_bgp_link(bgp, peer) != 0)
