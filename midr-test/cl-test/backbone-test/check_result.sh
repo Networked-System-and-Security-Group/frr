@@ -5,6 +5,8 @@
 # only runner-up -- this topology has no group 3).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
 LOGDIR="$SCRIPT_DIR/logs"
 
 echo "=== MIDR Backbone-Topology-Migration Test Result Summary ==="
@@ -43,9 +45,18 @@ check_node() {
     fi
 
     if grep -q "MIDR I-7：ANCHOR " "$log" 2>/dev/null; then
-        echo "  PASS: $node reached an ANCHOR decision (group 2 runner-up)"
+        established=$("$VTYSH" --vty_socket "/tmp/midr-bb-vty/$node" \
+            -c 'show midr neighbors' 2>/dev/null \
+            | awk '/Established/ && /CL_ANCHOR/' | wc -l)
+        if [[ "$established" -gt 0 ]]; then
+            echo "  PASS: $node has $established Established anchor session(s)"
+        else
+            echo "  FAIL: $node reached ANCHOR but no anchor session is Established"
+            FAILED=1
+        fi
     else
-        echo "  INFO: $node has no ANCHOR decision yet (this topology only has 1 runner-up group, so at most 2 anchor candidates are possible)"
+        echo "  FAIL: $node has no ANCHOR decision"
+        FAILED=1
     fi
     echo ""
 }
@@ -68,3 +79,5 @@ fi
 
 echo ""
 echo "Logs are in: $LOGDIR/"
+
+exit "$FAILED"

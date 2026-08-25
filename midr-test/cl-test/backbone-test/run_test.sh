@@ -8,7 +8,11 @@
 # against (tried 100s, then 160s; both still failed the same way, since the
 # race is about whether a bad thing happens even *once*, not about total
 # elapsed time -- see the wait_for_attach() comment below for the mechanism).
-#   t=0     b1-b5 start. `midr session`/`midr bootstrap` are static config,
+#   t=0     t1-t3 (transit fabric) start first -- b1-b5's underlay eBGP
+#           sessions peer directly with them, so the transit core must
+#           already be up. t1-t3 run no MIDR config at all (see setup.sh's
+#           header comment).
+#   +5s     b1-b5 start. `midr session`/`midr bootstrap` are static config,
 #           not join-flow-gated, so the 5-way backbone mesh forms fast.
 #   +15s    r1, r2 (reps only) start. Wait for BOTH to show a real
 #           Established session to some bootstrap (wait_for_attach) before
@@ -28,10 +32,28 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
-VTYSH="$REPO_ROOT/vtysh/vtysh"
+VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
 TESTDIR="$SCRIPT_DIR"
 JOIN_TIMEOUT=150
 DO_SETUP=1
+
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run this test with sudo: sudo ./run_test.sh" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" || ! -x "$VTYSH" ]]; then
+    echo "Missing locally built bgpd or vtysh" >&2
+    exit 2
+fi
+
+# bgpd/.libs/bgpd is the real binary (bgpd/bgpd is just a libtool wrapper
+# script that sets this up automatically -- we bypass it to run the binary
+# directly under `ip netns exec`, so we must set this ourselves). Without
+# it, the dynamic loader falls back to the system search path and can pick
+# up a stale, previously-`make install`-ed libfrr.so.0 instead of the one
+# actually built from this source tree, causing spurious
+# "undefined symbol" crashes on start that look nothing like a real bug.
+export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs:${LD_LIBRARY_PATH:-}"
 
 cd "$TESTDIR"
 
@@ -42,7 +64,14 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[bb-run_test] Interrupted."; exit 1' INT TERM
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo "[bb-run_test] Interrupted."; exit 130' INT TERM
 
 echo "[bb-run_test] Checking for stale bgpd instances from a previous run..."
 shopt -s nullglob
@@ -63,6 +92,7 @@ if [[ "$DO_SETUP" -eq 1 ]]; then
 fi
 
 mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/logs"/*.log "$TESTDIR/backbone_join_results.png"
 rm -rf /tmp/midr-bb-vty && mkdir -p /tmp/midr-bb-vty
 
 start_node() {
@@ -108,6 +138,40 @@ log_lines_now() {
     [[ -f "$log" ]] && wc -l < "$log" || echo 0
 }
 
+wait_callback_ready() {
+    local node="$1" timeout=90 elapsed=0
+    echo "[bb-run_test] Waiting for $node's remote-view callback registration..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "已向第二组注册 node/link 回调" \
+             "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
+            echo "  $node ready at t=${elapsed}s"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "  $node did not register its remote-view callback within ${timeout}s"
+    return 1
+}
+
+wait_group_members() {
+    local node="$1" gid="$2" want="$3" timeout=240 elapsed=0 got=0
+    echo "[bb-run_test] Waiting for $node to know $want group-$gid members..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$("$VTYSH" --vty_socket "/tmp/midr-bb-vty/$node" \
+                  -c 'show midr nodes' 2>/dev/null \
+                  | awk -v g="$gid" '$1 ~ /^10\.0\.0\./ && $4 == g' | wc -l)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  $node knows $got group-$gid members at t=${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "  $node knows only $got/$want group-$gid members after ${timeout}s"
+    return 1
+}
+
 # Waits for $node to show a real Established session to *any* bootstrap,
 # queried live via its own vty (show midr neighbors) rather than guessed from
 # a fixed sleep. First attempt confirmed r1/r2 had a real Established attach
@@ -141,17 +205,24 @@ wait_for_reps_known_to_b1() {
     return 1
 }
 
+echo "[bb-run_test] Starting t1-t3 (transit fabric, underlay-only eBGP)..."
+for t in t1 t2 t3; do start_node "$t"; done
+echo "[bb-run_test] Waiting 5s for the transit core to establish..."
+sleep 5
+
 echo "[bb-run_test] Starting b1-b5 (bootstrap backbone mesh)..."
 for b in b1 b2 b3 b4 b5; do start_node "$b"; done
-echo "[bb-run_test] Waiting 15s for the backbone mesh to establish..."
-sleep 15
+for b in b1 b2 b3 b4 b5; do wait_callback_ready "$b"; done
+sleep 5
 
 echo "[bb-run_test] Starting r1 (group 1 rep) and r2 (group 2 rep)..."
 r1_marker=$(log_lines_now r1); r2_marker=$(log_lines_now r2)
 start_node r1
 start_node r2
+wait_callback_ready r1
+wait_callback_ready r2
 echo "[bb-run_test] Waiting for b1 to learn about both r1 and r2 as reps..."
-wait_for_reps_known_to_b1 240 || true
+wait_for_reps_known_to_b1 240
 sleep 5
 
 echo "[bb-run_test] Starting m1a, m1b (group 1) and m2a (group 2)..."
@@ -159,20 +230,32 @@ m1a_marker=$(log_lines_now m1a); m1b_marker=$(log_lines_now m1b); m2a_marker=$(l
 start_node m1a
 start_node m1b
 start_node m2a
-echo "[bb-run_test] Waiting 140s for the members to settle (REP_PROBE_DONE + MEMBER_PROBE_DONE, ~120s + margin)..."
-sleep 140
+wait_group_members r1 1 3
+wait_group_members r2 2 2
 
 echo "[bb-run_test] Starting z1 and z2 (zero-config join-flow test nodes)..."
 z1_marker=$(log_lines_now z1); z2_marker=$(log_lines_now z2)
 start_node z1
 start_node z2
 
-wait_for_log z1 "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" "$z1_marker" || true
-wait_for_log z1 "MIDR I-7：ANCHOR " 30 "ANCHOR" "$z1_marker" || true
-wait_for_log z2 "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" "$z2_marker" || true
-wait_for_log z2 "MIDR I-7：ANCHOR " 30 "ANCHOR" "$z2_marker" || true
+wait_for_log z1 "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" "$z1_marker"
+wait_for_log z1 "MIDR I-7：ANCHOR " 30 "ANCHOR" "$z1_marker"
+wait_for_log z2 "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$JOIN_TIMEOUT" "JOIN" "$z2_marker"
+wait_for_log z2 "MIDR I-7：ANCHOR " 30 "ANCHOR" "$z2_marker"
 
 chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
 
 echo ""
-bash "$TESTDIR/check_result.sh"
+result_rc=0
+bash "$TESTDIR/check_result.sh" || result_rc=$?
+
+plot_rc=0
+mkdir -p /tmp/midr-matplotlib
+MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_backbone_join.py" \
+    --z1 "$TESTDIR/logs/bgpd-z1.log" --z2 "$TESTDIR/logs/bgpd-z2.log" \
+    --output "$TESTDIR/backbone_join_results.png" || plot_rc=$?
+chmod a+r "$TESTDIR/backbone_join_results.png" 2>/dev/null || true
+
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+    exit 1
+fi
