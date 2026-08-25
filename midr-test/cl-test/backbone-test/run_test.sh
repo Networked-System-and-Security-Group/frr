@@ -36,13 +36,28 @@ VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
 TESTDIR="$SCRIPT_DIR"
 JOIN_TIMEOUT=150
 DO_SETUP=1
+PYTHON_BIN="${MIDR_PYTHON_BIN:-python3}"
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this test with sudo: sudo ./run_test.sh" >&2
     exit 2
 fi
-if [[ ! -x "$BGPD" || ! -x "$VTYSH" ]]; then
-    echo "Missing locally built bgpd or vtysh" >&2
+for binary in "$BGPD" "$VTYSH"; do
+    if [[ ! -x "$binary" ]]; then
+        echo "Missing executable: $binary" >&2
+        exit 2
+    fi
+done
+for command_name in ip tc tee "$PYTHON_BIN"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Missing command: $command_name" >&2
+        exit 2
+    fi
+done
+mkdir -p /tmp/midr-matplotlib
+if ! MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" -c \
+    'import matplotlib' >/dev/null 2>&1; then
+    echo "Missing Python package: matplotlib is required." >&2
     exit 2
 fi
 
@@ -57,17 +72,37 @@ export LD_LIBRARY_PATH="$REPO_ROOT/lib/.libs:${LD_LIBRARY_PATH:-}"
 
 cd "$TESTDIR"
 
-for arg in "$@"; do
-    case "$arg" in
-        --no-setup) DO_SETUP=0 ;;
-        --join-timeout) shift; JOIN_TIMEOUT="$1" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-setup)
+            DO_SETUP=0
+            shift
+            ;;
+        --join-timeout)
+            if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "--join-timeout requires a positive integer." >&2
+                exit 2
+            fi
+            JOIN_TIMEOUT="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 2
+            ;;
     esac
 done
+
+rm -f "$TESTDIR/run.log"
+exec > >(tee "$TESTDIR/run.log") 2>&1
 
 cleanup() {
     local rc=$?
     trap - EXIT
     bash "$TESTDIR/teardown.sh" || true
+    chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
+    chmod a+r "$TESTDIR/run.log" 2>/dev/null || true
+    chmod a+r "$TESTDIR/backbone_join_results.png" 2>/dev/null || true
     exit "$rc"
 }
 trap cleanup EXIT
@@ -87,6 +122,8 @@ shopt -u nullglob
 sleep 1
 
 if [[ "$DO_SETUP" -eq 1 ]]; then
+    echo "[bb-run_test] Removing stale backbone-test processes and namespaces..."
+    bash "$TESTDIR/teardown.sh"
     echo "[bb-run_test] Setting up network namespaces (15 nodes, 15 links)..."
     bash "$TESTDIR/setup.sh"
 fi
@@ -249,12 +286,19 @@ echo ""
 result_rc=0
 bash "$TESTDIR/check_result.sh" || result_rc=$?
 
+echo "[bb-run_test] Stopping backbone-test processes before plotting..."
+if ! bash "$TESTDIR/teardown.sh"; then
+    echo "[bb-run_test] Failed to stop the testbed; retrying through the exit trap." >&2
+    exit 1
+fi
+trap - EXIT
+
 plot_rc=0
-mkdir -p /tmp/midr-matplotlib
-MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_backbone_join.py" \
+MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$TESTDIR/plot_backbone_join.py" \
     --z1 "$TESTDIR/logs/bgpd-z1.log" --z2 "$TESTDIR/logs/bgpd-z2.log" \
     --output "$TESTDIR/backbone_join_results.png" || plot_rc=$?
 chmod a+r "$TESTDIR/backbone_join_results.png" 2>/dev/null || true
+chmod a+r "$TESTDIR/run.log" 2>/dev/null || true
 
 if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
     exit 1

@@ -7,7 +7,7 @@ TRANSIT_NODES=(t1 t2 t3)
 ALL_NODES=("${REAL_NODES[@]}" "${TRANSIT_NODES[@]}")
 
 echo "[bb-teardown] Killing bgpd instances..."
-for node in "${REAL_NODES[@]}"; do
+for node in "${ALL_NODES[@]}"; do
     pidfile="/tmp/bgpd-bb-${node}.pid"
     if [[ -f "$pidfile" ]]; then
         pid=$(cat "$pidfile" 2>/dev/null || true)

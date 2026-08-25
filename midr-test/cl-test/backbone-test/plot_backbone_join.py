@@ -1,46 +1,33 @@
 #!/usr/bin/env python3
-"""
-Plot the join timeline (candidate long-term RTT + REP/MEMBER_PROBE_DONE
-decisions) for both zero-config joiners (z1, z2) in the backbone-test
-15-node topology, from their own bgpd logs.
+"""Create a slide-friendly summary of both backbone NDS join flows."""
 
-Usage:
-    python3 plot_backbone_join.py --z1 logs/bgpd-z1.log --z2 logs/bgpd-z2.log \
-        --output backbone_join_results.png
-
-Same parsing approach as midr-test/cl-test/plot_cl.py (phase 1 probes a rep
-by its transport address, phase 2 probes members by router-id -- both IDs
-for the same physical node are folded onto one legend label), adapted for
-this topology's addressing (transport 10.99.0.<n>, router-id 10.0.0.<n>,
-see CLAUDE.md's backbone-test section for the full n-to-name table).
-"""
-
-import re
-import sys
 import argparse
-from datetime import datetime
+import re
 from collections import defaultdict
+from datetime import datetime
 
-import numpy as np
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
 plt.rcParams.update({
-    "font.size": 26,
-    "axes.titlesize": 28,
-    "axes.labelsize": 26,
-    "xtick.labelsize": 22,
-    "ytick.labelsize": 22,
+    "font.size": 22,
+    "font.sans-serif": ["DejaVu Sans"],
+    "axes.titlesize": 26,
+    "axes.labelsize": 23,
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 21,
     "legend.fontsize": 20,
-    "figure.titlesize": 32,
+    "figure.titlesize": 30,
     "axes.linewidth": 1.8,
-    "lines.linewidth": 2.6,
 })
 
 RTT_THRESHOLD_MS = 20.0
+REPRESENTATIVES = ["r1", "r2"]
+GROUP1_MEMBERS = ["r1", "m1a", "m1b"]
 
-# n -> name (see CLAUDE.md's backbone-test addressing table)
 N_TO_NAME = {
     101: "b1", 102: "b2", 103: "b3", 104: "b4", 105: "b5",
     111: "r1", 112: "m1a", 113: "m1b",
@@ -48,127 +35,281 @@ N_TO_NAME = {
     191: "z1", 192: "z2",
 }
 
-
-def name_for(ip):
-    """10.99.0.<n> (transport, phase 1) or 10.0.0.<n> (router-id, phase 2) -> name."""
-    m = re.match(r'10\.(?:99|0)\.0\.(\d+)$', ip)
-    if not m:
-        return ip
-    return N_TO_NAME.get(int(m.group(1)), ip)
-
-
-TS_PAT = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)'
+TS_PAT = r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)"
 I5_PAT = re.compile(
-    TS_PAT + r'.*MIDR PM I-5: node=([\d.]+)/\d+ status=(\d+) failures=(\d+) '
-             r'st_rtt_us=(\d+) st_loss=([\d.]+) st_bw=(\d+) '
-             r'lt_rtt_us=(\d+) lt_loss=([\d.]+) lt_bw=(\d+)')
-REP_DONE_PAT = re.compile(TS_PAT + r'.*MIDR CL: REP_PROBE_DONE')
-MEMBER_DONE_PAT = re.compile(TS_PAT + r'.*MIDR CL: MEMBER_PROBE_DONE')
-RECOMMEND_PAT = re.compile(r'RECOMMEND 群 (\d+) 代表 ([\d.]+)')
-JOIN_PAT = re.compile(r'JOIN 群 (\d+)（(\d+)(?:/\d+)? 条好链路')
-CREATE_PAT = re.compile(r'无可用群代表，CREATE 新群 (\d+)|CREATE 新群 (\d+)')
-ANCHOR_PAT = re.compile(TS_PAT + r'.*MIDR I-7：ANCHOR ')
+    TS_PAT
+    + r".*MIDR PM I-5: node=([\d.]+)/\d+ status=(\d+) failures=(\d+) "
+      r"st_rtt_us=(\d+) st_loss=([\d.]+) st_bw=(\d+) "
+      r"lt_rtt_us=(\d+) lt_loss=([\d.]+) lt_bw=(\d+)"
+)
+REP_DONE_PAT = re.compile(TS_PAT + r".*MIDR CL: REP_PROBE_DONE")
+MEMBER_DONE_PAT = re.compile(TS_PAT + r".*MIDR CL: MEMBER_PROBE_DONE")
+RECOMMEND_PAT = re.compile(r"RECOMMEND 群 (\d+) 代表 ([\d.]+)")
+JOIN_PAT = re.compile(r"JOIN 群 (\d+)（(\d+)(?:/(\d+))? 条好链路")
+ANCHOR_CANDIDATE_PAT = re.compile(
+    r"锚点候选 ([\d.]+)/32 group=(\d+).*rtt=(\d+)"
+)
+ANCHOR_DECISION_PAT = re.compile(r"MIDR I-7：ANCHOR ")
+ANCHOR_ESTABLISHED_PAT = re.compile(
+    r"MIDR 台账：([\d.]+)（原因=CL_ANCHOR）掉出 Established"
+)
 
 
-def parse_ts(s):
-    return datetime.strptime(s, "%Y/%m/%d %H:%M:%S.%f")
+def parse_ts(value):
+    return datetime.strptime(value, "%Y/%m/%d %H:%M:%S.%f")
+
+
+def node_name(ip):
+    match = re.fullmatch(r"10\.(?:99|0)\.0\.(\d+)", ip)
+    return N_TO_NAME.get(int(match.group(1)), ip) if match else ip
 
 
 def parse_log(path):
-    series = defaultdict(lambda: {"t": [], "lt_rtt": []})
-    events = []
+    samples = defaultdict(list)
+    result = {
+        "rep_time": None,
+        "selected_group": None,
+        "selected_rep": None,
+        "member_time": None,
+        "joined_group": None,
+        "good_links": None,
+        "known_members": None,
+        "anchor_decision": False,
+    }
+    anchor_candidates = {}
+    anchor_established = set()
+
     try:
-        f = open(path)
-    except FileNotFoundError:
-        print(f"  (missing: {path})")
-        return series, events
-    with f:
-        for line in f:
-            m = I5_PAT.search(line)
-            if m:
-                ts = parse_ts(m.group(1))
-                label = name_for(m.group(2))
-                series[label]["t"].append(ts)
-                series[label]["lt_rtt"].append(int(m.group(8)) / 1000.0)
+        stream = open(path, encoding="utf-8")
+    except OSError as error:
+        return samples, result, anchor_candidates, anchor_established, str(error)
+
+    with stream:
+        for line in stream:
+            match = I5_PAT.search(line)
+            if match:
+                samples[node_name(match.group(2))].append(
+                    (parse_ts(match.group(1)), int(match.group(8)) / 1000.0)
+                )
                 continue
-            m = REP_DONE_PAT.search(line)
-            if m:
-                ts = parse_ts(m.group(1))
-                rec = RECOMMEND_PAT.search(line)
-                detail = f"RECOMMEND g{rec.group(1)}@{name_for(rec.group(2))}" if rec else "REP_PROBE_DONE"
-                events.append((ts, "rep_done", detail))
+
+            match = REP_DONE_PAT.search(line)
+            if match:
+                result["rep_time"] = parse_ts(match.group(1))
+                recommendation = RECOMMEND_PAT.search(line)
+                if recommendation:
+                    result["selected_group"] = int(recommendation.group(1))
+                    result["selected_rep"] = node_name(recommendation.group(2))
                 continue
-            m = MEMBER_DONE_PAT.search(line)
-            if m:
-                ts = parse_ts(m.group(1))
-                j = JOIN_PAT.search(line)
-                c = CREATE_PAT.search(line)
-                if j:
-                    detail = f"JOIN g{j.group(1)} ({j.group(2)} good links)"
-                elif c:
-                    detail = f"CREATE g{c.group(1) or c.group(2)}"
-                else:
-                    detail = "MEMBER_PROBE_DONE"
-                events.append((ts, "member_done", detail))
+
+            match = MEMBER_DONE_PAT.search(line)
+            if match:
+                result["member_time"] = parse_ts(match.group(1))
+                joined = JOIN_PAT.search(line)
+                if joined:
+                    result["joined_group"] = int(joined.group(1))
+                    result["good_links"] = int(joined.group(2))
+                    result["known_members"] = int(joined.group(3) or joined.group(2))
                 continue
-            m = ANCHOR_PAT.search(line)
-            if m:
-                events.append((parse_ts(m.group(1)), "anchor", "ANCHOR"))
-    return series, events
+
+            match = ANCHOR_CANDIDATE_PAT.search(line)
+            if match:
+                anchor_candidates[match.group(1)] = {
+                    "name": node_name(match.group(1)),
+                    "group": int(match.group(2)),
+                    "rtt_ms": int(match.group(3)) / 1000.0,
+                }
+                continue
+
+            if ANCHOR_DECISION_PAT.search(line):
+                result["anchor_decision"] = True
+                continue
+
+            match = ANCHOR_ESTABLISHED_PAT.search(line)
+            if match:
+                anchor_established.add(match.group(1))
+
+    return samples, result, anchor_candidates, anchor_established, None
 
 
-MARKER_STYLE = {"rep_done": ("purple", "-."), "member_done": ("darkgreen", "-"), "anchor": ("brown", ":")}
+def latest_value(samples, label, cutoff, start=None):
+    eligible = [
+        value
+        for timestamp, value in samples.get(label, [])
+        if cutoff is not None
+        and timestamp <= cutoff
+        and (start is None or timestamp >= start)
+    ]
+    return eligible[-1] if eligible else None
 
 
-def plot_one(ax, path, title):
-    series, events = parse_log(path)
-    if not series:
-        ax.set_title(f"{title} (no data)")
+def add_value_labels(ax, bars, values, limit):
+    for bar, value in zip(bars, values):
+        inside = value > limit * 0.72
+        ax.text(
+            value - limit * 0.018 if inside else value + limit * 0.018,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.2f} ms",
+            va="center",
+            ha="right" if inside else "left",
+            fontsize=20,
+            fontweight="bold",
+            color="white" if inside else "black",
+        )
+
+
+def configure_axis(ax, limit):
+    ax.axvline(
+        RTT_THRESHOLD_MS,
+        color="#c62828",
+        linestyle="--",
+        linewidth=2.6,
+        label="Good-link threshold: 20 ms",
+    )
+    ax.set_xlim(0, limit)
+    ax.set_xlabel("Long-term RTT (ms)")
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper right", frameon=True)
+
+
+def draw_bars(ax, labels, values, colors, title, minimum_limit):
+    if any(value is None for value in values):
+        ax.axis("off")
+        ax.text(0.5, 0.5, f"{title}\nIncomplete RTT data", ha="center", va="center",
+                fontsize=24, color="#b71c1c", fontweight="bold")
         return False
-    all_ts = [t for s in series.values() for t in s["t"]] + [e[0] for e in events]
-    t0 = min(all_ts)
 
-    colors = plt.cm.tab10.colors
-    for i, (label, s) in enumerate(sorted(series.items())):
-        t_rel = np.array([(t - t0).total_seconds() for t in s["t"]])
-        rtt = np.array(s["lt_rtt"])
-        ax.plot(t_rel, rtt, color=colors[i % len(colors)], label=label, marker="o", ms=5, alpha=0.9)
-
-    ax.axhline(RTT_THRESHOLD_MS, color="black", ls=":", lw=2.4, label=f"threshold {RTT_THRESHOLD_MS:.0f}ms")
-    ax.set_ylabel("Long-term RTT (ms)")
-    ax.set_xlabel("Experiment time (s)")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-
-    ymin, ymax = ax.get_ylim()
-    for t, kind, detail in events:
-        t_rel = (t - t0).total_seconds()
-        color, ls = MARKER_STYLE.get(kind, ("gray", ":"))
-        ax.axvline(t_rel, color=color, ls=ls, lw=2.2, alpha=0.8)
-        ax.text(t_rel, ymax * 0.95, f" {detail}", rotation=90, va="top", ha="left",
-                fontsize=20, color=color, fontweight="bold")
-
-    ax.legend(loc="upper right", ncol=2, fontsize=20)
+    limit = max(minimum_limit, max(values) * 1.18)
+    bars = ax.barh(labels, values, color=colors, height=0.56)
+    ax.invert_yaxis()
+    ax.set_title(title, fontweight="bold")
+    configure_axis(ax, limit)
+    add_value_labels(ax, bars, values, limit)
     return True
 
 
+def summary_card(ax, x, node, result, candidates, established, parse_error):
+    selected = len(candidates)
+    connected = len(set(candidates) & established)
+    valid = (
+        parse_error is None
+        and result["selected_group"] == 1
+        and result["selected_rep"] == "r1"
+        and result["joined_group"] == 1
+        and result["good_links"] == 3
+        and result["known_members"] == 3
+        and result["anchor_decision"]
+        and selected == 2
+        and connected == 2
+    )
+    if parse_error:
+        lines = ["LOG ERROR", parse_error]
+    else:
+        lines = [
+            f"RECOMMEND  Group {result['selected_group'] or '?'} via {result['selected_rep'] or '?'}",
+            f"JOIN  Group {result['joined_group'] or '?'} — "
+            f"{result['good_links'] or 0}/{result['known_members'] or 0} good links",
+            f"ANCHOR  Group 2 — {connected}/{selected} Established",
+            "PASS" if valid else "INCOMPLETE / FAIL",
+        ]
+    ax.text(
+        x,
+        0.50,
+        f"{node}\n" + "\n".join(lines),
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        fontsize=20,
+        linespacing=1.45,
+        fontweight="bold" if valid else "normal",
+        bbox={
+            "boxstyle": "round,pad=0.65",
+            "facecolor": "#66bb6a" if valid else "#ef9a9a",
+            "edgecolor": "#455a64",
+            "linewidth": 1.8,
+            "alpha": 0.18,
+        },
+    )
+    return valid
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Plot backbone-test join timelines for z1/z2")
-    ap.add_argument("--z1", default="logs/bgpd-z1.log")
-    ap.add_argument("--z2", default="logs/bgpd-z2.log")
-    ap.add_argument("--output", default="backbone_join_results.png")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Plot backbone NDS join results")
+    parser.add_argument("--z1", default="logs/bgpd-z1.log")
+    parser.add_argument("--z2", default="logs/bgpd-z2.log")
+    parser.add_argument("--output", default="backbone_join_results.png")
+    args = parser.parse_args()
 
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(20, 16))
-    fig.suptitle("MIDR NDS/CL — Backbone-Topology Join Timeline (z1, z2)",
-                 fontsize=32, fontweight="bold")
-    z1_ok = plot_one(ax0, args.z1, "z1 (attached to t3, near group 2's hub)")
-    z2_ok = plot_one(ax1, args.z2, "z2 (attached to t1, near group 1's hub)")
+    parsed = {"z1": parse_log(args.z1), "z2": parse_log(args.z2)}
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    fig = plt.figure(figsize=(20, 14))
+    grid = fig.add_gridspec(
+        3,
+        2,
+        height_ratios=[3.2, 3.6, 2.4],
+        left=0.11,
+        right=0.98,
+        top=0.89,
+        bottom=0.05,
+        hspace=0.60,
+        wspace=0.34,
+    )
+    fig.suptitle("MIDR NDS Zero-Configuration Join Summary", y=0.965,
+                 fontweight="bold")
+
+    plot_ok = True
+    for column, node in enumerate(("z1", "z2")):
+        samples, result, _candidates, _established, error = parsed[node]
+        rep_values = [
+            latest_value(samples, label, result["rep_time"])
+            for label in REPRESENTATIVES
+        ]
+        member_values = [
+            latest_value(samples, label, result["member_time"], result["rep_time"])
+            for label in GROUP1_MEMBERS
+        ]
+
+        rep_ax = fig.add_subplot(grid[0, column])
+        member_ax = fig.add_subplot(grid[1, column])
+        plot_ok &= draw_bars(
+            rep_ax,
+            ["Group 1 — r1", "Group 2 — r2"],
+            rep_values,
+            ["#2e7d32", "#ef5350"],
+            f"{node}: Representative Ranking",
+            58.0,
+        )
+        plot_ok &= draw_bars(
+            member_ax,
+            ["r1 (rep)", "m1a", "m1b"],
+            member_values,
+            ["#2e7d32", "#66bb6a", "#66bb6a"],
+            f"{node}: Group 1 Member Validation",
+            24.0,
+        )
+        plot_ok &= error is None
+
+    summary_ax = fig.add_subplot(grid[2, :])
+    summary_ax.axis("off")
+    summary_ok = True
+    for x, node in ((0.25, "z1"), (0.75, "z2")):
+        _samples, result, candidates, established, error = parsed[node]
+        summary_ok &= summary_card(
+            summary_ax, x, node, result, candidates, established, error
+        )
+
+    fig.text(
+        0.5,
+        0.015,
+        "Both zero-config nodes discover the directory, select Group 1, validate all members, and establish Group 2 anchors.",
+        ha="center",
+        fontsize=20,
+        color="#37474f",
+    )
     plt.savefig(args.output, dpi=150, bbox_inches="tight")
     print(f"Saved: {args.output}")
-    return 0 if z1_ok and z2_ok else 1
+    return 0 if plot_ok and summary_ok else 1
 
 
 if __name__ == "__main__":
