@@ -31,12 +31,14 @@ ip netns exec ns-gr-hub sysctl -qw net.ipv4.ip_forward=1
 # test is exercising; group size is.
 declare -A HUBIP=( [b]=10.20.5.1  [r]=10.20.1.1  [j1]=10.20.2.1  [j2]=10.20.3.1  [j3]=10.20.4.1 )
 declare -A NODEIP=( [b]=10.20.5.2 [r]=10.20.1.2 [j1]=10.20.2.2 [j2]=10.20.3.2 [j3]=10.20.4.2 )
+declare -A TRANSPORT=( [b]=10.0.100.1 [r]=10.0.101.1 [j1]=10.0.102.1 [j2]=10.0.103.1 [j3]=10.0.104.1 )
 
 for node in "${NODES[@]}"; do
     hv="v-gr-${node}-h"
     nv="v-gr-${node}-n"
     h_ip="${HUBIP[$node]}"
     n_ip="${NODEIP[$node]}"
+    transport="${TRANSPORT[$node]}"
 
     ip -n ns-gr-hub link add "$hv" type veth peer name "$nv"
     ip -n ns-gr-hub link set "$nv" netns "ns-gr-$node"
@@ -47,7 +49,9 @@ for node in "${NODES[@]}"; do
     ip -n "ns-gr-$node" addr add "${n_ip}/30" dev "$nv"
     ip -n "ns-gr-$node" link set "$nv" up
     ip -n "ns-gr-$node" link set lo up
+    ip -n "ns-gr-$node" addr add "${transport}/32" dev lo
     ip -n "ns-gr-$node" route add default via "$h_ip"
+    ip -n ns-gr-hub route add "${transport}/32" via "$n_ip"
 
     ip netns exec ns-gr-hub tc qdisc add dev "$hv" root netem delay 2ms
 
