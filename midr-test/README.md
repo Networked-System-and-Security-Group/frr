@@ -256,3 +256,13 @@ exit
 ```
 
 `show midr topology nodes/links` 只显示 active Local Fact，`show midr topology tombstones` 只显示已撤销对象的 key 和最后 input version。`show midr topology sync` 显示输入状态、Provider、队列和 Resync 诊断；`show midr events` 显示事件接收、处理、拒绝和丢弃计数。
+
+## 第一组与第二组只读验收
+
+15 节点 `midr-backbone` containerlab 已按阶段启动并收敛后运行：
+
+```bash
+./midr-test/backbone-group2/run_group1_group2_demo_check.sh
+```
+
+脚本只读取容器和 VTY 状态，不执行退网、重启、iptables 或配置修改。默认最多等待 600 秒，验证第一组 Node/Link 上报、强 Snapshot Provider、第二组输入队列、owned objects、MIDR RIB、LSDB、TED、group 0 引导静默和 remote view 对账。可通过 `MIDR_DEMO_WAIT_SECONDS`、`MIDR_DEMO_POLL_SECONDS` 和 `MIDR_LAB_PREFIX` 调整等待时间、轮询间隔和容器名前缀。
