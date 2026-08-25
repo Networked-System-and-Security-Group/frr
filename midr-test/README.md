@@ -17,6 +17,8 @@ midr-test/
   run-m4-scenarios.sh    # M4 RIB/LSDB Gherkin 组件测试
   run-m5-multinode.sh    # M5 rootless 多节点传播测试
   run-m5-scenarios.py    # M5 Gherkin ID 与自动断言映射
+  run-spf-e2e-multinode.sh
+                          # privileged 多节点 TED→SPF→Zebra→FIB 测试
   run-m6-m7-scenarios.py # M6/M7 Gherkin ID 与自动断言映射
   check-command-reference.py
                           # 配置手册与实际 VTY 语法一致性检查
@@ -167,6 +169,26 @@ python3 ./midr-test/run-m5-scenarios.py
 ```
 
 固定场景覆盖三节点线形传播、逐跳 `MP_UNREACH`、intra-group/global scope、三角拓扑 alternate path 与防环、EoR timeout/迟到恢复，以及 Route Refresh。M5 的阶段门禁以这些协议行为、完整 M0-M5 回归、Clang、ASAN/UBSAN/LeakSanitizer 和 codec fuzz 为主；覆盖率只用于定位明显缺失的关键分支，不设置为了达到单一百分比而反复补测的关闭门槛。
+
+运行 SPF 端到端测试：
+
+```bash
+make -j$(nproc) bgpd/bgpd zebra/zebra
+sudo ./midr-test/run-spf-e2e-multinode.sh line
+sudo ./midr-test/run-spf-e2e-multinode.sh complex
+sudo ./midr-test/run-spf-e2e-multinode.sh cross-group
+```
+
+该测试需要 Ubuntu 24.04 privileged 容器或等价的 root Linux 环境，并要求安装
+`iproute2` 和 `iputils-ping`。每个节点使用独立 network namespace，并运行一套真实
+`bgpd + zebra`。`line` 场景验证 r1→r2→r3 两跳路径；`complex` 场景构造
+r1→{r2,r3}→r4→r5 五节点等价双路径，验证两个 `proto 199` ECMP first-hop、两条
+分支分别故障时的无损收敛以及恢复后的 ECMP 重建。`cross-group` 使用相同物理拓扑，
+但将 r1/r2/r3、r4、r5 分别放入 Group 10、20、30，验证 `egress_links`、
+`group_edges`、`prefix_groups`、Group SPF 和本群物理出口选择。三个场景都从拓扑和
+Prefix 输入开始，贯穿 MIDR BGP 传播、LSDB/TED、SPF、第三组 ZAPI、Zebra、Linux
+FIB 和真实报文转发，并验证 Prefix 撤销/恢复。运行日志保存在
+`midr-test/run/spf-e2e/<scenario>/`。
 
 运行 M6 Prefix Contributor、Node/Group Prefix、代表接管，以及 M7 TED parity/Consumer 场景：
 
