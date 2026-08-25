@@ -248,7 +248,9 @@ for node in "${NODES[@]}"; do
     done
     docker cp "$REPO_ROOT/vtysh/.libs/vtysh" \
         "$container:/usr/bin/vtysh" >/dev/null
-    docker exec -u root "$container" sh -c ': > /etc/frr/logs/frr.log' >/dev/null
+    docker exec -u root "$container" sh -c \
+        ': > /etc/frr/logs/frr.log
+         chown -R frr:frr /etc/frr/logs' >/dev/null
 done
 
 vty() {
