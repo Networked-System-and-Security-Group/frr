@@ -36,6 +36,15 @@ TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for each joiner's JOIN decision
 DO_SETUP=1
 
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Run this test with sudo: sudo ./run_test.sh" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" ]]; then
+    echo "Missing bgpd binary: $BGPD" >&2
+    exit 2
+fi
+
 cd "$TESTDIR"
 
 for arg in "$@"; do
@@ -45,7 +54,14 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[growth-run_test] Interrupted."; exit 1' INT TERM
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo "[growth-run_test] Interrupted."; exit 130' INT TERM
 
 echo "[growth-run_test] Checking for stale bgpd instances from a previous run..."
 shopt -s nullglob
@@ -66,6 +82,7 @@ if [[ "$DO_SETUP" -eq 1 ]]; then
 fi
 
 mkdir -p "$TESTDIR/logs"
+rm -f "$TESTDIR/logs"/*.log "$TESTDIR/growth_results.png"
 rm -rf /tmp/midr-gr-vty && mkdir -p /tmp/midr-gr-vty
 
 start_node() {
@@ -193,4 +210,15 @@ wait_for_join j3 || true
 chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
 
 echo ""
-bash "$TESTDIR/check_result.sh"
+result_rc=0
+bash "$TESTDIR/check_result.sh" || result_rc=$?
+
+plot_rc=0
+mkdir -p /tmp/midr-matplotlib
+MPLCONFIGDIR=/tmp/midr-matplotlib python3 "$TESTDIR/plot_growth.py" \
+    --log-dir "$TESTDIR/logs" --output "$TESTDIR/growth_results.png" || plot_rc=$?
+chmod a+r "$TESTDIR/growth_results.png" 2>/dev/null || true
+
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+    exit 1
+fi
