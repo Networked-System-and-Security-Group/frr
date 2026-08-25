@@ -5,7 +5,21 @@ set -e
 NODES=(a d e f)
 
 echo "[iso-teardown] Killing bgpd instances..."
-for node in "${NODES[@]}"; do
+for node in f; do
+    pidfile="/tmp/bgpd-iso-${node}.pid"
+    if [[ -f "$pidfile" ]]; then
+        pid=$(cat "$pidfile" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            echo "  Killed bgpd for $node (pid $pid)"
+        fi
+        rm -f "$pidfile"
+    fi
+done
+
+sleep 1
+
+for node in a d e; do
     pidfile="/tmp/bgpd-iso-${node}.pid"
     if [[ -f "$pidfile" ]]; then
         pid=$(cat "$pidfile" 2>/dev/null || true)

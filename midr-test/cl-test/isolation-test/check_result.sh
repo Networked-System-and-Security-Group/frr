@@ -32,7 +32,7 @@ check() {
 # kill d/e 时 f 日志的行号，由 run_test.sh 落盘。ISOLATED / 重新 join / fallback
 # CREATE 这几条在**首次 join** 时也会合法出现，全文件 grep 会拿旧行报 PASS
 # （2026-08-25 实测：CREATE 在 kill 前 3 分钟就发生了，Phase 4 照样报 PASS）。
-KILL_MARKER=$(cat "$LOGDIR/.kill_marker" 2>/dev/null || echo "")
+KILL_MARKER=$(sed -n '1p' "$LOGDIR/kill_marker.log" 2>/dev/null || true)
 after_kill() {
     if [[ -n "$KILL_MARKER" ]]; then
         tail -n "+${KILL_MARKER}" "$LOG" 2>/dev/null
@@ -50,7 +50,7 @@ check_after() {
     fi
 }
 if [[ -z "$KILL_MARKER" ]]; then
-    echo "  ⚠ 未找到 logs/.kill_marker，Phase 2-4 退回全文件匹配，结果不可信"
+    echo "  ⚠ 未找到 logs/kill_marker.log，Phase 2-4 退回全文件匹配，结果不可信"
     echo ""
 fi
 
@@ -71,7 +71,7 @@ echo "--- Phase 3: recovery attempt against the still-alive bootstrap (a) ---"
 # 原判据是"全文件计数 >= 2"，但首次 join 死心时本身就会重试出好几条，
 # 光靠计数分不出新旧。改成只数 kill 之后的。
 after_kill | grep "MIDR JOIN: sent REP_LIST_REQ to bootstrap" | tail -2 | sed 's/^/    /'
-req_count=$(after_kill | grep -c "MIDR JOIN: sent REP_LIST_REQ to bootstrap" 2>/dev/null || echo 0)
+req_count=$(after_kill | grep -c "MIDR JOIN: sent REP_LIST_REQ to bootstrap" 2>/dev/null || true)
 if [[ "$req_count" -ge 1 ]]; then
     echo "  PASS: bootstrap was re-contacted after isolation ($req_count REP_LIST_REQ post-kill)"
 else
