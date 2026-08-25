@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -51,8 +51,10 @@ if [ "${IPERF_ENABLE:-0}" = "1" ]; then
     echo "[node-a] iperf3 UDP client will start in ${START}s and run for ${DURATION}s at ${BW}bps..."
     sleep "$START"
     printf '%s MIDR PM TEST: iperf START\n' "$(date '+%Y/%m/%d %H:%M:%S.%3N')" >> "$SCRIPT_DIR/bgpd-a.log"
-    echo "[node-a] starting iperf3 UDP client -> 10.2.1.1:5201"
-    iperf3 -c 10.2.1.1 -p 5201 -u -b "$BW" -t "$DURATION"
+    echo "[node-a] starting iperf3 UDP client 10.1.1.1:5202 -> 10.2.1.1:5201"
+    iperf3 -c 10.2.1.1 -B 10.1.1.1 -p 5201 --cport 5202 \
+        -u -b "$BW" -l 1200 -t "$DURATION" --get-server-output 2>&1 \
+        | tee "$SCRIPT_DIR/iperf-client.log"
     printf '%s MIDR PM TEST: iperf END\n' "$(date '+%Y/%m/%d %H:%M:%S.%3N')" >> "$SCRIPT_DIR/bgpd-a.log"
     echo "[node-a] iperf3 UDP client done"
 fi

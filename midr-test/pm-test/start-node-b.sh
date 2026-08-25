@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -20,7 +20,7 @@ echo "[node-b] RATTAN_BASE=$RATTAN_BASE"
 
 if [ "${IPERF_ENABLE:-0}" = "1" ]; then
     echo "[node-b] starting iperf3 server on port 5201..."
-    iperf3 -s -p 5201 &
+    iperf3 -s -1 -p 5201 > "$SCRIPT_DIR/iperf-server.log" 2>&1 &
     IPERF_PID=$!
 fi
 
