@@ -30,22 +30,29 @@ M1A_TRANSPORT=10.99.0.112; M1A_RID=10.0.0.112
 
 PASS=0; FAIL=0; NOSAMPLE=0
 Z1_SHUTDOWN=0
-GROUP_CHANGED=0
 FAULT_RULES=0
 pass()  { echo "  ✓ $1"; PASS=$((PASS+1)); }
 fail()  { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 nosam() { echo "  ⚠ 没造出场景：$1"; NOSAMPLE=$((NOSAMPLE+1)); }
 
 v()        { docker exec "$1" vtysh -c "$2" 2>/dev/null; }
-# 判据补 2 用它改群号造死心场景。本函数原先缺失（脚本第 276/277 行直接调用了
-# 未定义的 conf，报 "command not found" → 改群号没执行 → 判据补2-a 恒 NOSAMPLE）。
-# 2026-08-22 轮 4 步 0 回归时发现并补上，写法照抄 backbone-shutdown/ 同名函数。
+# Apply a BGP-scoped MIDR command.
 conf()     { docker exec "$1" vtysh -c "configure terminal" -c "router bgp $2" -c "$3" 2>/dev/null; }
 loglines() { docker exec "$1" sh -c "wc -l < $LOG" 2>/dev/null | tr -d ' '; }
 logtail()  { docker exec "$1" sh -c "tail -n +$(( $2 + 1 )) $LOG" 2>/dev/null; }
 dbgon()    { docker exec "$1" vtysh -c "configure terminal" \
                 -c "debug bgp midr" -c "debug bgp midr discovery" >/dev/null 2>&1; }
 groupid()  { v "$1" "show midr self" | awk -F: '/^Group-ID/{gsub(/ /,"",$2);print $2}'; }
+retry_cleanup_complete() {
+    local text="$1" transport="$2" rid="$3" half_line cleanup_line
+    half_line=$(printf '%s\n' "$text" | grep -n \
+        "拆除 $transport 的半边会话.*PEER_REQUEST 重传 5 次无回应" \
+        | tail -1 | cut -d: -f1)
+    cleanup_line=$(printf '%s\n' "$text" | grep -n \
+        "边注销：$rid/32" | tail -1 | cut -d: -f1)
+    [ -n "$half_line" ] && [ -n "$cleanup_line" ] && \
+        [ "$cleanup_line" -gt "$half_line" ]
+}
 
 remove_fault_rule() {
     local container="$1" source="$2" protocol="$3" port="$4"
@@ -68,9 +75,6 @@ restore_test_state() {
     local rc=$?
     trap - EXIT INT TERM
     if [ "$FAULT_RULES" -eq 1 ]; then clear_fault_rules; fi
-    if [ "$GROUP_CHANGED" -eq 1 ]; then
-        conf "$M1B" 65113 "midr group-id 1" >/dev/null 2>&1 || true
-    fi
     if [ "$Z1_SHUTDOWN" -eq 1 ]; then
         conf "$Z1" 65191 "no midr shutdown" >/dev/null 2>&1 || true
     fi
@@ -335,10 +339,9 @@ fi
 #      "MIDR 边注销：…的本群邻居身份已撤"（bgp_midr_nds.c:1055）。即便侥幸造出
 #      场景，第二层判据也会命中 fail 分支，报出**假 FAIL**。
 #
-# 它要验的语义（建连死心 → midr_nds_cleanup_by_transport → 停探 + 清 is_adjacent）
-# **已由下方判据补 2-a 完整覆盖**：那条走真实可达的自动建连路径（改群号 → 重收敛
-# → midr_ctrl_connect 发 PEER_REQUEST → 被两边对挡 → 重传耗尽死心），2026-08-22
-# 已拿到正样本。留一条造不出场景的判据只会每轮产出假 NOSAMPLE、掩盖真问题。
+# S2-a below covers the same cleanup path by dropping an established overlay
+# session while both transports are blocked, then letting fallback create a
+# real half-session whose PEER_REQUEST retries must expire.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -396,11 +399,12 @@ done
                   || fail "判据补1：缺 $MISS 条群内边"
 
 # ---------------------------------------------------------------------------
-# 判据 补2：死锁自愈（两边对挡 → 恢复后 30s 一拍内靠兜底重连）
-#   旧败：修复前同样场景 60s 不自愈，只能手动改群号救。
+# S2: block both directions, clear the live overlay, and verify retry cleanup
+# followed by fallback recovery after the transport is restored.
 # ---------------------------------------------------------------------------
 echo
 echo "[判据 补2] 死锁自愈（两边对挡 179+5859 → 恢复）"
+M1A_BASE=$(loglines $M1A)
 M1B_BASE=$(loglines $M1B)
 clear_fault_rules
 FAULT_RULES=1
@@ -411,24 +415,35 @@ for r in "$M1A:10.99.0.113" "$M1B:10.99.0.112"; do
 done
 if docker exec -u root $M1A iptables -C INPUT -s 10.99.0.113 \
     -p udp --dport 5859 -j DROP >/dev/null 2>&1; then
-    GROUP_CHANGED=1
-    conf $M1B 65113 "midr group-id 2"; sleep 6
-    v "$M1A" "clear bgp 10.99.0.113" >/dev/null 2>&1
-    v "$M1B" "clear bgp 10.99.0.112" >/dev/null 2>&1
-    if conf $M1B 65113 "midr group-id 1"; then GROUP_CHANGED=0; fi
-    DEAD=0; T0=$(date +%s)
-    while [ $(( $(date +%s) - T0 )) -le 60 ]; do
-        DEAD_LOG=$(logtail $M1B $M1B_BASE)
-        if echo "$DEAD_LOG" | grep -q "重传 5 次无回应\|尝试 5 次无响应"; then
-            DEAD=1; break
+    CLEAR_OK=1
+    v "$M1A" "clear bgp 10.99.0.113" >/dev/null 2>&1 || CLEAR_OK=0
+    v "$M1B" "clear bgp 10.99.0.112" >/dev/null 2>&1 || CLEAR_OK=0
+    CLEAN_NODE=""; DEAD_NODE=""; T0=$(date +%s)
+    while [ $(( $(date +%s) - T0 )) -le 75 ]; do
+        M1A_LOG=$(logtail $M1A $M1A_BASE)
+        M1B_LOG=$(logtail $M1B $M1B_BASE)
+        if echo "$M1A_LOG" | grep -q "PEER_REQUEST 尝试 5 次无响应.*目标 10.99.0.113"; then
+            DEAD_NODE=$M1A
+            if retry_cleanup_complete "$M1A_LOG" 10.99.0.113 10.0.0.113; then
+                CLEAN_NODE=$M1A; break
+            fi
+        fi
+        if echo "$M1B_LOG" | grep -q "PEER_REQUEST 尝试 5 次无响应.*目标 10.99.0.112"; then
+            DEAD_NODE=$M1B
+            if retry_cleanup_complete "$M1B_LOG" 10.99.0.112 10.0.0.112; then
+                CLEAN_NODE=$M1B; break
+            fi
         fi
         sleep 3
     done
-    if [ "$DEAD" -eq 1 ] && echo "$DEAD_LOG" | grep -q "边注销"; then
-        # 本条同时承接原判据 6「真死心清位」的语义（原判据已删，理由见上方留痕注释块）
-        pass "判据补2-a：死心后完整清理生效（边注销 = 停探 + 清位）"
+    if [ "$CLEAR_OK" -eq 0 ]; then
+        nosam "clear bgp 未能清除既有 overlay 会话"
+    elif [ -n "$CLEAN_NODE" ]; then
+        pass "判据补2-a：${CLEAN_NODE##*-} 重传死心后拆半边、停探并清除邻接"
+    elif [ -n "$DEAD_NODE" ]; then
+        fail "判据补2-a：${DEAD_NODE##*-} 已重传死心，但半边会话或邻接清理不完整"
     else
-        nosam "60s 内没同时观察到重传死心与边注销（对挡可能没生效）"
+        nosam "75s 内没有观察到 m1a/m1b 的 PEER_REQUEST 重传死心"
     fi
     # 放开网络，看兜底能否自愈
     clear_fault_rules
