@@ -1729,12 +1729,16 @@ static unsigned int midr_established_session_count(struct bgp *bgp)
  * since a transient zero-session count there is expected, not a failure.
  * 顺带效果：引导节点群号恒 0，第一道守卫即跳过——引导不入群，自然也谈不上
  * 失联自救（与 ⑧=A 第四守卫同向，不必另设防）。
+ *
+ * A new group representative can legitimately have no sessions while it
+ * waits for its first member.
  */
 static void midr_isolation_check(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 
-	if (mi->local_group_id == 0 || mi->join_phase != MIDR_JOIN_IDLE) {
+	if (mi->local_group_id == 0 || mi->join_phase != MIDR_JOIN_IDLE ||
+	    (mi->local_capabilities & MIDR_CAP_GROUP_REP)) {
 		mi->isolated_ticks = 0;
 		return;
 	}
