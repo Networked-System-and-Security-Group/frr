@@ -39,21 +39,22 @@ CRITERIA = [
 
 
 def read_samples(path):
-    rows = []
+    rows = {}
     with open(path, encoding="utf-8", errors="replace") as stream:
         for row in csv.DictReader(stream):
             try:
-                rows.append({
+                parsed = {
                     "elapsed": int(row["elapsed"]),
                     "node": row["node"],
                     "reported": int(row["node_reported"]),
                     "pending": int(row["node_pending"]),
                     "link_reported": int(row["link_reported"]),
                     "owned": int(row["owned_links"]),
-                })
+                }
+                rows[(parsed["elapsed"], parsed["node"])] = parsed
             except (KeyError, ValueError):
                 continue
-    return rows
+    return list(rows.values())
 
 
 def aggregate(rows, nodes, fields):
@@ -136,23 +137,32 @@ def main():
     link_elapsed, link_data = aggregate(
         rows, LINK_NODES, ("link_reported", "owned"))
     link_minutes = link_elapsed / 60.0
-    exact_match = np.allclose(link_data["link_reported"], link_data["owned"],
-                              equal_nan=True)
-    if exact_match:
-        draw_line(link_ax, link_minutes, link_data["link_reported"],
-                  "Reported = Group2-owned", "#238b45", "o")
-        valid = link_data["link_reported"][~np.isnan(link_data["link_reported"])]
-        if valid.size:
-            link_ax.text(0.97, 0.10, f"Final account: {int(valid[-1])} = {int(valid[-1])}",
-                         transform=link_ax.transAxes, ha="right", va="bottom",
-                         fontsize=21, color="#176b38", fontweight="bold",
-                         bbox={"boxstyle": "round,pad=0.35", "facecolor": "#d8f3dc",
-                               "edgecolor": "#238b45"})
-    else:
-        draw_line(link_ax, link_minutes, link_data["link_reported"],
-                  "Locally reported links", "#6a3d9a", "o")
-        draw_line(link_ax, link_minutes, link_data["owned"],
-                  "Group2-owned links", "#33a02c", "s")
+    both_valid = (~np.isnan(link_data["link_reported"]) &
+                  ~np.isnan(link_data["owned"]))
+    confirmed = np.where(
+        both_valid,
+        np.minimum(link_data["link_reported"], link_data["owned"]),
+        np.nan,
+    )
+    gap = np.where(
+        both_valid,
+        np.abs(link_data["link_reported"] - link_data["owned"]),
+        np.nan,
+    )
+    draw_line(link_ax, link_minutes, confirmed,
+              "Confirmed on both sides", "#238b45", "o")
+    draw_line(link_ax, link_minutes, gap,
+              "Accounting gap", "#d95f02", "s")
+    valid = np.flatnonzero(both_valid)
+    if valid.size:
+        last = valid[-1]
+        reported = int(link_data["link_reported"][last])
+        owned = int(link_data["owned"][last])
+        link_ax.text(0.97, 0.10, f"Final account: {reported} = {owned}",
+                     transform=link_ax.transAxes, ha="right", va="bottom",
+                     fontsize=21, color="#176b38", fontweight="bold",
+                     bbox={"boxstyle": "round,pad=0.35", "facecolor": "#d8f3dc",
+                           "edgecolor": "#238b45"})
     link_ax.set_title("Link-account convergence (r1, m1a, m1b)",
                       fontweight="bold")
     link_ax.set_xlabel("Elapsed time (minutes)")

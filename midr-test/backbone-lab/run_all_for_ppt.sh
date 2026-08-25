@@ -361,8 +361,8 @@ if [[ "$elapsed" -ge "$JOIN_TIMEOUT" ]]; then
     exit 1
 fi
 
-sample_once
 stop_sampler
+sample_once
 echo "[backbone] Running G1-G8 integration criteria..."
 set +e
 GROUP2_HEALTH_LOG="$SCRIPT_DIR/group2_health.log" \
