@@ -37,6 +37,8 @@ TESTDIR="$SCRIPT_DIR"
 JOIN_TIMEOUT=150
 DO_SETUP=1
 PYTHON_BIN="${MIDR_PYTHON_BIN:-python3}"
+BG_PIDS=()
+BG_NODES=()
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Run this test with sudo: sudo ./run_test.sh" >&2
@@ -96,10 +98,27 @@ done
 rm -f "$TESTDIR/run.log"
 exec > >(tee "$TESTDIR/run.log") 2>&1
 
+wait_for_nodes() {
+    local failed=0 index rc
+    for index in "${!BG_PIDS[@]}"; do
+        if wait "${BG_PIDS[$index]}"; then
+            continue
+        else
+            rc=$?
+            echo "[bb-run_test] ${BG_NODES[$index]} exited abnormally (status $rc)." >&2
+            failed=1
+        fi
+    done
+    BG_PIDS=()
+    BG_NODES=()
+    return "$failed"
+}
+
 cleanup() {
     local rc=$?
     trap - EXIT
     bash "$TESTDIR/teardown.sh" || true
+    wait_for_nodes || true
     chmod -R a+rX "$TESTDIR/logs" 2>/dev/null || true
     chmod a+r "$TESTDIR/run.log" 2>/dev/null || true
     chmod a+r "$TESTDIR/backbone_join_results.png" 2>/dev/null || true
@@ -141,6 +160,8 @@ start_node() {
         -i "/tmp/bgpd-bb-${node}.pid" \
         --vty_socket "/tmp/midr-bb-vty/$node" \
         --log-level debug &
+    BG_PIDS+=("$!")
+    BG_NODES+=("$node")
     echo "  started bgpd for $node (bg pid $!)"
 }
 
@@ -287,19 +308,22 @@ result_rc=0
 bash "$TESTDIR/check_result.sh" || result_rc=$?
 
 echo "[bb-run_test] Stopping backbone-test processes before plotting..."
+shutdown_rc=0
 if ! bash "$TESTDIR/teardown.sh"; then
     echo "[bb-run_test] Failed to stop the testbed; retrying through the exit trap." >&2
-    exit 1
+    shutdown_rc=1
 fi
+wait_for_nodes || shutdown_rc=1
 trap - EXIT
 
 plot_rc=0
 MPLCONFIGDIR=/tmp/midr-matplotlib "$PYTHON_BIN" "$TESTDIR/plot_backbone_join.py" \
     --z1 "$TESTDIR/logs/bgpd-z1.log" --z2 "$TESTDIR/logs/bgpd-z2.log" \
+    --result-log "$TESTDIR/run.log" \
     --output "$TESTDIR/backbone_join_results.png" || plot_rc=$?
 chmod a+r "$TESTDIR/backbone_join_results.png" 2>/dev/null || true
 chmod a+r "$TESTDIR/run.log" 2>/dev/null || true
 
-if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 ]]; then
+if [[ "$result_rc" -ne 0 || "$plot_rc" -ne 0 || "$shutdown_rc" -ne 0 ]]; then
     exit 1
 fi

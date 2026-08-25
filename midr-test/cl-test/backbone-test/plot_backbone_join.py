@@ -53,6 +53,9 @@ ANCHOR_DECISION_PAT = re.compile(r"MIDR I-7：ANCHOR ")
 ANCHOR_ESTABLISHED_PAT = re.compile(
     r"MIDR 台账：([\d.]+)（原因=CL_ANCHOR）掉出 Established"
 )
+LIVE_ANCHOR_PAT = re.compile(
+    r"PASS: (z[12]) has (\d+) Established anchor session"
+)
 
 
 def parse_ts(value):
@@ -114,7 +117,7 @@ def parse_log(path):
 
             match = ANCHOR_CANDIDATE_PAT.search(line)
             if match:
-                anchor_candidates[match.group(1)] = {
+                anchor_candidates[node_name(match.group(1))] = {
                     "name": node_name(match.group(1)),
                     "group": int(match.group(2)),
                     "rtt_ms": int(match.group(3)) / 1000.0,
@@ -127,9 +130,23 @@ def parse_log(path):
 
             match = ANCHOR_ESTABLISHED_PAT.search(line)
             if match:
-                anchor_established.add(match.group(1))
+                anchor_established.add(node_name(match.group(1)))
 
     return samples, result, anchor_candidates, anchor_established, None
+
+
+def parse_live_anchor_counts(path):
+    counts = {}
+    try:
+        stream = open(path, encoding="utf-8")
+    except OSError:
+        return counts
+    with stream:
+        for line in stream:
+            match = LIVE_ANCHOR_PAT.search(line)
+            if match:
+                counts[match.group(1)] = int(match.group(2))
+    return counts
 
 
 def latest_value(samples, label, cutoff, start=None):
@@ -189,9 +206,12 @@ def draw_bars(ax, labels, values, colors, title, minimum_limit):
     return True
 
 
-def summary_card(ax, x, node, result, candidates, established, parse_error):
+def summary_card(ax, x, node, result, candidates, established, live_count,
+                 parse_error):
     selected = len(candidates)
-    connected = len(set(candidates) & established)
+    connected = live_count if live_count is not None else len(
+        set(candidates) & established
+    )
     valid = (
         parse_error is None
         and result["selected_group"] == 1
@@ -238,10 +258,12 @@ def main():
     parser = argparse.ArgumentParser(description="Plot backbone NDS join results")
     parser.add_argument("--z1", default="logs/bgpd-z1.log")
     parser.add_argument("--z2", default="logs/bgpd-z2.log")
+    parser.add_argument("--result-log", default="run.log")
     parser.add_argument("--output", default="backbone_join_results.png")
     args = parser.parse_args()
 
     parsed = {"z1": parse_log(args.z1), "z2": parse_log(args.z2)}
+    live_anchor_counts = parse_live_anchor_counts(args.result_log)
 
     fig = plt.figure(figsize=(20, 14))
     grid = fig.add_gridspec(
@@ -296,7 +318,8 @@ def main():
     for x, node in ((0.25, "z1"), (0.75, "z2")):
         _samples, result, candidates, established, error = parsed[node]
         summary_ok &= summary_card(
-            summary_ax, x, node, result, candidates, established, error
+            summary_ax, x, node, result, candidates, established,
+            live_anchor_counts.get(node), error
         )
 
     fig.text(
