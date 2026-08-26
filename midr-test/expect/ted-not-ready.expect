@@ -12,7 +12,6 @@ MIDR SPF summary:
   cached generation:    0
   pending generation:   0
   pending change flags: 0x0
-  recompute pending:    no
   recomputes:           0
   last error:           0
   routes:               0
