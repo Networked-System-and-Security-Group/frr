@@ -1426,6 +1426,156 @@ void midr_show_lsdb(struct vty *vty, struct midr_context *ctx)
 	vty_out(vty, "  last error:       %d\n", summary.last_error);
 }
 
+static const char *midr_lsdb_scope_name(enum midr_lsdb_scope scope)
+{
+	switch (scope) {
+	case MIDR_LSDB_SCOPE_LOCAL_ONLY:
+		return "LOCAL_ONLY";
+	case MIDR_LSDB_SCOPE_INTRA_GROUP:
+		return "INTRA_GROUP";
+	case MIDR_LSDB_SCOPE_GLOBAL:
+		return "GLOBAL";
+	}
+	return "UNKNOWN";
+}
+
+static const char *midr_lsdb_object_type_name(enum midr_nlri_type type)
+{
+	switch (type) {
+	case MIDR_NLRI_TYPE_MEMBERSHIP:
+		return "MEMBERSHIP";
+	case MIDR_NLRI_TYPE_LINK:
+		return "LINK";
+	case MIDR_NLRI_TYPE_NODE_PREFIX:
+		return "NODE_PREFIX";
+	case MIDR_NLRI_TYPE_GROUP_PREFIX:
+		return "GROUP_PREFIX";
+	case MIDR_NLRI_TYPE_RESERVED:
+		break;
+	}
+	return "UNKNOWN";
+}
+
+static const char *midr_lsdb_pending_name(enum midr_lsdb_pending_reason reason)
+{
+	switch (reason) {
+	case MIDR_LSDB_PENDING_NONE:
+		return "NONE";
+	case MIDR_LSDB_PENDING_LOCAL_MEMBERSHIP:
+		return "LOCAL_MEMBERSHIP";
+	case MIDR_LSDB_PENDING_REMOTE_MEMBERSHIP:
+		return "REMOTE_MEMBERSHIP";
+	case MIDR_LSDB_PENDING_GROUP_MEMBERSHIP:
+		return "GROUP_MEMBERSHIP";
+	case MIDR_LSDB_PENDING_SCOPE_INELIGIBLE:
+		return "SCOPE_INELIGIBLE";
+	}
+	return "UNKNOWN";
+}
+
+struct midr_lsdb_show_state {
+	struct vty *vty;
+	struct midr_context *ctx;
+	size_t count;
+};
+
+static void midr_lsdb_show_entry(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_lsdb_show_state *show = arg;
+	struct midr_lsdb_entry *entry = bucket->data;
+	const struct midr_ls_object *object = &entry->object;
+	struct in_addr origin = {.s_addr = object->key.originator_node_id};
+	struct in_addr remote;
+
+	show->count++;
+	vty_out(show->vty,
+		"object type=%s origin=%pI4 sequence=%" PRIu64
+		" policy=0x%" PRIx64 " usable=%s scope=%s scope-group=%u"
+		" pending=%s source=",
+		midr_lsdb_object_type_name(object->key.type), &origin,
+		object->ls_sequence,
+		object->policy_tags, entry->usable ? "yes" : "no",
+		midr_lsdb_scope_name(entry->scope), entry->scope_group_id,
+		midr_lsdb_pending_name(entry->pending_reason));
+	if (entry->peer == show->ctx->bgp->peer_self)
+		vty_out(show->vty, "self");
+	else if (entry->peer && entry->peer->remote_id.s_addr)
+		vty_out(show->vty, "%pI4", &entry->peer->remote_id);
+	else
+		vty_out(show->vty, "%s",
+			entry->peer && entry->peer->host ? entry->peer->host
+							 : "unknown");
+
+	switch (object->key.type) {
+	case MIDR_NLRI_TYPE_MEMBERSHIP:
+		vty_out(show->vty, " group=%u transport=",
+			object->payload.membership.group_id);
+		if (object->payload.membership.has_transport_address)
+			vty_out(show->vty, "%pIA",
+				&object->payload.membership.transport_address);
+		else
+			vty_out(show->vty, "none");
+		vty_out(show->vty, " caps=0x%" PRIx64,
+			object->payload.membership.cap_flags);
+		break;
+	case MIDR_NLRI_TYPE_LINK:
+		remote.s_addr = object->key.u.link.remote_node_id;
+		vty_out(show->vty,
+			" remote=%pI4 link-id=%" PRIu64
+			" addresses=%pIA->%pIA advertised-cost=%u"
+			" derived-cost=%u ifindex=%d",
+			&remote, object->key.u.link.link_id,
+			&object->payload.link.link_local_address,
+			&object->payload.link.link_remote_address,
+			object->payload.link.canonical_cost,
+			entry->canonical_cost, entry->local_ifindex);
+		break;
+	case MIDR_NLRI_TYPE_NODE_PREFIX:
+		vty_out(show->vty, " afi=%u safi=%u prefix=%pFX",
+			object->key.u.node_prefix.afi,
+			object->key.u.node_prefix.safi,
+			&object->key.u.node_prefix.prefix);
+		break;
+	case MIDR_NLRI_TYPE_GROUP_PREFIX:
+		vty_out(show->vty, " group=%u afi=%u safi=%u prefix=%pFX",
+			object->key.u.group_prefix.group_id,
+			object->key.u.group_prefix.prefix.afi,
+			object->key.u.group_prefix.prefix.safi,
+			&object->key.u.group_prefix.prefix.prefix);
+		break;
+	case MIDR_NLRI_TYPE_RESERVED:
+		break;
+	}
+	vty_out(show->vty, "\n");
+}
+
+void midr_show_lsdb_objects(struct vty *vty, struct midr_context *ctx)
+{
+	struct midr_lsdb_show_state show = {
+		.vty = vty,
+		.ctx = ctx,
+	};
+	struct midr_lsdb_state *state;
+
+	if (!vty || !ctx || !ctx->lsdb_store) {
+		if (vty)
+			vty_out(vty, "MIDR LSDB is unavailable\n");
+		return;
+	}
+	state = ctx->lsdb_store->current;
+	if (!state) {
+		vty_out(vty, "MIDR LSDB objects: no committed state\n");
+		return;
+	}
+	vty_out(vty,
+		"MIDR LSDB objects: generation=%" PRIu64 " ready=%s\n",
+		state->generation, state->ready ? "yes" : "no");
+	hash_iterate(state->identities, midr_lsdb_show_entry, &show);
+	if (!show.count)
+		vty_out(vty, "  none\n");
+	vty_out(vty, "MIDR LSDB object total: %zu\n", show.count);
+}
+
 int midr_lsdb_test_process(struct midr_context *ctx)
 {
 	if (!ctx || !ctx->lsdb_store)

@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <string.h>
 
+#include "command.h"
 #include "hash.h"
 #include "id_alloc.h"
 #include "memory.h"
@@ -789,6 +790,172 @@ int midr_rib_summary_get(struct midr_context *ctx,
 			store->rejected_payload_conflict,
 	};
 	return 0;
+}
+
+static const char *midr_rib_identity_state_name(enum midr_rib_identity_state state)
+{
+	switch (state) {
+	case MIDR_RIB_IDENTITY_NO_PATH:
+		return "NO_PATH";
+	case MIDR_RIB_IDENTITY_SELECTED:
+		return "SELECTED";
+	case MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED:
+		return "CONFLICT_QUARANTINED";
+	}
+	return "UNKNOWN";
+}
+
+static const char *midr_rib_object_type_name(enum midr_nlri_type type)
+{
+	switch (type) {
+	case MIDR_NLRI_TYPE_MEMBERSHIP:
+		return "MEMBERSHIP";
+	case MIDR_NLRI_TYPE_LINK:
+		return "LINK";
+	case MIDR_NLRI_TYPE_NODE_PREFIX:
+		return "NODE_PREFIX";
+	case MIDR_NLRI_TYPE_GROUP_PREFIX:
+		return "GROUP_PREFIX";
+	case MIDR_NLRI_TYPE_RESERVED:
+		break;
+	}
+	return "UNKNOWN";
+}
+
+static void midr_rib_show_object(struct vty *vty,
+				 const struct midr_ls_object *object)
+{
+	struct in_addr origin = {.s_addr = object->key.originator_node_id};
+	struct in_addr remote;
+
+	vty_out(vty, " object=%s origin=%pI4 sequence=%" PRIu64
+		     " policy=0x%" PRIx64,
+		midr_rib_object_type_name(object->key.type), &origin,
+		object->ls_sequence, object->policy_tags);
+	switch (object->key.type) {
+	case MIDR_NLRI_TYPE_MEMBERSHIP:
+		vty_out(vty, " group=%u transport=",
+			object->payload.membership.group_id);
+		if (object->payload.membership.has_transport_address)
+			vty_out(vty, "%pIA",
+				&object->payload.membership.transport_address);
+		else
+			vty_out(vty, "none");
+		vty_out(vty, " caps=0x%" PRIx64,
+			object->payload.membership.cap_flags);
+		break;
+	case MIDR_NLRI_TYPE_LINK:
+		remote.s_addr = object->key.u.link.remote_node_id;
+		vty_out(vty,
+			" remote=%pI4 link-id=%" PRIu64
+			" addresses=%pIA->%pIA cost=%u",
+			&remote, object->key.u.link.link_id,
+			&object->payload.link.link_local_address,
+			&object->payload.link.link_remote_address,
+			object->payload.link.canonical_cost);
+		break;
+	case MIDR_NLRI_TYPE_NODE_PREFIX:
+		vty_out(vty, " afi=%u safi=%u prefix=%pFX",
+			object->key.u.node_prefix.afi,
+			object->key.u.node_prefix.safi,
+			&object->key.u.node_prefix.prefix);
+		break;
+	case MIDR_NLRI_TYPE_GROUP_PREFIX:
+		vty_out(vty, " group=%u afi=%u safi=%u prefix=%pFX",
+			object->key.u.group_prefix.group_id,
+			object->key.u.group_prefix.prefix.afi,
+			object->key.u.group_prefix.prefix.safi,
+			&object->key.u.group_prefix.prefix.prefix);
+		break;
+	case MIDR_NLRI_TYPE_RESERVED:
+		break;
+	}
+}
+
+struct midr_rib_show_state {
+	struct vty *vty;
+	struct midr_context *ctx;
+	size_t identity_count;
+	size_t path_count;
+};
+
+static void midr_rib_show_identity(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_rib_show_state *show = arg;
+	struct midr_rib_identity *identity = bucket->data;
+	struct bgp_path_info *path;
+
+	if (!identity->path_count)
+		return;
+	show->identity_count++;
+	vty_out(show->vty,
+		"identity synthetic-id=%u state=%s paths=%zu\n",
+		identity->synthetic_id,
+		midr_rib_identity_state_name(identity->state),
+		identity->path_count);
+	for (path = bgp_dest_get_bgp_path_info(identity->dest); path;
+	     path = path->next) {
+		const struct midr_propagation_path *propagation;
+		struct midr_ls_object object;
+		struct in_addr peer_id;
+		size_t index;
+
+		show->path_count++;
+		vty_out(show->vty, "  path peer=");
+		if (path->peer == show->ctx->bgp->peer_self)
+			vty_out(show->vty, "self");
+		else if (path->peer && path->peer->remote_id.s_addr) {
+			peer_id = path->peer->remote_id;
+			vty_out(show->vty, "%pI4", &peer_id);
+		} else
+			vty_out(show->vty, "%s",
+				path->peer && path->peer->host ? path->peer->host
+							       : "unknown");
+		vty_out(show->vty,
+			" selected=%s valid=%s stale=%s removed=%s",
+			CHECK_FLAG(path->flags, BGP_PATH_SELECTED) ? "yes" : "no",
+			CHECK_FLAG(path->flags, BGP_PATH_VALID) ? "yes" : "no",
+			CHECK_FLAG(path->flags, BGP_PATH_STALE) ? "yes" : "no",
+			CHECK_FLAG(path->flags, BGP_PATH_REMOVED) ? "yes" : "no");
+		if (midr_rib_path_object(identity->dest, path, &object) != 0) {
+			vty_out(show->vty, " object=INVALID\n");
+			continue;
+		}
+		midr_rib_show_object(show->vty, &object);
+		propagation = midr_rib_path_propagation(path);
+		vty_out(show->vty, " propagation=[");
+		if (propagation)
+			for (index = 0; index < propagation->node_count; index++) {
+				struct in_addr node = {
+					.s_addr = propagation->nodes[index],
+				};
+
+				vty_out(show->vty, "%s%pI4",
+					index ? "," : "", &node);
+			}
+		vty_out(show->vty, "]\n");
+	}
+}
+
+void midr_show_rib_paths(struct vty *vty, struct midr_context *ctx)
+{
+	struct midr_rib_show_state show = {
+		.vty = vty,
+		.ctx = ctx,
+	};
+
+	if (!vty || !ctx || !ctx->rib_store) {
+		if (vty)
+			vty_out(vty, "MIDR RIB is unavailable\n");
+		return;
+	}
+	vty_out(vty, "MIDR RIB paths:\n");
+	hash_iterate(ctx->rib_store->identities, midr_rib_show_identity,
+		     &show);
+	if (!show.identity_count)
+		vty_out(vty, "  none\n");
+	vty_out(vty, "MIDR RIB path totals: identities=%zu paths=%zu\n",
+		show.identity_count, show.path_count);
 }
 
 int midr_rib_test_set_identity_limit(struct midr_context *ctx,

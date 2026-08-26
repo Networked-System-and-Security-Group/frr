@@ -21,6 +21,7 @@ struct bgp_dest;
 struct bgp_path_info;
 struct midr_context;
 struct peer;
+struct vty;
 
 enum midr_rib_identity_state {
 	MIDR_RIB_IDENTITY_NO_PATH,
@@ -84,6 +85,7 @@ extern int midr_rib_selected_entry_foreach(
 	void *arg);
 extern int midr_rib_summary_get(struct midr_context *ctx,
 				struct midr_rib_summary *summary);
+extern void midr_show_rib_paths(struct vty *vty, struct midr_context *ctx);
 
 extern int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 					     size_t limit);

@@ -75,6 +75,8 @@ extern void midr_lsdb_remote_snapshot_release(
 extern int midr_lsdb_summary_get(struct midr_context *ctx,
 				 struct midr_lsdb_summary *summary);
 extern void midr_show_lsdb(struct vty *vty, struct midr_context *ctx);
+extern void midr_show_lsdb_objects(struct vty *vty,
+				   struct midr_context *ctx);
 extern int midr_lsdb_local_group_get(struct midr_context *ctx, uint32_t *group_id,
 				     uint32_t *representative_node_id);
 extern int midr_lsdb_local_group_prefix_foreach(struct midr_context *ctx,

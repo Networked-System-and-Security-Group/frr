@@ -225,6 +225,21 @@ DEFUN(show_midr_lsdb_summary, show_midr_lsdb_summary_cmd,
 	return CMD_SUCCESS;
 }
 
+DEFUN(show_midr_lsdb_objects, show_midr_lsdb_objects_cmd,
+      "show midr lsdb objects",
+      SHOW_STR
+      "MIDR information\n"
+      "Selected-object database\n"
+      "Selected LS objects and derived state\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_lsdb_objects(vty, ctx);
+	return CMD_SUCCESS;
+}
+
 DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
       "show midr rib summary",
       SHOW_STR
@@ -255,6 +270,21 @@ DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
 		summary.rejected_limit);
 	vty_out(vty, "  payload conflicts: %" PRIu64 "\n",
 		summary.rejected_payload_conflict);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_rib_paths, show_midr_rib_paths_cmd,
+      "show midr rib paths",
+      SHOW_STR
+      "MIDR information\n"
+      "MIDR SAFI RIB\n"
+      "All identity paths and propagation paths\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+
+	if (!ctx)
+		return CMD_WARNING;
+	midr_show_rib_paths(vty, ctx);
 	return CMD_SUCCESS;
 }
 
@@ -348,6 +378,120 @@ DEFUN(show_midr_ted_generation, show_midr_ted_generation_cmd,
 
 	vty_out(vty, "MIDR TED generation: %" PRIu64 " (%s)\n", status.generation,
 		status.ready ? "READY" : "NOT_READY");
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_ted_detail, show_midr_ted_detail_cmd,
+      "show midr ted detail",
+      SHOW_STR
+      "MIDR information\n"
+      "Path-computation TED\n"
+      "All arrays in the current immutable snapshot\n")
+{
+	struct midr_context *ctx = midr_vty_context(vty);
+	const struct midr_ted_snapshot *snapshot = NULL;
+	struct midr_ted_status status;
+	struct in_addr node_id;
+	size_t index;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_ted_status_get(ctx, &status);
+	if (ret) {
+		vty_out(vty, "%% MIDR TED status failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+	vty_out(vty, "MIDR TED detail: state=%s generation=%" PRIu64
+		     " sync-reasons=",
+		status.ready ? "READY" : "NOT_READY", status.generation);
+	midr_vty_show_sync_reasons(vty, status.sync_reason_flags);
+	vty_out(vty, "\n");
+	if (!status.ready)
+		return CMD_SUCCESS;
+
+	ret = midr_ted_snapshot_get(ctx, &snapshot);
+	if (ret) {
+		vty_out(vty, "%% MIDR TED snapshot failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+	node_id.s_addr = snapshot->local_node_id;
+	vty_out(vty, "local node=%pI4 group=%u\n", &node_id,
+		snapshot->local_group_id);
+	vty_out(vty, "nodes (%zu):\n", snapshot->node_count);
+	for (index = 0; index < snapshot->node_count; index++) {
+		const struct midr_ted_node *node = &snapshot->nodes[index];
+
+		node_id.s_addr = node->node_id;
+		vty_out(vty,
+			"  node=%pI4 group=%u caps=0x%" PRIx64
+			" policy=0x%" PRIx64 "\n",
+			&node_id, node->group_id, node->cap_flags,
+			node->policy_tags);
+	}
+	vty_out(vty, "intra-links (%zu):\n", snapshot->intra_link_count);
+	for (index = 0; index < snapshot->intra_link_count; index++) {
+		const struct midr_ted_link *link = &snapshot->intra_links[index];
+		struct in_addr remote_id;
+
+		node_id.s_addr = link->local_node_id;
+		remote_id.s_addr = link->remote_node_id;
+		vty_out(vty,
+			"  %pI4(group=%u)->%pI4(group=%u) link-id=%" PRIu64
+			" addresses=%pIA->%pIA cost=%u ifindex=%d"
+			" policy=0x%" PRIx64 "\n",
+			&node_id, link->local_group_id, &remote_id,
+			link->remote_group_id, link->link_id,
+			&link->link_local_address, &link->link_remote_address,
+			link->canonical_cost, link->local_ifindex,
+			link->policy_tags);
+	}
+	vty_out(vty, "egress-links (%zu):\n", snapshot->egress_link_count);
+	for (index = 0; index < snapshot->egress_link_count; index++) {
+		const struct midr_ted_link *link = &snapshot->egress_links[index];
+		struct in_addr remote_id;
+
+		node_id.s_addr = link->local_node_id;
+		remote_id.s_addr = link->remote_node_id;
+		vty_out(vty,
+			"  %pI4(group=%u)->%pI4(group=%u) link-id=%" PRIu64
+			" addresses=%pIA->%pIA cost=%u ifindex=%d"
+			" policy=0x%" PRIx64 "\n",
+			&node_id, link->local_group_id, &remote_id,
+			link->remote_group_id, link->link_id,
+			&link->link_local_address, &link->link_remote_address,
+			link->canonical_cost, link->local_ifindex,
+			link->policy_tags);
+	}
+	vty_out(vty, "node-prefixes (%zu):\n", snapshot->node_prefix_count);
+	for (index = 0; index < snapshot->node_prefix_count; index++) {
+		const struct midr_ted_node_prefix *prefix =
+			&snapshot->node_prefixes[index];
+
+		node_id.s_addr = prefix->node_id;
+		vty_out(vty, "  node=%pI4 afi=%u safi=%u prefix=%pFX\n",
+			&node_id, prefix->key.afi, prefix->key.safi,
+			&prefix->key.prefix);
+	}
+	vty_out(vty, "group-edges (%zu):\n", snapshot->group_edge_count);
+	for (index = 0; index < snapshot->group_edge_count; index++) {
+		const struct midr_ted_group_edge *edge =
+			&snapshot->group_edges[index];
+
+		vty_out(vty, "  group=%u->%u aggregate-cost=%" PRIu64 "\n",
+			edge->source_group_id, edge->target_group_id,
+			edge->aggregate_cost);
+	}
+	vty_out(vty, "prefix-groups (%zu):\n", snapshot->prefix_group_count);
+	for (index = 0; index < snapshot->prefix_group_count; index++) {
+		const struct midr_ted_prefix_group *prefix =
+			&snapshot->prefix_groups[index];
+
+		vty_out(vty, "  group=%u afi=%u safi=%u prefix=%pFX\n",
+			prefix->group_id, prefix->key.afi, prefix->key.safi,
+			&prefix->key.prefix);
+	}
+	midr_ted_snapshot_release(&snapshot);
 	return CMD_SUCCESS;
 }
 
@@ -862,10 +1006,13 @@ void bgp_midr_vty_init(void)
 {
 	install_element(VIEW_NODE, &show_midr_ted_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_ted_generation_cmd);
+	install_element(VIEW_NODE, &show_midr_ted_detail_cmd);
 	install_element(VIEW_NODE, &show_midr_sync_cmd);
 	install_element(VIEW_NODE, &show_midr_owned_cmd);
 	install_element(VIEW_NODE, &show_midr_lsdb_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_lsdb_objects_cmd);
 	install_element(VIEW_NODE, &show_midr_rib_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_rib_paths_cmd);
 	install_element(VIEW_NODE, &show_midr_prefix_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_prefix_contributors_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
