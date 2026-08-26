@@ -37,6 +37,28 @@ LIBDIR="$REPO_ROOT/lib/.libs"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+ANCHOR_ESTABLISH_TIMEOUT="${MIDR_ANCHOR_ESTABLISH_TIMEOUT:-60}"
+POST_CONVERGENCE_TIMEOUT="${MIDR_POST_CONVERGENCE_TIMEOUT:-120}"
+CAPTURE_RUN_ID="${MIDR_CAPTURE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
+CAPTURE_ROOT="${MIDR_CAPTURE_ROOT:-$TESTDIR/artifacts/$CAPTURE_RUN_ID}"
+export MIDR_CAPTURE_RUN_ID="$CAPTURE_RUN_ID"
+export MIDR_CAPTURE_ROOT="$CAPTURE_ROOT"
+
+capture_state() {
+    local phase="$1"
+
+    bash "$TESTDIR/capture_state.sh" "$phase" ||
+        echo "[run_test] State capture failed for phase '$phase'; continuing." >&2
+}
+
+archive_logs() {
+    mkdir -p "$CAPTURE_ROOT/logs"
+    cp -f "$TESTDIR"/logs/*.log "$CAPTURE_ROOT/logs/" 2>/dev/null || true
+    chmod -R a+rX "$CAPTURE_ROOT" 2>/dev/null || true
+    if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+        chown -R "$SUDO_UID:$SUDO_GID" "$CAPTURE_ROOT" 2>/dev/null || true
+    fi
+}
 
 if [[ $EUID -ne 0 ]]; then
     echo "[run_test] This test must run as root: sudo ./run_test.sh" >&2
@@ -56,7 +78,8 @@ if [[ -n "$MISSING_LIBS" ]]; then
     echo "$MISSING_LIBS" >&2
     exit 2
 fi
-if ! strings "$VTYSH" | grep -qF 'show midr self'; then
+if ! strings "$VTYSH" | grep -qF 'show midr self' ||
+   ! strings "$VTYSH" | grep -qF 'show midr ted detail'; then
     echo "[run_test] vtysh has a stale command table; run: make -j\$(nproc) vtysh/vtysh" >&2
     exit 2
 fi
@@ -64,6 +87,8 @@ fi
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
 # so bgpd must be launched with TESTDIR as its cwd.
 cd "$TESTDIR"
+mkdir -p "$CAPTURE_ROOT"
+exec > >(tee "$CAPTURE_ROOT/console.log") 2>&1
 
 for arg in "$@"; do
     case "$arg" in
@@ -72,7 +97,7 @@ for arg in "$@"; do
     esac
 done
 
-trap 'echo "[run_test] Interrupted."; exit 1' INT TERM
+trap 'echo "[run_test] Interrupted."; capture_state interrupted; archive_logs; exit 1' INT TERM
 
 # ---- 0. Reap any stale bgpd instances left running by a previous, ----------
 #         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
@@ -103,7 +128,24 @@ fi
 
 # ---- 2. Create log and VTY dirs ---------------------------------------------
 mkdir -p "$TESTDIR/logs"
+# bgpd appends to configured log files.  Old JOIN/ANCHOR lines would make a
+# rerun satisfy the log-based waits immediately, so start each run with empty
+# live logs; the previous run is already preserved under artifacts/<run-id>/.
+shopt -s nullglob
+for logfile in "$TESTDIR"/logs/bgpd-*.log; do
+    : >"$logfile"
+done
+shopt -u nullglob
 rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
+mkdir -p "$CAPTURE_ROOT"
+{
+    echo "run_id=$CAPTURE_RUN_ID"
+    echo "started_at=$(date --iso-8601=seconds)"
+    echo "git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "timeout_seconds=$TIMEOUT"
+    echo "anchor_establish_timeout_seconds=$ANCHOR_ESTABLISH_TIMEOUT"
+    echo "post_convergence_timeout_seconds=$POST_CONVERGENCE_TIMEOUT"
+} >"$CAPTURE_ROOT/run-metadata.txt"
 
 # ---- 3. 分阶段启动 ----------------------------------------------------------
 # 按依赖链 引导 → 代表 → 成员 → 新节点（docs/midr-backbone运行手册.md §3.2），
@@ -186,31 +228,128 @@ wait_group_members() {
     return 1
 }
 
+vty_node() {
+    local node="$1"
+    local command="$2"
+
+    "$VTYSH" --vty_socket "/tmp/midr-cl-vty/$node" \
+        -c "$command" 2>/dev/null
+}
+
+anchor_established_count() {
+    vty_node newnode "show midr neighbors" \
+        | awk '/Established/ && /CL_ANCHOR/' | wc -l
+}
+
+wait_anchor_sessions() {
+    local want="$1" timeout="$2" elapsed=0 got=0
+
+    echo "[run_test] Waiting up to ${timeout}s for $want/$want Anchor sessions to establish..."
+    while [[ $elapsed -lt $timeout ]]; do
+        got=$(anchor_established_count || true)
+        if [[ "$got" -ge "$want" ]]; then
+            echo "  ✓ $got/$want Anchor sessions Established at t=${elapsed}s"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "  ✗ only $got/$want Anchor sessions Established after ${timeout}s"
+    return 1
+}
+
+post_convergence_status() {
+    local new_lsdb new_ted g1b_objects
+
+    new_lsdb=$(vty_node newnode "show midr lsdb summary" || true)
+    new_ted=$(vty_node newnode "show midr ted detail" || true)
+    g1b_objects=$(vty_node g1b "show midr lsdb objects" || true)
+
+    POST_ANCHORS=$(anchor_established_count || true)
+    POST_MEMBERSHIPS=$(awk '/^  memberships:/ {print $2; exit}' <<<"$new_lsdb")
+    POST_PENDING=$(awk '/^  pending:/ {print $2; exit}' <<<"$new_lsdb")
+    POST_TED_NODES=$(sed -n 's/^nodes (\([0-9][0-9]*\)):.*/\1/p' \
+        <<<"$new_ted" | head -1)
+    if grep -q \
+        'object type=MEMBERSHIP origin=10.0.99.1 .*usable=yes' \
+        <<<"$g1b_objects"; then
+        POST_G1B_SEES_NEWNODE=yes
+    else
+        POST_G1B_SEES_NEWNODE=no
+    fi
+
+    POST_MEMBERSHIPS=${POST_MEMBERSHIPS:-0}
+    POST_PENDING=${POST_PENDING:-unknown}
+    POST_TED_NODES=${POST_TED_NODES:-0}
+}
+
+wait_post_convergence() {
+    local timeout="$1" elapsed=0 stable=0
+
+    echo "[run_test] Waiting up to ${timeout}s for Membership/LSDB/TED convergence..."
+    while [[ $elapsed -lt $timeout ]]; do
+        post_convergence_status
+        if [[ "$POST_ANCHORS" -ge 4 && "$POST_MEMBERSHIPS" -ge 9 &&
+              "$POST_PENDING" == 0 && "$POST_TED_NODES" -ge 5 &&
+              "$POST_G1B_SEES_NEWNODE" == yes ]]; then
+            stable=$((stable + 1))
+            if [[ $stable -ge 2 ]]; then
+                echo "  ✓ stable: anchors=$POST_ANCHORS memberships=$POST_MEMBERSHIPS" \
+                     "pending=$POST_PENDING ted-nodes=$POST_TED_NODES" \
+                     "g1b-sees-newnode=$POST_G1B_SEES_NEWNODE"
+                return 0
+            fi
+        else
+            stable=0
+        fi
+        if (( elapsed % 10 == 0 )); then
+            echo "  elapsed=${elapsed}s anchors=$POST_ANCHORS" \
+                 "memberships=$POST_MEMBERSHIPS pending=$POST_PENDING" \
+                 "ted-nodes=$POST_TED_NODES" \
+                 "g1b-sees-newnode=$POST_G1B_SEES_NEWNODE"
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    post_convergence_status
+    echo "  ✗ not converged after ${timeout}s: anchors=$POST_ANCHORS" \
+         "memberships=$POST_MEMBERSHIPS pending=$POST_PENDING" \
+         "ted-nodes=$POST_TED_NODES" \
+         "g1b-sees-newnode=$POST_G1B_SEES_NEWNODE"
+    return 1
+}
+
 echo "[run_test] Stage 1/4: bootstrap (g1a)..."
 start_node g1a || exit 1
 wait_bootstrap_ready g1a || true
+capture_state after-bootstrap
 
 echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
 for node in g1b g2a g3a; do start_node "$node" || exit 1; sleep 1; done
 wait_rep_directory g1a 3 || true
+capture_state after-representatives
 
 echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
 for node in g1c g1d g1e g2b g3b; do start_node "$node" || exit 1; sleep 1; done
 # 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
 wait_group_members g1b 1 4 || true
+capture_state after-members
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
 echo "[run_test] Stage 4/4: newnode (join flow will begin automatically)..."
 start_node newnode || exit 1
+capture_state after-newnode-start
 
 # ---- 5. Wait for JOIN decision in newnode's log -----------------------------
 LOG="$TESTDIR/logs/bgpd-newnode.log"
 echo "[run_test] Waiting up to ${TIMEOUT}s for 'JOIN' decision in newnode log..."
 elapsed=0
+join_detected=0
 while [[ $elapsed -lt $TIMEOUT ]]; do
     if [[ -f "$LOG" ]] && grep -q "MIDR CL: MEMBER_PROBE_DONE → JOIN 群" "$LOG" 2>/dev/null; then
         echo ""
         echo "[run_test] ✓ JOIN decision detected at t=${elapsed}s!"
+        join_detected=1
         break
     fi
     printf "\r  elapsed: %3ds / %ds" "$elapsed" "$TIMEOUT"
@@ -222,17 +361,24 @@ echo ""
 if [[ $elapsed -ge $TIMEOUT ]]; then
     echo "[run_test] ✗ Timed out — no JOIN decision in ${TIMEOUT}s."
 fi
+if [[ $join_detected -eq 1 ]]; then
+    capture_state after-join
+else
+    capture_state join-timeout
+fi
 
 # ---- 5b. Wait a bit more for the anchor-connection side effect --------------
 # ANCHOR_PROBE_DONE runs on its own independent timer (restarted whenever
 # either runner-up group's member list arrives), so it can land a few seconds
 # after JOIN. Give it up to 30 s before declaring it missing.
+anchor_decision_detected=0
 if [[ $elapsed -lt $TIMEOUT ]]; then
     echo "[run_test] Waiting up to 30s for the ANCHOR decision (group-3/group-2 anchor connections)..."
     anchor_elapsed=0
     while [[ $anchor_elapsed -lt 30 ]]; do
         if grep -q "MIDR I-7：ANCHOR " "$LOG" 2>/dev/null; then
             echo "[run_test] ✓ ANCHOR decision detected at t≈$((elapsed + anchor_elapsed))s!"
+            anchor_decision_detected=1
             break
         fi
         sleep 3
@@ -243,6 +389,26 @@ if [[ $elapsed -lt $TIMEOUT ]]; then
     fi
 fi
 
+if [[ $join_detected -eq 1 && $anchor_decision_detected -eq 1 ]]; then
+    if wait_anchor_sessions 4 "$ANCHOR_ESTABLISH_TIMEOUT"; then
+        capture_state after-anchor-sessions
+    else
+        capture_state anchor-session-timeout
+    fi
+
+    if wait_post_convergence "$POST_CONVERGENCE_TIMEOUT"; then
+        capture_state post-convergence
+    else
+        capture_state post-convergence-timeout
+    fi
+else
+    echo "[run_test] Skipping convergence wait because JOIN/ANCHOR decision is missing."
+    capture_state convergence-not-started
+fi
+
 # ---- 6. Show result summary -------------------------------------------------
 echo ""
 bash "$TESTDIR/check_result.sh"
+capture_state final
+archive_logs
+echo "[run_test] State artifacts: $CAPTURE_ROOT"

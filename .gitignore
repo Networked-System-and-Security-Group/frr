@@ -127,3 +127,4 @@ midr-test/pm-test/*.rtl
 midr-test/pm-test/*.flow
 midr-test/pm-test/*.png
 midr-test/cl-test/logs/
+midr-test/cl-test/artifacts/
