@@ -279,7 +279,42 @@ exit
 
 `show midr topology nodes/links` 只显示 active Local Fact，`show midr topology tombstones` 只显示已撤销对象的 key 和最后 input version。`show midr topology sync` 显示输入状态、Provider、队列和 Resync 诊断；`show midr events` 显示事件接收、处理、拒绝和丢弃计数。
 
+## 第一组与第二组 10 节点联合测试
+
+10 节点 CL 测试按 bootstrap、群代表、现有成员和 newnode 的顺序启动，验证 newnode 的 JOIN 决策和跨群 Anchor Session 建立：
+
+```bash
+cd midr-test/cl-test
+sudo ./run_test.sh
+```
+
+测试会在 `midr-test/cl-test/artifacts/<run-id>/` 保存各阶段的只读状态，并将完整终端输出同步写入 `console.log`。JOIN 和 ANCHOR 决策后，脚本还会等待 4 条 Anchor 会话全部 Established，并等待 newnode Membership/LSDB/TED 与 g1b 所见 newnode Membership 连续两次满足稳定条件；成功时生成 `after-anchor-sessions/` 和 `post-convergence/`，超时则生成对应的 `*-timeout/` 诊断快照。每个节点的文件包含第一组视图、第二组 Local Fact、owned object、全部 MIDR RIB path、LSDB object 和完整 TED snapshot；`events/` 保存第一组上报及第二组传播相关日志摘录，`logs/` 保存最终完整 bgpd 日志。状态采集与第二组稳定条件不改变原 JOIN/ANCHOR 判定，单条诊断命令失败会记录退出码但不会改变原测试结果。
+
+台子使用 `bgpd -Z`、不连接 zebra，因此 `show midr neighbors` 在会话尚未 Established 时可能显示 `（no route）`：该标记只检查 BGP NHT/RIB，在此环境中不能反映 namespace 的内核默认路由。底层可达性应结合 PM reply 和最终会话状态判断。
+
+测试仍在运行时可手工追加一次快照：
+
+```bash
+sudo MIDR_CAPTURE_RUN_ID=<run-id> ./capture_state.sh manual
+```
+
+新增详细命令为：
+
+```text
+show midr rib paths
+show midr lsdb objects
+show midr ted detail
+```
+
 ## 第一组与第二组只读验收
+
+从当前合栈工作树构建镜像并部署独立的 15 节点台子：
+
+```bash
+sudo -E ./midr-test/backbone-lab/run_group1_group2_lab.sh all
+```
+
+脚本默认使用实验名 `midr-backbone-yhy`，运行文件保存在仓库同级的 `midr-lab-runs/midr-backbone-yhy/`，不会自动销毁或替换任何已有容器。发现同名实验时会直接退出。`preflight` 只检查环境，`check` 复跑已经部署台子的验收并保存第二组证据，`capture` 不等待收敛而立即采集当前状态；可通过 `MIDR_LAB_NAME`、`MIDR_LAB_IMAGE` 和 `MIDR_LAB_RUN_ROOT` 使用其他独立名称和目录。不要执行 `backbone-lab/gen-backbone-configs.py`，该生成器仍保留旧工作目录，仅应维护并使用仓库内已经审查的配置和拓扑。
 
 15 节点 `midr-backbone` containerlab 已按阶段启动并收敛后运行：
 
@@ -288,3 +323,11 @@ exit
 ```
 
 脚本只读取容器和 VTY 状态，不执行退网、重启、iptables 或配置修改。默认最多等待 600 秒，验证第一组 Node/Link 上报、强 Snapshot Provider、第二组输入队列、owned objects、MIDR RIB、LSDB、TED、group 0 引导静默和 remote view 对账。可通过 `MIDR_DEMO_WAIT_SECONDS`、`MIDR_DEMO_POLL_SECONDS` 和 `MIDR_LAB_PREFIX` 调整等待时间、轮询间隔和容器名前缀。
+
+推荐通过统一入口复跑验收和证据采集：
+
+```bash
+./midr-test/backbone-lab/run_group1_group2_lab.sh check
+```
+
+证据保存在 `midr-lab-runs/<lab-name>/evidence/<timestamp>/post-convergence/`。`summary.md` 提供适合审查和录屏的紧凑表格，`summary.tsv` 保存同一份机器可读计数，`semantic-digests.tsv` 记录规范化对象集合，`verification.log` 保存跨层自动断言；`nodes/<node>/` 分别保存第一组接口、Local Fact、owned object、全部 RIB path、LSDB object、TED detail、完整 FRR 日志和 MIDR 日志摘录。验证包括 Provider/Local Fact/owned 数量一致，RIB selected 与 LSDB object 一致，全节点 Membership 和 Prefix-to-Group 收敛一致，以及 LSDB Membership、Link、Node Prefix、Group Prefix 与 TED 六类数组的逐项对应。验证失败时仍会保留同一时刻的全部采集结果。
