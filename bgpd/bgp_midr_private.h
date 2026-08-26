@@ -84,6 +84,10 @@ extern int midr_input_init(struct midr_context *ctx);
 extern void midr_input_finish(struct midr_context *ctx);
 extern int midr_input_router_id_update(struct bgp *bgp, bool withdraw);
 extern int midr_input_status_get(struct midr_context *ctx, struct midr_input_status *status);
+typedef int (*midr_topology_snapshot_get_cb)(
+	struct midr_context *ctx, struct midr_topology_snapshot *snapshot);
+typedef void (*midr_topology_snapshot_release_cb)(
+	struct midr_context *ctx, struct midr_topology_snapshot *snapshot);
 extern int midr_local_fact_node_get(struct midr_context *ctx, uint32_t node_id,
 				    struct midr_node_update *node, bool *active);
 extern int midr_local_fact_link_get(struct midr_context *ctx, const struct midr_link_key *key,
@@ -97,6 +101,9 @@ extern int midr_local_fact_foreach(struct midr_context *ctx,
 				   midr_local_fact_link_cb link_cb, void *arg);
 extern int midr_input_test_set_queue_limits(struct midr_context *ctx, size_t normal_limit,
 					    size_t resync_limit);
+extern int midr_input_test_set_snapshot_provider(
+	struct midr_context *ctx, midr_topology_snapshot_get_cb snapshot_get,
+	midr_topology_snapshot_release_cb snapshot_release);
 extern void midr_input_test_resync_now(struct midr_context *ctx);
 
 extern void bgp_midr_init(struct bgp *bgp);

@@ -63,6 +63,7 @@ unsigned long conf_bgp_debug_bfd;
 unsigned long conf_bgp_debug_cond_adv;
 unsigned long conf_bgp_debug_aggregate;
 unsigned long conf_bgp_debug_linkstate;
+unsigned long conf_bgp_debug_midr;
 
 unsigned long term_bgp_debug_as4;
 unsigned long term_bgp_debug_neighbor_events;
@@ -85,6 +86,7 @@ unsigned long term_bgp_debug_bfd;
 unsigned long term_bgp_debug_cond_adv;
 unsigned long term_bgp_debug_aggregate;
 unsigned long term_bgp_debug_linkstate;
+unsigned long term_bgp_debug_midr;
 
 struct list *bgp_debug_neighbor_events_peers = NULL;
 struct list *bgp_debug_keepalive_peers = NULL;
@@ -2321,6 +2323,67 @@ DEFPY (no_debug_bgp_linkstate,
 	return CMD_SUCCESS;
 }
 
+DEFPY (debug_bgp_midr,
+       debug_bgp_midr_cmd,
+       "debug bgp midr [discovery]$discovery",
+       DEBUG_STR
+       BGP_STR
+       "BGP MIDR\n"
+       "MIDR hierarchical-discovery flow only\n")
+{
+	if (discovery) {
+		if (vty->node == CONFIG_NODE)
+			DEBUG_ON(midr, MIDR_DISCOVERY);
+		else {
+			TERM_DEBUG_ON(midr, MIDR_DISCOVERY);
+			vty_out(vty,
+				"BGP MIDR discovery debugging is on\n");
+		}
+	} else {
+		if (vty->node == CONFIG_NODE)
+			DEBUG_ON(midr, MIDR);
+		else {
+			TERM_DEBUG_ON(midr, MIDR);
+			vty_out(vty, "BGP MIDR debugging is on\n");
+		}
+	}
+
+	return CMD_SUCCESS;
+}
+
+DEFPY (no_debug_bgp_midr,
+       no_debug_bgp_midr_cmd,
+       "no debug bgp midr [discovery]$discovery",
+       NO_STR
+       DEBUG_STR
+       BGP_STR
+       "BGP MIDR\n"
+       "MIDR hierarchical-discovery flow only\n")
+{
+	if (discovery) {
+		/* Turn off only the discovery channel. */
+		if (vty->node == CONFIG_NODE)
+			DEBUG_OFF(midr, MIDR_DISCOVERY);
+		else {
+			TERM_DEBUG_OFF(midr, MIDR_DISCOVERY);
+			vty_out(vty,
+				"BGP MIDR discovery debugging is off\n");
+		}
+	} else {
+		/* Master off: clear both the general switch and the channel. */
+		if (vty->node == CONFIG_NODE) {
+			DEBUG_OFF(midr, MIDR);
+			DEBUG_OFF(midr, MIDR_DISCOVERY);
+		} else {
+			TERM_DEBUG_OFF(midr, MIDR);
+			TERM_DEBUG_OFF(midr, MIDR_DISCOVERY);
+			vty_out(vty, "BGP MIDR debugging is off\n");
+		}
+	}
+
+	return CMD_SUCCESS;
+}
+
 DEFUN (no_debug_bgp,
        no_debug_bgp_cmd,
        "no debug bgp",
@@ -2367,6 +2430,8 @@ DEFUN (no_debug_bgp,
 	TERM_DEBUG_OFF(bfd, BFD_LIB);
 	TERM_DEBUG_OFF(cond_adv, COND_ADV);
 	TERM_DEBUG_OFF(linkstate, LINKSTATE);
+	TERM_DEBUG_OFF(midr, MIDR);
+	TERM_DEBUG_OFF(midr, MIDR_DISCOVERY);
 
 	vty_out(vty, "All possible debugging has been turned off\n");
 
@@ -2469,6 +2534,12 @@ DEFUN_NOSH (show_debugging_bgp,
 
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty, "  BGP Link-State debugging is on\n");
+
+	if (BGP_DEBUG(midr, MIDR))
+		vty_out(vty, "  BGP MIDR debugging is on\n");
+
+	if (BGP_DEBUG(midr, MIDR_DISCOVERY))
+		vty_out(vty, "  BGP MIDR discovery debugging is on\n");
 
 	cmd_show_lib_debugs(vty);
 
@@ -2615,6 +2686,16 @@ static int bgp_config_write_debug(struct vty *vty)
 
 	if (CONF_BGP_DEBUG(linkstate, LINKSTATE)) {
 		vty_out(vty, "debug bgp link-state\n");
+		write++;
+	}
+
+	if (CONF_BGP_DEBUG(midr, MIDR)) {
+		vty_out(vty, "debug bgp midr\n");
+		write++;
+	}
+
+	if (CONF_BGP_DEBUG(midr, MIDR_DISCOVERY)) {
+		vty_out(vty, "debug bgp midr discovery\n");
 		write++;
 	}
 
@@ -2783,6 +2864,10 @@ void bgp_debug_init(void)
 	install_element(CONFIG_NODE, &debug_bgp_linkstate_cmd);
 	install_element(ENABLE_NODE, &no_debug_bgp_linkstate_cmd);
 	install_element(CONFIG_NODE, &no_debug_bgp_linkstate_cmd);
+	install_element(ENABLE_NODE, &debug_bgp_midr_cmd);
+	install_element(CONFIG_NODE, &debug_bgp_midr_cmd);
+	install_element(ENABLE_NODE, &no_debug_bgp_midr_cmd);
+	install_element(CONFIG_NODE, &no_debug_bgp_midr_cmd);
 }
 
 /* Return true if this prefix is on the per_prefix_list of prefixes to debug

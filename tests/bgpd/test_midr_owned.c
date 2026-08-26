@@ -231,7 +231,29 @@ static void test_origination_suppression_and_withdraw(void)
 	midr_topology_process_pending(ctx);
 	assert_selected_missing(&link_key);
 
+	link = link_update(8, 1000);
+	assert(midr_topology_link_upsert(ctx, &link) == 0);
+	midr_topology_process_pending(ctx);
+	(void)selected_sequence(&link_key, &selected);
+
 	node = node_update(3, 0);
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert_selected_missing(&membership_key);
+	assert_selected_missing(&link_key);
+
+	link.version = 9;
+	assert(midr_topology_link_upsert(ctx, &link) == 0);
+	midr_topology_process_pending(ctx);
+	assert_selected_missing(&link_key);
+
+	node = node_update(4, 10);
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	(void)selected_sequence(&membership_key, &selected);
+	(void)selected_sequence(&link_key, &selected);
+
+	node = node_update(5, 0);
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
 	assert(midr_owned_summary_get(ctx, &summary) == 0);

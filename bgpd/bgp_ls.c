@@ -766,9 +766,10 @@ int bgp_nlri_parse_ls(struct peer *peer, struct attr *attr, struct bgp_nlri *pac
 				   BGP_ROUTE_NORMAL, NULL, NULL, 0, 0, NULL);
 
 			bgp_dest_unlock_node(dest);
-		} else
+		} else {
 			bgp_withdraw(peer, &p, 0, packet->afi, packet->safi, ZEBRA_ROUTE_BGP,
 				     BGP_ROUTE_NORMAL, NULL, NULL, 0);
+		}
 
 		if (BGP_DEBUG(linkstate, LINKSTATE))
 			zlog_debug("%s processed BGP-LS %s NLRI type=%u", peer->host,
@@ -1495,6 +1496,12 @@ int bgp_ls_withdraw_bgp_link(struct bgp *bgp, struct peer *peer)
 
 	return bgp_ls_withdraw(bgp, nlri);
 }
+
+/*
+ * 〔件②（轮 4）删除 bgp_ls_withdraw_bgp_node()：它只为 MIDR 优雅下线而加
+ * （唯一调用者是已删的 midr_propagate_self 的 LEAVE 分支）。退网撤销现在走
+ * midr_nds_report_node(LEAVE) → 第二组的 midr_topology_node_withdraw()。〕
+ */
 
 int bgp_ls_withdraw_bgp_prefix(struct bgp *bgp, afi_t afi, safi_t safi, struct bgp_dest *dest,
 			       struct bgp_path_info *path)

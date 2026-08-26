@@ -525,7 +525,11 @@ static int zebra_read_route(ZAPI_CALLBACK_ARGS)
 {
 	enum nexthop_types_t nhtype = 0;
 	enum blackhole_type bhtype = BLACKHOLE_UNSPEC;
-	struct zapi_route api;
+	/* zapi_route with MULTIPATH_NUM=64 can exceed 50 KB — too large for the
+	 * stack in this shallow zclient_read callback. Declare static (mirroring
+	 * bgp_zebra_announce_actual): the event loop is single-threaded so there
+	 * is no re-entrancy concern. */
+	static struct zapi_route api;
 	union g_addr nexthop = {};
 	ifindex_t ifindex = IFINDEX_INTERNAL;
 	int add, i;
@@ -1604,7 +1608,11 @@ enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 						   struct bgp_path_info *info, struct bgp *bgp)
 {
 	struct bgp_path_info *bpi_ultimate;
-	struct zapi_route api;
+	/* zapi_route with MULTIPATH_NUM=64 can exceed 50 KB — too large for the
+	 * stack when reached from a shallow call chain (e.g. the FRR event loop).
+	 * Declare static: the event loop is single-threaded so there is no
+	 * re-entrancy concern. */
+	static struct zapi_route api;
 	unsigned int valid_nh_count = 0;
 	bool allow_recursion = false;
 	uint8_t distance;
@@ -1807,7 +1815,11 @@ enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
 						   struct bgp_path_info *info,
 						   struct bgp *bgp)
 {
-	struct zapi_route api;
+	/* zapi_route with MULTIPATH_NUM=64 can exceed 50 KB — too large for the
+	 * stack when reached from a shallow call chain (e.g. the FRR event loop).
+	 * Declare static (mirroring bgp_zebra_announce_actual): the event loop is
+	 * single-threaded so there is no re-entrancy concern. */
+	static struct zapi_route api;
 	struct peer *peer;
 	struct bgp_table *table = bgp_dest_table(dest);
 	const struct prefix *p = bgp_dest_get_prefix(dest);
@@ -4785,7 +4797,11 @@ void bgp_zebra_announce_default(struct bgp *bgp, struct nexthop *nh,
 				afi_t afi, uint32_t table_id, bool announce)
 {
 	struct zapi_nexthop *api_nh;
-	struct zapi_route api;
+	/* zapi_route with MULTIPATH_NUM=64 can exceed 50 KB — too large for the
+	 * stack when reached from a shallow event callback. Declare static
+	 * (mirroring bgp_zebra_announce_actual): the event loop is single-threaded
+	 * so there is no re-entrancy concern. */
+	static struct zapi_route api;
 	struct prefix p;
 
 	if (!nh || (nh->type != NEXTHOP_TYPE_IPV4

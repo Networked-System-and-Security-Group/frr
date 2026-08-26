@@ -61,6 +61,8 @@
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
+#include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_nds_vty.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_nhg.h"
@@ -84,6 +86,7 @@
 #include "bgpd/bgp_ls_ted.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_vty.h"
+#include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -3937,7 +3940,11 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
+		/* 第二组的 MIDR 上下文必须先建：我方 NDS 侧
+		 * midr_context_get_default() 要取它（取不到有懒惰重取兜底，
+		 * 但别故意排反）。 */
 		bgp_midr_init(bgp);
+		bgp_midr_nds_init(bgp);
 	}
 
 	/*initialize global GR FSM */
@@ -4759,6 +4766,8 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
+	/* 拆除与创建反序：NDS 后建先拆（它引用第二组 ctx），再拆 ctx 本体。 */
+	bgp_midr_nds_finish(bgp);
 	bgp_midr_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
@@ -5137,7 +5146,11 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 	    || peer->afc[AFI_IP6][SAFI_ENCAP]
 	    || peer->afc[AFI_IP6][SAFI_FLOWSPEC]
 	    || peer->afc[AFI_L2VPN][SAFI_EVPN]
-	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
+	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS]
+	    /* (4,9) MIDR-LS：第二组加该族时漏在此处登记。件②（轮 4）撤掉 (4,8)
+	     * 之后 MIDR overlay 会话只剩这一个族，不认它就等于"没有任何激活地址
+	     * 族" → FSM 压根不启动、peer 永远 Idle（Opens Sent 恒 0）。 */
+	    || peer->afc[AFI_BGP_LS][SAFI_MIDR_LS])
 		return BGP_PEER_ACTIVE;
 
 	return BGP_PEER_AF_UNCONFIGURED;
@@ -9375,6 +9388,10 @@ void bgp_init(unsigned short instance)
 	/* Init zebra. */
 	bgp_zebra_init(bm->master, instance);
 
+	if (midr_trace_scheduler_init(bm->master) != 0)
+		zlog_warn(
+			"MIDR traceroute scheduler is unavailable; traceroute requests will be rejected");
+
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
 #endif
@@ -9382,6 +9399,7 @@ void bgp_init(unsigned short instance)
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
 	bgp_midr_vty_init();
+	bgp_midr_nds_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
@@ -9434,6 +9452,14 @@ void bgp_terminate(void)
 	struct peer *peer;
 	struct listnode *node, *nnode;
 	struct listnode *mnode, *mnnode;
+
+	/*
+	 * No further event-loop iteration is guaranteed after this function.
+	 * First settle callbacks while their consumers are alive, then perform
+	 * the executor's synchronous child/fd teardown.
+	 */
+	midr_trace_scheduler_quiesce();
+	midr_trace_scheduler_fini();
 
 	QOBJ_UNREG(bm);
 

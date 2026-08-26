@@ -837,8 +837,9 @@ struct bgp {
 	/* BGP-LS specific data */
 	struct bgp_ls *ls_info;
 
-	/* MIDR specific data */
+	/* MIDR specific data（第二组 = midr_info，我方 NDS = midr_nds_info） */
 	struct bgp_midr *midr_info;
+	struct bgp_midr_nds *midr_nds_info;
 
 	/* BGP table route-map.  */
 	struct bgp_rmap table_map[AFI_MAX][SAFI_MAX];
@@ -1855,6 +1856,18 @@ struct peer {
 /* BGP-LS per-peer link identifiers configured */
 #define PEER_FLAG_LS_LOCAL_LINK_ID  (1ULL << 49)
 #define PEER_FLAG_LS_REMOTE_LINK_ID (1ULL << 50)
+/*
+ * MIDR overlay session marker.  Set ONLY by midr_nds_ctrl_setup_overlay_peer()
+ * (the single shaping point both auto-connect and `midr neighbor` pass through),
+ * so it uniquely stamps peers MIDR itself created.  Read by
+ * midr_nds_peer_is_overlay() to distinguish MIDR overlay sessions from
+ * operator-configured underlay sessions (which peer_remote_as() sets no MIDR
+ * flag on).  Lives/dies with the peer object — no explicit clear needed.
+ * ⚠ 必须留在本块（peer->flags 的位空间）：曾误放进下方 af_flags 块的 bit 37，
+ * 与本块 PEER_FLAG_CAPABILITY_FQDN 撞位（FQDN 默认置 1），判据恒真、守卫失效
+ * ——07-22 E3b 实验实抓。
+ */
+#define PEER_FLAG_MIDR_OVERLAY (1ULL << 51)
 
 	/*
 	 *GR-Disabled mode means unset PEER_FLAG_GRACEFUL_RESTART

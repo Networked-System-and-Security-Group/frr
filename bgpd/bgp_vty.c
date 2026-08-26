@@ -68,10 +68,15 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
+#include "bgpd/midr_ip2asn.h"
+#include "bgpd/midr_tier1_vty.h"
+#include "bgpd/midr_trace_scheduler.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
+
+// 自己注册的命令
 
 FRR_CFG_DEFAULT_BOOL(BGP_IMPORT_CHECK,
 	{
@@ -2013,6 +2018,7 @@ DEFPY (no_bgp_router_id,
 
 	return CMD_SUCCESS;
 }
+
 
 DEFPY(bgp_community_alias, bgp_community_alias_cmd,
       "[no$no] bgp community alias WORD$community ALIAS_NAME$alias_name",
@@ -20509,11 +20515,17 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->instance_id = instance_id;
 	bgp->ls_info->enable_distribution = true;
 
-	if (bgp_ls_export_bgp_topology(bgp) != 0) {
-		vty_out(vty, "%% Failed to export BGP topology\n");
-		return CMD_WARNING;
-	}
-
+	/*
+	 * 本命令**只置开关、不当场导出**：同步调 bgp_ls_export_bgp_topology()
+	 * 会在 frr.conf 加载 / VTY 处理期形成很深的调用链而爆栈。
+	 *
+	 * 真正的导出由 router-id 更新那条路触发（bgpd.c 的 bgp_router_id_set()
+	 * 末尾：enable_distribution 为真即调 export）。
+	 * 〔件②（轮 4）注记：原注释写"defer 到 keepalive 定时器"是不准确的——
+	 * MIDR 的 keepalive 调的是 midr_propagate_self()、只发 Node NLRI，从来
+	 * 不是全量 export；而件② 已把那条自通告线整条删除，keepalive 定时器现在
+	 * 空转。BGP-LS 自身的导出功能不受影响，仍走上面那条 router-id 路径。〕
+	 */
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty,
 			"BGP-LS: BGP fabric topology export enabled (instance-id %" PRIu64 ")\n",
@@ -21915,6 +21927,11 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
+	if (midr_ip2asn_config_write(vty))
+		vty_out(vty, "!\n");
+	if (midr_trace_scheduler_config_write(vty))
+		vty_out(vty, "!\n");
+
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
@@ -24574,6 +24591,9 @@ void bgp_vty_init(void)
 
 	/* "show bgp vrfs bestpath" command. */
 	install_element(VIEW_NODE, &show_bgp_vrf_bestpath_cmd);
+
+	/* MIDR application-layer underlay observation helpers. */
+	midr_tier1_vty_init();
 
 	/* Community-list. */
 	community_list_vty();

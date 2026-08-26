@@ -3,6 +3,22 @@
  * Public MIDR interface shared with the topology provider.
  */
 
+/*
+ * ⚠ 拷自第二组分支 feat/pc-ls-propagation @c344e40ba1（2026-07-26 commit
+ * "docs: publish MIDR configuration and TED handoff guides"），除本注释块外
+ * 与他们的 bgpd/bgp_midr.h 逐字节一致。**以他们为准**：不要在此手改任何原型或
+ * 字段。需要同步他们的更新时，重新整份拷贝再把本注释块补回来即可。
+ *
+ * ⊕ 2026-08-22（对接轮 4 步 0）**已合栈**：他们的实现文件（bgp_midr.c /
+ * bgp_midr_input.c / bgp_midr_lsdb.c 等 31 个）已进树，本头文件的原型从此有真
+ * 实现顶着。我方轮 1–3 用的假实现（bgp_midr_group2_shim.c）已随轮 5 清理批
+ * 删除 —— 合栈后同名同签名会重复符号，且它调的旧出口件② 已删、留着也编不过。
+ *
+ * 一个例外：midr_topology_snapshot_get/release 是 **provider 方向**，由我方实现
+ * （轮 3，在 bgp_midr_nds_facts.c）。他们树中那两个带 __attribute__((weak))
+ * （bgp_midr_input.c，返回 -ENOSYS），我方的强定义覆盖它们，合树不出现重复符号。
+ */
+
 #ifndef _FRR_BGP_MIDR_H
 #define _FRR_BGP_MIDR_H
 

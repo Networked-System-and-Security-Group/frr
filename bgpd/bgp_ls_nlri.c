@@ -5239,6 +5239,11 @@ static int parse_ospf_srv6_lan_endx_sid(struct stream *s, uint16_t length, struc
 /*
  * Parse SRv6 Locator TLV (Type 1162, RFC 9514 Section 5.1)
  * Format: Flags (1) + Algorithm (1) + Reserved (2) + Metric (4) + Sub-TLVs (variable)
+ 为什么设计成"丢整条路由"而不是"跳过这个 TLV"
+
+TLV 长度错误或重复出现，说明对端发来了格式畸形的消息
+这时候已经不知道字节流当前位置是否还对齐，继续解析后面的 TLV 可能读到错误数据
+安全做法是丢弃整条路由（treat-as-withdraw），但保留 BGP 连接不断开
  */
 static int parse_srv6_locator(struct stream *s, uint16_t length, struct bgp_ls_attr *attr)
 {
@@ -5824,7 +5829,6 @@ struct json_object *bgp_ls_attr_to_json(struct bgp_ls_attr *ls_attr)
 		json_object_int_add(jss, "argLen", ls_attr->srv6_sid_structure.arg_len);
 		json_object_object_add(json_ls_attr, "srv6SidStructure", jss);
 	}
-
 	return json_ls_attr;
 }
 
@@ -6136,7 +6140,6 @@ void bgp_ls_attr_display(struct vty *vty, struct bgp_ls_attr *ls_attr)
 			       ls_attr->srv6_sid_structure.fun_len,
 			       ls_attr->srv6_sid_structure.arg_len);
 	}
-
 	(void)col; /* Don't complain about last 'col +=' */
 
 #undef CHECK_WRAP

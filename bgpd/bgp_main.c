@@ -51,6 +51,7 @@
 #include "bgpd/bgp_nhg.h"
 #include "bgpd/bgp_routemap_nb.h"
 #include "bgpd/bgp_community_alias.h"
+#include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_HOOK(bgp_hook_config_write_vrf, (struct vty *vty, struct vrf *vrf),
 	    (vty, vrf));
@@ -98,6 +99,10 @@ static struct frr_signal_t bgp_signals[] = {
 	{
 		.signal = SIGTERM,
 		.handler = &sigint,
+	},
+	{
+		.signal = SIGCHLD,
+		.handler = &midr_trace_scheduler_sigchld,
 	},
 };
 
