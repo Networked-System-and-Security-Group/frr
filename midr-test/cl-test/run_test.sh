@@ -32,9 +32,29 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
+LIBDIR="$REPO_ROOT/lib/.libs"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[run_test] This test must run as root: sudo ./run_test.sh" >&2
+    exit 2
+fi
+if [[ ! -x "$BGPD" || ! -r "$LIBDIR/libfrr.so.0" ]]; then
+    echo "[run_test] Build artifacts are missing; build bgpd and libfrr first." >&2
+    exit 2
+fi
+
+# sudo clears the caller's LD_LIBRARY_PATH.  The test launches uninstalled
+# .libs binaries directly, so point the dynamic linker at the matching libfrr.
+export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+MISSING_LIBS=$(ldd "$BGPD" 2>&1 | awk '/not found/ {print}')
+if [[ -n "$MISSING_LIBS" ]]; then
+    echo "[run_test] bgpd has unresolved runtime libraries:" >&2
+    echo "$MISSING_LIBS" >&2
+    exit 2
+fi
 
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
 # so bgpd must be launched with TESTDIR as its cwd.
@@ -87,6 +107,8 @@ rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
 # （靠 periodic_sync 每 30s 兜底），15s 内目录必空 → 人人 CREATE 自建群、群号乱套。
 start_node() {
     local node="$1"
+    local pid
+
     mkdir -p "/tmp/midr-cl-vty/$node"
     ip netns exec "ns-$node" "$BGPD" \
         -f "$TESTDIR/configs/bgpd-${node}.conf" \
@@ -94,7 +116,14 @@ start_node() {
         -i "/tmp/bgpd-cl-${node}.pid" \
         --vty_socket "/tmp/midr-cl-vty/$node" \
         --log-level debug &
-    echo "  started bgpd for $node (bg pid $!)"
+    pid=$!
+    echo "  started bgpd for $node (bg pid $pid)"
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" || true
+        echo "[run_test] bgpd for $node exited during startup; aborting." >&2
+        return 1
+    fi
 }
 
 wait_bootstrap_ready() {
@@ -153,21 +182,21 @@ wait_group_members() {
 }
 
 echo "[run_test] Stage 1/4: bootstrap (g1a)..."
-start_node g1a
+start_node g1a || exit 1
 wait_bootstrap_ready g1a || true
 
 echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
-for node in g1b g2a g3a; do start_node "$node"; sleep 1; done
+for node in g1b g2a g3a; do start_node "$node" || exit 1; sleep 1; done
 wait_rep_directory g1a 3 || true
 
 echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
-for node in g1c g1d g1e g2b g3b; do start_node "$node"; sleep 1; done
+for node in g1c g1d g1e g2b g3b; do start_node "$node" || exit 1; sleep 1; done
 # 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
 wait_group_members g1b 1 4 || true
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
 echo "[run_test] Stage 4/4: newnode (join flow will begin automatically)..."
-start_node newnode
+start_node newnode || exit 1
 
 # ---- 5. Wait for JOIN decision in newnode's log -----------------------------
 LOG="$TESTDIR/logs/bgpd-newnode.log"
