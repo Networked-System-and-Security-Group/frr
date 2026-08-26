@@ -574,7 +574,10 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	struct midr_nds_facts *f;
 	struct midr_context *ctx;
 	struct midr_nds_fact_link *fl;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *remote_node;
 	struct midr_link_metrics metrics = {};
+	struct prefix remote_locator;
 	uint32_t local_rid, remote_rid;
 	uint64_t link_id, seqno;
 	int ret;
@@ -615,6 +618,14 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	local_rid = bgp->router_id.s_addr;
 	remote_rid = link->remote_node_id.u.prefix4.s_addr;
 	if (!local_rid || !remote_rid || local_rid == remote_rid)
+		return;
+	prefix_copy(&key.node_id, &link->remote_node_id);
+	remote_node = midr_node_hash_find(&mi->global_view->nodes, &key);
+	if (!remote_node)
+		return;
+	midr_node_get_locator(remote_node, &remote_locator);
+	if (remote_locator.family != AF_INET ||
+	    !remote_locator.u.prefix4.s_addr)
 		return;
 
 	/*
@@ -701,8 +712,9 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	/*
 	 * 链路两端地址：他们的校验要求两个都 present 且同族（IPv4）。overlay
 	 * 链路没有"接口地址"这一说，用两端的 locator —— 本端取 transport（没配
-	 * 则回落 router-id，与 midr_node_get_locator 的口径一致）、对端取
-	 * remote_node_id。local_ifindex 恒 0（多跳链路出口由路由表现算，文档
+	 * 则回落 router-id，与 midr_node_get_locator 的口径一致）、对端同样取
+	 * Membership 中的 transport locator，缺失时才回落 router-id。
+	 * local_ifindex 恒 0（多跳链路出口由路由表现算，文档
 	 * 约定填 0 = 不适用），XCALLOC 已置 0。
 	 */
 	fl->data.link_local_address.ipa_type = IPADDR_V4;
@@ -710,7 +722,7 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 						       ? mi->local_transport_addr
 						       : bgp->router_id;
 	fl->data.link_remote_address.ipa_type = IPADDR_V4;
-	fl->data.link_remote_address.ipaddr_v4 = link->remote_node_id.u.prefix4;
+	fl->data.link_remote_address.ipaddr_v4 = remote_locator.u.prefix4;
 	fl->data.metrics = metrics;
 	fl->data.policy_state = MIDR_POLICY_ALLOWED;
 
