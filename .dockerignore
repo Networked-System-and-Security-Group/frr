@@ -7,3 +7,11 @@
 **/.libs
 docker/alpine/pkgs
 docker/centos/pkgs
+midr-test/backbone-lab/logs-backbone
+midr-test/cl-test/artifacts
+midr-test/cl-test/logs
+midr-test/pm-test/*.flow
+midr-test/pm-test/*.log
+midr-test/pm-test/*.png
+midr-test/pm-test/*.rtl
+midr-test/run

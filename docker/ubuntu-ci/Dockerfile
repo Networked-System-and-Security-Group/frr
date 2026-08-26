@@ -94,18 +94,18 @@ RUN for i in $(seq 1 ${APT_RETRIES}); do \
         yodl \
         && break || sleep 10; \
     done && \
-    download-mibs && \
-    wget --tries=5 --waitretry=10 --retry-connrefused https://raw.githubusercontent.com/FRRouting/frr-mibs/main/iana/IANA-IPPM-METRICS-REGISTRY-MIB -O /usr/share/snmp/mibs/iana/IANA-IPPM-METRICS-REGISTRY-MIB && \
-    wget --tries=5 --waitretry=10 --retry-connrefused https://raw.githubusercontent.com/FRRouting/frr-mibs/main/ietf/SNMPv2-PDU -O /usr/share/snmp/mibs/ietf/SNMPv2-PDU && \
-    wget --tries=5 --waitretry=10 --retry-connrefused https://raw.githubusercontent.com/FRRouting/frr-mibs/main/ietf/IPATM-IPMC-MIB -O /usr/share/snmp/mibs/ietf/IPATM-IPMC-MIB && \
+    test -x /usr/bin/tshark
+
+RUN download-mibs
+
+RUN \
     rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED && \
     python3 -m pip install wheel && \
     bash -c "PV=($(pkg-config --modversion protobuf | tr '.' ' ')); if (( PV[0] == 3 && PV[1] < 19 )); then python3 -m pip install 'protobuf<4' grpcio grpcio-tools; else python3 -m pip install 'protobuf>=4' grpcio grpcio-tools; fi" && \
     python3 -m pip install 'pytest>=6.2.4' 'pytest-xdist>=3.6.1' 'pytest-asyncio>=0.25.3' && \
     python3 -m pip install 'scapy>=2.4.5' && \
     python3 -m pip install pyyaml && \
-    python3 -m pip install xmltodict && \
-    python3 -m pip install git+https://github.com/Exa-Networks/exabgp@0659057837cd6c6351579e9f0fa47e9fb7de7311
+    python3 -m pip install xmltodict
 
 # LTTng tracing dependencies (conditional)
 RUN if [ "$ENABLE_LTTNG" = "true" ]; then \
@@ -176,9 +176,18 @@ RUN mkdir -p /etc/apt/keyrings && \
 
 # build and install libyang3
 RUN cd && pwd && ls -al && \
-    git clone https://github.com/CESNET/libyang.git && \
+    for i in $(seq 1 ${APT_RETRIES}); do \
+        curl --http1.1 -fL --connect-timeout 20 --max-time 120 \
+            https://codeload.github.com/CESNET/libyang/tar.gz/refs/tags/v3.13.6 \
+            -o libyang.tar.gz && break; \
+        rm -f libyang.tar.gz; \
+        sleep 10; \
+    done && \
+    echo "5cd5018f39c830f97d70616c003990287ce5e820ae2792763a49e2a1f63af8d6  libyang.tar.gz" | sha256sum -c - && \
+    mkdir libyang && \
+    tar -xzf libyang.tar.gz --strip-components=1 -C libyang && \
+    rm libyang.tar.gz && \
     cd libyang && \
-    git checkout v3.13.6 && \
     mkdir build; cd build && \
     cmake -DCMAKE_INSTALL_PREFIX:PATH=/usr \
     -DCMAKE_BUILD_TYPE:String="Debug" .. && \
