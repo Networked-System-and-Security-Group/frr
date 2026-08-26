@@ -7,5 +7,18 @@ MIDR TED summary:
   pending node-prefixes: 0
   pending prefix-groups: 0
 MIDR TED generation: 0 (NOT_READY)
+MIDR SPF summary:
+  state:                NOT_READY
+  cached generation:    0
+  pending generation:   0
+  pending change flags: 0x0
+  recompute pending:    no
+  recomputes:           0
+  last error:           0
+  routes:               0
+  local/intra/inter:    0/0/0
+  unreachable:          0
+  nexthops:             0
+MIDR SPF routes: NOT_READY
 !% MIDR TED status failed
 !% MIDR TED snapshot failed

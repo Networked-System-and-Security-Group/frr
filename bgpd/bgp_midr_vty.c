@@ -18,6 +18,7 @@
 #include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_spf.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_midr_vty.h"
@@ -285,6 +286,169 @@ DEFUN(show_midr_rib_paths, show_midr_rib_paths_cmd,
 	if (!ctx)
 		return CMD_WARNING;
 	midr_show_rib_paths(vty, ctx);
+	return CMD_SUCCESS;
+}
+
+static const char *midr_vty_spf_scope_name(enum midr_spf_route_scope scope)
+{
+	switch (scope) {
+	case MIDR_SPF_ROUTE_UNREACHABLE:
+		return "UNREACHABLE";
+	case MIDR_SPF_ROUTE_LOCAL:
+		return "LOCAL";
+	case MIDR_SPF_ROUTE_INTRA_GROUP:
+		return "INTRA_GROUP";
+	case MIDR_SPF_ROUTE_INTER_GROUP:
+		return "INTER_GROUP";
+	}
+	return "UNKNOWN";
+}
+
+DEFUN(show_midr_spf_summary, show_midr_spf_summary_cmd,
+      "show midr spf summary",
+      SHOW_STR
+      "MIDR information\n"
+      "Hierarchical shortest-path computation\n"
+      "Runtime status and result counts\n")
+{
+	const struct midr_spf_results *results = NULL;
+	struct midr_context *ctx = midr_vty_context(vty);
+	struct midr_spf_runtime_status status;
+	size_t intra = 0;
+	size_t inter = 0;
+	size_t local = 0;
+	size_t nexthops = 0;
+	size_t unreachable = 0;
+	size_t index;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_spf_runtime_status_get(ctx, &status);
+	if (ret) {
+		vty_out(vty, "%% MIDR SPF status failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+	ret = midr_spf_results_get(ctx, &results);
+	if (ret != 0 && ret != -EAGAIN) {
+		vty_out(vty, "%% MIDR SPF results failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+	for (index = 0; results && index < midr_spf_results_count(results);
+	     index++) {
+		const struct midr_spf_route *route =
+			midr_spf_results_at(results, index);
+
+		nexthops += route->nexthop_count;
+		switch (route->scope) {
+		case MIDR_SPF_ROUTE_UNREACHABLE:
+			unreachable++;
+			break;
+		case MIDR_SPF_ROUTE_LOCAL:
+			local++;
+			break;
+		case MIDR_SPF_ROUTE_INTRA_GROUP:
+			intra++;
+			break;
+		case MIDR_SPF_ROUTE_INTER_GROUP:
+			inter++;
+			break;
+		}
+	}
+
+	vty_out(vty, "MIDR SPF summary:\n");
+	vty_out(vty, "  state:                %s\n",
+		 results ? "READY" : "NOT_READY");
+	vty_out(vty, "  cached generation:    %" PRIu64 "\n",
+		 status.cached_generation);
+	vty_out(vty, "  pending generation:   %" PRIu64 "\n",
+		 status.pending_generation);
+	vty_out(vty, "  pending change flags: 0x%x\n",
+		 status.pending_change_flags);
+	vty_out(vty, "  recompute pending:    %s\n",
+		 status.recompute_pending ? "yes" : "no");
+	vty_out(vty, "  recomputes:           %" PRIu64 "\n",
+		 status.recompute_count);
+	vty_out(vty, "  last error:           %d\n", status.last_error);
+	vty_out(vty, "  routes:               %zu\n",
+		 midr_spf_results_count(results));
+	vty_out(vty, "  local/intra/inter:    %zu/%zu/%zu\n", local, intra,
+		 inter);
+	vty_out(vty, "  unreachable:          %zu\n", unreachable);
+	vty_out(vty, "  nexthops:             %zu\n", nexthops);
+	midr_spf_results_release(&results);
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_spf_routes, show_midr_spf_routes_cmd,
+      "show midr spf routes",
+      SHOW_STR
+      "MIDR information\n"
+      "Hierarchical shortest-path computation\n"
+      "Computed routes and next hops\n")
+{
+	const struct midr_spf_results *results = NULL;
+	struct midr_context *ctx = midr_vty_context(vty);
+	size_t index;
+	int ret;
+
+	if (!ctx)
+		return CMD_WARNING;
+	ret = midr_spf_results_get(ctx, &results);
+	if (ret == -EAGAIN) {
+		vty_out(vty, "MIDR SPF routes: NOT_READY\n");
+		return CMD_SUCCESS;
+	}
+	if (ret) {
+		vty_out(vty, "%% MIDR SPF results failed: %d\n", ret);
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "MIDR SPF routes: generation=%" PRIu64 " count=%zu\n",
+		 midr_spf_results_generation(results),
+		 midr_spf_results_count(results));
+	for (index = 0; index < midr_spf_results_count(results); index++) {
+		const struct midr_spf_route *route =
+			midr_spf_results_at(results, index);
+		size_t nh_index;
+
+		vty_out(vty,
+			"route afi=%u safi=%u prefix=%pFX scope=%s"
+			" reachable=%s local=%s group-score=%" PRIu64
+			" local-cost=%" PRIu64 " nexthops=%zu\n",
+			route->prefix.afi, route->prefix.safi,
+			&route->prefix.prefix,
+			midr_vty_spf_scope_name(route->scope),
+			route->reachable ? "yes" : "no",
+			route->local_destination ? "yes" : "no",
+			route->group_score, route->local_cost,
+			route->nexthop_count);
+		for (nh_index = 0; nh_index < route->nexthop_count;
+		     nh_index++) {
+			const struct midr_spf_nexthop *nexthop =
+				&route->nexthops[nh_index];
+			struct in_addr local = {
+				.s_addr = nexthop->local_node_id,
+			};
+			struct in_addr remote = {
+				.s_addr = nexthop->remote_node_id,
+			};
+
+			vty_out(vty,
+				"  nexthop address=%pIA ifindex=%d"
+				" link=%pI4->%pI4 link-id=%" PRIu64
+				" groups=%u->%u destination-group=%u"
+				" next-group=%u bandwidth-kbps=%u\n",
+				&nexthop->address, nexthop->ifindex, &local,
+				&remote, nexthop->link_id,
+				nexthop->local_group_id,
+				nexthop->remote_group_id,
+				nexthop->destination_group_id,
+				nexthop->next_group_id,
+				nexthop->available_bandwidth_kbps);
+		}
+	}
+	midr_spf_results_release(&results);
 	return CMD_SUCCESS;
 }
 
@@ -1013,6 +1177,8 @@ void bgp_midr_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_lsdb_objects_cmd);
 	install_element(VIEW_NODE, &show_midr_rib_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_rib_paths_cmd);
+	install_element(VIEW_NODE, &show_midr_spf_summary_cmd);
+	install_element(VIEW_NODE, &show_midr_spf_routes_cmd);
 	install_element(VIEW_NODE, &show_midr_prefix_summary_cmd);
 	install_element(VIEW_NODE, &show_midr_prefix_contributors_cmd);
 	install_element(VIEW_NODE, &show_midr_topology_nodes_cmd);
