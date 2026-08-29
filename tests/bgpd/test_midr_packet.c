@@ -37,6 +37,40 @@ static uint32_t router_id(const char *text)
 	return address.s_addr;
 }
 
+static struct midr_ls_prefix_key prefix_key(const char *text)
+{
+	struct midr_ls_prefix_key key = {
+		.safi = SAFI_UNICAST,
+	};
+
+	assert(str2prefix(text, &key.prefix) > 0);
+	key.afi = family2afi(key.prefix.family);
+	assert(key.afi == AFI_IP || key.afi == AFI_IP6);
+	apply_mask(&key.prefix);
+	return key;
+}
+
+static struct midr_ls_object_key node_prefix_key(const char *text)
+{
+	return (struct midr_ls_object_key){
+		.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+		.originator_node_id = remote->remote_id.s_addr,
+		.u.node_prefix = prefix_key(text),
+	};
+}
+
+static struct midr_ls_object_key group_prefix_key(const char *text, uint32_t group_id)
+{
+	return (struct midr_ls_object_key){
+		.type = MIDR_NLRI_TYPE_GROUP_PREFIX,
+		.originator_node_id = remote->remote_id.s_addr,
+		.u.group_prefix = {
+			.group_id = group_id,
+			.prefix = prefix_key(text),
+		},
+	};
+}
+
 static struct midr_ls_attributes membership_attributes(uint64_t sequence, uint32_t group_id)
 {
 	return (struct midr_ls_attributes){
@@ -44,6 +78,14 @@ static struct midr_ls_attributes membership_attributes(uint64_t sequence, uint32
 			   MIDR_LS_ATTR_HAS_CAP_FLAGS,
 		.ls_sequence = sequence,
 		.group_id = group_id,
+	};
+}
+
+static struct midr_ls_attributes prefix_attributes(uint64_t sequence)
+{
+	return (struct midr_ls_attributes){
+		.present = MIDR_LS_ATTR_HAS_SEQUENCE,
+		.ls_sequence = sequence,
 	};
 }
 
@@ -187,6 +229,106 @@ static void test_unknown_and_malformed_nlri(void)
 	stream_free(stream);
 }
 
+static void assert_selected_sequence(const struct midr_ls_object_key *key, uint64_t sequence)
+{
+	const struct midr_propagation_path *selected_path;
+	struct midr_ls_object selected;
+	struct peer *selected_peer;
+
+	assert(midr_rib_selected_get(ctx, key, &selected, &selected_path, &selected_peer) == 0);
+	assert(midr_ls_object_key_same(&selected.key, key));
+	assert(selected.ls_sequence == sequence);
+	assert(selected_path->node_count == 1);
+	assert(selected_path->nodes[0] == remote->remote_id.s_addr);
+	assert(selected_peer == remote);
+}
+
+static void assert_selected_missing(const struct midr_ls_object_key *key)
+{
+	const struct midr_propagation_path *selected_path;
+	struct midr_ls_object selected;
+	struct peer *selected_peer;
+
+	assert(midr_rib_selected_get(ctx, key, &selected, &selected_path, &selected_peer) ==
+	       -ENOENT);
+}
+
+static void test_ipv6_prefix_update_and_withdraw(void)
+{
+	struct midr_ls_object_key keys[] = {
+		node_prefix_key("::/0"),
+		node_prefix_key("2001:db8:abcd:ef01:8000::/73"),
+		group_prefix_key("2001:db8:ffff::1/128", 20),
+	};
+	struct midr_propagation_path path = {};
+	struct stream *nlri = stream_new(512);
+	struct bgp_nlri packet;
+	size_t index;
+
+	assert(midr_propagation_path_init(&path, remote->remote_id.s_addr) == 0);
+	for (index = 0; index < array_size(keys); index++) {
+		struct midr_ls_attributes attributes = prefix_attributes(100 + index);
+		struct attr attr = wire_attr(&attributes, &path);
+
+		stream_reset(nlri);
+		assert(midr_nlri_encode(nlri, &keys[index]) == MIDR_CODEC_OK);
+		packet = packet_from_stream(nlri);
+		assert(packet.afi == AFI_BGP_LS);
+		assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_OK);
+		assert_selected_sequence(&keys[index], 100 + index);
+		assert(bgp_nlri_parse_midr(remote, NULL, &packet) == BGP_NLRI_PARSE_OK);
+		assert_selected_missing(&keys[index]);
+		bgp_attr_unintern_sub(&attr);
+	}
+
+	stream_reset(nlri);
+	assert(midr_nlri_encode(nlri, &keys[0]) == MIDR_CODEC_OK);
+	packet = packet_from_stream(nlri);
+	packet.afi = AFI_IP6;
+	assert(bgp_nlri_parse_midr(remote, NULL, &packet) == BGP_NLRI_PARSE_ERROR);
+
+	midr_propagation_path_fini(&path);
+	stream_free(nlri);
+}
+
+static void test_ipv4_ipv6_identity_isolation(void)
+{
+	struct midr_ls_object_key ipv4 = node_prefix_key("192.0.2.0/24");
+	struct midr_ls_object_key ipv6 = node_prefix_key("::ffff:192.0.2.0/120");
+	struct midr_ls_attributes attributes = prefix_attributes(200);
+	struct midr_propagation_path path = {};
+	struct stream *updates = stream_new(256);
+	struct stream *withdraw = stream_new(128);
+	struct bgp_nlri packet;
+	struct attr attr;
+
+	assert(midr_propagation_path_init(&path, remote->remote_id.s_addr) == 0);
+	attr = wire_attr(&attributes, &path);
+	assert(midr_nlri_encode(updates, &ipv4) == MIDR_CODEC_OK);
+	assert(midr_nlri_encode(updates, &ipv6) == MIDR_CODEC_OK);
+	packet = packet_from_stream(updates);
+	assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_OK);
+	assert_selected_sequence(&ipv4, 200);
+	assert_selected_sequence(&ipv6, 200);
+
+	assert(midr_nlri_encode(withdraw, &ipv6) == MIDR_CODEC_OK);
+	packet = packet_from_stream(withdraw);
+	assert(bgp_nlri_parse_midr(remote, NULL, &packet) == BGP_NLRI_PARSE_OK);
+	assert_selected_sequence(&ipv4, 200);
+	assert_selected_missing(&ipv6);
+
+	stream_reset(withdraw);
+	assert(midr_nlri_encode(withdraw, &ipv4) == MIDR_CODEC_OK);
+	packet = packet_from_stream(withdraw);
+	assert(bgp_nlri_parse_midr(remote, NULL, &packet) == BGP_NLRI_PARSE_OK);
+	assert_selected_missing(&ipv4);
+
+	bgp_attr_unintern_sub(&attr);
+	midr_propagation_path_fini(&path);
+	stream_free(withdraw);
+	stream_free(updates);
+}
+
 int main(void)
 {
 	as_t asn = 65000;
@@ -209,6 +351,8 @@ int main(void)
 	remote->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] = 1;
 
 	test_update_withdraw_and_outbound_path();
+	test_ipv6_prefix_update_and_withdraw();
+	test_ipv4_ipv6_identity_isolation();
 	test_unknown_and_malformed_nlri();
 	puts("MIDR packet tests passed");
 	return 0;

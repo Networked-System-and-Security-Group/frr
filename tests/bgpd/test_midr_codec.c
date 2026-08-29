@@ -155,6 +155,27 @@ static void test_other_nlri_round_trip(void)
 						prefix_key("2001:db8::/32"),
 				},
 		},
+		{
+			.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+			.originator_node_id = router_id("4.4.4.4"),
+			.u.node_prefix = prefix_key("::/0"),
+		},
+		{
+			.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+			.originator_node_id = router_id("4.4.4.4"),
+			.u.node_prefix =
+				prefix_key("2001:db8:abcd:ef01:8000::/73"),
+		},
+		{
+			.type = MIDR_NLRI_TYPE_GROUP_PREFIX,
+			.originator_node_id = router_id("5.5.5.5"),
+			.u.group_prefix =
+				{
+					.group_id = 300,
+					.prefix =
+						prefix_key("2001:db8:ffff::1/128"),
+				},
+		},
 	};
 	struct midr_ls_object_key decoded;
 	struct stream *stream;
@@ -185,6 +206,11 @@ static void test_nlri_errors_and_atomicity(void)
 		0x00, 0x03, 0x00, 0x0c, 0x01, 0x01, 0x01, 0x01,
 		0x00, 0x01, 0x01, 0x19, 0xc0, 0x00, 0x02, 0x81,
 	};
+	static const uint8_t ipv6_host_bits[] = {
+		0x00, 0x03, 0x00, 0x12, 0x01, 0x01, 0x01, 0x01,
+		0x00, 0x02, 0x01, 0x49, 0x20, 0x01, 0x0d, 0xb8,
+		0xab, 0xcd, 0xef, 0x01, 0x80, 0x01,
+	};
 	struct midr_ls_object object = link_object();
 	struct midr_ls_object_key decoded = {
 		.type = MIDR_NLRI_TYPE_LINK,
@@ -204,6 +230,11 @@ static void test_nlri_errors_and_atomicity(void)
 	stream_free(stream);
 
 	stream = stream_from_bytes(host_bits, sizeof(host_bits));
+	assert(midr_nlri_decode(stream, &decoded) == MIDR_CODEC_MALFORMED_NLRI);
+	assert(stream_get_getp(stream) == 0);
+	stream_free(stream);
+
+	stream = stream_from_bytes(ipv6_host_bits, sizeof(ipv6_host_bits));
 	assert(midr_nlri_decode(stream, &decoded) == MIDR_CODEC_MALFORMED_NLRI);
 	assert(stream_get_getp(stream) == 0);
 	stream_free(stream);

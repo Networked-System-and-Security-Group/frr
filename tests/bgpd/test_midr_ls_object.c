@@ -107,6 +107,11 @@ static void test_prefix_normalization(void)
 	expected = prefix_key("2001:db8::/64");
 	assert(prefix_same(&normalized.prefix, &expected.prefix));
 
+	input = prefix_key("2001:db8:abcd:ef01:80ff::/73");
+	assert(midr_ls_prefix_key_normalize(&input, &normalized) == 0);
+	expected = prefix_key("2001:db8:abcd:ef01:8080::/73");
+	assert(prefix_same(&normalized.prefix, &expected.prefix));
+
 	input.safi = SAFI_MULTICAST;
 	assert(midr_ls_prefix_key_normalize(&input, &normalized) == -EINVAL);
 }
@@ -130,11 +135,19 @@ static void test_identity(void)
 				.prefix = prefix_key("2001:db8:1::/48"),
 			},
 	};
+	struct midr_ls_object_key ipv6_prefix = {
+		.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+		.originator_node_id = router_id("1.1.1.1"),
+		.u.node_prefix = prefix_key("::ffff:198.51.100.0/120"),
+	};
 
 	assert(midr_ls_object_key_validate(&membership.key) == 0);
 	assert(midr_ls_object_key_validate(&link.key) == 0);
 	assert(midr_ls_object_key_validate(&prefix) == 0);
+	assert(midr_ls_object_key_validate(&ipv6_prefix) == 0);
 	assert(midr_ls_object_key_validate(&group_prefix) == 0);
+	assert(!midr_ls_object_key_same(&prefix, &ipv6_prefix));
+	assert(midr_ls_object_key_cmp(&prefix, &ipv6_prefix) != 0);
 
 	assert(midr_ls_object_key_same(&membership.key, &other.key));
 	assert(midr_ls_object_key_hash(&membership.key) == midr_ls_object_key_hash(&other.key));
@@ -215,6 +228,9 @@ static void test_defensive_arguments(void)
 	assert(midr_ls_prefix_key_normalize(&input, &normalized) == -EINVAL);
 	input = prefix_key("192.0.2.0/24");
 	input.afi = AFI_UNSPEC;
+	assert(midr_ls_prefix_key_normalize(&input, &normalized) == -EINVAL);
+	input = prefix_key("2001:db8::/64");
+	input.prefix.prefixlen = IPV6_MAX_BITLEN + 1;
 	assert(midr_ls_prefix_key_normalize(&input, &normalized) == -EINVAL);
 	assert(!midr_ls_prefix_key_is_canonical(NULL));
 
