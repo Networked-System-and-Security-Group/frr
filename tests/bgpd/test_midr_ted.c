@@ -406,6 +406,84 @@ static void test_snapshot_derivation_and_stable_order(void)
 	midr_ted_context_finish(&ctx);
 }
 
+static void test_ipv6_snapshot_and_address_family_isolation(void)
+{
+	const uint32_t r1 = node_id("1.1.1.1");
+	const uint32_t r2 = node_id("2.2.2.2");
+	const uint32_t r3 = node_id("3.3.3.3");
+	struct midr_context ctx = {};
+	const struct midr_ted_snapshot *snapshot = NULL;
+	struct midr_ted_builder *builder = NULL;
+	struct midr_ted_link_input link;
+	struct midr_ted_node n;
+	struct midr_ted_node_prefix attachment;
+	struct midr_ted_prefix_group mapping;
+	struct midr_ted_prefix_key ipv6_key = prefix_key("2001:db8:100::/64");
+	struct midr_ted_prefix_key ipv4_key = prefix_key("192.0.2.0/24");
+	size_t ipv6_group_rows = 0;
+	size_t index;
+
+	assert(midr_ted_context_init(&ctx) == 0);
+	assert(midr_ted_builder_create(r1, 100, &builder) == 0);
+	n = node(r1, 100);
+	assert(midr_ted_builder_add_node(builder, &n) == 0);
+	n = node(r2, 100);
+	assert(midr_ted_builder_add_node(builder, &n) == 0);
+	n = node(r3, 200);
+	assert(midr_ted_builder_add_node(builder, &n) == 0);
+
+	link = link_input(r1, r2, 10, 25);
+	link.local_ifindex = 7;
+	link.link_local_address = ip_address("2001:db8:12::1");
+	link.link_remote_address = ip_address("2001:db8:12::2");
+	assert(midr_ted_builder_add_link(builder, &link) == 0);
+
+	attachment = node_prefix("2001:db8:100::/64", r1);
+	assert(midr_ted_builder_add_node_prefix(builder, &attachment) == 0);
+	attachment = node_prefix("192.0.2.0/24", r2);
+	assert(midr_ted_builder_add_node_prefix(builder, &attachment) == 0);
+
+	mapping = prefix_group("2001:db8:100::/64", 100);
+	assert(midr_ted_builder_add_prefix_group(builder, &mapping) == 0);
+	mapping.group_id = 200;
+	assert(midr_ted_builder_add_prefix_group(builder, &mapping) == 0);
+	mapping = prefix_group("192.0.2.0/24", 100);
+	assert(midr_ted_builder_add_prefix_group(builder, &mapping) == 0);
+
+	assert(midr_ted_builder_publish(&ctx, builder, 0) == 0);
+	midr_ted_builder_destroy(&builder);
+	assert(midr_ted_snapshot_get(&ctx, &snapshot) == 0);
+	assert(snapshot->intra_link_count == 1);
+	assert(snapshot->intra_links[0].link_local_address.ipa_type == IPADDR_V6);
+	assert(snapshot->intra_links[0].link_remote_address.ipa_type == IPADDR_V6);
+	assert(snapshot->node_prefix_count == 2);
+	assert(snapshot->prefix_group_count == 3);
+
+	for (index = 0; index < snapshot->node_prefix_count; index++) {
+		const struct midr_ted_prefix_key *key = &snapshot->node_prefixes[index].key;
+
+		assert((key->afi == AFI_IP && prefix_same(&key->prefix, &ipv4_key.prefix)) ||
+		       (key->afi == AFI_IP6 && prefix_same(&key->prefix, &ipv6_key.prefix)));
+	}
+	for (index = 0; index < snapshot->prefix_group_count; index++) {
+		const struct midr_ted_prefix_group *row = &snapshot->prefix_groups[index];
+
+		if (row->key.afi == AFI_IP6 &&
+		    prefix_same(&row->key.prefix, &ipv6_key.prefix)) {
+			assert(row->group_id == 100 || row->group_id == 200);
+			ipv6_group_rows++;
+		} else {
+			assert(row->key.afi == AFI_IP);
+			assert(prefix_same(&row->key.prefix, &ipv4_key.prefix));
+			assert(row->group_id == 100);
+		}
+	}
+	assert(ipv6_group_rows == 2);
+
+	midr_ted_snapshot_release(&snapshot);
+	midr_ted_context_finish(&ctx);
+}
+
 static void populate_minimal(struct midr_ted_builder *builder, uint32_t r1, uint32_t r2,
 			     bool include_r2)
 {
@@ -719,6 +797,7 @@ int main(void)
 	test_not_ready_and_context_validation();
 	test_builder_input_validation();
 	test_snapshot_derivation_and_stable_order();
+	test_ipv6_snapshot_and_address_family_isolation();
 	test_generation_consumer_and_lifetime();
 	test_consumer_self_unregister();
 	test_group_edge_reselection_and_removal();

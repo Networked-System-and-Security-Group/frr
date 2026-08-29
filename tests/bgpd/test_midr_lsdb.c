@@ -65,11 +65,12 @@ static struct ipaddr ip_address(const char *text)
 	return address;
 }
 
-static struct prefix ipv4_prefix(const char *text)
+static struct prefix text_prefix(const char *text)
 {
 	struct prefix prefix;
 
 	assert(str2prefix(text, &prefix) > 0);
+	apply_mask(&prefix);
 	return prefix;
 }
 
@@ -120,8 +121,8 @@ static struct midr_link_update local_link(uint64_t version)
 				.link_id = 1,
 			},
 		.local_ifindex = 9,
-		.link_local_address = ip_address("198.51.100.1"),
-		.link_remote_address = ip_address("198.51.100.2"),
+		.link_local_address = ip_address("2001:db8:12::1"),
+		.link_remote_address = ip_address("2001:db8:12::2"),
 		.metrics =
 			{
 				.has_rtt_us = true,
@@ -175,9 +176,9 @@ static struct midr_ls_object remote_link(uint64_t sequence)
 			.payload.link =
 				{
 					.link_local_address =
-						ip_address("198.51.100.2"),
+						ip_address("2001:db8:12::2"),
 					.link_remote_address =
-						ip_address("198.51.100.1"),
+						ip_address("2001:db8:12::1"),
 					.canonical_cost = 65,
 				},
 		};
@@ -193,11 +194,11 @@ static struct midr_ls_object remote_node_prefix(uint64_t sequence)
 					remote_peer->remote_id.s_addr,
 				.u.node_prefix =
 					{
-						.afi = AFI_IP,
+						.afi = AFI_IP6,
 						.safi = SAFI_UNICAST,
 						.prefix =
-							ipv4_prefix(
-								"203.0.113.0/24"),
+							text_prefix(
+								"2001:db8:203::/64"),
 					},
 			},
 		.ls_sequence = sequence,
@@ -213,11 +214,11 @@ static struct midr_ls_object local_node_prefix(uint64_t sequence)
 				.originator_node_id = bgp->router_id.s_addr,
 				.u.node_prefix =
 					{
-						.afi = AFI_IP,
+						.afi = AFI_IP6,
 						.safi = SAFI_UNICAST,
 						.prefix =
-							ipv4_prefix(
-								"192.0.2.0/24"),
+							text_prefix(
+								"2001:db8:192::/64"),
 					},
 			},
 		.ls_sequence = sequence,
@@ -237,12 +238,12 @@ static struct midr_ls_object remote_group_prefix(uint64_t sequence, uint32_t gro
 						.group_id = group_id,
 						.prefix =
 							{
-								.afi = AFI_IP,
+								.afi = AFI_IP6,
 								.safi =
 									SAFI_UNICAST,
 								.prefix =
-									ipv4_prefix(
-										"198.18.0.0/15"),
+									text_prefix(
+										"2001:db8:198::/48"),
 							},
 					},
 			},
@@ -350,24 +351,24 @@ static void assert_mock_matches_real(const struct midr_ted_snapshot *real,
 		       "{\"node_id\":\"10.0.0.2\",\"group_id\":20,"
 		       "\"cap_flags\":0,\"policy_tags\":0}],"
 		       "\"links\":["
-			       "{\"local\":\"10.0.0.1\",\"remote\":\"10.0.0.2\","
-			       "\"link_id\":1,\"local_address\":\"198.51.100.1\","
-			       "\"remote_address\":\"198.51.100.2\",\"cost\":%u,"
-			       "\"local_ifindex\":9,\"policy_tags\":0},"
-			       "{\"local\":\"10.0.0.2\",\"remote\":\"10.0.0.1\","
-			       "\"link_id\":2,\"local_address\":\"198.51.100.2\","
-			       "\"remote_address\":\"198.51.100.1\",\"cost\":%u,"
-			       "\"local_ifindex\":0,\"policy_tags\":0}],"
+		       "{\"local\":\"10.0.0.1\",\"remote\":\"10.0.0.2\","
+		       "\"link_id\":1,\"local_address\":\"2001:db8:12::1\","
+		       "\"remote_address\":\"2001:db8:12::2\",\"cost\":%u,"
+		       "\"local_ifindex\":9,\"policy_tags\":0},"
+		       "{\"local\":\"10.0.0.2\",\"remote\":\"10.0.0.1\","
+		       "\"link_id\":2,\"local_address\":\"2001:db8:12::2\","
+		       "\"remote_address\":\"2001:db8:12::1\",\"cost\":%u,"
+		       "\"local_ifindex\":0,\"policy_tags\":0}],"
 		       "\"node_prefixes\":["
-		       "{\"prefix\":\"192.0.2.0/24\","
+		       "{\"prefix\":\"2001:db8:192::/64\","
 		       "\"node_id\":\"10.0.0.1\"},"
-		       "{\"prefix\":\"203.0.113.0/24\","
+		       "{\"prefix\":\"2001:db8:203::/64\","
 		       "\"node_id\":\"10.0.0.2\"}],"
-			       "\"prefix_groups\":["
-			       "{\"prefix\":\"198.18.0.0/15\",\"group_id\":20}]"
-			       "}",
-			       local_cost,
-			       remote_link_object->payload.link.canonical_cost) > 0);
+		       "\"prefix_groups\":["
+		       "{\"prefix\":\"2001:db8:198::/48\",\"group_id\":20}]"
+		       "}",
+		       local_cost,
+		       remote_link_object->payload.link.canonical_cost) > 0);
 	assert(fclose(file) == 0);
 	assert(midr_ted_mock_provider_publish_file(ctx, path, error, sizeof(error)) == 0);
 	assert(unlink(path) == 0);
@@ -540,6 +541,10 @@ static void test_pending_activation_and_four_objects(void)
 	assert(held->group_edge_count == 2);
 	assert(held->node_prefix_count == 1);
 	assert(held->prefix_group_count == 1);
+	assert(held->node_prefixes[0].key.afi == AFI_IP6);
+	assert(held->prefix_groups[0].key.afi == AFI_IP6);
+	assert(held->egress_links[0].link_local_address.ipa_type == IPADDR_V6);
+	assert(held->egress_links[0].link_remote_address.ipa_type == IPADDR_V6);
 	assert(held->egress_links[0].local_ifindex == 9);
 	assert(path_consumer.notification_count > 0);
 	assert(midr_ted_path_consumer_stub_result_is_current(ctx, &path_consumer,
