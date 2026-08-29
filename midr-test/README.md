@@ -207,6 +207,24 @@ python3 ./midr-test/run-m6-m7-scenarios.py M7-TED-002
 
 M6/M7 的 Gherkin 只映射跨模块和外部可观察行为。PFX-01 的字段级 eligibility、sequence 和异常输入由 `test_midr_prefix` 直接断言；真实 Node Prefix、Group Prefix、逐跳撤销和代表接管由 rootless 多节点场景断言；Real/Mock parity 和 public Consumer 生命周期由 `test_midr_lsdb` 断言。
 
+### IPv6 控制面组件验证
+
+第二组 IPv6 控制面继续使用外层 `AFI_BGP_LS/SAFI_MIDR_LS`，IPv6 AFI 和 Prefix 编码在 Node Prefix、Group Prefix 的对象 key 内。Router-ID 和 Propagation Path node ID 仍为 32 位，组件测试不要求第一组提供 IPv6 Session transport，也不执行第三组 Zebra/FIB 安装。
+
+```bash
+./tests/bgpd/test_midr_prefix
+./tests/bgpd/test_midr_ls_object
+./tests/bgpd/test_midr_codec
+./tests/bgpd/test_midr_packet
+./tests/bgpd/test_midr_rib
+./tests/bgpd/test_midr_owned
+./tests/bgpd/test_midr_lsdb
+./tests/bgpd/test_midr_ted
+./midr-test/run.sh prefix-config
+```
+
+这些测试覆盖 IPv6 `/0`、非字节对齐 Prefix、`/128`、MP_REACH/MP_UNREACH、IPv4/IPv6 identity 隔离、Node/Group Prefix 撤销与恢复、IPv6 Link endpoint、`prefix-to-group` 一对多映射，以及 IPv4/IPv6 独立 route-map、AS_PATH 上限和诊断计数。该结果证明第二组从 Unicast RIB 到 production TED 的组件级闭环，不代表第一组真实 IPv6 locator 或最终 Linux IPv6 FIB 已完成。
+
 运行全部 M1 TED YAML/Gherkin 场景：
 
 ```bash
@@ -248,7 +266,7 @@ sync-status    输入状态、队列上限和 Provider 状态
 eor-config     EoR timeout 配置、持久化输出和默认值恢复
 router-id-restart
                Router-ID 变化时清理旧 identity，并将新输入置于 Resync Barrier 后
-prefix-config  Prefix policy、external source 和代表接管延迟配置
+prefix-config  IPv4/IPv6 Prefix policy、AS_PATH 上限和代表接管延迟配置
 ```
 
 每个场景的完整输出保存在 `midr-test/run/<scenario>.log`。缺少必要输出、出现禁止输出、命令无法解析、进程崩溃或超时都会使脚本返回非零。普通用户运行时出现 `/var/lib/frr` 或 `/var/run/frr` permission warning 不作为失败。
