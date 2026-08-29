@@ -41,6 +41,8 @@ COMMANDS=(
 	"lsdb-objects|show midr lsdb objects"
 	"ted-summary|show midr ted summary"
 	"ted-detail|show midr ted detail"
+	"spf-summary|show midr spf summary"
+	"spf-routes|show midr spf routes"
 	"prefix-summary|show midr prefix summary"
 	"prefix-contributors|show midr prefix contributors"
 )

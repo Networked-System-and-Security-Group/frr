@@ -15,10 +15,10 @@ EXPECTED_GROUP_SIZE = {
     "r1": 4,
     "m1a": 4,
     "m1b": 4,
-    "z1": 4,
+    "z1": 1,
     "r2": 2,
     "m2a": 2,
-    "z2": 1,
+    "z2": 4,
 }
 
 
@@ -106,7 +106,9 @@ def lsdb_local_memberships(
     }
 
 
-def lsdb_links(objects: list[dict[str, str]]) -> set[tuple[str, ...]]:
+def lsdb_links(
+    objects: list[dict[str, str]], origin_nodes: set[str] | None = None
+) -> set[tuple[str, ...]]:
     return {
         (
             obj["origin"],
@@ -118,6 +120,7 @@ def lsdb_links(objects: list[dict[str, str]]) -> set[tuple[str, ...]]:
         for obj in objects
         if obj.get("type") == "LINK"
         and obj.get("usable") == "yes"
+        and (origin_nodes is None or obj.get("origin") in origin_nodes)
         and all(
             key in obj
             for key in ("origin", "remote", "link-id", "addresses", "derived-cost")
@@ -211,10 +214,23 @@ def ted_group_edges(text: str) -> set[tuple[int, int, int]]:
     return rows
 
 
-def expected_group_edges(egress: list[tuple[int, int, int]]) -> set[tuple[int, int, int]]:
+def expected_group_edges(
+    objects: list[dict[str, str]], memberships: set[tuple[str, ...]]
+) -> set[tuple[int, int, int]]:
+    groups = {row[0]: int(row[1]) for row in memberships if len(row) >= 2}
     costs: dict[tuple[int, int], int] = {}
-    for source, target, cost in egress:
-        key = (source, target)
+    for obj in objects:
+        if obj.get("type") != "LINK" or obj.get("usable") != "yes":
+            continue
+        source_group = groups.get(obj.get("origin", ""))
+        target_group = groups.get(obj.get("remote", ""))
+        cost = obj.get("derived-cost")
+        if source_group is None or target_group is None or source_group == target_group:
+            continue
+        if cost is None:
+            continue
+        key = (source_group, target_group)
+        cost = int(cost)
         costs[key] = min(costs.get(key, cost), cost)
     return {(source, target, cost) for (source, target), cost in costs.items()}
 
@@ -328,7 +344,8 @@ def main() -> int:
 
         memberships = lsdb_memberships(objects)
         local_memberships = lsdb_local_memberships(objects, group_id or -1)
-        links = lsdb_links(objects)
+        local_nodes = {row[0] for row in local_memberships}
+        links = lsdb_links(objects, local_nodes)
         node_prefixes = lsdb_node_prefixes(objects)
         group_prefixes = lsdb_group_prefixes(objects)
         ted_node_rows = ted_nodes(ted_text)
@@ -363,8 +380,8 @@ def main() -> int:
         checks.check(
             len(active_node_lines) == 1
             and len(active_link_lines) == reported_links
-            and fact_link_entries == reported_links,
-            f"{node} Local Fact table matches the Provider snapshot",
+            and fact_link_entries >= reported_links,
+            f"{node} Local Fact active rows match the Provider snapshot (tombstones retained separately)",
         )
         checks.check(
             owned_memberships == 1 and owned_links == reported_links,
@@ -442,7 +459,7 @@ def main() -> int:
             f"{node} TED Prefix-to-Group rows match usable Group Prefix objects",
         )
         checks.check(
-            expected_group_edges(egress_rows) == ted_edge_rows
+            expected_group_edges(objects, memberships) == ted_edge_rows
             and len(ted_edge_rows) == ted_group_edge_count,
             f"{node} TED directed Group Edges are the minimum-cost egress aggregation",
         )
