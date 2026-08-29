@@ -35,6 +35,7 @@ struct midr_prefix_entry {
 struct midr_prefix_family {
 	char *route_map_name;
 	uint32_t max_as_path_length;
+	uint64_t rejected_as_path;
 };
 
 struct midr_prefix_store {
@@ -185,6 +186,7 @@ static bool midr_prefix_path_eligible(struct midr_prefix_store *store, afi_t afi
 	if (aspath_count_hops(path->attr->aspath) >
 	    store->family[afi].max_as_path_length) {
 		store->rejected_as_path++;
+		store->family[afi].rejected_as_path++;
 		return false;
 	}
 	return midr_prefix_route_map_permits(store, afi, dest, path);
@@ -478,7 +480,9 @@ uint32_t midr_prefix_max_as_path_length(struct midr_context *ctx, afi_t afi)
 
 int midr_prefix_status_get(struct midr_context *ctx, struct midr_prefix_status *status)
 {
+	struct hash_bucket *bucket;
 	struct midr_prefix_store *store;
+	unsigned int index;
 
 	if (!status)
 		return -EINVAL;
@@ -489,10 +493,22 @@ int midr_prefix_status_get(struct midr_context *ctx, struct midr_prefix_status *
 	status->state = store->state;
 	status->generation = store->generation;
 	status->contributor_count = store->contributors->count;
+	for (index = 0; index < store->contributors->size; index++)
+		for (bucket = store->contributors->index[index]; bucket;
+		     bucket = bucket->next) {
+			const struct midr_prefix_entry *entry = bucket->data;
+
+			if (entry->prefix.family == AF_INET)
+				status->ipv4_contributor_count++;
+			else if (entry->prefix.family == AF_INET6)
+				status->ipv6_contributor_count++;
+		}
 	status->scans = store->scans;
 	status->route_events = store->route_events;
 	status->policy_rechecks = store->policy_rechecks;
 	status->rejected_as_path = store->rejected_as_path;
+	status->ipv4_rejected_as_path = store->family[AFI_IP].rejected_as_path;
+	status->ipv6_rejected_as_path = store->family[AFI_IP6].rejected_as_path;
 	return 0;
 }
 
@@ -561,11 +577,17 @@ void midr_show_prefix_summary(struct vty *vty, struct midr_context *ctx)
 	vty_out(vty, "  state:             %s\n", midr_prefix_state_name(status.state));
 	vty_out(vty, "  generation:        %" PRIu64 "\n", status.generation);
 	vty_out(vty, "  contributors:      %zu\n", status.contributor_count);
+	vty_out(vty, "  IPv4 contributors: %zu\n", status.ipv4_contributor_count);
+	vty_out(vty, "  IPv6 contributors: %zu\n", status.ipv6_contributor_count);
 	vty_out(vty, "  scans:             %" PRIu64 "\n", status.scans);
 	vty_out(vty, "  route events:      %" PRIu64 "\n", status.route_events);
 	vty_out(vty, "  policy rechecks:   %" PRIu64 "\n", status.policy_rechecks);
 	vty_out(vty, "  AS_PATH rejects:   %" PRIu64 "\n",
 		status.rejected_as_path);
+	vty_out(vty, "  IPv4 AS_PATH rejects: %" PRIu64 "\n",
+		status.ipv4_rejected_as_path);
+	vty_out(vty, "  IPv6 AS_PATH rejects: %" PRIu64 "\n",
+		status.ipv6_rejected_as_path);
 }
 
 static int midr_show_prefix_cb(const struct prefix *prefix, void *arg)

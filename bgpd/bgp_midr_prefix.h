@@ -27,10 +27,14 @@ struct midr_prefix_status {
 	enum midr_prefix_state state;
 	uint64_t generation;
 	size_t contributor_count;
+	size_t ipv4_contributor_count;
+	size_t ipv6_contributor_count;
 	uint64_t scans;
 	uint64_t route_events;
 	uint64_t policy_rechecks;
 	uint64_t rejected_as_path;
+	uint64_t ipv4_rejected_as_path;
+	uint64_t ipv6_rejected_as_path;
 };
 
 typedef int (*midr_prefix_contributor_cb)(const struct prefix *prefix, void *arg);

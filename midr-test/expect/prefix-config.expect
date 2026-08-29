@@ -1,5 +1,10 @@
 MIDR prefix input:
   state:             READY
+  contributors:      0
+  IPv4 contributors: 0
+  IPv6 contributors: 0
+  IPv4 AS_PATH rejects: 0
+  IPv6 AS_PATH rejects: 0
  midr group-prefix takeover-delay-ms 2500
   midr prefix-export max-as-path-length 2
   midr prefix-export route-map EXPORT-MIDR-V4

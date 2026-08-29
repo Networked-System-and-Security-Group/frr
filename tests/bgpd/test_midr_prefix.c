@@ -439,35 +439,107 @@ static void test_route_types_and_optional_deny_policy(void)
 static void test_ipv6_and_default_route(void)
 {
 	struct prefix ipv6 = text_prefix("2001:db8:100::/48");
+	struct prefix ipv6_default = text_prefix("::/0");
 	struct prefix default_route = text_prefix("0.0.0.0/0");
 	struct bgp_dest *ipv6_dest = prefix_dest(&ipv6);
+	struct bgp_dest *ipv6_default_dest = prefix_dest(&ipv6_default);
 	struct bgp_dest *default_dest = prefix_dest(&default_route);
 	struct attr ipv6_attr;
+	struct attr ipv6_default_attr;
 	struct attr default_attr;
 	struct bgp_path_info ipv6_path;
+	struct bgp_path_info ipv6_default_path;
 	struct bgp_path_info default_path;
+	struct midr_prefix_status status;
+	uint64_t ipv6_default_group_sequence;
+	uint64_t ipv6_default_sequence;
+	uint64_t ipv6_group_sequence;
+	uint64_t ipv6_sequence;
 
 	test_attr_init(&ipv6_attr, 1);
+	test_attr_init(&ipv6_default_attr, 1);
 	test_attr_init(&default_attr, 1);
 	ipv6_path = path_info(&ipv6_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
 			      BGP_PATH_VALID | BGP_PATH_SELECTED);
+	ipv6_default_path = path_info(&ipv6_default_attr, ZEBRA_ROUTE_BGP,
+				      BGP_ROUTE_STATIC,
+				      BGP_PATH_VALID | BGP_PATH_SELECTED);
 	default_path = path_info(&default_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC,
 				 BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(ipv6_dest, &ipv6_path);
+	install_path(ipv6_default_dest, &ipv6_default_path);
 	install_path(default_dest, &default_path);
 	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
 	assert(midr_prefix_route_map_unset(ctx, AFI_IP6) == 0);
 	assert(midr_prefix_rescan(ctx) == 0);
+	assert(contributor_count() == 3);
+	assert(midr_prefix_status_get(ctx, &status) == 0);
+	assert(status.ipv4_contributor_count == 1);
+	assert(status.ipv6_contributor_count == 2);
+	ipv6_sequence = node_prefix_sequence(&ipv6);
+	ipv6_default_sequence = node_prefix_sequence(&ipv6_default);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	ipv6_group_sequence = group_prefix_sequence(&ipv6, 10);
+	ipv6_default_group_sequence = group_prefix_sequence(&ipv6_default, 10);
+
+	ipv6_path.flags |= BGP_PATH_STALE;
+	midr_prefix_route_changed(ctx, AFI_IP6, SAFI_UNICAST, ipv6_dest, &ipv6_path,
+				  &ipv6_path);
 	assert(contributor_count() == 2);
+	assert_node_prefix_missing(&ipv6);
+	assert(node_prefix_sequence(&ipv6_default) == ipv6_default_sequence);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert_group_prefix_missing(&ipv6, 10);
+	assert(group_prefix_sequence(&ipv6_default, 10) == ipv6_default_group_sequence);
+
+	ipv6_path.flags &= ~BGP_PATH_STALE;
+	midr_prefix_route_changed(ctx, AFI_IP6, SAFI_UNICAST, ipv6_dest, &ipv6_path,
+				  &ipv6_path);
+	assert(contributor_count() == 3);
+	assert(node_prefix_sequence(&ipv6) > ipv6_sequence);
+	assert(node_prefix_sequence(&ipv6_default) == ipv6_default_sequence);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(group_prefix_sequence(&ipv6, 10) > ipv6_group_sequence);
+	assert(group_prefix_sequence(&ipv6_default, 10) == ipv6_default_group_sequence);
 
 	assert(midr_prefix_route_map_set(ctx, AFI_IP, "DENY-V4") == 0);
-	assert(contributor_count() == 1);
-	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
 	assert(contributor_count() == 2);
+	assert(midr_prefix_status_get(ctx, &status) == 0);
+	assert(status.ipv4_contributor_count == 0);
+	assert(status.ipv6_contributor_count == 2);
+	assert(node_prefix_sequence(&ipv6_default) == ipv6_default_sequence);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(contributor_count() == 3);
+
+	create_route_map("DENY-V6", RMAP_DENY);
+	assert(midr_prefix_route_map_set(ctx, AFI_IP6, "DENY-V6") == 0);
+	assert(contributor_count() == 1);
+	assert(midr_prefix_status_get(ctx, &status) == 0);
+	assert(status.ipv4_contributor_count == 1);
+	assert(status.ipv6_contributor_count == 0);
+	assert_node_prefix_missing(&ipv6);
+	assert_node_prefix_missing(&ipv6_default);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert_group_prefix_missing(&ipv6, 10);
+	assert_group_prefix_missing(&ipv6_default, 10);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP6) == 0);
+	assert(contributor_count() == 3);
+	assert(node_prefix_sequence(&ipv6) > ipv6_sequence);
+	assert(node_prefix_sequence(&ipv6_default) > ipv6_default_sequence);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(group_prefix_sequence(&ipv6, 10) > ipv6_group_sequence);
+	assert(group_prefix_sequence(&ipv6_default, 10) > ipv6_default_group_sequence);
 
 	remove_paths(ipv6_dest);
+	remove_paths(ipv6_default_dest);
 	remove_paths(default_dest);
 	test_attr_fini(&ipv6_attr);
+	test_attr_fini(&ipv6_default_attr);
 	test_attr_fini(&default_attr);
 }
 
@@ -475,32 +547,46 @@ static void test_as_path_limit(void)
 {
 	struct prefix one_hop_prefix = text_prefix("172.16.0.0/16");
 	struct prefix two_hop_prefix = text_prefix("172.17.0.0/16");
+	struct prefix ipv6_two_hop_prefix = text_prefix("2001:db8:200::/48");
 	struct bgp_dest *one_hop_dest = prefix_dest(&one_hop_prefix);
 	struct bgp_dest *two_hop_dest = prefix_dest(&two_hop_prefix);
+	struct bgp_dest *ipv6_two_hop_dest = prefix_dest(&ipv6_two_hop_prefix);
 	struct attr one_hop_attr;
 	struct attr two_hop_attr;
+	struct attr ipv6_two_hop_attr;
 	struct bgp_path_info one_hop;
 	struct bgp_path_info two_hop;
+	struct bgp_path_info ipv6_two_hop;
+	struct midr_prefix_status initial_status;
 	struct midr_prefix_status status;
 
 	test_attr_init(&one_hop_attr, 1);
 	test_attr_init(&two_hop_attr, 2);
+	test_attr_init(&ipv6_two_hop_attr, 2);
 	one_hop = path_info(&one_hop_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 			    BGP_PATH_VALID | BGP_PATH_SELECTED);
 	two_hop = path_info(&two_hop_attr, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 			    BGP_PATH_VALID | BGP_PATH_SELECTED);
+	ipv6_two_hop = path_info(&ipv6_two_hop_attr, ZEBRA_ROUTE_BGP,
+				  BGP_ROUTE_NORMAL,
+				  BGP_PATH_VALID | BGP_PATH_SELECTED);
 	install_path(one_hop_dest, &one_hop);
 	install_path(two_hop_dest, &two_hop);
+	install_path(ipv6_two_hop_dest, &ipv6_two_hop);
 
 	assert(midr_prefix_route_map_unset(ctx, AFI_IP) == 0);
+	assert(midr_prefix_route_map_unset(ctx, AFI_IP6) == 0);
 	assert(midr_prefix_max_as_path_length(ctx, AFI_IP) == 1);
 	assert(midr_prefix_max_as_path_length(ctx, AFI_IP6) == 1);
+	assert(midr_prefix_status_get(ctx, &initial_status) == 0);
 	assert(midr_prefix_rescan(ctx) == 0);
 	assert(aspath_count_hops(one_hop.attr->aspath) == 1);
 	assert(aspath_count_hops(two_hop.attr->aspath) == 2);
 	assert(contributor_count() == 1);
 	assert(midr_prefix_status_get(ctx, &status) == 0);
 	assert(status.rejected_as_path > 0);
+	assert(status.ipv4_rejected_as_path > initial_status.ipv4_rejected_as_path);
+	assert(status.ipv6_rejected_as_path > initial_status.ipv6_rejected_as_path);
 
 	assert(midr_prefix_max_as_path_length_set(ctx, AFI_IP, 2) == 0);
 	assert(contributor_count() == 2);
@@ -509,15 +595,18 @@ static void test_as_path_limit(void)
 
 	assert(midr_prefix_max_as_path_length_set(ctx, AFI_IP6, 3) == 0);
 	assert(midr_prefix_max_as_path_length(ctx, AFI_IP6) == 3);
+	assert(contributor_count() == 3);
 	assert(midr_prefix_max_as_path_length_unset(ctx, AFI_IP) == 0);
-	assert(contributor_count() == 1);
+	assert(contributor_count() == 2);
 	assert(midr_prefix_max_as_path_length(ctx, AFI_IP) == 1);
 	assert(midr_prefix_max_as_path_length_unset(ctx, AFI_IP6) == 0);
 
 	remove_paths(one_hop_dest);
 	remove_paths(two_hop_dest);
+	remove_paths(ipv6_two_hop_dest);
 	test_attr_fini(&one_hop_attr);
 	test_attr_fini(&two_hop_attr);
+	test_attr_fini(&ipv6_two_hop_attr);
 }
 
 static void test_group_zero_node_prefix_gate(void)
