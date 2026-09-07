@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from statistics import median
 
 
 I5_PATTERN = re.compile(
     r"MIDR PM I-5: node=(\S+) status=(\d+) failures=(\d+) "
     r"st_rtt_us=(\d+) st_loss=([\d.]+)")
 TARGET_PATTERN = re.compile(r"MIDR PM I-1: start probing \S+ -> (\S+)")
+RTT_PATTERN = re.compile(
+    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).*"
+    r"MIDR PM: reply from \S+ rtt=(\d+)us")
 
 
 def require(condition, message, failures):
@@ -32,6 +38,18 @@ def packet_count(capture, expression):
     return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
+def parse_timestamp(value):
+    return datetime.strptime(value, "%Y/%m/%d %H:%M:%S.%f")
+
+
+def read_events(path):
+    with path.open(newline="") as event_file:
+        return {
+            row["event"]: parse_timestamp(row["timestamp"])
+            for row in csv.DictReader(event_file)
+        }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=("baseline", "impairment",
@@ -41,6 +59,8 @@ def main():
     parser.add_argument("--socket-a", type=Path, required=True)
     parser.add_argument("--socket-b", type=Path, required=True)
     parser.add_argument("--capture", type=Path, required=True)
+    parser.add_argument("--events", type=Path, required=True)
+    parser.add_argument("--delay-ms", type=float, default=30.0)
     args = parser.parse_args()
 
     log_a = args.log_a.read_text(errors="replace")
@@ -88,6 +108,34 @@ def main():
                 "PM returns to NORMAL after recovery", failures)
         require(any(loss > 0 for _, _, _, loss in measurements),
                 "I-5 reports non-zero loss during impairment", failures)
+
+        events = read_events(args.events)
+        rtts = [
+            (parse_timestamp(timestamp), int(rtt_us) / 1000.0)
+            for timestamp, rtt_us in RTT_PATTERN.findall(combined)
+        ]
+        baseline_rtts = [
+            rtt for timestamp, rtt in rtts
+            if events["baseline-start"] <= timestamp
+            < events["forced-loss-start"]
+        ]
+        impaired_rtts = [
+            rtt for timestamp, rtt in rtts
+            if events["impairment-start"] <= timestamp
+            < events["recovery-start"]
+        ]
+        recovered_rtts = [
+            rtt for timestamp, rtt in rtts
+            if timestamp >= events["recovery-start"]
+        ]
+        require(bool(baseline_rtts) and bool(impaired_rtts)
+                and median(impaired_rtts) >= median(baseline_rtts)
+                + args.delay_ms,
+                "RTT rises during the delayed phase", failures)
+        require(bool(impaired_rtts) and bool(recovered_rtts)
+                and median(recovered_rtts) + args.delay_ms
+                <= median(impaired_rtts),
+                "RTT returns near baseline after recovery", failures)
 
     if args.case == "invalid-source":
         require("packet from unknown transport fd00:dead::1, dropped" in log_b,

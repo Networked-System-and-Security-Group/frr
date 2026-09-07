@@ -134,7 +134,8 @@ ARTIFACT_ROOT="$SCRIPT_DIR/artifacts"
 ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID-$CASE"
 VTY_A="$ARTIFACT_DIR/vty-a"
 VTY_B="$ARTIFACT_DIR/vty-b"
-mkdir -p "$ARTIFACT_DIR" "$VTY_A" "$VTY_B"
+export MPLCONFIGDIR="$ARTIFACT_DIR/matplotlib"
+mkdir -p "$ARTIFACT_DIR" "$VTY_A" "$VTY_B" "$MPLCONFIGDIR"
 ln -sfn "$(basename "$ARTIFACT_DIR")" "$ARTIFACT_ROOT/latest"
 exec > >(tee "$ARTIFACT_DIR/test.log") 2>&1
 
@@ -199,7 +200,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for command in ip tc ss tcpdump "$PYTHON_BIN"; do
+for command in ip tc ss tcpdump ping "$PYTHON_BIN"; do
     command -v "$command" >/dev/null || {
         echo "Missing command: $command" >&2
         exit 1
@@ -433,7 +434,8 @@ stop_pid "$PID_B"
 PID_A=""
 PID_B=""
 
-PLOT_ARGS=("$ARTIFACT_DIR/bgpd-a.log" --output "$ARTIFACT_DIR/pm-results.png")
+PLOT_ARGS=("$ARTIFACT_DIR/bgpd-a.log" --output "$ARTIFACT_DIR/pm-results.png"
+           --events-file "$EVENTS")
 if (( IPERF_ENABLE == 1 )); then
     PLOT_ARGS+=(--iperf-start "$IPERF_START_TIME"
                 --iperf-duration "$IPERF_DURATION")
@@ -446,6 +448,8 @@ fi
     --socket-a "$ARTIFACT_DIR/ss-node-a.txt" \
     --socket-b "$ARTIFACT_DIR/ss-node-b.txt" \
     --capture "$ARTIFACT_DIR/pm-ipv6.pcap" \
+    --events "$EVENTS" \
+    --delay-ms "$DELAY_MS" \
     | tee "$ARTIFACT_DIR/assertions.txt"
 
 echo "[run_ipv6_test] PASS"
