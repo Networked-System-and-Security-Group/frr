@@ -39,6 +39,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_pm.h"
+#include "bgpd/bgp_midr_pm_net.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_PROBE_CTX, "MIDR probe context");
 
@@ -231,58 +232,6 @@ static void pm_update_stats(struct midr_probe_ctx *ctx, uint64_t rtt_us)
 static void midr_pm_probe_timer_fn(struct event *t); /* forward */
 static void midr_pm_timeout(struct event *t);	     /* forward */
 
-static bool pm_sockunion_set_port(union sockunion *su, uint16_t port)
-{
-	switch (sockunion_family(su)) {
-	case AF_INET:
-		su->sin.sin_port = htons(port);
-		return true;
-	case AF_INET6:
-		su->sin6.sin6_port = htons(port);
-		return true;
-	default:
-		return false;
-	}
-}
-
-static uint16_t pm_sockunion_get_port(const union sockunion *su)
-{
-	switch (sockunion_family(su)) {
-	case AF_INET:
-		return ntohs(su->sin.sin_port);
-	case AF_INET6:
-		return ntohs(su->sin6.sin6_port);
-	default:
-		return 0;
-	}
-}
-
-static bool pm_transport_to_sockunion(const struct ipaddr *transport,
-				      union sockunion *su)
-{
-	return midr_ipaddr_valid_locator(transport)
-	       && midr_ipaddr_to_sockunion(transport, su)
-	       && pm_sockunion_set_port(su, MIDR_PM_PROBE_PORT);
-}
-
-static bool pm_socket_matches_transport(int sock,
-				const struct ipaddr *transport)
-{
-	union sockunion bound = {};
-	struct ipaddr bound_addr;
-	socklen_t bound_len = sizeof(bound);
-
-	if (sock < 0 || !midr_ipaddr_valid_locator(transport))
-		return false;
-	if (getsockname(sock, &bound.sa, &bound_len) < 0)
-		return false;
-	if (!midr_sockunion_to_ipaddr(&bound, &bound_addr))
-		return false;
-
-	return pm_sockunion_get_port(&bound) == MIDR_PM_PROBE_PORT
-	       && midr_ipaddr_same(&bound_addr, transport);
-}
-
 /* Send one probe packet and arm the per-probe timeout. */
 static void pm_send_probe(struct midr_probe_ctx *ctx)
 {
@@ -296,8 +245,10 @@ static void pm_send_probe(struct midr_probe_ctx *ctx)
 		return;
 	if (!midr_nds_local_transport_get(ctx->bgp, &local_transport)
 	    || local_transport.ipa_type != ctx->target_addr.ipa_type
-	    || !pm_socket_matches_transport(mi->pm_sock, &local_transport)
-	    || !pm_transport_to_sockunion(&ctx->target_addr, &dst))
+	    || !midr_pm_net_socket_matches(mi->pm_sock, &local_transport,
+					   MIDR_PM_PROBE_PORT)
+	    || !midr_pm_net_transport_to_sockunion(&ctx->target_addr,
+					       MIDR_PM_PROBE_PORT, &dst))
 		return;
 
 	now = pm_now_us();
@@ -308,7 +259,7 @@ static void pm_send_probe(struct midr_probe_ctx *ctx)
 	pkt.sent_us = htobe64(now);
 
 	if (sendto(mi->pm_sock, &pkt, sizeof(pkt), 0,
-		   &dst.sa, sockunion_sizeof(&dst)) < 0)
+		   &dst.sa, midr_pm_net_sockaddr_size(&dst)) < 0)
 		MIDR_LOG("MIDR PM: sendto %pIA failed: %s",
 			 &ctx->target_addr, safe_strerror(errno));
 
@@ -450,15 +401,18 @@ static void midr_pm_recv(struct event *t)
 
 	if (!midr_nds_local_transport_get(bgp, &local_transport)
 	    || local_transport.ipa_type != src_addr.ipa_type
-	    || !pm_socket_matches_transport(mi->pm_sock, &local_transport)) {
+	    || !midr_pm_net_socket_matches(mi->pm_sock, &local_transport,
+					   MIDR_PM_PROBE_PORT)) {
 		MIDR_LOG("MIDR PM: packet from cross-family transport %pIA, dropped",
 			 &src_addr);
 		return;
 	}
 
-	if (pm_sockunion_get_port(&src) != MIDR_PM_PROBE_PORT) {
+	if (!midr_pm_net_source_valid(&local_transport, &src_addr,
+				      midr_pm_net_get_port(&src),
+				      MIDR_PM_PROBE_PORT)) {
 		MIDR_LOG("MIDR PM: packet from %pIA:%u has invalid source port, dropped",
-			 &src_addr, pm_sockunion_get_port(&src));
+			 &src_addr, midr_pm_net_get_port(&src));
 		return;
 	}
 
@@ -571,7 +525,8 @@ static void midr_pm_open_sock(struct bgp *bgp)
 			  "PM socket deferred until `midr transport-address` is set");
 		return;
 	}
-	if (!pm_transport_to_sockunion(&local_transport, &local)) {
+	if (!midr_pm_net_transport_to_sockunion(&local_transport,
+						MIDR_PM_PROBE_PORT, &local)) {
 		zlog_warn("MIDR PM: invalid local transport %pIA",
 			  &local_transport);
 		return;
@@ -585,14 +540,16 @@ static void midr_pm_open_sock(struct bgp *bgp)
 	}
 
 	sockopt_reuseaddr(sock);
-	if (sockopt_v6only(family, sock) < 0) {
+	if (midr_pm_net_enable_v6only(family, sock) < 0) {
+		zlog_warn("MIDR PM: cannot enable IPV6_V6ONLY: %s",
+			  safe_strerror(errno));
 		close(sock);
 		return;
 	}
 
 	/* Bind to local_transport_addr only — NOT INADDR_ANY — to limit
 	 * the attack surface to the MIDR loopback interface only. */
-	if (bind(sock, &local.sa, sockunion_sizeof(&local)) < 0) {
+	if (bind(sock, &local.sa, midr_pm_net_sockaddr_size(&local)) < 0) {
 		zlog_warn("MIDR PM: bind(%pIA:%u) failed: %s",
 			  &local_transport, MIDR_PM_PROBE_PORT,
 			  safe_strerror(errno));
@@ -633,7 +590,8 @@ static void midr_pm_probe_timer(struct event *t)
 
 	if (!midr_nds_local_transport_get(bgp, &local_transport))
 		midr_pm_on_transport_addr_unset(bgp);
-	else if (!pm_socket_matches_transport(mi->pm_sock, &local_transport))
+	else if (!midr_pm_net_socket_matches(mi->pm_sock, &local_transport,
+					     MIDR_PM_PROBE_PORT))
 		midr_pm_on_transport_addr_set(bgp);
 
 	if (mi->pm_sock < 0)
@@ -704,7 +662,8 @@ int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 	}
 
 	if (!midr_nds_local_transport_get(bgp, &local_transport)
-	    || !pm_socket_matches_transport(mi->pm_sock, &local_transport)) {
+	    || !midr_pm_net_socket_matches(mi->pm_sock, &local_transport,
+					   MIDR_PM_PROBE_PORT)) {
 		MIDR_LOG("MIDR PM I-1: local transport socket is not ready");
 		return -1;
 	}
@@ -843,7 +802,8 @@ void midr_pm_on_transport_addr_set(struct bgp *bgp)
 	}
 
 	if (mi->pm_sock >= 0
-	    && !pm_socket_matches_transport(mi->pm_sock, &local_transport)) {
+	    && !midr_pm_net_socket_matches(mi->pm_sock, &local_transport,
+					   MIDR_PM_PROBE_PORT)) {
 		MIDR_LOG("MIDR PM: rebinding probe socket to %pIA",
 			 &local_transport);
 		midr_pm_close_sock(bgp);
