@@ -139,8 +139,7 @@ bool midr_nds_facts_node_refresh(struct bgp *bgp)
 
 	if (mi->transport_addr_set) {
 		next.has_transport_address = true;
-		next.transport_address.ipa_type = IPADDR_V4;
-		next.transport_address.ipaddr_v4 = mi->local_transport_addr;
+		next.transport_address = mi->local_transport_addr;
 	} else {
 		/* 他们要求 has_transport_address 为假时 ipa_type 必须是
 		 * IPADDR_NONE（不能留脏值），XCALLOC 的 0 正好是它。 */
@@ -717,12 +716,13 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	 * local_ifindex 恒 0（多跳链路出口由路由表现算，文档
 	 * 约定填 0 = 不适用），XCALLOC 已置 0。
 	 */
-	fl->data.link_local_address.ipa_type = IPADDR_V4;
-	fl->data.link_local_address.ipaddr_v4 = mi->transport_addr_set
-						       ? mi->local_transport_addr
-						       : bgp->router_id;
-	fl->data.link_remote_address.ipa_type = IPADDR_V4;
-	fl->data.link_remote_address.ipaddr_v4 = remote_locator.u.prefix4;
+	fl->data.link_local_address =
+		mi->transport_addr_set
+			? mi->local_transport_addr
+			: midr_ipaddr_from_ipv4(bgp->router_id);
+	if (!midr_ipaddr_from_prefix(&remote_locator,
+				       &fl->data.link_remote_address))
+		return;
 	fl->data.metrics = metrics;
 	fl->data.policy_state = MIDR_POLICY_ALLOWED;
 

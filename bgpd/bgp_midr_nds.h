@@ -24,6 +24,7 @@
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_midr.h" /* 第二组接口结构（remote view 回调与逆换算用） */
+#include "bgpd/bgp_midr_addr.h"
 #include "bgpd/bgp_midr_pm.h" /* enum midr_stop_reason（I-2 停探原因） */
 
 /*
@@ -236,7 +237,7 @@ struct midr_node_entry {
 	 * does not advertise one.  Kept separate from the key so the address
 	 * can change without changing identity.
 	 */
-	struct in_addr transport_addr;
+	struct ipaddr transport_addr;
 	bool has_transport_addr;
 	/*
 	 * 上次收到关于该节点的消息（第二组回调 / 5859 名单 / PM 回包），monotime。
@@ -294,7 +295,7 @@ struct midr_global_view {
  */
 struct midr_rep_entry {
 	uint32_t group_id;
-	struct in_addr rep_transport; /* rep's reachable address (UDP + peering) */
+	struct ipaddr rep_transport; /* rep's reachable address (UDP + peering) */
 	as_t rep_asn;
 	struct in_addr rep_rid; /* rep's router-id (真名)；0 = 未知（探测退回
 				 * 占位路径，wire 上对应 v2 rep_rid 栏） */
@@ -311,7 +312,7 @@ enum midr_bootstrap_source {
 };
 
 struct midr_bootstrap_entry {
-	struct in_addr transport; /* 引导节点可达地址 */
+	struct ipaddr transport; /* 引导节点可达地址 */
 	as_t asn;
 	/*
 	 * 引导节点的 router-id（保底轮 2 批 5 R 系列）。
@@ -483,7 +484,7 @@ enum midr_session_reason {
 };
 
 struct midr_session_ledger_entry {
-	struct in_addr transport; /* 键 */
+	struct ipaddr transport; /* 键 */
 	enum midr_session_reason reason;
 	struct in_addr remote_rid; /* 值：认人（show / 对账"这条边对面是谁"） */
 	uint32_t remote_group;	   /* 值：对端群号 */
@@ -547,7 +548,7 @@ struct bgp_midr_nds {
 	struct list *session_ledger;
 
 	/* === Local transport address (TLV 1188) + graceful shutdown === */
-	struct in_addr local_transport_addr; /* our reachable locator */
+	struct ipaddr local_transport_addr; /* our reachable locator */
 	bool transport_addr_set;	     /* operator configured one */
 	bool shutdown;			     /* graceful shutdown: stop advertising self */
 	/* === TLV sequence numbers === */
@@ -568,7 +569,7 @@ struct bgp_midr_nds {
 	struct event *t_session_reap;	  /* 掉沿清账的"下一拍"处理（件④） */
 	struct event *t_shutdown_teardown; /* 退网延时拆会话（见 MIDR_SHUTDOWN_TEARDOWN_DELAY） */
 	/*
-	 * 钩子 (b) 记下的待处理掉线 transport（struct in_addr *；同时掉线最多 K 条）。
+	 * 钩子 (b) 记下的待处理掉线 transport（struct ipaddr *；同时掉线最多 K 条）。
 	 * 为什么不在钩子里当场拆：FSM 喊完 peer_status_changed 之后还要回来摸这条
 	 * 会话（收尾、打日志），当场 peer_delete 是重入雷区。官方三个消费者
 	 * （bmp/dump/snmp）无一动 peer 生命周期，我们照同款姿势——钩子只记名，
@@ -691,7 +692,7 @@ extern void bgp_midr_nds_finish(struct bgp *bgp);
  */
 extern void midr_nds_remote_node_decode(const struct midr_remote_node_info *node,
 					struct in_addr *rid, uint32_t *caps,
-					struct in_addr *transport,
+					struct ipaddr *transport,
 					bool *has_transport);
 
 /* 收包侧反应链（数据源无关）：第二组 remote-view 回调进来后走这条。 */
@@ -709,25 +710,27 @@ struct midr_remote_withdrawn {
 
 /* 把一个群成员（MEMBER_LIST_RESP）灌入 global_view、标记邻居并 I-1 探测 */
 extern void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
-				  struct in_addr transport, uint32_t group_id);
+				  struct ipaddr transport,
+				  uint32_t group_id);
 
 /* 同上，但不标邻居——锚点候选是跨群评估节点，不是本群成员。 */
 extern void midr_nds_learn_anchor_candidate(struct bgp *bgp,
 					    struct in_addr rid, as_t asn,
-					    struct in_addr transport,
+					    struct ipaddr transport,
 					    uint32_t group_id);
 
 /* 把一个同群对端纳入本群邻居：查建条目 + 标 is_adjacent + I-1 起探。删探测 A 后
  * "老成员认识新成员"的唯一入口；详见定义处。 */
 extern void midr_nds_adopt_group_peer(struct bgp *bgp, struct in_addr rid,
-				      as_t asn, struct in_addr transport,
+				      as_t asn,
+				      struct ipaddr transport,
 				      uint32_t group_id);
 
 /* 反面：一条边没了之后按 transport 反查节点表做完整清理（停探 + 撤链路上报 +
  * 清 link_entry + 清 is_adjacent，不拆会话）。死心与拆边两处共用。
  * reason 只透传给 I-2 停探进日志。 */
 extern void midr_nds_cleanup_by_transport(struct bgp *bgp,
-					  struct in_addr transport,
+					  struct ipaddr transport,
 					  enum midr_stop_reason reason);
 
 /*
@@ -737,7 +740,8 @@ extern void midr_nds_cleanup_by_transport(struct bgp *bgp,
  * "自证身份的探测来源"被接受，不代表已建立邻居关系。
  */
 extern void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid,
-				     as_t asn, struct in_addr transport);
+				     as_t asn,
+				     struct ipaddr transport);
 
 /* Refresh the local self-entry after originating the local Node NLRI */
 extern void midr_nds_local_node_update(struct bgp *bgp);
@@ -842,11 +846,13 @@ extern void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
  * 请求；候选耗尽则放弃本轮（join_intent 保留，迟到 RESP 仍可自愈——与单候选旧
  * 行为一致）。
  */
-extern void midr_join_bootstrap_failed(struct bgp *bgp, struct in_addr failed);
+extern void midr_join_bootstrap_failed(struct bgp *bgp,
+				       struct ipaddr failed);
 
 /* `no midr bootstrap A.B.C.D`：删指定候选（true=找到并删除）；正在尝试的
  * 被删则顺移到下一候选。 */
-extern bool midr_bootstrap_list_del(struct bgp *bgp, struct in_addr addr);
+extern bool midr_bootstrap_list_del(struct bgp *bgp,
+				    struct ipaddr addr);
 
 /* `no midr bootstrap`（无参）：清空候选清单并作废在途加入意图（与手动换组
  * 同款中止语义，批注点 C 已拍板）。 */
@@ -881,8 +887,9 @@ extern void midr_nds_bootstrap_list_fetch(struct bgp *bgp);
  * 原来那条"periodic_sync 遍历全局表"的旧路自然断料（旧路本轮一行不动，两路
  * 并行则批 3–5 之间种子表持续有源、§8.31 自举零空窗）。
  */
-extern void midr_nds_bootstrap_learn(struct bgp *bgp, struct in_addr transport,
-				     as_t asn, struct in_addr rid);
+extern void midr_nds_bootstrap_learn(struct bgp *bgp,
+				     struct ipaddr transport, as_t asn,
+				     struct in_addr rid);
 
 /*
  * 一份名单**开始**收之前调（批 6 缺口 A）：把候选池里所有 in_last_list 清掉，
@@ -894,7 +901,8 @@ extern void midr_nds_bootstrap_list_begin(struct bgp *bgp);
 
 /* 一份名单收完后的汇总回调（src = 应答方，count = 条目数）。批 5 在此接
  * "哈希顺次取 K 台挂靠"。 */
-extern void midr_nds_on_bootstrap_list(struct bgp *bgp, struct in_addr src,
+extern void midr_nds_on_bootstrap_list(struct bgp *bgp,
+				       struct ipaddr src,
 				       unsigned int count);
 
 /*
@@ -918,7 +926,8 @@ extern void midr_nds_attach_pick_from(struct bgp *bgp,
  * 查不到该地址时返回 FIRST（保守：宁可多扫一遍第一批，也不跳过还没试的候选）。
  */
 extern enum midr_attach_batch
-midr_nds_attach_mark_failed(struct bgp *bgp, struct in_addr transport);
+midr_nds_attach_mark_failed(struct bgp *bgp,
+			    struct ipaddr transport);
 
 /*
  * 本机是否为 MIDR 引导节点（带 BOOTSTRAP 能力位）。
@@ -965,7 +974,7 @@ extern void midr_nds_attach_detach_all(struct bgp *bgp);
  * 注册在 FRR 的 peer_status_changed 钩子上，全局只注册一次。
  */
 extern void midr_nds_attach_on_session_down(struct bgp *bgp,
-					    struct in_addr transport);
+					    struct ipaddr transport);
 
 /*
  * 兜底遍历的"死心"回调（唯一调用点 = midr_ctrl_retx_timer 放弃分支里
@@ -974,7 +983,7 @@ extern void midr_nds_attach_on_session_down(struct bgp *bgp,
  * 再加"；批 6 实验专门造一次全灭场景验证人工命令能拉回来）。
  */
 extern void midr_nds_bootstrap_list_failed(struct bgp *bgp,
-					   struct in_addr failed);
+					   struct ipaddr failed);
 
 /*
  * Stage 1: the bootstrap's REP_LIST_RESP has been parsed into mi->rep_dir.
@@ -1001,23 +1010,24 @@ extern void midr_rep_candidates(struct bgp *bgp, struct list *out);
 /* Group-representative directory (bootstrap config + learned).
  * rep_rid: 代表的 router-id；手配来源无从得知时传 0（wire 亦以 0 表未知）。 */
 extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
-			     struct in_addr rep_transport, as_t rep_asn,
+			     struct ipaddr rep_transport, as_t rep_asn,
 			     struct in_addr rep_rid);
 
 /* 按 transport 在 bootstrap 候选池反查 router-id；查不到返回 0（批 5 R 系列）。
  * `no midr session <IP>` 反查链的第三级——引导节点前两级都翻不到（不发 NLRI、
  * 半边会话无 remote_id），全靠这一级才拉得黑。 */
 extern struct in_addr midr_nds_bootstrap_rid_by_transport(struct bgp *bgp,
-							  struct in_addr transport);
+							  struct ipaddr transport);
 
 /* 按 transport 地址在节点表反查 router-id（真名）；查不到返回 0。
  * build_rep_list 应答时刻给手配条目回填 rid 用（护栏②，批注 55）。 */
 extern struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
-						struct in_addr transport);
+						struct ipaddr transport);
 
 /* ⑦ `no midr neighbor` 清账：按地址反查节点表条目并 detach 全套（停探+删 link+
  * 清 is_adjacent+拆会话）。查到返回 true，查不到 false（调用方退化为只拆会话）。 */
-extern bool midr_nds_detach_by_locator(struct bgp *bgp, struct in_addr addr);
+extern bool midr_nds_detach_by_locator(struct bgp *bgp,
+				       struct ipaddr addr);
 
 /*
  * `no midr session` 持久排除名单存取。**键 = router-id（真名）**（2026-08-11
@@ -1064,17 +1074,19 @@ extern bool midr_discovery_should_peer(struct bgp *bgp,
  *      该字段功能性为零，且分家删复用分支后必死〕。
  * note() 为幂等 upsert；drop() 对不存在的键是空操作。
  */
-extern void midr_nds_ledger_note(struct bgp *bgp, struct in_addr transport,
+extern void midr_nds_ledger_note(struct bgp *bgp,
+				 struct ipaddr transport,
 				 enum midr_session_reason reason,
 				 struct in_addr remote_rid,
 				 uint32_t remote_group);
-extern void midr_nds_ledger_drop(struct bgp *bgp, struct in_addr transport);
+extern void midr_nds_ledger_drop(struct bgp *bgp,
+				 struct ipaddr transport);
 extern const struct midr_session_ledger_entry *
-midr_nds_ledger_lookup(struct bgp *bgp, struct in_addr transport);
+midr_nds_ledger_lookup(struct bgp *bgp, struct ipaddr transport);
 extern const char *midr_session_reason_str(enum midr_session_reason reason);
 
 extern bool midr_rep_dir_del(struct bgp *bgp, uint32_t group_id,
-			     struct in_addr rep_transport);
+			     struct ipaddr rep_transport);
 extern void midr_rep_dir_clear(struct bgp *bgp);
 extern struct midr_rep_entry *midr_rep_dir_find_group(struct bgp *bgp,
 						      uint32_t group_id);
@@ -1093,5 +1105,12 @@ extern uint32_t midr_local_group_id(struct bgp *bgp);
  * return true, else return false (*out untouched). */
 extern bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
 			       uint32_t *out);
+
+/* Address-family-neutral transport accessors for PM and other consumers. */
+extern bool midr_nds_local_transport_get(const struct bgp *bgp,
+					 struct ipaddr *transport);
+extern bool midr_nds_node_transport_get(const struct bgp *bgp,
+					const struct prefix *node_id,
+					struct ipaddr *transport);
 
 #endif /* _FRR_BGP_MIDR_NDS_H */

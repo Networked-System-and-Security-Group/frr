@@ -193,6 +193,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_ted.h \
 	bgpd/bgp_midr_ted_private.h \
 	bgpd/bgp_midr_vty.h \
+	bgpd/bgp_midr_addr.h \
 	bgpd/bgp_midr_nds.h \
 	bgpd/bgp_midr_nds_facts.h \
 	bgpd/bgp_midr_pm.h \
