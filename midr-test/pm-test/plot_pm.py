@@ -149,7 +149,7 @@ def shade_iperf_window(ax, start, duration):
     ax.axvspan(start, start + duration, color="purple", alpha=0.12, zorder=0)
     ymin, ymax = ax.get_ylim()
     ax.text(start + duration / 2.0, ymax * 0.96, "iperf UDP 打满链路",
-            ha="center", va="top", fontsize=14, color="purple",
+            ha="center", va="top", fontsize=24, color="purple",
             fontweight="bold")
     ax.set_ylim(ymin, ymax)
 
