@@ -54,9 +54,9 @@ plt.rcParams.update({
 
 TS_PAT  = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)'
 RTT_PAT = re.compile(
-    TS_PAT + r'.*MIDR PM: reply from [\d.]+ rtt=(\d+)us')
+    TS_PAT + r'.*MIDR PM: reply from \S+ rtt=(\d+)us')
 I5_PAT  = re.compile(
-    TS_PAT + r'.*MIDR PM I-5: node=([\d./]+) status=(\d+) failures=(\d+) '
+    TS_PAT + r'.*MIDR PM I-5: node=(\S+) status=(\d+) failures=(\d+) '
              r'st_rtt_us=(\d+) st_loss=([\d.]+) st_bw=(\d+) '
              r'lt_rtt_us=(\d+) lt_loss=([\d.]+) lt_bw=(\d+)')
 
