@@ -69,7 +69,7 @@ struct midr_ctrl_tcp_conn {
 	int fd;
 	enum midr_ctrl_conn_role role;
 	enum midr_ctrl_conn_state state;
-	struct in_addr remote;	 /* client=请求目标 / server=accept 对端 (日志/去重键) */
+	struct ipaddr remote;	 /* client=请求目标 / server=accept 对端 (日志/去重键) */
 	uint8_t type;		 /* client: 请求类型 (响应配对/在途去重) */
 	uint32_t target_group;	 /* client: 请求携带的 group */
 	struct stream *ibuf;	 /* server 固定 24B; client 512B 起, 按帧长 resize */
@@ -87,17 +87,6 @@ static void midr_ctrl_tcp_timeout(struct event *t);
 static void midr_ctrl_tcp_connect_check(struct event *t);
 static void midr_ctrl_tcp_accept(struct event *t);
 static void midr_ctrl_tcp_send_request(struct midr_ctrl_tcp_conn *conn);
-
-/* Build a union sockunion (AF_INET) from a bare in_addr. */
-static void midr_tcp_su_from_in_addr(union sockunion *su, struct in_addr a)
-{
-	struct prefix p = {};
-
-	p.family = AF_INET;
-	p.prefixlen = IPV4_MAX_BITLEN;
-	p.u.prefix4 = a;
-	prefix2sockunion(&p, su);
-}
 
 /* ------------------------------------------------------------------ */
 /* 连接生命周期                                                          */
@@ -157,7 +146,7 @@ static void midr_ctrl_tcp_timeout(struct event *t)
 {
 	struct midr_ctrl_tcp_conn *conn = EVENT_ARG(t);
 
-	MIDR_LOG("MIDR ctrl: TCP %s conn to %pI4 timed out (%ds) — closing",
+	MIDR_LOG("MIDR ctrl: TCP %s conn to %pIA timed out (%ds) — closing",
 		 conn->role == MIDR_CTRL_CONN_CLIENT ? "client" : "server",
 		 &conn->remote, MIDR_CTRL_TCP_TIMEOUT);
 	midr_ctrl_tcp_conn_close(conn);
@@ -193,14 +182,14 @@ static void midr_ctrl_tcp_write(struct event *t)
 					conn->fd, &conn->t_write);
 			return;
 		}
-		MIDR_LOG("MIDR ctrl: TCP write to %pI4 failed: %s — closing",
+		MIDR_LOG("MIDR ctrl: TCP write to %pIA failed: %s — closing",
 			 &conn->remote, safe_strerror(errno));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
 	}
 	if (n == 0) {
 		/* 有数据待发却写出 0: 不应发生; 防死循环当致命。 */
-		MIDR_LOG("MIDR ctrl: TCP write to %pI4 returned 0 — closing",
+		MIDR_LOG("MIDR ctrl: TCP write to %pIA returned 0 — closing",
 			 &conn->remote);
 		midr_ctrl_tcp_conn_close(conn);
 		return;
@@ -264,7 +253,7 @@ static void midr_ctrl_tcp_read(struct event *t)
 		/* 校验帧长 (在扩缓冲之前拦下非法值)。 */
 		if (conn->role == MIDR_CTRL_CONN_SERVER) {
 			if (conn->frame_len != sizeof(struct midr_ctrl_msg)) {
-				MIDR_LOG("MIDR ctrl: TCP request from %pI4 bad frame_len %u (want %zu) — closing",
+				MIDR_LOG("MIDR ctrl: TCP request from %pIA bad frame_len %u (want %zu) — closing",
 					 &conn->remote, conn->frame_len,
 					 sizeof(struct midr_ctrl_msg));
 				midr_ctrl_tcp_conn_close(conn);
@@ -273,7 +262,7 @@ static void midr_ctrl_tcp_read(struct event *t)
 		} else {
 			if (conn->frame_len == 0 ||
 			    conn->frame_len > MIDR_CTRL_TCP_MAX_FRAME) {
-				MIDR_LOG("MIDR ctrl: TCP response from %pI4 bad frame_len %u (max %zu) — closing",
+				MIDR_LOG("MIDR ctrl: TCP response from %pIA bad frame_len %u (max %zu) — closing",
 					 &conn->remote, conn->frame_len,
 					 (size_t)MIDR_CTRL_TCP_MAX_FRAME);
 				midr_ctrl_tcp_conn_close(conn);
@@ -369,13 +358,13 @@ static void midr_ctrl_tcp_connect_check(struct event *t)
 	event_cancel(&conn->t_write);
 
 	if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &status, &slen) < 0) {
-		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 getsockopt failed: %s — closing",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pIA getsockopt failed: %s — closing",
 			 &conn->remote, safe_strerror(errno));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
 	}
 	if (status != 0) {
-		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 failed: %s — closing (等重试)",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pIA failed: %s — closing (等重试)",
 			 &conn->remote, safe_strerror(status));
 		midr_ctrl_tcp_conn_close(conn);
 		return;
@@ -384,7 +373,7 @@ static void midr_ctrl_tcp_connect_check(struct event *t)
 	midr_ctrl_tcp_send_request(conn);
 }
 
-void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
+void midr_ctrl_tcp_client_start(struct bgp *bgp, struct ipaddr dst,
 				uint8_t type, uint32_t target_group)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
@@ -397,13 +386,17 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 
 	if (!mi || !mi->ctrl_tcp_conns)
 		return;
+	if (!IS_IPADDR_V4(&dst)) {
+		MIDR_LOG("MIDR ctrl: protocol v3 cannot connect to %pIA", &dst);
+		return;
+	}
 
 	/* 在途去重: 同 (dst,type) 已有 client 连接 —— group 相同则忽略, 不同 (join
 	 * 中途换群) 则关旧起新。 */
 	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_tcp_conns, node, c)) {
 		if (c->role != MIDR_CTRL_CONN_CLIENT)
 			continue;
-		if (c->remote.s_addr != dst.s_addr || c->type != type)
+		if (!midr_ipaddr_same(&c->remote, &dst) || c->type != type)
 			continue;
 		if (c->target_group == target_group)
 			return; /* 同请求在途, 去重 */
@@ -411,7 +404,7 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 		break;			     /* 列表已变, 退出遍历 */
 	}
 
-	fd = socket(AF_INET, SOCK_STREAM, 0);
+	fd = socket(ipaddr_family(&dst), SOCK_STREAM, 0);
 	if (fd < 0) {
 		zlog_warn("MIDR ctrl: TCP socket() failed: %s",
 			  safe_strerror(errno));
@@ -425,18 +418,25 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 	if (mi->transport_addr_set) {
 		union sockunion su_local;
 
-		midr_tcp_su_from_in_addr(&su_local, mi->local_transport_addr);
+		if (!midr_ipaddr_to_sockunion(&mi->local_transport_addr,
+					     &su_local)) {
+			close(fd);
+			return;
+		}
 		if (sockunion_bind(fd, &su_local, 0, &su_local) < 0)
-			MIDR_LOG("MIDR ctrl: TCP bind source %pI4 failed: %s (软降级, 直连仍可用)",
+			MIDR_LOG("MIDR ctrl: TCP bind source %pIA failed: %s (软降级, 直连仍可用)",
 				 &mi->local_transport_addr,
 				 safe_strerror(errno));
 	}
 
-	midr_tcp_su_from_in_addr(&su_dst, dst);
+	if (!midr_ipaddr_to_sockunion(&dst, &su_dst)) {
+		close(fd);
+		return;
+	}
 	res = sockunion_connect(fd, &su_dst, htons(MIDR_CTRL_TCP_PORT));
 	switch (res) {
 	case connect_error:
-		MIDR_LOG("MIDR ctrl: TCP connect to %pI4 refused: %s (等重试)",
+		MIDR_LOG("MIDR ctrl: TCP connect to %pIA refused: %s (等重试)",
 			 &dst, safe_strerror(errno));
 		close(fd); /* conn 未建, pending 队列会稍后重试 */
 		return;
@@ -462,7 +462,7 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
 	}
 }
 
-bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi, struct in_addr dst,
+bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi, struct ipaddr dst,
 				   uint8_t type)
 {
 	struct listnode *node;
@@ -473,7 +473,7 @@ bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi, struct in_addr dst,
 
 	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_tcp_conns, node, c))
 		if (c->role == MIDR_CTRL_CONN_CLIENT &&
-		    c->remote.s_addr == dst.s_addr && c->type == type)
+		    midr_ipaddr_same(&c->remote, &dst) && c->type == type)
 			return true;
 
 	return false;
@@ -513,8 +513,7 @@ static void midr_ctrl_tcp_accept(struct event *t)
 	}
 
 	conn = midr_ctrl_tcp_conn_new(bgp, client_fd, MIDR_CTRL_CONN_SERVER);
-	if (su.sa.sa_family == AF_INET)
-		conn->remote = su.sin.sin_addr;
+	(void)midr_sockunion_to_ipaddr(&su, &conn->remote);
 	conn->state = MIDR_CTRL_CONN_READING;
 	midr_ctrl_tcp_want_read(conn);
 }

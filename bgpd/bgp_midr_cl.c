@@ -241,9 +241,8 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		d.decision_type = MIDR_DECISION_RECOMMEND;
 		d.new_group_id = top_rep[0]->group_id;
 		d.old_group_id = mi->local_group_id;
-		d.recommended_rep.family = AF_INET;
-		d.recommended_rep.prefixlen = IPV4_MAX_BITLEN;
-		d.recommended_rep.u.prefix4 = top_rep[0]->rep_transport;
+		midr_ipaddr_to_host_prefix(&top_rep[0]->rep_transport,
+					   &d.recommended_rep);
 
 		/* 第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
 		d.anchor_reps = list_new();
@@ -253,7 +252,7 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 			listnode_add(d.anchor_reps, top_rep[2]);
 
 		MIDR_FLOW_LOG(
-			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pI4"
+			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pIA"
 			"（rtt=%u us, loss=%.4f, bw=%u），另有 %d 个次优群锚点候选",
 			top_rep[0]->group_id, &top_rep[0]->rep_transport,
 			top_link[0]->long_term.rtt_us,

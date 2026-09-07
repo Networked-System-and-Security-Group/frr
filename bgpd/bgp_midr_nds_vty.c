@@ -146,7 +146,7 @@ DEFUN(midr_group_id,
  * 混进以 router-id 为键的表里——那正是换键要根治的病）。
  */
 static struct in_addr midr_vty_rid_for_session_addr(struct bgp *bgp,
-						    struct in_addr addr,
+						    struct ipaddr addr,
 						    struct peer *peer)
 {
 	struct in_addr rid;
@@ -200,7 +200,7 @@ DEFUN(midr_session,
 	if (peer) {
 		if (midr_nds_peer_is_overlay(peer)) {
 			struct in_addr rid = midr_vty_rid_for_session_addr(
-				bgp, su.sin.sin_addr, peer);
+				bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), peer);
 
 			/* 已是 MIDR 自建会话：幂等重整形（同值短路、不 reset），不改 AS。 */
 			midr_nds_ctrl_setup_overlay_peer(bgp, peer);
@@ -210,7 +210,8 @@ DEFUN(midr_session,
 				midr_nds_session_exclude_del(bgp, rid);
 			/* 台账家规②：运维点名 → 记 MANUAL（粘性，之后自动流程
 			 * 不改写它的原因）。会话已存在也照记——记账不看去重。 */
-			midr_nds_ledger_note(bgp, su.sin.sin_addr,
+			midr_nds_ledger_note(bgp,
+					     midr_ipaddr_from_ipv4(su.sin.sin_addr),
 					     MIDR_SESSION_MANUAL, rid, 0);
 			vty_out(vty,
 				"MIDR session %s 已存在（MIDR overlay 会话），已确保形态一致\n",
@@ -250,7 +251,7 @@ DEFUN(midr_session,
 	 */
 	{
 		struct in_addr rid = midr_vty_rid_for_session_addr(
-			bgp, su.sin.sin_addr, NULL);
+			bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), NULL);
 
 		if (rid.s_addr != INADDR_ANY)
 			midr_nds_session_exclude_del(bgp, rid);
@@ -276,8 +277,11 @@ DEFUN(midr_session,
 
 	/* 台账家规②：运维点名建的边记 MANUAL（粘性）。本轮骨干互连也走这条
 	 * 命令（Q7 定：骨干纯手工），故引导之间的边同样落在 MANUAL 名下。 */
-	midr_nds_ledger_note(bgp, su.sin.sin_addr, MIDR_SESSION_MANUAL,
-			     midr_nds_rid_by_transport(bgp, su.sin.sin_addr), 0);
+	midr_nds_ledger_note(
+		bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), MIDR_SESSION_MANUAL,
+		midr_nds_rid_by_transport(
+			bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr)),
+		0);
 
 	vty_out(vty, "MIDR session %s AS %u created\n", argv[2]->arg, asn);
 	vty_out(vty, "%s", MIDR_SESSION_SYMMETRY_HINT);
@@ -337,19 +341,21 @@ DEFUN(no_midr_session,
 	 * 在拆会话之前**把 rid 解析出来：peer 一删，peer->remote_id 这个最可靠的
 	 * 来源就没了。
 	 */
-	excl_rid = midr_vty_rid_for_session_addr(bgp, su.sin.sin_addr, peer);
+	excl_rid = midr_vty_rid_for_session_addr(
+		bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), peer);
 
 	/*
 	 * S6 清账：按地址反查节点表条目，查到走 detach 全套（停探 + 删 link +
 	 * 清 is_adjacent + 拆会话）；查不到（该地址不对应已知节点）退化为只拆会话。
 	 */
-	if (!midr_nds_detach_by_locator(bgp, su.sin.sin_addr))
+	if (!midr_nds_detach_by_locator(
+		    bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr)))
 		peer_delete(peer);
 
 	/* 拆口销账：detach 那条路已经过 midr_try_disconnect 销过账，这里补的是
 	 * 上面 peer_delete 退化分支（该地址不对应已知节点，detach 走不到）。
 	 * drop 幂等，重复调用无副作用。 */
-	midr_nds_ledger_drop(bgp, su.sin.sin_addr);
+	midr_nds_ledger_drop(bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr));
 
 	/*
 	 * 持久排除而非临时拔线——运维显式敲这条命令表达"不想再跟这个节点做
@@ -663,7 +669,8 @@ DEFUN(no_midr_bootstrap,
 		vty_out(vty, "%% Invalid IPv4 address: %s\n", argv[3]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
-	if (!midr_bootstrap_list_del(bgp, su.sin.sin_addr)) {
+	if (!midr_bootstrap_list_del(
+		    bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr))) {
 		vty_out(vty, "%% No such bootstrap candidate: %s\n", argv[3]->arg);
 		return CMD_WARNING;
 	}
@@ -695,7 +702,7 @@ DEFUN(midr_transport_address,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp->midr_nds_info->local_transport_addr = addr;
+	bgp->midr_nds_info->local_transport_addr = midr_ipaddr_from_ipv4(addr);
 	bgp->midr_nds_info->transport_addr_set = true;
 	midr_nds_report_node(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE); /* +TLV 1188 */
 
@@ -724,7 +731,7 @@ DEFUN(no_midr_transport_address,
 	}
 
 	bgp->midr_nds_info->transport_addr_set = false;
-	bgp->midr_nds_info->local_transport_addr.s_addr = INADDR_ANY;
+	SET_IPADDR_NONE(&bgp->midr_nds_info->local_transport_addr);
 	midr_nds_report_node(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE); /* -TLV 1188 */
 
 	vty_out(vty, "MIDR transport-address cleared\n");
@@ -1171,8 +1178,8 @@ DEFUN(show_midr_neighbors,
 		 */
 		nbr_disp = peer->host;
 		if (ne && ne->has_transport_addr) {
-			inet_ntop(AF_INET, &ne->transport_addr, taddr,
-				  sizeof(taddr));
+			snprintfrr(taddr, sizeof(taddr), "%pIA",
+				   &ne->transport_addr);
 			nbr_disp = taddr;
 		}
 
@@ -1197,9 +1204,13 @@ DEFUN(show_midr_neighbors,
 		 */
 		if (ne && ne->has_transport_addr)
 			le = midr_nds_ledger_lookup(bgp, ne->transport_addr);
-		if (!le && sockunion_family(&peer->connection->su) == AF_INET)
-			le = midr_nds_ledger_lookup(
-				bgp, peer->connection->su.sin.sin_addr);
+		if (!le) {
+			struct ipaddr peer_addr;
+
+			if (midr_sockunion_to_ipaddr(&peer->connection->su,
+						    &peer_addr))
+				le = midr_nds_ledger_lookup(bgp, peer_addr);
+		}
 		if (le)
 			snprintf(origin, sizeof(origin), "%s",
 				 midr_session_reason_str(le->reason));
@@ -1452,7 +1463,8 @@ DEFUN(show_midr_group2_remote,
 		const struct midr_remote_node_info *rn = &snap.nodes[i];
 		struct midr_node_entry key = {};
 		struct midr_node_entry *e;
-		struct in_addr rid, transport;
+		struct in_addr rid;
+		struct ipaddr transport;
 		uint32_t caps;
 		bool has_transport;
 
@@ -1482,8 +1494,8 @@ DEFUN(show_midr_group2_remote,
 			diff++;
 		}
 		if (has_transport && e->has_transport_addr &&
-		    e->transport_addr.s_addr != transport.s_addr) {
-			vty_out(vty, "  ✗ %pI4 transport 不一致（我方 %pI4 / 第二组 %pI4）\n",
+		    !midr_ipaddr_same(&e->transport_addr, &transport)) {
+			vty_out(vty, "  ✗ %pI4 transport 不一致（我方 %pIA / 第二组 %pIA）\n",
 				&rid, &e->transport_addr, &transport);
 			diff++;
 		}
@@ -1614,8 +1626,8 @@ DEFUN(show_midr_group2_snapshot,
 			midr_caps_str((uint32_t)n->cap_flags, caps_buf,
 				      sizeof(caps_buf)));
 		if (n->has_transport_address)
-			vty_out(vty, "  transport    : %pI4\n",
-				&n->transport_address.ipaddr_v4);
+			vty_out(vty, "  transport    : %pIA\n",
+				&n->transport_address);
 		else
 			vty_out(vty, "  transport    : -\n");
 		vty_out(vty, "  version      : %" PRIu64 "\n", n->version);
@@ -1771,10 +1783,8 @@ DEFUN(show_midr_join,
 	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_pending, node, pend)) {
 		struct prefix p = {};
 
-		p.family = AF_INET;
-		p.prefixlen = IPV4_MAX_BITLEN;
-		p.u.prefix4 = pend->target_transport;
-		vty_out(vty, "  %-16s -> %-15pI4  retries_left=%d%s\n",
+		midr_ipaddr_to_host_prefix(&pend->target_transport, &p);
+		vty_out(vty, "  %-16s -> %-15pIA  retries_left=%d%s\n",
 			midr_ctrl_msg_type_str(pend->type),
 			&pend->target_transport, pend->retries_left,
 			midr_bgp_rib_covers(bgp, &p) ? ""

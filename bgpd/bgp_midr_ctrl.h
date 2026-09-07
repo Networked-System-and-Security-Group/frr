@@ -195,7 +195,7 @@ struct midr_ctrl_retx_params {
  * MEMBER_LIST_REQ) 迁 TCP 后计 "TCP 短连接尝试次数" (retx tick 遇在途连接
  * 跳过不减)。 */
 struct midr_ctrl_pending {
-	struct in_addr target_transport; /* resend destination */
+	struct ipaddr target_transport; /* resend destination */
 	uint8_t type;			 /* request type being retransmitted */
 	uint32_t target_group;		 /* group field carried in the request */
 	int retries_left;
@@ -275,7 +275,8 @@ extern void midr_ctrl_on_node_remove(struct bgp *bgp,
  */
 /* reason 透传到 I-2 停探日志（退网传 GRACEFUL_SHUTDOWN，其余会话层拆边传
  * SESSION_DOWN）。 */
-extern void midr_ctrl_detach_transport(struct bgp *bgp, struct in_addr transport,
+extern void midr_ctrl_detach_transport(struct bgp *bgp,
+				       struct ipaddr transport,
 				       struct in_addr rid, bool force,
 				       enum midr_stop_reason reason);
 
@@ -296,9 +297,9 @@ extern int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id,
  * each retry re-opens a TCP short connection (see bgp_midr_ctrl_tcp.c).
  */
 extern void midr_ctrl_send_rep_request(struct bgp *bgp,
-				       struct in_addr bootstrap_transport);
+				       struct ipaddr bootstrap_transport);
 extern void midr_ctrl_send_member_request(struct bgp *bgp,
-					  struct in_addr rep_transport,
+					  struct ipaddr rep_transport,
 					  uint32_t group_id);
 
 /*
@@ -308,7 +309,7 @@ extern void midr_ctrl_send_member_request(struct bgp *bgp,
  * 候选——与 REP_LIST_REQ 的 join failover 是**两条独立的路**，各用各的游标。
  */
 extern void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp,
-						  struct in_addr dst);
+						  struct ipaddr dst);
 
 /*
  * 改一条**在途请求**的剩余重传次数（保底轮 2 批 6）。
@@ -318,7 +319,8 @@ extern void midr_ctrl_send_bootstrap_list_request(struct bgp *bgp,
  * 按 (目标 transport, 消息类型) 定位，查不到就什么都不做——调用方在
  * midr_ctrl_connect() 之后调，而 connect 可能因去重根本没入队。
  */
-extern void midr_ctrl_set_retx_budget(struct bgp *bgp, struct in_addr dst,
+extern void midr_ctrl_set_retx_budget(struct bgp *bgp,
+				      struct ipaddr dst,
 				      uint8_t type, int retries);
 
 /*
@@ -328,7 +330,8 @@ extern void midr_ctrl_set_retx_budget(struct bgp *bgp, struct in_addr dst,
  * known source even though it never sent us a REP_LIST_REQ/MEMBER_LIST_REQ
  * itself (e.g. a non-bootstrap rep in the representative directory).
  */
-extern void midr_ctrl_send_announce(struct bgp *bgp, struct in_addr dst);
+extern void midr_ctrl_send_announce(struct bgp *bgp,
+				    struct ipaddr dst);
 
 /*
  * Mark a qualifying connection into the topology graph.  Skeleton stub: the
@@ -365,7 +368,7 @@ extern void midr_ctrl_fill_msg(struct bgp *bgp, struct midr_ctrl_msg *msg,
 extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
 					       const uint8_t *payload,
 					       size_t len,
-					       struct in_addr remote);
+					       struct ipaddr remote);
 
 /*
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型，供响应
@@ -377,7 +380,7 @@ extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
  */
 extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 				      const uint8_t *payload, size_t len,
-				      struct in_addr src);
+				      struct ipaddr src);
 
 /* --- 传输层 (tcp.c) 提供给语义层调用 --- */
 
@@ -391,12 +394,14 @@ extern void midr_ctrl_tcp_finish(struct bgp *bgp);
  * 在途去重: 同 (dst,type) 已有连接时，group 相同则忽略、不同则关旧起新。
  * 连接失败不阻塞——语义层的 ctrl_pending 重试机制会稍后再来一次。
  */
-extern void midr_ctrl_tcp_client_start(struct bgp *bgp, struct in_addr dst,
+extern void midr_ctrl_tcp_client_start(struct bgp *bgp,
+				       struct ipaddr dst,
 				       uint8_t type, uint32_t target_group);
 
 /* 重试定时器查询: 到 dst 的 type 请求是否已有在途 TCP 连接 (在途则本轮不减
  * retries_left，避免虚耗重试数)。 */
 extern bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi,
-					  struct in_addr dst, uint8_t type);
+					  struct ipaddr dst,
+					  uint8_t type);
 
 #endif /* _FRR_BGP_MIDR_CTRL_H */

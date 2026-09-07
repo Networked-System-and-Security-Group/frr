@@ -237,9 +237,12 @@ static void pm_send_probe(struct midr_probe_ctx *ctx)
 	struct bgp_midr_nds *mi = ctx->bgp->midr_nds_info;
 	struct midr_probe_pkt pkt = {};
 	struct sockaddr_in dst = {};
+	struct in_addr target4;
 	uint64_t now;
 
 	if (mi->pm_sock < 0)
+		return;
+	if (!midr_ipaddr_to_ipv4(&ctx->target_addr, &target4))
 		return;
 
 	now = pm_now_us();
@@ -251,11 +254,11 @@ static void pm_send_probe(struct midr_probe_ctx *ctx)
 
 	dst.sin_family = AF_INET;
 	dst.sin_port = htons(MIDR_PM_PROBE_PORT);
-	dst.sin_addr = ctx->target_addr;
+	dst.sin_addr = target4;
 
 	if (sendto(mi->pm_sock, &pkt, sizeof(pkt), 0,
 		   (struct sockaddr *)&dst, sizeof(dst)) < 0)
-		MIDR_LOG("MIDR PM: sendto %pI4 failed: %s",
+		MIDR_LOG("MIDR PM: sendto %pIA failed: %s",
 			 &ctx->target_addr, safe_strerror(errno));
 
 	ctx->pending_seqno = ctx->seqno;
@@ -331,12 +334,13 @@ static void midr_pm_probe_timer_fn(struct event *t)
 static bool pm_is_known_transport(struct bgp_midr_nds *mi, struct in_addr addr)
 {
 	struct midr_node_entry *entry;
+	struct ipaddr locator = midr_ipaddr_from_ipv4(addr);
 
 	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
 		if (entry->is_self)
 			continue;
 		if (entry->has_transport_addr) {
-			if (entry->transport_addr.s_addr == addr.s_addr) {
+			if (midr_ipaddr_same(&entry->transport_addr, &locator)) {
 				entry->last_update = monotime(NULL);
 				return true;
 			}
@@ -353,7 +357,7 @@ static bool pm_is_known_transport(struct bgp_midr_nds *mi, struct in_addr addr)
 
 /* Walk-callback: find a probe context whose target_addr matches a given IP. */
 struct pm_ctx_find_by_ip_arg {
-	struct in_addr ip;
+	struct ipaddr ip;
 	struct midr_probe_ctx *result;
 };
 
@@ -364,7 +368,7 @@ static void pm_ctx_find_by_ip_cb(struct hash_bucket *hb, void *arg)
 
 	if (a->result)
 		return; /* already found */
-	if (ctx->target_addr.s_addr == a->ip.s_addr)
+	if (midr_ipaddr_same(&ctx->target_addr, &a->ip))
 		a->result = ctx;
 }
 
@@ -433,7 +437,10 @@ static void midr_pm_recv(struct event *t)
 	if (!mi->probe_contexts)
 		return;
 	{
-		struct pm_ctx_find_by_ip_arg arg = { src.sin_addr, NULL };
+		struct pm_ctx_find_by_ip_arg arg = {
+			.ip = midr_ipaddr_from_ipv4(src.sin_addr),
+			.result = NULL,
+		};
 
 		hash_iterate(mi->probe_contexts, pm_ctx_find_by_ip_cb, &arg);
 		ctx = arg.result;
@@ -489,11 +496,17 @@ static void midr_pm_open_sock(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct sockaddr_in sa = {};
+	struct ipaddr local_transport;
+	struct in_addr local4;
 	int sock;
 
-	if (!mi->transport_addr_set) {
+	if (!midr_nds_local_transport_get(bgp, &local_transport)) {
 		zlog_warn("MIDR PM: local transport-address not configured; "
 			  "PM socket deferred until `midr transport-address` is set");
+		return;
+	}
+	if (!midr_ipaddr_to_ipv4(&local_transport, &local4)) {
+		MIDR_LOG("MIDR PM: IPv6 probe socket is not implemented yet");
 		return;
 	}
 
@@ -509,10 +522,10 @@ static void midr_pm_open_sock(struct bgp *bgp)
 	 * the attack surface to the MIDR loopback interface only. */
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons(MIDR_PM_PROBE_PORT);
-	sa.sin_addr = mi->local_transport_addr;
+	sa.sin_addr = local4;
 	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_warn("MIDR PM: bind(%pI4:%u) failed: %s",
-			  &mi->local_transport_addr, MIDR_PM_PROBE_PORT,
+		zlog_warn("MIDR PM: bind(%pIA:%u) failed: %s",
+			  &local_transport, MIDR_PM_PROBE_PORT,
 			  safe_strerror(errno));
 		close(sock);
 		return;
@@ -522,8 +535,8 @@ static void midr_pm_open_sock(struct bgp *bgp)
 	mi->pm_sock = sock;
 	event_add_read(bm->master, midr_pm_recv, bgp, sock, &mi->t_pm_read);
 
-	MIDR_LOG("MIDR PM: probe socket ready on %pI4:%u",
-		 &mi->local_transport_addr, MIDR_PM_PROBE_PORT);
+	MIDR_LOG("MIDR PM: probe socket ready on %pIA:%u", &local_transport,
+		 MIDR_PM_PROBE_PORT);
 }
 
 static void midr_pm_close_sock(struct bgp *bgp)
@@ -631,8 +644,12 @@ int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 	ctx = XCALLOC(MTYPE_MIDR_PROBE_CTX, sizeof(*ctx));
 	ctx->bgp = bgp;
 	prefix_copy(&ctx->target, node_id);
-	ctx->target_addr = entry->has_transport_addr ? entry->transport_addr
-						     : entry->node_id.u.prefix4;
+	if (!midr_nds_node_transport_get(bgp, node_id, &ctx->target_addr)) {
+		XFREE(MTYPE_MIDR_PROBE_CTX, ctx);
+		MIDR_LOG("MIDR PM I-1: node %pFX has no transport locator",
+			 node_id);
+		return -1;
+	}
 	ctx->state = MIDR_PROBE_NORMAL;
 	ctx->capabilities = capabilities;
 	ctx->source = source;
@@ -643,7 +660,7 @@ int midr_pm_add_target(struct bgp *bgp, const struct prefix *node_id,
 	event_add_timer(bm->master, midr_pm_probe_timer_fn, ctx, 0,
 			&ctx->t_probe);
 
-	MIDR_LOG("MIDR PM I-1: start probing %pFX -> %pI4 src=%d caps=0x%x",
+	MIDR_LOG("MIDR PM I-1: start probing %pFX -> %pIA src=%d caps=0x%x",
 		 node_id, &ctx->target_addr, source, capabilities);
 	return 0;
 }

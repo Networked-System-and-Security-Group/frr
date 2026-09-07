@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 
 #include "prefix.h"
+#include "ipaddr.h"
 #include "frrevent.h"
 
 struct bgp;
@@ -88,7 +89,7 @@ enum midr_probe_state {
 struct midr_probe_ctx {
 	struct bgp *bgp;
 	struct prefix target;	       /* node_id — hash key */
-	struct in_addr target_addr;    /* transport_addr: where to send probes */
+	struct ipaddr target_addr;     /* transport_addr: where to send probes */
 	enum midr_probe_state state;
 	uint32_t capabilities;
 	enum midr_node_source source;
