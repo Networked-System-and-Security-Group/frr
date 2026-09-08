@@ -2441,6 +2441,13 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 					  entry->group_id);
 		midr_mark_topology(bgp, entry);
 	}
+	/* Locator replacement retires the old PM context.  Cross-group anchors
+	 * are deliberately not is_adjacent, so the PM neighbor sweep cannot
+	 * restore them.  Reissue I-1 through the common connect path, including
+	 * ledger replay, without turning an anchor into a same-group neighbor. */
+	if (reason == MIDR_SESSION_CL_ANCHOR)
+		midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
+				   entry->capabilities);
 
 	/*
 	 * 反向建连 nudge：请对端也建一条回来。由函数末尾提到去重之前——去重 return
