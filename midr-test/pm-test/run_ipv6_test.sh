@@ -6,7 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
 VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python3" ]]; then
+        PYTHON_BIN="$CONDA_PREFIX/bin/python3"
+    else
+        PYTHON_BIN="python3"
+    fi
+fi
 
 CASE="baseline"
 DURATION=""
@@ -147,11 +154,19 @@ stop_pid() {
     local pid="$1"
     local signal="${2:-TERM}"
     local attempt
+    local process_state
 
     [[ -n "$pid" ]] || return 0
     kill -0 "$pid" 2>/dev/null || return 0
     kill "-$signal" "$pid" 2>/dev/null || true
     for attempt in {1..30}; do
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ process_state _ <"/proc/$pid/stat" || true
+            if [[ "$process_state" == "Z" ]]; then
+                wait "$pid" 2>/dev/null || true
+                return 0
+            fi
+        fi
         if ! kill -0 "$pid" 2>/dev/null; then
             wait "$pid" 2>/dev/null || true
             return 0
@@ -188,7 +203,7 @@ cleanup() {
     trap - EXIT INT TERM
     stop_pid "$IPERF_CLIENT_PID"
     stop_pid "$IPERF_SERVER_PID"
-    stop_pid "$TCPDUMP_PID" INT
+    stop_pid "$TCPDUMP_PID"
     stop_pid "$PID_A"
     stop_pid "$PID_B"
     delete_namespace "$NS_A"
@@ -222,6 +237,7 @@ if (( IPERF_ENABLE == 1 )); then
 fi
 
 echo "[run_ipv6_test] case: $CASE"
+echo "[run_ipv6_test] python: $PYTHON_BIN"
 echo "[run_ipv6_test] duration: ${DURATION}s"
 echo "[run_ipv6_test] artifacts: $ARTIFACT_DIR"
 echo "[run_ipv6_test] transport: $TRANSPORT_A <-> $TRANSPORT_B"
@@ -427,20 +443,13 @@ esac
 
 stop_pid "$IPERF_CLIENT_PID"
 stop_pid "$IPERF_SERVER_PID"
-stop_pid "$TCPDUMP_PID" INT
+stop_pid "$TCPDUMP_PID"
 TCPDUMP_PID=""
 stop_pid "$PID_A"
 stop_pid "$PID_B"
 PID_A=""
 PID_B=""
 
-PLOT_ARGS=("$ARTIFACT_DIR/bgpd-a.log" --output "$ARTIFACT_DIR/pm-results.png"
-           --events-file "$EVENTS")
-if (( IPERF_ENABLE == 1 )); then
-    PLOT_ARGS+=(--iperf-start "$IPERF_START_TIME"
-                --iperf-duration "$IPERF_DURATION")
-fi
-"$PYTHON_BIN" "$SCRIPT_DIR/plot_pm.py" "${PLOT_ARGS[@]}"
 "$PYTHON_BIN" "$SCRIPT_DIR/check_ipv6_result.py" \
     --case "$CASE" \
     --log-a "$ARTIFACT_DIR/bgpd-a.log" \
@@ -451,6 +460,20 @@ fi
     --events "$EVENTS" \
     --delay-ms "$DELAY_MS" \
     | tee "$ARTIFACT_DIR/assertions.txt"
+
+if "$PYTHON_BIN" -c 'import matplotlib, numpy' >/dev/null 2>&1; then
+    PLOT_ARGS=("$ARTIFACT_DIR/bgpd-a.log"
+               --output "$ARTIFACT_DIR/pm-results.png"
+               --events-file "$EVENTS")
+    if (( IPERF_ENABLE == 1 )); then
+        PLOT_ARGS+=(--iperf-start "$IPERF_START_TIME"
+                    --iperf-duration "$IPERF_DURATION")
+    fi
+    "$PYTHON_BIN" "$SCRIPT_DIR/plot_pm.py" "${PLOT_ARGS[@]}"
+else
+    echo "[run_ipv6_test] plotting skipped: matplotlib or numpy is unavailable in $PYTHON_BIN" \
+        | tee -a "$ARTIFACT_DIR/assertions.txt"
+fi
 
 echo "[run_ipv6_test] PASS"
 echo "[run_ipv6_test] results: $ARTIFACT_DIR"
