@@ -619,14 +619,9 @@ static void midr_pm_probe_timer(struct event *t)
 		    && pm_ctx_find(mi, &entry->node_id))
 			continue;
 
-		/* Push a minimal UP update to keep the link entry alive in NDS
-		 * for nodes without explicit probe_ctx registration. */
-		{
-			struct midr_nds_link_metrics m = {};
-
-			midr_nds_on_link_update(bgp, &entry->node_id,
-						MIDR_LINK_UP, 0, &m, &m);
-		}
+		/* Repair a missed I-1 registration with a real probe context. */
+		midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_GOSSIP,
+				   entry->capabilities);
 	}
 
 reschedule:
