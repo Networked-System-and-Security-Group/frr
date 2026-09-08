@@ -14,36 +14,82 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
     fi
 fi
 
-NS_A="midr-pms-a"
-NS_B="midr-pms-b"
-IF_A="pms-a"
-IF_B="pms-b"
-LINK_A="fd00:20::1"
-LINK_B="fd00:20::2"
-TRANSPORT_A="fd00:99::a"
-TRANSPORT_B="fd00:99::b"
-UNKNOWN_A="fd00:dead::1"
+ADDRESS_FAMILY="ipv6"
 
-RUN_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
-ARTIFACT_ROOT="$SCRIPT_DIR/artifacts"
-ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID-smoke"
-SMOKE_BIN="$ARTIFACT_DIR/pm-ipv6-smoke"
-SERVER_PID=""
-TCPDUMP_PID=""
-CLEANED_UP=0
+while (( $# > 0 )); do
+    case "$1" in
+        --address-family)
+            ADDRESS_FAMILY="${2:-}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: sudo -E ./midr-test/pm-test/run_ipv6_smoke.sh [--address-family ipv4|ipv6|all]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    echo "Usage: sudo -E ./midr-test/pm-test/run_ipv6_smoke.sh"
-    exit 0
-fi
-if (( $# != 0 )); then
-    echo "This smoke test takes no arguments." >&2
-    exit 2
-fi
 if (( EUID != 0 )); then
     echo "Run this script with sudo -E." >&2
     exit 1
 fi
+
+if [[ "$ADDRESS_FAMILY" == "all" ]]; then
+    "$SCRIPT_DIR/run_ipv6_smoke.sh" --address-family ipv4
+    "$SCRIPT_DIR/run_ipv6_smoke.sh" --address-family ipv6
+    exit 0
+fi
+
+case "$ADDRESS_FAMILY" in
+    ipv4)
+        NS_A="midr-pms4-a"
+        NS_B="midr-pms4-b"
+        IF_A="pms4-a"
+        IF_B="pms4-b"
+        LINK_A="10.10.1.1"
+        LINK_B="10.10.1.2"
+        LINK_PREFIX=30
+        TRANSPORT_A="10.99.0.1"
+        TRANSPORT_B="10.99.0.2"
+        TRANSPORT_PREFIX=32
+        UNKNOWN_A="10.99.0.99"
+        IP_FLAG=-4
+        PING_FLAG=-4
+        PCAP_FILTER='ip and udp port 5860'
+        ;;
+    ipv6)
+        NS_A="midr-pms6-a"
+        NS_B="midr-pms6-b"
+        IF_A="pms6-a"
+        IF_B="pms6-b"
+        LINK_A="fd00:20::1"
+        LINK_B="fd00:20::2"
+        LINK_PREFIX=64
+        TRANSPORT_A="fd00:99::a"
+        TRANSPORT_B="fd00:99::b"
+        TRANSPORT_PREFIX=128
+        UNKNOWN_A="fd00:dead::1"
+        IP_FLAG=-6
+        PING_FLAG=-6
+        PCAP_FILTER='ip6 and udp port 5860'
+        ;;
+    *)
+        echo "Unsupported address family: $ADDRESS_FAMILY" >&2
+        exit 2
+        ;;
+esac
+
+RUN_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
+ARTIFACT_ROOT="$SCRIPT_DIR/artifacts"
+ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID-$ADDRESS_FAMILY-smoke"
+SMOKE_BIN="$ARTIFACT_DIR/pm-af-smoke"
+SERVER_PID=""
+TCPDUMP_PID=""
+CLEANED_UP=0
 
 export MPLCONFIGDIR="$ARTIFACT_DIR/matplotlib"
 mkdir -p "$ARTIFACT_DIR" "$MPLCONFIGDIR"
@@ -124,12 +170,14 @@ for command in ip ping tcpdump "$CC_BIN"; do
 done
 
 echo "[pm-smoke] compiling the standalone endpoint"
+echo "[pm-smoke] address family: $ADDRESS_FAMILY"
 echo "[pm-smoke] python: $PYTHON_BIN"
 "$CC_BIN" -std=gnu11 -DHAVE_CONFIG_H -O2 -Wall -Wextra \
     -Wno-unused-parameter -I"$REPO_ROOT" -I"$REPO_ROOT/include" \
     -I"$REPO_ROOT/lib" "$SCRIPT_DIR/pm_ipv6_smoke.c" -o "$SMOKE_BIN"
 
-"$SMOKE_BIN" classify | tee "$ARTIFACT_DIR/classification.log"
+"$SMOKE_BIN" classify "$ADDRESS_FAMILY" \
+    | tee "$ARTIFACT_DIR/classification.log"
 
 delete_namespace "$NS_A"
 delete_namespace "$NS_B"
@@ -140,25 +188,33 @@ ip link set "$IF_A" netns "$NS_A"
 ip link set "$IF_B" netns "$NS_B"
 
 for namespace in "$NS_A" "$NS_B"; do
-    ip netns exec "$namespace" sysctl -qw net.ipv6.conf.all.disable_ipv6=0
+    if [[ "$ADDRESS_FAMILY" == "ipv6" ]]; then
+        ip netns exec "$namespace" sysctl -qw net.ipv6.conf.all.disable_ipv6=0
+        ip netns exec "$namespace" sysctl -qw net.ipv6.conf.default.disable_ipv6=0
+    else
+        ip netns exec "$namespace" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+        ip netns exec "$namespace" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+    fi
     ip -n "$namespace" link set lo up
 done
 
 ip -n "$NS_A" link set "$IF_A" up
 ip -n "$NS_B" link set "$IF_B" up
-ip -n "$NS_A" addr add "$LINK_A/64" dev "$IF_A"
-ip -n "$NS_B" addr add "$LINK_B/64" dev "$IF_B"
-ip -n "$NS_A" addr add "$TRANSPORT_A/128" dev lo
-ip -n "$NS_B" addr add "$TRANSPORT_B/128" dev lo
-ip -n "$NS_A" addr add "$UNKNOWN_A/128" dev lo
-ip -n "$NS_A" -6 route add "$TRANSPORT_B/128" via "$LINK_B" dev "$IF_A"
-ip -n "$NS_B" -6 route add "$TRANSPORT_A/128" via "$LINK_A" dev "$IF_B"
+ip -n "$NS_A" addr add "$LINK_A/$LINK_PREFIX" dev "$IF_A"
+ip -n "$NS_B" addr add "$LINK_B/$LINK_PREFIX" dev "$IF_B"
+ip -n "$NS_A" addr add "$TRANSPORT_A/$TRANSPORT_PREFIX" dev lo
+ip -n "$NS_B" addr add "$TRANSPORT_B/$TRANSPORT_PREFIX" dev lo
+ip -n "$NS_A" addr add "$UNKNOWN_A/$TRANSPORT_PREFIX" dev lo
+ip -n "$NS_A" "$IP_FLAG" route add "$TRANSPORT_B/$TRANSPORT_PREFIX" \
+    via "$LINK_B" dev "$IF_A"
+ip -n "$NS_B" "$IP_FLAG" route add "$TRANSPORT_A/$TRANSPORT_PREFIX" \
+    via "$LINK_A" dev "$IF_B"
 
-ip netns exec "$NS_A" ping -6 -c 2 -W 1 "$TRANSPORT_B" >/dev/null
-ip netns exec "$NS_B" ping -6 -c 2 -W 1 "$TRANSPORT_A" >/dev/null
+ip netns exec "$NS_A" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_B" >/dev/null
+ip netns exec "$NS_B" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_A" >/dev/null
 
 ip netns exec "$NS_A" tcpdump -U -i "$IF_A" -s 0 \
-    -w "$ARTIFACT_DIR/pm-smoke.pcap" 'udp port 5860' \
+    -w "$ARTIFACT_DIR/pm-smoke.pcap" "$PCAP_FILTER" \
     >"$ARTIFACT_DIR/tcpdump.log" 2>&1 &
 TCPDUMP_PID=$!
 
@@ -178,14 +234,14 @@ stop_pid "$TCPDUMP_PID"
 TCPDUMP_PID=""
 
 PACKET_COUNT="$(tcpdump -nr "$ARTIFACT_DIR/pm-smoke.pcap" \
-    'ip6 and udp port 5860' 2>/dev/null | wc -l)"
+    "$PCAP_FILTER" 2>/dev/null | wc -l)"
 PACKET_COUNT="${PACKET_COUNT//[[:space:]]/}"
 
 if (( PACKET_COUNT < 3 )); then
     echo "[pm-smoke] FAIL: capture contains only $PACKET_COUNT PM packets" >&2
     exit 1
 fi
-echo "PASS: capture contains $PACKET_COUNT IPv6 PM packets" \
+echo "PASS: capture contains $PACKET_COUNT $ADDRESS_FAMILY PM packets" \
     | tee "$ARTIFACT_DIR/assertions.txt"
 
 if command -v "$PYTHON_BIN" >/dev/null 2>&1 \
@@ -196,7 +252,8 @@ if command -v "$PYTHON_BIN" >/dev/null 2>&1 \
         "$ARTIFACT_DIR/client.log" \
         "$ARTIFACT_DIR/unknown.log" \
         --packet-count "$PACKET_COUNT" \
-        --output "$ARTIFACT_DIR/pm-ipv6-smoke.png" \
+        --address-family "$ADDRESS_FAMILY" \
+        --output "$ARTIFACT_DIR/pm-$ADDRESS_FAMILY-smoke.png" \
         | tee -a "$ARTIFACT_DIR/assertions.txt"
 else
     echo "[pm-smoke] plotting skipped: matplotlib is unavailable in $PYTHON_BIN" \

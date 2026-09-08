@@ -29,21 +29,21 @@ static int open_endpoint(const struct ipaddr *local)
 {
 	union sockunion address = {};
 	struct timeval timeout = {.tv_sec = 5};
-	socklen_t option_length;
-	int enabled = 0;
+	int family;
 	int reuse = 1;
 	int sock;
 
 	if (!midr_pm_net_transport_to_sockunion(local, MIDR_PM_PROBE_PORT,
 						&address))
 		return -1;
-	sock = socket(ipaddr_family(local), SOCK_DGRAM, 0);
+	family = ipaddr_family(local);
+	sock = socket(family, SOCK_DGRAM, 0);
 	if (sock < 0)
 		return -1;
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))
 	    < 0)
 		goto fail;
-	if (midr_pm_net_enable_v6only(ipaddr_family(local), sock) < 0)
+	if (midr_pm_net_enable_v6only(family, sock) < 0)
 		goto fail;
 	if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout,
 		       sizeof(timeout)) < 0)
@@ -53,13 +53,20 @@ static int open_endpoint(const struct ipaddr *local)
 	if (!midr_pm_net_socket_matches(sock, local, MIDR_PM_PROBE_PORT))
 		goto fail;
 
-	option_length = sizeof(enabled);
-	if (getsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &enabled,
-		       &option_length) < 0
-	    || enabled != 1)
-		goto fail;
+	if (family == AF_INET6) {
+		socklen_t option_length;
+		int enabled = 0;
 
-	printf("PASS exact-bind\nPASS ipv6-v6only\n");
+		option_length = sizeof(enabled);
+		if (getsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &enabled,
+			       &option_length) < 0
+		    || enabled != 1)
+			goto fail;
+	}
+
+	printf("PASS exact-bind\n");
+	printf("PASS %s\n",
+	       family == AF_INET6 ? "ipv6-v6only" : "ipv4-native");
 	return sock;
 
 fail:
@@ -203,24 +210,44 @@ static bool classification_case(const struct ipaddr *local,
 			  == expected;
 }
 
-static int run_classification(void)
+static int run_classification(const char *family)
 {
 	struct ipaddr local;
+	const char *valid_source;
+	const char *multicast_source;
+	const char *unspecified_source;
+	const char *cross_family_source;
 
-	if (!parse_locator("fd00:99::a", &local))
+	if (strcmp(family, "ipv4") == 0) {
+		if (!parse_locator("10.99.0.1", &local))
+			return EXIT_FAILURE;
+		valid_source = "10.99.0.2";
+		multicast_source = "239.1.1.1";
+		unspecified_source = "0.0.0.0";
+		cross_family_source = "fd00:99::2";
+	} else if (strcmp(family, "ipv6") == 0) {
+		if (!parse_locator("fd00:99::a", &local))
+			return EXIT_FAILURE;
+		valid_source = "fd00:99::b";
+		multicast_source = "ff02::1";
+		unspecified_source = "::";
+		cross_family_source = "192.0.2.1";
+	} else {
 		return EXIT_FAILURE;
-	if (!classification_case(&local, "fd00:99::b", MIDR_PM_PROBE_PORT,
-				 true)
+	}
+
+	if (!classification_case(&local, valid_source, MIDR_PM_PROBE_PORT, true)
 	    || !classification_case(&local, "::ffff:192.0.2.1",
 				    MIDR_PM_PROBE_PORT, false)
 	    || !classification_case(&local, "fe80::1", MIDR_PM_PROBE_PORT,
 				    false)
-	    || !classification_case(&local, "ff02::1", MIDR_PM_PROBE_PORT,
-				    false)
-	    || !classification_case(&local, "192.0.2.1", MIDR_PM_PROBE_PORT,
-				    false)
-	    || !classification_case(&local, "::", MIDR_PM_PROBE_PORT, false)
-	    || !classification_case(&local, "fd00:99::b",
+	    || !classification_case(&local, multicast_source,
+				    MIDR_PM_PROBE_PORT, false)
+	    || !classification_case(&local, cross_family_source,
+				    MIDR_PM_PROBE_PORT, false)
+	    || !classification_case(&local, unspecified_source,
+				    MIDR_PM_PROBE_PORT, false)
+	    || !classification_case(&local, valid_source,
 				    MIDR_PM_PROBE_PORT + 1, false))
 		return EXIT_FAILURE;
 
@@ -236,8 +263,8 @@ static int run_classification(void)
 
 int main(int argc, char **argv)
 {
-	if (argc == 2 && strcmp(argv[1], "classify") == 0)
-		return run_classification();
+	if (argc == 3 && strcmp(argv[1], "classify") == 0)
+		return run_classification(argv[2]);
 	if (argc == 4 && strcmp(argv[1], "server") == 0)
 		return run_server(argv[2], argv[3]);
 	if (argc == 4 && strcmp(argv[1], "client") == 0)
@@ -246,7 +273,7 @@ int main(int argc, char **argv)
 		return send_request(argv[2], argv[3], false);
 
 	fprintf(stderr,
-		"Usage: %s classify|server LOCAL KNOWN|client LOCAL REMOTE|unknown LOCAL REMOTE\n",
+		"Usage: %s classify ipv4|ipv6 | server LOCAL KNOWN | client LOCAL REMOTE | unknown LOCAL REMOTE\n",
 		argv[0]);
 	return EXIT_FAILURE;
 }

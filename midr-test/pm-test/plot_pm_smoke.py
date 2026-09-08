@@ -25,6 +25,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("logs", nargs="+", type=Path)
     parser.add_argument("--packet-count", type=int, required=True)
+    parser.add_argument("--address-family", choices=("ipv4", "ipv6"),
+                        default="ipv6")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -32,7 +34,9 @@ def main():
                         for path in args.logs)
     checks = [
         ("精确绑定 transport", "PASS exact-bind" in content),
-        ("仅接收 IPv6", "PASS ipv6-v6only" in content),
+        ("地址族 socket", ("PASS ipv6-v6only" in content
+                          if args.address_family == "ipv6"
+                          else "PASS ipv4-native" in content)),
         ("20 字节请求与应答", "PASS request-echoed" in content
          and "PASS request-reply" in content),
         ("未知来源拒绝", "PASS unknown-source-rejected" in content),
@@ -41,7 +45,7 @@ def main():
          and "PASS multicast-source-rejected" in content),
         ("跨族 / 错误端口拒绝", "PASS cross-family-source-rejected" in content
          and "PASS wrong-port-rejected" in content),
-        ("IPv6 抓包可见", args.packet_count >= 3),
+        (f"{args.address_family.upper()} 抓包可见", args.packet_count >= 3),
     ]
 
     for label, passed in checks:
@@ -55,7 +59,8 @@ def main():
     axis.invert_yaxis()
     axis.set_xlim(0, 1.22)
     axis.set_xticks([])
-    axis.set_title("PM IPv6 独立冒烟测试", pad=24, fontweight="bold")
+    axis.set_title(f"PM {args.address_family.upper()} 独立冒烟测试",
+                   pad=24, fontweight="bold")
     axis.spines[["top", "right", "bottom", "left"]].set_visible(False)
 
     for bar, passed in zip(bars, values):
