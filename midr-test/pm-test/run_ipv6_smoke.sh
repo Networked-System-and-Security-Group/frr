@@ -127,6 +127,41 @@ stop_pid() {
     wait "$pid" 2>/dev/null || true
 }
 
+wait_for_log() {
+    local path="$1"
+    local pattern="$2"
+    local pid="$3"
+    local attempt
+
+    for attempt in {1..50}; do
+        grep -q "$pattern" "$path" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_for_pid() {
+    local pid="$1"
+    local attempt
+    local process_state
+
+    for attempt in {1..50}; do
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ process_state _ <"/proc/$pid/stat" || true
+            if [[ "$process_state" == "Z" ]]; then
+                wait "$pid"
+                return $?
+            fi
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 delete_namespace() {
     local namespace="$1"
     local pid
@@ -215,10 +250,14 @@ ip -n "$NS_B" "$IP_FLAG" route add "$UNKNOWN_A/$TRANSPORT_PREFIX" \
 ip netns exec "$NS_A" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_B" >/dev/null
 ip netns exec "$NS_B" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_A" >/dev/null
 
-ip netns exec "$NS_A" tcpdump -U -i "$IF_A" -s 0 \
+ip netns exec "$NS_A" tcpdump -U -c 3 -i "$IF_A" -s 0 \
     -w "$ARTIFACT_DIR/pm-smoke.pcap" "$PCAP_FILTER" \
     >"$ARTIFACT_DIR/tcpdump.log" 2>&1 &
 TCPDUMP_PID=$!
+if ! wait_for_log "$ARTIFACT_DIR/tcpdump.log" "listening on" "$TCPDUMP_PID"; then
+    echo "[pm-smoke] FAIL: tcpdump did not become ready" >&2
+    exit 1
+fi
 
 ip netns exec "$NS_B" "$SMOKE_BIN" server "$TRANSPORT_B" "$TRANSPORT_A" \
     >"$ARTIFACT_DIR/server.log" 2>&1 &
@@ -237,7 +276,11 @@ if ! wait "$SERVER_PID"; then
     exit 1
 fi
 SERVER_PID=""
-stop_pid "$TCPDUMP_PID"
+if ! wait_for_pid "$TCPDUMP_PID"; then
+    echo "[pm-smoke] FAIL: tcpdump did not finish writing three packets" >&2
+    stop_pid "$TCPDUMP_PID"
+    exit 1
+fi
 TCPDUMP_PID=""
 
 PACKET_COUNT="$(tcpdump -nr "$ARTIFACT_DIR/pm-smoke.pcap" \
