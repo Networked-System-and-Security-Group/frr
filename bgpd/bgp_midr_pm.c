@@ -428,6 +428,12 @@ static void midr_pm_recv(struct event *t)
 		return;
 	}
 
+	if (pkt.type != MIDR_PM_PROBE_REQ && pkt.type != MIDR_PM_PROBE_REP) {
+		MIDR_LOG("MIDR PM: invalid packet type %u from %pIA, dropped",
+			 pkt.type, &src_addr);
+		return;
+	}
+
 	/*
 	 * Security: source must be a transport_addr we recognise in global_view.
 	 * Probes travel between transport_addrs (loopback /32s, e.g. 10.99.x.x),
@@ -449,9 +455,6 @@ static void midr_pm_recv(struct event *t)
 				 &src_addr, safe_strerror(errno));
 		return;
 	}
-
-	if (pkt.type != MIDR_PM_PROBE_REP)
-		return;
 
 	/* Prober role: find the matching context by source transport_addr */
 	if (!mi->probe_contexts)
@@ -481,6 +484,12 @@ static void midr_pm_recv(struct event *t)
 	if (ntohl(pkt.seqno) != ctx->pending_seqno) {
 		MIDR_LOG("MIDR PM: seqno mismatch from %pIA: got %u expected %u, dropped",
 			 &src_addr, ntohl(pkt.seqno), ctx->pending_seqno);
+		return;
+	}
+
+	if (be64toh(pkt.sent_us) != ctx->sent_us) {
+		MIDR_LOG("MIDR PM: timestamp mismatch from %pIA, dropped",
+			 &src_addr);
 		return;
 	}
 
