@@ -10,6 +10,7 @@
 #ifndef _FRR_BGP_MIDR_CTRL_H
 #define _FRR_BGP_MIDR_CTRL_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <netinet/in.h>
@@ -29,12 +30,12 @@ struct stream;
  *
  * 端口 5859 上并存两条传输（内核 TCP/UDP 端口空间独立，同号无冲突）：
  *
- *  - UDP :5859 —— PEER_REQUEST 专用。新节点选定群后向各群成员的 transport
- *    地址单播 PEER_REQUEST，成员反向建连（双向）。载荷固定 20B、永不撞尺寸墙，
- *    以反向会话 Established 为隐式 ack，保留原 3s×5 次重传。此通道独立于 PM
- *    探测通道（各自 socket/端口/格式），PM 设计变更不影响它。
+ *  - UDP :5859 —— 固定长控制消息：PEER_REQUEST、ATTACH_REQUEST、ANNOUNCE
+ *    与 PEER_REJECT。建连请求以反向会话 Established 或显式拒绝作为终止信号，
+ *    保留原 3s×5 次重传。此通道独立于 PM 探测通道（各自 socket/端口/格式），
+ *    PM 设计变更不影响它。
  *
- *  - TCP :5859 短连接 —— REP_LIST / MEMBER_LIST 请求-响应（列表交换）。载荷随
+ *  - TCP :5859 短连接 —— REP/MEMBER/BOOTSTRAP_LIST 请求-响应（列表交换）。载荷随
  *    全网群数 / 群规模增长会撞 UDP 尺寸墙（rep 目录 ~122 群、成员表 >91 人即
  *    分片；UDP 5 次重传即弃 + 超 80 条静默截断），故迁 TCP 流式短连接（连上→
  *    请求→响应→立即关）。决策见 docs/decisions/
@@ -44,13 +45,24 @@ struct stream;
 #define MIDR_CTRL_UDP_PORT    5859 /* control channel only (distinct from PM) */
 #define MIDR_CTRL_TCP_PORT    MIDR_CTRL_UDP_PORT /* 列表交换 TCP，与 UDP 同号并存 */
 /*
- * v2: REP_LIST_RESP 条目加 rep_rid 栏 (12B→16B)
- * v3: BOOTSTRAP_LIST_RESP 条目加 rid 栏 (8B→12B，保底轮 2 批 5 R 系列)
- *     —— 条目变长必须升版：不升的话旧 v2 收方会按 8B 错位解析出垃圾，升了则
- *     整包直接丢弃、干净失败。新增**消息类型**不必升版（PEER_REJECT /
- *     BOOTSTRAP_LIST / ATTACH_REQUEST 都没升），改**条目长度**才必须升。
+ * Version 4: every transport locator is encoded as an IANA AFI plus a fixed
+ *     16-byte address field.  Router IDs remain four-byte BGP Identifiers.
+ *     This is a synchronous upgrade: older frames are rejected rather than
+ *     partially decoded.
  */
-#define MIDR_CTRL_MSG_VERSION 3
+#define MIDR_CTRL_MSG_VERSION 4
+
+/* Wire sizes are protocol constants, never sizeof(C structure). */
+#define MIDR_CTRL_LOCATOR_LEN        20U
+#define MIDR_CTRL_REQUEST_LEN        36U
+#define MIDR_CTRL_LIST_HDR_LEN       4U
+#define MIDR_CTRL_REP_ITEM_LEN       32U
+#define MIDR_CTRL_MEMBER_ITEM_LEN    32U
+#define MIDR_CTRL_BOOTSTRAP_ITEM_LEN 28U
+#define MIDR_CTRL_MAX_LIST_COUNT     UINT16_MAX
+#define MIDR_CTRL_MAX_PAYLOAD                                               \
+	(MIDR_CTRL_LIST_HDR_LEN +                                            \
+	 (size_t)MIDR_CTRL_MAX_LIST_COUNT * MIDR_CTRL_MEMBER_ITEM_LEN)
 
 enum midr_ctrl_msg_type {
 	MIDR_CTRL_PEER_REQUEST = 1,	  /* "please peer back with me" */
@@ -85,13 +97,13 @@ enum midr_ctrl_msg_type {
 	 * TCP，见决策 midr-preexchange-transport-udp-vs-tcp.md），复用 4B 长度前缀
 	 * 分帧与 ctrl_pending 重试。协议版本不动（新增类型不升版，同 PEER_REJECT）。
 	 *
-	 * REQ 用与 REP_LIST_REQ 同构的 20B 请求帧，target_group 无意义置 0。
+	 * REQ 用与 REP_LIST_REQ 同构的 36B 请求帧，target_group 无意义置 0。
 	 */
 	MIDR_CTRL_BOOTSTRAP_LIST_REQ = 8,
 	MIDR_CTRL_BOOTSTRAP_LIST_RESP = 9,
 	/*
 	 * 挂靠专用建连请求（保底轮 2 批 5 前置①）。语义 = "我是群代表，来挂靠"，
-	 * 帧结构与 PEER_REQUEST **完全一致**（同 20B、字段同义），只是 type 值不同。
+	 * 帧结构与 PEER_REQUEST **完全一致**（同 36B、字段同义），只是 type 值不同。
 	 *
 	 * 为什么要单独一类：引导的负面守卫靠"查节点表猜发起方是谁"决定拒不拒，而
 	 * learn_requester 造出的幽灵条目（只有 rid/transport/asn、caps 与 group_id
@@ -106,68 +118,13 @@ enum midr_ctrl_msg_type {
 	MIDR_CTRL_ATTACH_REQUEST = 10,
 };
 
-/*
- * Request frame, fixed 20 bytes, network byte order.  Shared by PEER_REQUEST,
- * REP_LIST_REQ, MEMBER_LIST_REQ and ANNOUNCE: all carry the requester's
- * identity so the responder can reply / peer back / recognise it without a
- * node-table lookup.
- *   - PEER_REQUEST     : target_group = the group the requester joined
- *   - REP_LIST_REQ     : target_group = 0 (ignored)
- *   - MEMBER_LIST_REQ  : target_group = the group whose members are wanted
- *   - ANNOUNCE         : target_group = 0 (ignored)
- */
-struct midr_ctrl_msg {
-	uint8_t version;
+/* Decoded request representation.  It is intentionally not a wire struct. */
+struct midr_ctrl_request {
 	uint8_t type;
-	uint16_t reserved;
-	struct in_addr requester_rid;	    /* router-id (identity) */
-	struct in_addr requester_transport; /* reachable locator to reply / peer back */
-	uint32_t requester_asn;
+	struct in_addr requester_rid; /* four-byte BGP Identifier */
+	struct ipaddr requester_transport;
+	as_t requester_asn;
 	uint32_t target_group;
-};
-
-/* Variable-length response header, followed by `count` list items. 4 bytes. */
-struct midr_ctrl_list_hdr {
-	uint8_t version;
-	uint8_t type;
-	uint16_t count; /* number of items that follow (network order) */
-};
-
-/* REP_LIST_RESP item, 16 bytes, network byte order.
- * rep_rid = 代表的 router-id（真名）；0 = 应答方不知道（收方退回
- * "拿 transport 冒充 node_id"的旧占位路径，向后兼容）。 */
-struct midr_ctrl_rep_item {
-	uint32_t group_id;
-	struct in_addr rep_transport;
-	uint32_t rep_asn;
-	struct in_addr rep_rid;
-};
-
-/*
- * BOOTSTRAP_LIST_RESP item, 12 bytes, network byte order.
- *
- * 三栏 = transport + asn + rid（保底轮 2 批 5 R 系列，协议 v3）。
- * 〔旧注释说"没有 rid：引导专职化后不发 Node NLRI，谁都学不到它的 router-id"，
- *  该理由已被推翻——引导的 rid 现在由**运维手配**：`midr bootstrap <IP>
- *  remote-as <ASN> router-id <RID>` 三个参数全必选，rid 因此静态可得、不依赖
- *  引导发不发 NLRI，也不依赖会话是否 Established。〕
- *
- * 为什么名单要带 rid：① 挂靠挑台按 rid 排环（确定可重放）；② 会话排除名单以
- * router-id 为键，没有 rid 就没法把一台引导拉黑；③ 会话台账的"对端 rid"栏。
- * 收侧规矩：rid 为 0 的条目**拒收**（见 midr_nds_bootstrap_learn）。
- */
-struct midr_ctrl_bootstrap_item {
-	struct in_addr transport;
-	uint32_t asn;
-	struct in_addr rid;
-};
-
-/* MEMBER_LIST_RESP item, 16 bytes, network byte order. */
-struct midr_ctrl_member_item {
-	struct in_addr rid;
-	struct in_addr transport;
-	uint32_t asn;
-	uint32_t group_id;
 };
 
 /*
@@ -192,8 +149,8 @@ struct midr_ctrl_retx_params {
  * bgp_midr_nds->ctrl_pending; exposed here so `show midr join` can render the
  * not-yet-answered requests.
  * retries_left 语义: PEER_REQUEST 计 UDP 重发次数; 列表类 (REP_LIST_REQ /
- * MEMBER_LIST_REQ) 迁 TCP 后计 "TCP 短连接尝试次数" (retx tick 遇在途连接
- * 跳过不减)。 */
+ * MEMBER_LIST_REQ / BOOTSTRAP_LIST_REQ) 迁 TCP 后计 "TCP 短连接尝试次数"
+ * (retx tick 遇在途连接跳过不减)。 */
 struct midr_ctrl_pending {
 	struct ipaddr target_transport; /* resend destination */
 	uint8_t type;			 /* request type being retransmitted */
@@ -217,12 +174,20 @@ struct midr_ctrl_pending {
 /* Human-readable name of an enum midr_ctrl_msg_type value (for logs/show). */
 extern const char *midr_ctrl_msg_type_str(uint8_t type);
 
-/* Open / close the control-channel UDP socket (called from bgp_midr_nds_init/finish). */
+/* Initialise/free containers.  Socket binding is driven by transport reconcile. */
 extern void midr_ctrl_init(struct bgp *bgp);
 extern void midr_ctrl_finish(struct bgp *bgp);
+/* Atomically open/close UDP and TCP channels on one exact local locator. */
+extern bool midr_ctrl_open(struct bgp *bgp, const struct ipaddr *local);
+extern void midr_ctrl_close(struct bgp *bgp);
+/* Cancel all asynchronous Control work and remove an NDS-owned peer for one
+ * obsolete remote locator.  Ledger/index migration remains the NDS caller's
+ * responsibility. */
+extern void midr_ctrl_forget_target(struct bgp *bgp,
+				    struct ipaddr transport);
 
 /*
- * Called by bgp_midr_nds.c (NDS) to initiate a (multi-hop eBGP + BGP-LS) session to
+ * Called by bgp_midr_nds.c (NDS) to initiate a (multi-hop eBGP + MIDR-LS) session to
  * a node, after NDS has decided to peer.  Dedups against an existing peer and
  * sends a reverse PEER_REQUEST so the far end peers back.
  *
@@ -240,7 +205,7 @@ extern void midr_ctrl_connect(struct bgp *bgp,
 
 /*
  * 把一个刚建出的 peer 整形成 MIDR overlay 会话：multihop + update-source
- * (本端 transport) + 激活 BGP-LS + 撤销 FRR 自动附送的 IPv4 单播（overlay
+ * (本端 transport) + 激活 MIDR-LS + 撤销 FRR 自动附送的 IPv4/IPv6 单播（overlay
  * 不得向 underlay 注入转发路由——否则递归下一跳环路，见函数实现头注释与
  * docs/decisions/midr-overlay-underlay-layering.md）。自动建连
  * (midr_ctrl_connect) 与手动命令 (midr neighbor) 共用。
@@ -250,15 +215,16 @@ extern void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 /*
  * 会话归属判据（⑦，四处守卫共用）：peer 是不是 MIDR 自建的 overlay 会话。
  * 判据 = 带 PEER_FLAG_MIDR_OVERLAY 标记（出身）——运维原生会话永远没有它。
- * 〔批 5c 删掉了原来的第二条"只载 BGP-LS"签名判据，理由见函数定义处注释。〕
+ * 〔批 5c 删掉了原来的第二条"只载 LS"签名判据，理由见函数定义处注释。〕
  * 用于让 no midr session / midr session / try_disconnect / connect 去重四处
  * 一律"运维会话让路"：真是 MIDR 自己的才动，否则拒绝 + 告警。
  */
 extern bool midr_nds_peer_is_overlay(struct peer *peer);
 
 /*
- * Called by bgp_midr_nds.c (NDS) before a node entry is removed (withdraw or
- * expiry). Tears down the dynamically-created BGP session if one exists.
+ * Called by bgp_midr_nds.c (NDS) before a node entry is removed or replaced by
+ * a new locator generation. Tears down the dynamically-created BGP session if
+ * one exists.
  */
 extern void midr_ctrl_on_node_remove(struct bgp *bgp,
 				     struct midr_node_entry *entry);
@@ -269,9 +235,9 @@ extern void midr_ctrl_on_node_remove(struct bgp *bgp,
  * 临时条目后复用同一套拆除逻辑（MANUAL 豁免 + 销账 + ⑦ 归属守卫）。
  * rid 只用于日志可读，可为 0。
  *
- * force：真则跳过 MANUAL 豁免（α）。**只有本端 `midr shutdown` 退网传 true**
- * ——那是运维显式命令、与手配同级；自动路径（挂靠卸任、B1 老化、换台先拆旧）
- * 一律传 false。判据与理由见 midr_try_disconnect 内 α 注释。
+ * force：真则跳过 MANUAL 豁免（α）。仅本端显式运维动作 `midr shutdown` 与
+ * `no midr session` 传 true；自动路径（挂靠卸任、B1 老化、换台先拆旧）一律
+ * 传 false。判据与理由见 midr_try_disconnect 内 α 注释。
  */
 /* reason 透传到 I-2 停探日志（退网传 GRACEFUL_SHUTDOWN，其余会话层拆边传
  * SESSION_DOWN）。 */
@@ -353,12 +319,13 @@ extern void midr_mark_topology(struct bgp *bgp,
 /* --- 语义层 (ctrl.c) 提供给传输层调用 --- */
 
 /*
- * 填充一个 20B 请求帧 (PEER_REQUEST / REP_LIST_REQ / MEMBER_LIST_REQ) —— 携带
- * 本节点身份 (rid/transport/asn) 与 target_group。UDP 与 TCP 两条路径共用。
- * 各字段已按 wire 序 (htonl) 就绪，调用方直接整块拷贝即可。
+ * Encode one fixed 36-byte v4 request payload.  The active local transport is
+ * included and all integers/locators are written explicitly in wire order.
+ * Returns false when local identity/transport or the requested type is invalid.
  */
-extern void midr_ctrl_fill_msg(struct bgp *bgp, struct midr_ctrl_msg *msg,
-			       uint8_t type, uint32_t target_group);
+extern bool midr_ctrl_encode_request(struct bgp *bgp, uint8_t *payload,
+				     size_t len, uint8_t type,
+				     uint32_t target_group);
 
 /*
  * 传输层收到一个完整请求帧后回调。返回响应 payload (stream，不含长度前缀，
@@ -375,8 +342,8 @@ extern struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp,
  * 类型配对校验；src = 响应来源（即当初请求的目的地），供并发多个
  * MEMBER_LIST_REQ（主候选群 + 至多 2 个次优群）时精确清对应的重传 pending
  * 条目（按 (dst,type) 而非只按 type，否则某个目标的响应会误清掉另一个尚未
- * 响应的目标的重传追踪）；内部转现有 recv_rep_list / recv_member_list 灌全
- * 局视图并推进 join 状态机。
+ * 响应的目标的重传追踪）；内部转现有 recv_rep_list / recv_member_list /
+ * recv_bootstrap_list，按响应类型更新运行态并推进对应状态机。
  */
 extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 				      const uint8_t *payload, size_t len,
@@ -384,13 +351,19 @@ extern void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 
 /* --- 传输层 (tcp.c) 提供给语义层调用 --- */
 
-/* 建连接表 + 开 5859/TCP 监听 (监听失败仅 warn，不影响客户端侧)。 */
+/* Initialise/free the connection container (no wildcard listener). */
 extern void midr_ctrl_tcp_init(struct bgp *bgp);
-/* 关监听 + 逐条关闭所有活动连接 + 释放连接表。 */
 extern void midr_ctrl_tcp_finish(struct bgp *bgp);
+/* Open/close the exact-address listener and all current short connections. */
+extern bool midr_ctrl_tcp_open(struct bgp *bgp,
+			       const struct ipaddr *local);
+extern void midr_ctrl_tcp_close(struct bgp *bgp);
+extern void midr_ctrl_tcp_cancel_target(struct bgp *bgp,
+					struct ipaddr transport);
 
 /*
- * 发起一次 TCP 短连接请求 (REP_LIST_REQ / MEMBER_LIST_REQ) 到 dst:5859。
+ * 发起一次 TCP 短连接请求 (REP_LIST_REQ / MEMBER_LIST_REQ /
+ * BOOTSTRAP_LIST_REQ) 到 dst:5859。
  * 在途去重: 同 (dst,type) 已有连接时，group 相同则忽略、不同则关旧起新。
  * 连接失败不阻塞——语义层的 ctrl_pending 重试机制会稍后再来一次。
  */

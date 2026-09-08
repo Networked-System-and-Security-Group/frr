@@ -153,7 +153,7 @@ extern struct midr_nds_fact_link *
 midr_nds_facts_link_find(struct bgp *bgp, uint32_t remote_node_id,
 			 uint64_t link_id);
 
-/* 找不到就建一条（version 从 1 起）。返回 NULL 仅在事实表未就绪时。 */
+/* 找不到就建一条（version 初值为 0，首次实际上报前递增为 1）。 */
 extern struct midr_nds_fact_link *
 midr_nds_facts_link_get(struct bgp *bgp, uint32_t remote_node_id,
 			uint64_t link_id);
@@ -212,8 +212,8 @@ extern uint32_t midr_nds_metric_rtt_us(const struct midr_nds_link_metrics *m);
  * 注意上限 —— 第二组是 loss_ppm >= 1000000 即 -EINVAL（**严格小于**，不是文档
  * 里写的「≤1e6」），故本函数把结果夹到 [0, 999999]。
  *
- * ⚠ 2026-08-19 口径改定：满格丢包**照报**（夹在 999999），不再转 withdraw
- * ——理由见 midr_nds_metrics_to_group2() 头注释。
+ * 满格丢包由 midr_nds_report_link() 在调用本换算函数前转为 withdraw；本 helper
+ * 仍把任意输入夹进第二组接受的数值范围，不能单独承担链路生死语义。
  */
 extern uint32_t midr_nds_metric_loss_ppm(const struct midr_nds_link_metrics *m);
 
@@ -228,16 +228,9 @@ extern uint32_t midr_nds_metric_bw_kbps(const struct midr_nds_link_metrics *m);
  *     link_state，探测中/热身中不提交」的约定。
  * 返回 true 时 *out 已填满，可直接塞进 struct midr_link_update.metrics。
  *
- * ⚠ **满格丢包（loss_rate >= 1.0）照样返回 true**（loss_ppm 夹在 999999）——
- * 2026-08-19 口径改定，推翻轮 1 交接书里「loss==1e6 转 withdraw」那句：
- *   - 他们 loss_ppm >= 1e6 拒收管的是**值域**，不是「该撤链路」，「死链怎么
- *     表达」他们文档没规定，转 withdraw 是我方当初的推导；
- *   - 会话还 Established 而丢包打满 = 「活着但质量烂穿」（07-21 overlay 环路
- *     bug 正是此形态：BGP 全 Established、转发面成环、探测全丢），此时该让
- *     CL 看见差指标自然绕开，而不是宣告这条链路不存在；
- *   - 链路生死一律归**会话/节点级**：清理路径（detach 时
- *     midr_nds_report_link_withdraw）与轮 4/5 的 peer_status_changed 钩子。
- *     指标层不再有任何 withdraw 触发点，两层不打架。
+ * 该换算函数本身对 loss_rate >= 1.0 仍返回 true 并夹到 999999；生产出口
+ * midr_nds_report_link() 会先依照第二组的 link-unavailable 语义执行 withdraw，
+ * 因而调用者不得绕过该出口直接用本 helper 决定链路生死。
  */
 extern bool midr_nds_metrics_to_group2(const struct midr_nds_link_metrics *m,
 				       uint64_t seqno,
@@ -267,11 +260,11 @@ extern void midr_nds_report_link(struct bgp *bgp,
 				 const struct midr_link_entry *link);
 
 /*
- * link 撤销出口：报过才撤，撤完删事实表条目。调用点 = 统一收口原语
+ * link 撤销出口：报过才撤，撤完保留事实表墓碑以延续 version。调用点 = 统一收口原语
  * midr_nds_detach_node()（换群拆边 / 节点下线 / 运维拆边都经它）。
  *
  * 这是「链路生死归会话/节点级」的清理路径那一半（另一半是轮 4/5 要挂的
- * peer_status_changed 钩子）。没报过（reported 为假）就没什么可撤，只删条目。
+ * peer_status_changed 钩子）。没报过（reported 为假）就没什么可撤。
  *
  * ⚠ 历史注记：轮 2/3 的 shim 期它只打日志不发真撤销（旧 E-1 路径本来就没有
  * 「撤 Link NLRI」这个动作，接上去反而改变行为）。件② 起 shim 不参与编译，
@@ -279,6 +272,8 @@ extern void midr_nds_report_link(struct bgp *bgp,
  */
 extern void midr_nds_report_link_withdraw(struct bgp *bgp,
 					  const struct prefix *remote_node_id);
+/* Withdraw every previously reported link while retaining version tombstones. */
+extern void midr_nds_facts_withdraw_all_links(struct bgp *bgp);
 
 /* ===========================================================================
  * 钩子回调（轮 4：上报资格守卫的配套，注册在 bgp_midr_nds_init）

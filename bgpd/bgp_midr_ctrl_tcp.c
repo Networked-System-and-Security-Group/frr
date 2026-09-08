@@ -2,8 +2,8 @@
 /*
  * MIDR Control Layer —— TCP 传输层（列表交换）
  *
- * 承载 REP_LIST / MEMBER_LIST 请求-响应的 TCP 短连接（连上→请求→响应→立即
- * 关）。只管 "可靠地送出一帧、收回一帧"：连接生命周期、监听/接受、非阻塞连接、
+ * 承载 REP_LIST / MEMBER_LIST / BOOTSTRAP_LIST 请求-响应的 TCP 短连接
+ * （连上→请求→响应→立即关）。只管 "可靠地送出一帧、收回一帧"：连接生命周期、监听/接受、非阻塞连接、
  * 长度前缀分帧、超时、错误汇聚。连接对象（struct midr_ctrl_tcp_conn）是本文件
  * 私有，语义层（bgp_midr_ctrl.c）完全不可见——两层经 bgp_midr_ctrl.h 的
  * midr_ctrl_on_tcp_request / on_tcp_response 回调与 tcp_client_start / init /
@@ -13,11 +13,12 @@
  * (docs/decisions/midr-preexchange-transport-udp-vs-tcp.md) 要求 "局限在控制层、
  * 不外溢到 BGP 建连"，拆紧邻的 _tcp.c 属控制层内部组织，不违此意图。
  *
- * PEER_REQUEST 仍走 UDP（bgp_midr_ctrl.c），不在本文件。
+ * 固定长 PEER/ATTACH/ANNOUNCE/REJECT 消息仍走 UDP
+ * （bgp_midr_ctrl.c），不在本文件。
  *
  * 帧格式: [4B 长度前缀 (网络序，只计 payload)][payload = 原 UDP 报文字节]。
- *   请求 payload = 20B struct midr_ctrl_msg (严格等长)。
- *   响应 payload = struct midr_ctrl_list_hdr + count × item。
+ *   请求 payload = 36B Control v4 request (严格等长)。
+ *   响应 payload = 4B list header + count × v4 item。
  *
  * 事件生命周期 / 防 UAF: 每条连接持 t_read/t_write/t_timeout 三事件, 同一轮
  * poll 可能双双就绪。统一关闭 conn_close() 先 event_cancel 三事件 (可摘除已就绪
@@ -44,11 +45,8 @@
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_TCP_CONN, "MIDR ctrl TCP connection");
 
 #define MIDR_CTRL_TCP_TIMEOUT 5 /* 秒: 整条连接寿命上限 (故障保底, 正常触发不到) */
-/* 收侧帧长上限: 由 u16 count 极值推导 (≈1MB), 防假长度大分配。用推导式不用魔数
- * —— 将来能力字段进 member 条目时上限自动跟着结构体走。 */
-#define MIDR_CTRL_TCP_MAX_FRAME                                                 \
-	(sizeof(struct midr_ctrl_list_hdr) +                                   \
-	 65535UL * sizeof(struct midr_ctrl_member_item))
+/* 收侧帧长上限由 v4 最大 item 和 u16 count 推导（2,097,124 bytes）。 */
+#define MIDR_CTRL_TCP_MAX_FRAME MIDR_CTRL_MAX_PAYLOAD
 #define MIDR_CTRL_TCP_MAX_CONNS 128 /* 服务端并发上限, 防 fd 耗尽 */
 #define MIDR_CTRL_TCP_IBUF_INIT 512 /* 客户端收缓冲初值 (响应到手后按帧长扩) */
 #define MIDR_CTRL_TCP_PREFIX_LEN 4  /* 长度前缀字节数 */
@@ -72,7 +70,7 @@ struct midr_ctrl_tcp_conn {
 	struct ipaddr remote;	 /* client=请求目标 / server=accept 对端 (日志/去重键) */
 	uint8_t type;		 /* client: 请求类型 (响应配对/在途去重) */
 	uint32_t target_group;	 /* client: 请求携带的 group */
-	struct stream *ibuf;	 /* server 固定 24B; client 512B 起, 按帧长 resize */
+	struct stream *ibuf;	 /* 512B 起，按已校验的帧长扩容 */
 	struct stream *obuf;	 /* 可扩; 承载待发的整帧 (前缀+payload) */
 	uint32_t frame_len;	 /* 已解析的 payload 长度; 0 = 前缀未解析 */
 	struct event *t_read;
@@ -105,11 +103,11 @@ midr_ctrl_tcp_conn_new(struct bgp *bgp, int fd, enum midr_ctrl_conn_role role)
 	conn->role = role;
 	conn->frame_len = 0;
 
-	/* server 只收一个 20B 请求帧, 收缓冲够装前缀+请求即可; client 响应变长, 起
+	/* server 只收一个 36B 请求帧, 收缓冲够装前缀+请求即可; client 响应变长, 起
 	 * 步 512B, 解析出帧长后再 resize。 */
 	ibuf_init = (role == MIDR_CTRL_CONN_SERVER)
 			    ? (MIDR_CTRL_TCP_PREFIX_LEN +
-			       sizeof(struct midr_ctrl_msg))
+			       MIDR_CTRL_REQUEST_LEN)
 			    : MIDR_CTRL_TCP_IBUF_INIT;
 	conn->ibuf = stream_new(ibuf_init);
 	conn->obuf = stream_new_expandable(256);
@@ -252,10 +250,10 @@ static void midr_ctrl_tcp_read(struct event *t)
 
 		/* 校验帧长 (在扩缓冲之前拦下非法值)。 */
 		if (conn->role == MIDR_CTRL_CONN_SERVER) {
-			if (conn->frame_len != sizeof(struct midr_ctrl_msg)) {
-				MIDR_LOG("MIDR ctrl: TCP request from %pIA bad frame_len %u (want %zu) — closing",
+			if (conn->frame_len != MIDR_CTRL_REQUEST_LEN) {
+				MIDR_LOG("MIDR ctrl: TCP request from %pIA bad frame_len %u (want %u) — closing",
 					 &conn->remote, conn->frame_len,
-					 sizeof(struct midr_ctrl_msg));
+					 MIDR_CTRL_REQUEST_LEN);
 				midr_ctrl_tcp_conn_close(conn);
 				return;
 			}
@@ -334,15 +332,21 @@ static void midr_ctrl_tcp_read(struct event *t)
 
 static void midr_ctrl_tcp_send_request(struct midr_ctrl_tcp_conn *conn)
 {
-	struct midr_ctrl_msg msg = {};
+	uint8_t payload[MIDR_CTRL_REQUEST_LEN];
 
-	midr_ctrl_fill_msg(conn->bgp, &msg, conn->type, conn->target_group);
+	if (!midr_ctrl_encode_request(conn->bgp, payload, sizeof(payload),
+				      conn->type, conn->target_group)) {
+		MIDR_LOG("MIDR ctrl: cannot encode TCP request type %u to %pIA — closing",
+			 conn->type, &conn->remote);
+		midr_ctrl_tcp_conn_close(conn);
+		return;
+	}
 
-	/* 帧总长 24B 恒小于 obuf 初始 256B, raw stream_put 的 CHECK_SIZE 截断
+	/* 帧总长 40B 恒小于 obuf 初始 256B, raw stream_put 的 CHECK_SIZE 截断
 	 * (见 tcp_read 服务端封帧处注释) 在此永不触发。 */
 	stream_reset(conn->obuf);
-	stream_putl(conn->obuf, sizeof(msg));	   /* 4B 长度前缀 */
-	stream_put(conn->obuf, &msg, sizeof(msg)); /* 20B payload */
+	stream_putl(conn->obuf, MIDR_CTRL_REQUEST_LEN);
+	stream_put(conn->obuf, payload, sizeof(payload));
 	midr_ctrl_tcp_start_send(conn);
 }
 
@@ -376,20 +380,37 @@ static void midr_ctrl_tcp_connect_check(struct event *t)
 void midr_ctrl_tcp_client_start(struct bgp *bgp, struct ipaddr dst,
 				uint8_t type, uint32_t target_group)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct bgp_midr_nds *mi;
 	struct listnode *node;
 	struct midr_ctrl_tcp_conn *c;
 	struct midr_ctrl_tcp_conn *conn;
-	union sockunion su_dst;
+	union sockunion su_dst, su_local;
+	struct ipaddr local;
+	struct prefix owner = {};
 	enum connect_result res;
 	int fd;
 
-	if (!mi || !mi->ctrl_tcp_conns)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
-	if (!IS_IPADDR_V4(&dst)) {
-		MIDR_LOG("MIDR ctrl: protocol v3 cannot connect to %pIA", &dst);
+	mi = bgp->midr_nds_info;
+	if (!mi->ctrl_tcp_conns)
+		return;
+	if (!midr_ipaddr_valid_locator(&dst) ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    ipaddr_family(&local) != ipaddr_family(&dst)) {
+		MIDR_LOG("MIDR ctrl: no active same-family transport for TCP request to %pIA",
+			 &dst);
 		return;
 	}
+	if (type != MIDR_CTRL_REP_LIST_REQ &&
+	    type != MIDR_CTRL_MEMBER_LIST_REQ &&
+	    type != MIDR_CTRL_BOOTSTRAP_LIST_REQ)
+		return;
+	owner.family = AF_INET;
+	owner.prefixlen = IPV4_MAX_BITLEN;
+	owner.u.prefix4 = midr_nds_rid_by_transport(bgp, dst);
+	if (!midr_nds_locator_unique(bgp, &owner, &dst))
+		return;
 
 	/* 在途去重: 同 (dst,type) 已有 client 连接 —— group 相同则忽略, 不同 (join
 	 * 中途换群) 则关旧起新。 */
@@ -410,23 +431,29 @@ void midr_ctrl_tcp_client_start(struct bgp *bgp, struct ipaddr dst,
 			  safe_strerror(errno));
 		return;
 	}
+	if (IS_IPADDR_V6(&dst)) {
+		int one = 1;
+
+		if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one,
+			       sizeof(one)) < 0) {
+			zlog_warn("MIDR ctrl: TCP IPV6_V6ONLY(%pIA) failed: %s",
+				  &dst, safe_strerror(errno));
+			close(fd);
+			return;
+		}
+	}
 	set_nonblocking(fd);
 
 	/* 绑源地址到 local_transport_addr (端口 0): TCP 响应沿连接原路回, 对端回包
 	 * 目标 = 我们的源地址; 不绑则内核自动选接口地址, 多跳场景对端可能无回程路由
-	 * (与 BGP 会话设 update-source loopback 同理)。绑定失败仅 warn, 软降级。 */
-	if (mi->transport_addr_set) {
-		union sockunion su_local;
-
-		if (!midr_ipaddr_to_sockunion(&mi->local_transport_addr,
-					     &su_local)) {
-			close(fd);
-			return;
-		}
-		if (sockunion_bind(fd, &su_local, 0, &su_local) < 0)
-			MIDR_LOG("MIDR ctrl: TCP bind source %pIA failed: %s (软降级, 直连仍可用)",
-				 &mi->local_transport_addr,
-				 safe_strerror(errno));
+	 * (与 BGP 会话设 update-source loopback 同理)。Control v4 的严格来源校验要求
+	 * 绑定失败即停。 */
+	if (!midr_ipaddr_to_sockunion(&local, &su_local) ||
+	    sockunion_bind(fd, &su_local, 0, &su_local) < 0) {
+		MIDR_LOG("MIDR ctrl: TCP bind source %pIA failed: %s",
+			 &local, safe_strerror(errno));
+		close(fd);
+		return;
 	}
 
 	if (!midr_ipaddr_to_sockunion(&dst, &su_dst)) {
@@ -479,6 +506,23 @@ bool midr_ctrl_tcp_client_inflight(struct bgp_midr_nds *mi, struct ipaddr dst,
 	return false;
 }
 
+void midr_ctrl_tcp_cancel_target(struct bgp *bgp, struct ipaddr transport)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node, *nnode;
+	struct midr_ctrl_tcp_conn *conn;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+	if (!mi->ctrl_tcp_conns)
+		return;
+
+	for (ALL_LIST_ELEMENTS(mi->ctrl_tcp_conns, node, nnode, conn))
+		if (midr_ipaddr_same(&conn->remote, &transport))
+			midr_ctrl_tcp_conn_close(conn);
+}
+
 /* ------------------------------------------------------------------ */
 /* 服务端: 监听 + 接受                                                   */
 /* ------------------------------------------------------------------ */
@@ -518,42 +562,59 @@ static void midr_ctrl_tcp_accept(struct event *t)
 	midr_ctrl_tcp_want_read(conn);
 }
 
-static void midr_ctrl_tcp_listen(struct bgp *bgp)
+bool midr_ctrl_tcp_open(struct bgp *bgp, const struct ipaddr *local)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct sockaddr_in sa = {};
+	struct bgp_midr_nds *mi;
+	union sockunion su;
 	int sock;
 
-	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (!bgp || !bgp->midr_nds_info ||
+	    !midr_ipaddr_valid_locator(local))
+		return false;
+	mi = bgp->midr_nds_info;
+	if (!mi->ctrl_tcp_conns)
+		return false;
+	midr_ctrl_tcp_close(bgp);
+
+	sock = socket(ipaddr_family(local), SOCK_STREAM, 0);
 	if (sock < 0) {
-		zlog_err("MIDR ctrl: TCP socket() failed: %s (列表交换监听未开, 客户端侧不受影响)",
+		zlog_err("MIDR ctrl: TCP socket(%pIA) failed: %s", local,
 			 safe_strerror(errno));
-		return;
+		return false;
 	}
 	sockopt_reuseaddr(sock);
+	if (IS_IPADDR_V6(local)) {
+		int one = 1;
 
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(INADDR_ANY);
-	sa.sin_port = htons(MIDR_CTRL_TCP_PORT);
-	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_err("MIDR ctrl: TCP bind(:%u) failed: %s",
+		if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &one,
+			       sizeof(one)) < 0) {
+			zlog_err("MIDR ctrl: TCP IPV6_V6ONLY(%pIA) failed: %s",
+				 local, safe_strerror(errno));
+			close(sock);
+			return false;
+		}
+	}
+	if (!midr_ipaddr_to_sockunion(local, &su) ||
+	    sockunion_bind(sock, &su, MIDR_CTRL_TCP_PORT, &su) < 0) {
+		zlog_err("MIDR ctrl: TCP bind(%pIA:%u) failed: %s", local,
 			 MIDR_CTRL_TCP_PORT, safe_strerror(errno));
 		close(sock);
-		return;
+		return false;
 	}
 	if (listen(sock, SOMAXCONN) < 0) {
-		zlog_err("MIDR ctrl: TCP listen(:%u) failed: %s",
+		zlog_err("MIDR ctrl: TCP listen(%pIA:%u) failed: %s", local,
 			 MIDR_CTRL_TCP_PORT, safe_strerror(errno));
 		close(sock);
-		return;
+		return false;
 	}
 	set_nonblocking(sock);
 	mi->ctrl_tcp_lsock = sock;
 	event_add_read(bm->master, midr_ctrl_tcp_accept, bgp, sock,
 		       &mi->t_ctrl_tcp_accept);
 
-	MIDR_LOG("MIDR ctrl: TCP list-exchange channel on :%u",
-		 MIDR_CTRL_TCP_PORT);
+	MIDR_LOG("MIDR ctrl: TCP list-exchange channel ready on %pIA:%u",
+		 local, MIDR_CTRL_TCP_PORT);
+	return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -562,25 +623,25 @@ static void midr_ctrl_tcp_listen(struct bgp *bgp)
 
 void midr_ctrl_tcp_init(struct bgp *bgp)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct bgp_midr_nds *mi;
 
-	if (!mi)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
 
 	/* 连接表先于监听无条件创建: 即便监听失败, 客户端侧仍可发起短连接。 */
 	mi->ctrl_tcp_lsock = -1;
 	mi->ctrl_tcp_conns = list_new();
-
-	midr_ctrl_tcp_listen(bgp); /* 失败仅 warn */
 }
 
-void midr_ctrl_tcp_finish(struct bgp *bgp)
+void midr_ctrl_tcp_close(struct bgp *bgp)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct bgp_midr_nds *mi;
 	struct listnode *node;
 
-	if (!mi)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
 
 	event_cancel(&mi->t_ctrl_tcp_accept);
 	if (mi->ctrl_tcp_lsock >= 0) {
@@ -593,6 +654,17 @@ void midr_ctrl_tcp_finish(struct bgp *bgp)
 		 * 每次取表头关一个。 */
 		while ((node = listhead(mi->ctrl_tcp_conns)) != NULL)
 			midr_ctrl_tcp_conn_close(listgetdata(node));
-		list_delete(&mi->ctrl_tcp_conns);
 	}
+}
+
+void midr_ctrl_tcp_finish(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+	midr_ctrl_tcp_close(bgp);
+	if (mi->ctrl_tcp_conns)
+		list_delete(&mi->ctrl_tcp_conns);
 }

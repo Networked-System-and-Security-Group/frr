@@ -39,16 +39,22 @@ static inline bool midr_ipaddr_to_ipv4(const struct ipaddr *locator,
 
 static inline bool midr_ipaddr_valid_locator(const struct ipaddr *locator)
 {
+	uint32_t address;
+
 	if (!locator || ipaddr_is_zero(locator) || ipaddr_is_mcast(locator))
 		return false;
 
-	if (IS_IPADDR_V4(locator))
-		return true;
+	if (IS_IPADDR_V4(locator)) {
+		address = ntohl(locator->ipaddr_v4.s_addr);
+		return address != INADDR_BROADCAST && !IPV4_NET0(address) &&
+		       !IPV4_NET127(address) && !IPV4_LINKLOCAL(address);
+	}
 
 	if (!IS_IPADDR_V6(locator))
 		return false;
 
-	return !IN6_IS_ADDR_LINKLOCAL(&locator->ipaddr_v6) &&
+	return !IN6_IS_ADDR_LOOPBACK(&locator->ipaddr_v6) &&
+	       !IN6_IS_ADDR_LINKLOCAL(&locator->ipaddr_v6) &&
 	       !IN6_IS_ADDR_V4MAPPED(&locator->ipaddr_v6);
 }
 
