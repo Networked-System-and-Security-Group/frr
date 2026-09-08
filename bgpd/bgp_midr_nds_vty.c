@@ -158,7 +158,7 @@ static struct in_addr midr_vty_rid_for_session_addr(struct bgp *bgp,
 		return rid;
 	/*
 	 * 第三本字典：bootstrap 候选池（批 5 R 系列）。
-	 * 前两本对**引导节点**不保证翻得到——节点表要等它的 Node NLRI 传过来（刚起
+	 * 前两本对**引导节点**不保证翻得到——专职引导通常没有 remote-view Node 条目（刚起
 	 * 或链路不通时就没有），而挂靠没建成的半边（对方死了/拒了、会话停在 Active）
 	 * 也没有 remote_id。于是"拆掉这条挂靠边顺便把这台引导拉黑"就落空（报"未能
 	 * 持久排除"）。候选池里每条都带运维手配的 rid，正好补上这一级。
@@ -166,28 +166,102 @@ static struct in_addr midr_vty_rid_for_session_addr(struct bgp *bgp,
 	return midr_nds_bootstrap_rid_by_transport(bgp, addr);
 }
 
+static bool midr_vty_parse_locator(const char *text, struct ipaddr *locator)
+{
+	if (!text || !locator || str2ipaddr(text, locator) != 0 ||
+	    !midr_ipaddr_valid_locator(locator)) {
+		if (locator)
+			SET_IPADDR_NONE(locator);
+		return false;
+	}
+	return true;
+}
+
+/* Validate before changing configuration, blacklist, or runtime state. */
+static bool midr_vty_locator_family_ok(struct vty *vty,
+				     const struct bgp_midr_nds *mi,
+				     const struct ipaddr *locator)
+{
+	struct listnode *node;
+	struct midr_bootstrap_entry *bootstrap;
+	struct midr_manual_session *session;
+	int family = ipaddr_family(locator);
+
+	if ((mi->transport_addr_set &&
+	     family != ipaddr_family(&mi->local_transport_addr)) ||
+	    (mi->transport_active &&
+	     family != ipaddr_family(&mi->active_transport_addr))) {
+		vty_out(vty, "%% MIDR locator family differs from local transport; remove transport before changing family\n");
+		return false;
+	}
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, bootstrap)) {
+		if (family == ipaddr_family(&bootstrap->transport))
+			continue;
+		vty_out(vty, "%% MIDR locator family conflicts with bootstrap %pIA; remove that candidate first\n",
+			&bootstrap->transport);
+		return false;
+	}
+	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session)) {
+		if (family == ipaddr_family(&session->transport))
+			continue;
+		vty_out(vty, "%% MIDR locator family conflicts with manual session %pIA; remove that session first\n",
+			&session->transport);
+		return false;
+	}
+	return true;
+}
+
+static struct midr_manual_session *
+midr_vty_manual_session_find(struct bgp *bgp, const struct ipaddr *transport)
+{
+	struct listnode *node;
+	struct midr_manual_session *session;
+
+	if (!bgp || !bgp->midr_nds_info || !transport)
+		return NULL;
+	for (ALL_LIST_ELEMENTS_RO(bgp->midr_nds_info->manual_sessions, node,
+				  session))
+		if (midr_ipaddr_same(&session->transport, transport))
+			return session;
+	return NULL;
+}
+
 DEFUN(midr_session,
       midr_session_cmd,
-      "midr session A.B.C.D remote-as (1-4294967295)",
+      "midr session <A.B.C.D|X:X::X:X> remote-as (1-4294967295)",
       "MIDR configuration\n"
       "Manually build a MIDR overlay session (escape hatch/debug; normal join uses midr group-id / midr bootstrap)\n"
-      "Session peer IP address\n"
+      "Session peer IPv4 address\n"
+      "Session peer IPv6 address\n"
       "Remote AS\n"
       "AS number\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	union sockunion su;
+	struct ipaddr transport, local;
 	as_t asn = (as_t)atol(argv[4]->arg);
+	struct midr_node_entry target = {};
+	struct in_addr rid;
 	struct peer *peer;
-	int ret;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
 
-	if (str2sockunion(argv[2]->arg, &su) < 0) {
-		vty_out(vty, "%% Invalid IP address: %s\n", argv[2]->arg);
+	if (!midr_vty_parse_locator(argv[2]->arg, &transport) ||
+	    !midr_ipaddr_to_sockunion(&transport, &su)) {
+		vty_out(vty, "%% Invalid unicast locator: %s\n", argv[2]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	if ((bgp->midr_nds_info->transport_addr_set &&
+	     midr_ipaddr_same(&transport,
+			      &bgp->midr_nds_info->local_transport_addr)) ||
+	    (bgp->midr_nds_info->transport_active &&
+	     midr_ipaddr_same(&transport,
+			      &bgp->midr_nds_info->active_transport_addr))) {
+		vty_out(vty, "%% Refusing a MIDR session to the local locator %s\n",
+			argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
@@ -198,27 +272,14 @@ DEFUN(midr_session,
 	 */
 	peer = peer_lookup(bgp, &su);
 	if (peer) {
-		if (midr_nds_peer_is_overlay(peer)) {
-			struct in_addr rid = midr_vty_rid_for_session_addr(
-				bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), peer);
-
-			/* 已是 MIDR 自建会话：幂等重整形（同值短路、不 reset），不改 AS。 */
-			midr_nds_ctrl_setup_overlay_peer(bgp, peer);
-			/* 本路径命令【成功】，同样是运维显式意图 → 一并解除排除
-			 * （见下方 peer_remote_as 前那段注释）。排除名单以 rid 为键。 */
-			if (rid.s_addr != INADDR_ANY)
-				midr_nds_session_exclude_del(bgp, rid);
-			/* 台账家规②：运维点名 → 记 MANUAL（粘性，之后自动流程
-			 * 不改写它的原因）。会话已存在也照记——记账不看去重。 */
-			midr_nds_ledger_note(bgp,
-					     midr_ipaddr_from_ipv4(su.sin.sin_addr),
-					     MIDR_SESSION_MANUAL, rid, 0);
+		if (midr_nds_peer_is_overlay(peer) && peer->as != asn) {
 			vty_out(vty,
-				"MIDR session %s 已存在（MIDR overlay 会话），已确保形态一致\n",
-				argv[2]->arg);
-			vty_out(vty, "%s", MIDR_SESSION_SYMMETRY_HINT);
-			return CMD_SUCCESS;
+				"%% MIDR session %s already uses remote-as %u; remove it before changing AS\n",
+				argv[2]->arg, peer->as);
+			return CMD_WARNING_CONFIG_FAILED;
 		}
+		if (midr_nds_peer_is_overlay(peer))
+			goto accepted;
 		/* 运维会话占用该地址：拒绝接管（运维优先，绝不动它）。
 		 * ⚠ 件②（轮 4）迁 MIDR-LS 后**不再复用运维会话**（真分离约定），
 		 * 所以两种情形都只能改地址，区别仅在提示里点明现状。 */
@@ -233,55 +294,53 @@ DEFUN(midr_session,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	/*
-	 * 手工敲这条命令是运维显式意图，必须能覆盖此前的 `no midr session`
-	 * 排除——否则下一次自动重收敛（connect_group）又会被排除名单挡住，
-	 * 运维刚建好的会话反而在下一次换组/退群时消失，从"手工建连"退化成
-	 * "手工建一次性连接"。
-	 *
-	 * 【我方改动，需知会 zhc】此句原在 S3 撞车守卫【之前】：守卫一拒（命令
-	 * 失败），排除却已经解除了——运维以为自己那条 `no midr session` 还生效，
-	 * 实际该节点已能被自动流程连回来（副作用先于校验）。挪到守卫之后，只在
-	 * 命令真要往下走时才解除；守卫里"已是 overlay 会话"那条【成功】路径另
-	 * 补了一次。
-	 *
-	 * 排除名单以 router-id 为键（08-11 批 2）：这条路径上 peer 尚未建立
-	 * （下面才 peer_remote_as），只能靠节点表反查。查不到就解除不了——告警
-	 * 说清楚，别让运维以为拉黑已经撤了。
-	 */
-	{
-		struct in_addr rid = midr_vty_rid_for_session_addr(
-			bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), NULL);
-
-		if (rid.s_addr != INADDR_ANY)
-			midr_nds_session_exclude_del(bgp, rid);
-		else if (midr_nds_session_blacklist_nonempty(bgp))
-			vty_out(vty,
-				"%% 注意：查不到 %s 的 router-id（节点表里没有它），无法解除可能存在的排除记录；会话照建，但自动重收敛仍可能被排除名单挡住\n",
-				argv[2]->arg);
-	}
-
-	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
-	if (ret != 0) {
-		vty_out(vty, "%% Failed to add neighbor %s (err %d)\n",
-			argv[2]->arg, ret);
+accepted:
+	if (!midr_vty_locator_family_ok(vty, bgp->midr_nds_info, &transport))
+		return CMD_WARNING_CONFIG_FAILED;
+	rid = midr_vty_rid_for_session_addr(bgp, transport, peer);
+	target.node_id.family = AF_INET;
+	target.node_id.prefixlen = IPV4_MAX_BITLEN;
+	target.node_id.u.prefix4 = rid;
+	if ((rid.s_addr != INADDR_ANY &&
+	     IPV4_ADDR_SAME(&rid, &bgp->router_id)) ||
+	    !midr_nds_locator_unique(bgp, &target.node_id, &transport)) {
+		vty_out(vty, "%% MIDR session locator %s has a conflicting node identity\n",
+			argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
+	if (rid.s_addr != INADDR_ANY)
+		midr_nds_session_exclude_del(bgp, rid);
+	else if (midr_nds_session_blacklist_nonempty(bgp))
+		vty_out(vty,
+			"%% Cannot resolve %s to a router-id; a pre-existing identity blacklist entry cannot be removed\n",
+			argv[2]->arg);
 
-	/* 与自动建连（midr_ctrl_connect）共用同一整形：multihop + update-source
-	 * + 只载 BGP-LS（撤 FRR 自动附送的 IPv4 单播——overlay 不得向 underlay
-	 * 注入转发路由）。定义与理由见 midr_nds_ctrl_setup_overlay_peer。 */
+	/* Save exact-address operator intent independently of transient peer and
+	 * ledger objects.  It is also the config writer's source of truth. */
+	midr_nds_manual_session_set(bgp, transport, asn, rid);
+	if (bgp_config_inprocess() || bgp->midr_nds_info->shutdown ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    ipaddr_family(&local) != ipaddr_family(&transport)) {
+		vty_out(vty,
+			"MIDR session %s AS %u configured (inactive until a same-family local transport is active)\n",
+			argv[2]->arg, asn);
+		vty_out(vty, "%s", MIDR_SESSION_SYMMETRY_HINT);
+		return CMD_SUCCESS;
+	}
+
+	target.transport_addr = transport;
+	target.has_transport_addr = true;
+	target.asn = asn;
+	midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+
 	peer = peer_lookup(bgp, &su);
-	if (peer)
-		midr_nds_ctrl_setup_overlay_peer(bgp, peer);
-
-	/* 台账家规②：运维点名建的边记 MANUAL（粘性）。本轮骨干互连也走这条
-	 * 命令（Q7 定：骨干纯手工），故引导之间的边同样落在 MANUAL 名下。 */
-	midr_nds_ledger_note(
-		bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), MIDR_SESSION_MANUAL,
-		midr_nds_rid_by_transport(
-			bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr)),
-		0);
+	if (!peer || !midr_nds_peer_is_overlay(peer)) {
+		vty_out(vty,
+			"%% MIDR session %s is configured but peer creation failed\n",
+			argv[2]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	midr_nds_ctrl_setup_overlay_peer(bgp, peer);
 
 	vty_out(vty, "MIDR session %s AS %u created\n", argv[2]->arg, asn);
 	vty_out(vty, "%s", MIDR_SESSION_SYMMETRY_HINT);
@@ -290,10 +349,11 @@ DEFUN(midr_session,
 
 /* 旧名弃用别名（Q5 过渡期保留：不出现在 ? 补全，但仍可执行；过渡期后删）。 */
 ALIAS_DEPRECATED(midr_session, midr_neighbor_cmd,
-      "midr neighbor A.B.C.D remote-as (1-4294967295)",
+      "midr neighbor <A.B.C.D|X:X::X:X> remote-as (1-4294967295)",
       "MIDR configuration\n"
       "Deprecated alias of `midr session` (kept for transition)\n"
-      "Session peer IP address\n"
+      "Session peer IPv4 address\n"
+      "Session peer IPv6 address\n"
       "Remote AS\n"
       "AS number\n")
 
@@ -303,38 +363,47 @@ ALIAS_DEPRECATED(midr_session, midr_neighbor_cmd,
 
 DEFUN(no_midr_session,
       no_midr_session_cmd,
-      "no midr session A.B.C.D",
+      "no midr session <A.B.C.D|X:X::X:X>",
       NO_STR
       "MIDR configuration\n"
       "Tear down a MIDR overlay session (guarded: operator sessions refused)\n"
-      "Session peer IP address\n")
+      "Session peer IPv4 address\n"
+      "Session peer IPv6 address\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	union sockunion su;
+	struct ipaddr transport;
+	struct midr_manual_session *manual;
+	const struct midr_session_ledger_entry *ledger;
 	struct peer *peer;
 	struct in_addr excl_rid;
+	bool operator_peer;
 
-	if (str2sockunion(argv[3]->arg, &su) < 0) {
-		vty_out(vty, "%% Invalid IP address: %s\n", argv[3]->arg);
+	if (!bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+	if (!midr_vty_parse_locator(argv[3]->arg, &transport) ||
+	    !midr_ipaddr_to_sockunion(&transport, &su)) {
+		vty_out(vty, "%% Invalid unicast locator: %s\n", argv[3]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
+	manual = midr_vty_manual_session_find(bgp, &transport);
+	ledger = midr_nds_ledger_lookup(bgp, transport);
 	peer = peer_lookup(bgp, &su);
-	if (!peer) {
-		vty_out(vty, "%% Neighbor %s not found\n", argv[3]->arg);
+	operator_peer = peer && !midr_nds_peer_is_overlay(peer);
+	if (!manual && !ledger && (!peer || operator_peer)) {
+		vty_out(vty, "%% MIDR session %s is not configured\n",
+			argv[3]->arg);
 		return CMD_WARNING;
 	}
 
 	/*
-	 * S2 归属守卫：只拆 MIDR 自建的 overlay 会话，绝不误删运维 underlay 会话
-	 * （删了会砸转发面）。判据 = OVERLAY 标记（运维原生会话永远没有它）。
+	 * S2 归属守卫由三个统一清理入口执行：它们只拆带 OVERLAY 标记的 peer。
+	 * 若同地址恰有运维会话，仍允许删除独立的 MIDR 配置/台账意图，但必须保留
+	 * 运维 peer；“仅有运维 peer”在上面按“未配置 MIDR session”返回。
 	 */
-	if (!midr_nds_peer_is_overlay(peer)) {
-		vty_out(vty,
-			"%% %s 是运维配置的会话（非 MIDR overlay），拒绝删除；如确需删除请用原生命令 no neighbor %s\n",
-			argv[3]->arg, argv[3]->arg);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
 
 	/*
 	 * 排除名单以 router-id 为键（08-11 批 2），而本命令的入参是地址——**必须
@@ -342,20 +411,18 @@ DEFUN(no_midr_session,
 	 * 来源就没了。
 	 */
 	excl_rid = midr_vty_rid_for_session_addr(
-		bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr), peer);
+		bgp, transport, peer);
+	if (excl_rid.s_addr == INADDR_ANY && manual)
+		excl_rid = manual->remote_rid;
 
-	/*
-	 * S6 清账：按地址反查节点表条目，查到走 detach 全套（停探 + 删 link +
-	 * 清 is_adjacent + 拆会话）；查不到（该地址不对应已知节点）退化为只拆会话。
-	 */
-	if (!midr_nds_detach_by_locator(
-		    bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr)))
-		peer_delete(peer);
-
-	/* 拆口销账：detach 那条路已经过 midr_try_disconnect 销过账，这里补的是
-	 * 上面 peer_delete 退化分支（该地址不对应已知节点，detach 走不到）。
-	 * drop 幂等，重复调用无副作用。 */
-	midr_nds_ledger_drop(bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr));
+	(void)midr_nds_manual_session_del(bgp, transport);
+	/* First clean the node/PM/fact side, then force-remove the exact NDS-owned
+	 * runtime edge.  `force` is justified here by an explicit operator command;
+	 * the persistent MANUAL intent was removed immediately above. */
+	(void)midr_nds_detach_by_locator(bgp, transport);
+	midr_ctrl_detach_transport(bgp, transport, excl_rid, true,
+				   MIDR_STOP_SESSION_DOWN);
+	midr_ctrl_forget_target(bgp, transport);
 
 	/*
 	 * 持久排除而非临时拔线——运维显式敲这条命令表达"不想再跟这个节点做
@@ -365,15 +432,22 @@ DEFUN(no_midr_session,
 	 */
 	if (excl_rid.s_addr != INADDR_ANY) {
 		midr_nds_session_exclude_add(bgp, excl_rid);
-		vty_out(vty,
-			"MIDR session %s removed and persistently excluded (rid %pI4; use `midr session %s remote-as <ASN>` to reconnect)\n",
-			argv[3]->arg, &excl_rid, argv[3]->arg);
+		if (operator_peer)
+			vty_out(vty,
+				"MIDR intent for %s removed and persistently excluded (rid %pI4); the operator-configured BGP peer at this address was preserved\n",
+				argv[3]->arg, &excl_rid);
+		else
+			vty_out(vty,
+				"MIDR session %s removed and persistently excluded (rid %pI4; use `midr session %s remote-as <ASN>` to reconnect)\n",
+				argv[3]->arg, &excl_rid, argv[3]->arg);
 	} else {
 		/* 解析不出真名 = 没法记进以 router-id 为键的名单。会话照拆，但
 		 * 必须说清楚"这次没拉黑"——否则运维以为拉黑了，自动重收敛却把它
 		 * 连回来。宁可不落表，也不拿地址冒充 rid 混进表里。 */
-		vty_out(vty,
-			"MIDR session %s removed\n", argv[3]->arg);
+		vty_out(vty, operator_peer
+				     ? "MIDR intent for %s removed; the operator-configured BGP peer was preserved\n"
+				     : "MIDR session %s removed\n",
+			argv[3]->arg);
 		vty_out(vty,
 			"%% 未能持久排除：查不到该地址对应的 router-id（会话未曾 Established 且节点表中无此节点）。自动重收敛可能把它连回来；待学到该节点后重敲本命令即可拉黑\n");
 	}
@@ -383,11 +457,12 @@ DEFUN(no_midr_session,
 
 /* 旧名弃用别名（Q5 过渡期保留；过渡期后删）。 */
 ALIAS_DEPRECATED(no_midr_session, no_midr_neighbor_cmd,
-      "no midr neighbor A.B.C.D",
+      "no midr neighbor <A.B.C.D|X:X::X:X>",
       NO_STR
       "MIDR configuration\n"
       "Deprecated alias of `no midr session` (kept for transition)\n"
-      "Session peer IP address\n")
+      "Session peer IPv4 address\n"
+      "Session peer IPv6 address\n")
 
 /* ------------------------------------------------------------------ */
 /* midr role bootstrap / no midr role bootstrap                        */
@@ -571,7 +646,7 @@ DEFUN(no_midr_role_group_rep,
 /* 键、恒有真名，rid=0 这个中间态从产生源上消失。                       */
 /*                                                                      */
 /* 引导冷启动时目录为空不需要手配兜底：应答侧空目录本就沉默不回包，请求 */
-/* 侧 3s×5 死心后 failover 换下一台引导，等 BGP-LS 收敛后自愈。         */
+/* 侧 3s×5 死心后 failover 换下一台引导，等远端视图收敛后自愈。         */
 /* 救僵尸群改用 `midr role group-rep`（带"群里已有代表则拒"守卫）。     */
 /* 决策见 docs/群间保底连接/轮2/轮2执行计划.md 答疑 92 与批 1.5 段。    */
 /* ------------------------------------------------------------------ */
@@ -582,10 +657,11 @@ DEFUN(no_midr_role_group_rep,
 
 DEFUN(midr_bootstrap,
       midr_bootstrap_cmd,
-      "midr bootstrap A.B.C.D remote-as (1-4294967295) router-id A.B.C.D",
+      "midr bootstrap <A.B.C.D|X:X::X:X> remote-as (1-4294967295) router-id A.B.C.D",
       "MIDR configuration\n"
       "Join the network via a bootstrap node\n"
-      "Bootstrap node IP address\n"
+      "Bootstrap node IPv4 address\n"
+      "Bootstrap node IPv6 address\n"
       "Remote AS\n"
       "AS number\n"
       "Bootstrap node router-id (identity; required)\n"
@@ -593,6 +669,7 @@ DEFUN(midr_bootstrap,
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	union sockunion su;
+	struct ipaddr transport;
 	as_t asn = (as_t)atol(argv[4]->arg);
 	struct in_addr rid;
 
@@ -601,14 +678,26 @@ DEFUN(midr_bootstrap,
 		return CMD_WARNING;
 	}
 
-	if (str2sockunion(argv[2]->arg, &su) < 0) {
-		vty_out(vty, "%% Invalid IP address: %s\n", argv[2]->arg);
+	if (!midr_vty_parse_locator(argv[2]->arg, &transport) ||
+	    !midr_ipaddr_to_sockunion(&transport, &su)) {
+		vty_out(vty, "%% Invalid unicast locator: %s\n", argv[2]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	if ((bgp->midr_nds_info->transport_addr_set &&
+	     midr_ipaddr_same(&transport,
+			      &bgp->midr_nds_info->local_transport_addr)) ||
+	    (bgp->midr_nds_info->transport_active &&
+	     midr_ipaddr_same(&transport,
+			      &bgp->midr_nds_info->active_transport_addr))) {
+		vty_out(vty, "%% Bootstrap locator %s is this node itself\n",
+			argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
 	/*
-	 * router-id 必选（批 5 R 系列）：引导节点不发 Node NLRI，谁也学不到它的
-	 * 真名，只能由运维在这里给。三处指着它——挂靠挑台按 rid 排环（确定可
+	 * router-id 必选（批 5 R 系列）：第一次通信之前，本机并不保证已从权威
+	 * remote-view 学到引导身份，只能由运维在这里给。三处指着它——挂靠挑台
+	 * 按 rid 排环（确定可
 	 * 重放）、`no midr session <引导IP>` 按 rid 落排除名单、会话台账登记对端
 	 * 身份。做成必选而非可选，是为了保住"候选池内 rid 恒非 0"这条不变量：
 	 * 有一条无名条目，上面三处就都要加兜底。
@@ -621,6 +710,8 @@ DEFUN(midr_bootstrap,
 		vty_out(vty, "%% router-id 不能为 0.0.0.0\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
+	if (!midr_vty_locator_family_ok(vty, bgp->midr_nds_info, &transport))
+		return CMD_WARNING_CONFIG_FAILED;
 
 	/*
 	 * 回显只说"开始加入"，不提具体引导节点——这条命令的语义是【追加候选】
@@ -641,17 +732,18 @@ DEFUN(midr_bootstrap,
 	return CMD_SUCCESS;
 }
 
-/* no midr bootstrap [A.B.C.D]  (§8.32：删一条候选 / 清空候选并中止在途加入) */
+/* no midr bootstrap [locator]  (§8.32：删一条候选 / 清空候选并中止在途加入) */
 DEFUN(no_midr_bootstrap,
       no_midr_bootstrap_cmd,
-      "no midr bootstrap [A.B.C.D]",
+      "no midr bootstrap [<A.B.C.D|X:X::X:X>]",
       NO_STR
       "MIDR configuration\n"
       "Join the network via a bootstrap node\n"
-      "Bootstrap node IP address (omit to clear all candidates)\n")
+      "Bootstrap node IPv4 address (omit to clear all candidates)\n"
+      "Bootstrap node IPv6 address (omit to clear all candidates)\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	union sockunion su;
+	struct ipaddr transport;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
@@ -665,12 +757,11 @@ DEFUN(no_midr_bootstrap,
 		return CMD_SUCCESS;
 	}
 
-	if (str2sockunion(argv[3]->arg, &su) < 0 || su.sa.sa_family != AF_INET) {
-		vty_out(vty, "%% Invalid IPv4 address: %s\n", argv[3]->arg);
+	if (!midr_vty_parse_locator(argv[3]->arg, &transport)) {
+		vty_out(vty, "%% Invalid unicast locator: %s\n", argv[3]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
-	if (!midr_bootstrap_list_del(
-		    bgp, midr_ipaddr_from_ipv4(su.sin.sin_addr))) {
+	if (!midr_bootstrap_list_del(bgp, transport)) {
 		vty_out(vty, "%% No such bootstrap candidate: %s\n", argv[3]->arg);
 		return CMD_WARNING;
 	}
@@ -679,37 +770,45 @@ DEFUN(no_midr_bootstrap,
 }
 
 /* ------------------------------------------------------------------ */
-/* midr transport-address A.B.C.D   (node's real reachable locator)    */
+/* midr transport-address <locator> (node's real reachable locator)   */
 /* ------------------------------------------------------------------ */
 
 DEFUN(midr_transport_address,
       midr_transport_address_cmd,
-      "midr transport-address A.B.C.D",
+      "midr transport-address <A.B.C.D|X:X::X:X>",
       "MIDR configuration\n"
       "Set the local reachable address others use to peer with / probe us\n"
-      "IPv4 address\n")
+      "IPv4 address\n"
+      "IPv6 address\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct in_addr addr;
+	struct ipaddr transport;
+	int ret;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
 
-	if (inet_pton(AF_INET, argv[2]->arg, &addr) != 1) {
-		vty_out(vty, "%% Invalid IPv4 address: %s\n", argv[2]->arg);
+	if (!midr_vty_parse_locator(argv[2]->arg, &transport)) {
+		vty_out(vty, "%% Invalid unicast locator: %s\n", argv[2]->arg);
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp->midr_nds_info->local_transport_addr = midr_ipaddr_from_ipv4(addr);
-	bgp->midr_nds_info->transport_addr_set = true;
-	midr_nds_report_node(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE); /* +TLV 1188 */
-
-	/* Open PM socket now that we have an address to bind to.  midr_pm_init()
-	 * runs before the config file is read, so the socket is deferred until
-	 * this command is processed. */
-	midr_pm_on_transport_addr_set(bgp);
+	if (!midr_vty_locator_family_ok(vty, bgp->midr_nds_info, &transport))
+		return CMD_WARNING_CONFIG_FAILED;
+	ret = midr_nds_transport_configure(bgp, &transport);
+	if (ret) {
+		if (ret == -EADDRINUSE)
+			vty_out(vty,
+				"%% MIDR transport-address %s is configured but inactive (locator conflicts with another node); it will be retried periodically\n",
+				argv[2]->arg);
+		else
+			vty_out(vty,
+				"%% MIDR transport-address %s is configured but inactive (local Control bind failed); it will be retried periodically\n",
+				argv[2]->arg);
+		return CMD_WARNING_CONFIG_FAILED;
+	}
 
 	vty_out(vty, "MIDR transport-address set to %s\n", argv[2]->arg);
 	return CMD_SUCCESS;
@@ -717,22 +816,38 @@ DEFUN(midr_transport_address,
 
 DEFUN(no_midr_transport_address,
       no_midr_transport_address_cmd,
-      "no midr transport-address [A.B.C.D]",
+      "no midr transport-address [<A.B.C.D|X:X::X:X>]",
       NO_STR
       "MIDR configuration\n"
       "Clear the local reachable address\n"
-      "IPv4 address\n")
+      "IPv4 address\n"
+      "IPv6 address\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ipaddr supplied;
+	struct bgp_midr_nds *mi;
 
 	if (!bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
+	mi = bgp->midr_nds_info;
+	if (argc >= 4) {
+		if (!midr_vty_parse_locator(argv[3]->arg, &supplied)) {
+			vty_out(vty, "%% Invalid unicast locator: %s\n",
+				argv[3]->arg);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+		if (!mi->transport_addr_set ||
+		    !midr_ipaddr_same(&supplied, &mi->local_transport_addr)) {
+			vty_out(vty,
+				"%% Configured MIDR transport-address does not match %s\n",
+				argv[3]->arg);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+	}
 
-	bgp->midr_nds_info->transport_addr_set = false;
-	SET_IPADDR_NONE(&bgp->midr_nds_info->local_transport_addr);
-	midr_nds_report_node(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE); /* -TLV 1188 */
+	(void)midr_nds_transport_configure(bgp, NULL);
 
 	vty_out(vty, "MIDR transport-address cleared\n");
 	return CMD_SUCCESS;
@@ -776,10 +891,10 @@ DEFUN(midr_shutdown,
 	vty_out(vty,
 		"MIDR: 已退网（撤销自身通告、拆除 MIDR 会话、停止探测、清空节点表；群号回落 %u）\n",
 		bgp->midr_nds_info->local_group_id);
-	/* 运维手配过的两样：退网清运行态，提醒重入后自己重敲（不替运维记账）。 */
+	/* 运维手配会话清运行态，但配置意图独立保存，重入时自动恢复。 */
 	if (manual)
 		vty_out(vty,
-			"%% 其中 %u 条是运维手配会话——重入后如仍需要，请重敲 `midr session <IP> remote-as <ASN>`\n",
+			"%% 其中 %u 条是运维手配会话——配置意图已保留，`no midr shutdown` 后自动恢复\n",
 			manual);
 	if (was_rep)
 		vty_out(vty,
@@ -840,8 +955,8 @@ static const char *midr_caps_str(uint32_t caps, char *buf, size_t len)
 /*
  * 三个节点表视图命令 (nodes/reps/bootstraps) 共用的表格体: required_caps=0
  * 列全部, 非 0 只列 capabilities 含全部所要位的节点。reps/bootstraps 是同一
- * 张表的过滤视图, 含 expired 条目 (诊断命令要能看见异常; 协议侧 REP_LIST 组
- * 装另用严过滤, 见 midr_rep_candidates)。
+ * 张表的过滤视图；表项生死由权威 remote-view withdraw 或 Control 临时状态
+ * 清理决定。协议侧 REP_LIST 组装另用严过滤，见 midr_rep_candidates()。
  */
 /* 年龄格式化：show midr nodes 的 Age 列与 bootstrap-seeds 共用一把尺。 */
 static void midr_seed_age_str(time_t age, char *buf, size_t len)
@@ -868,23 +983,23 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 	char caps_buf[64];
 	time_t now = monotime(NULL);
 
-	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
+	vty_out(vty, "%-18s %-39s %-8s %-10s %-8s %s\n",
 		"Router-ID", "Transport-Addr", "ASN", "Group-ID", "Age",
 		"Capabilities");
-	vty_out(vty, "%-18s %-18s %-8s %-10s %-8s %s\n",
-		"------------------", "------------------", "--------",
+	vty_out(vty, "%-18s %-39s %-8s %-10s %-8s %s\n",
+		"------------------", "---------------------------------------", "--------",
 		"----------", "--------", "------------");
 
 	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes, entry) {
-		char taddr[INET_ADDRSTRLEN];
+		char taddr[IPADDR_STRING_SIZE];
 		char age[32];
 
 		if ((entry->capabilities & required_caps) != required_caps)
 			continue;
 
-		if (entry->has_transport_addr)
-			inet_ntop(AF_INET, &entry->transport_addr, taddr,
-				  sizeof(taddr));
+		if (entry->has_transport_addr &&
+		    midr_ipaddr_valid_locator(&entry->transport_addr))
+			ipaddr2str(&entry->transport_addr, taddr, sizeof(taddr));
 		else
 			snprintf(taddr, sizeof(taddr), "-");
 
@@ -896,7 +1011,7 @@ static void midr_show_node_table(struct vty *vty, struct bgp *bgp,
 			midr_seed_age_str(now - entry->last_update, age,
 					  sizeof(age));
 
-		vty_out(vty, "%-18pI4 %-18s %-8u %-10u %-8s %s\n",
+		vty_out(vty, "%-18pI4 %-39s %-8u %-10u %-8s %s\n",
 			&entry->node_id.u.prefix4,
 			taddr,
 			entry->asn,
@@ -951,8 +1066,8 @@ DEFUN(show_midr_reps,
 	}
 
 	/*
-	 * 只剩这一段"全网视图"（按 GROUP_REP 能力位从节点表过滤，随 NLRI 更新、
-	 * 会 expire、带 router-id）。原下半段 `Local rep directory` 已随
+	 * 只剩这一段"全网视图"（按 GROUP_REP 能力位从节点表过滤，随权威
+	 * remote-view update/withdraw 更新、带 router-id）。原下半段 `Local rep directory` 已随
 	 * `midr rep group` 一并删除（2026-08-11 批 1.5）——手配来源没了之后，
 	 * 引导侧 rep_dir 恒空，加入方那份则是 join 那一刻收来的死快照（无刷新
 	 * 无老化），展示出来只会被读成"这是我配的"。看代表一律看本表。
@@ -990,9 +1105,9 @@ DEFUN(show_midr_bootstraps,
 /* show midr bootstrap-seeds （子稿 §4-2）                             */
 /*                                                                     */
 /* 与上面 `show midr bootstraps` 是**两回事**，别混：                  */
-/*   - bootstraps  = 节点表按 BOOTSTRAP 能力位过滤的**运行时视图**     */
-/*     （靠对方发 Node NLRI 才看得见；批 5 引导不再发 NLRI 后它会空掉，*/
-/*      删除已登记在对接轮清理批）；                                   */
+/*   - bootstraps  = 节点表按 BOOTSTRAP 能力位过滤的**运行时视图**；当前 */
+/*     专职引导不发布自身 Node fact，且群 0 pending 不保证回灌，因此该表 */
+/*     可以为空；                                                        */
 /*   - bootstrap-seeds = **持久化种子表**（bgpd.db）现查现出，是"我连过/ */
 /*     学到过哪些引导"的跨重启记忆，重启自举的第一跳清单就从它读回。   */
 /* ------------------------------------------------------------------ */
@@ -1003,6 +1118,7 @@ struct midr_seed_show_ctx {
 	time_t now;
 };
 
+#ifdef HAVE_SQLITE3
 /* 把"距今多久"印成人话（秒/分/时/天），比裸的 epoch 好读得多。 */
 static void midr_seed_show_cb(const char *transport, uint32_t asn,
 			      const char *rid, time_t last_seen, void *arg)
@@ -1011,10 +1127,11 @@ static void midr_seed_show_cb(const char *transport, uint32_t asn,
 	char age[32];
 
 	midr_seed_age_str(ctx->now - last_seen, age, sizeof(age));
-	vty_out(ctx->vty, "%-18s %-10u %-16s %s\n", transport, asn,
+	vty_out(ctx->vty, "%-39s %-10u %-16s %s\n", transport, asn,
 		rid ? rid : "-", age);
 	ctx->count++;
 }
+#endif /* HAVE_SQLITE3 */
 
 DEFUN(show_midr_bootstrap_seeds,
       show_midr_bootstrap_seeds_cmd,
@@ -1031,9 +1148,9 @@ DEFUN(show_midr_bootstrap_seeds,
 	 * 不能用 monotime——那是节点表那个同名字段的时钟，混用会算出荒谬的距今。 */
 	ctx.now = time(NULL);
 
-	vty_out(vty, "%-18s %-10s %-16s %s\n", "Transport", "ASN", "Router-ID",
+	vty_out(vty, "%-39s %-10s %-16s %s\n", "Transport", "ASN", "Router-ID",
 		"Last-seen");
-	vty_out(vty, "%-18s %-10s %-16s %s\n", "------------------",
+	vty_out(vty, "%-39s %-10s %-16s %s\n", "---------------------------------------",
 		"----------", "----------------", "------------");
 
 	midr_store_seed_load(midr_seed_show_cb, &ctx);
@@ -1052,26 +1169,28 @@ DEFUN(show_midr_bootstrap_seeds,
 /* show midr neighbors                                                 */
 /*                                                                     */
 /* Unlike `show midr nodes` (which lists every node learned from a     */
-/* BGP-LS Node NLRI — possibly relayed, not directly connected), this  */
-/* lists the BGP peers we have an actual MIDR session with, i.e. peers */
-/* with the BGP-LS address-family activated.  Group-id / capabilities  */
-/* are cross-referenced from the node table when available.            */
+/* Remote node facts may be relayed rather than directly connected.     */
+/* This command lists the BGP peers owned by NDS; the MIDR-LS column     */
+/* exposes whether their dedicated topology AF is actually activated.   */
+/* Group-id / capabilities are cross-referenced from the node table.     */
 /* ------------------------------------------------------------------ */
 
 /*
- * BGP RIB（ipv4 unicast）里有没有覆盖该前缀的路由。注意这只是"BGP 视角
+ * 对应地址族的 BGP Unicast RIB 里有没有覆盖该前缀的路由。注意这只是"BGP 视角
  * 有无覆盖路由"，不是严格的转发可达性（zebra/内核 FIB 才是权威）；用途是
  * 给 show 命令里"卡住"的目标一个可行动的提示（underlay 路由缺失时 UDP 黑洞
  * / 会话卡 Active 都是静默的，见 transport 互通部署契约）。
  */
-static bool midr_bgp_rib_covers(struct bgp *bgp, const struct prefix *p)
+static bool midr_bgp_rib_covers(struct bgp *bgp, afi_t afi,
+				const struct prefix *p)
 {
 	struct bgp_dest *dest;
 
-	if (!bgp->rib[AFI_IP][SAFI_UNICAST])
+	if ((afi != AFI_IP && afi != AFI_IP6) ||
+	    !bgp->rib[afi][SAFI_UNICAST])
 		return true; /* 判不了当可达，不误报 */
 
-	dest = bgp_node_match(bgp->rib[AFI_IP][SAFI_UNICAST], p);
+	dest = bgp_node_match(bgp->rib[afi][SAFI_UNICAST], p);
 	if (!dest)
 		return false;
 	bgp_dest_unlock_node(dest); /* bgp_node_match 返回已加锁节点 */
@@ -1080,7 +1199,7 @@ static bool midr_bgp_rib_covers(struct bgp *bgp, const struct prefix *p)
 
 /*
  * 对端 transport 地址在本端是否可达：优先查 BGP nexthop tracking 缓存
- * （multihop peer 建连时经 FSM 注册，键 = connection->su 的 /32 host 前缀，
+ * （multihop peer 建连时经 FSM 注册，键 = connection->su 的 host 前缀，
  * 见 bgp_find_or_add_nexthop 的 peer 分支）；无缓存条目（peer 未注册 NHT）
  * 再退化查 BGP RIB 覆盖路由。只读，不注册、不改状态。
  */
@@ -1088,15 +1207,19 @@ static bool midr_underlay_reachable(struct bgp *bgp, union sockunion *su)
 {
 	struct prefix p;
 	struct bgp_nexthop_cache *bnc;
+	afi_t afi;
 
-	if (sockunion_family(su) != AF_INET || !sockunion2hostprefix(su, &p))
+	if (!sockunion2hostprefix(su, &p))
 		return true; /* 判不了当可达，不误报 */
+	afi = family2afi(p.family);
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return true;
 
-	bnc = bnc_find(&bgp->nexthop_cache_table[AFI_IP], &p, 0, 0);
+	bnc = bnc_find(&bgp->nexthop_cache_table[afi], &p, 0, 0);
 	if (bnc)
 		return CHECK_FLAG(bnc->flags, BGP_NEXTHOP_VALID);
 
-	return midr_bgp_rib_covers(bgp, &p);
+	return midr_bgp_rib_covers(bgp, afi, &p);
 }
 
 DEFUN(show_midr_neighbors,
@@ -1104,7 +1227,7 @@ DEFUN(show_midr_neighbors,
       "show midr neighbors",
       SHOW_STR
       "MIDR information\n"
-      "Show established MIDR (BGP-LS) sessions\n")
+      "Show NDS-owned MIDR overlay sessions\n")
 {
 	struct bgp *bgp = bgp_get_default();
 	struct midr_node_hash_head *nodes;
@@ -1113,7 +1236,7 @@ DEFUN(show_midr_neighbors,
 	char caps_buf[64];
 	bool any = false;
 	unsigned int established = 0;
-	unsigned int no_nlri = 0;
+	unsigned int no_remote_view = 0;
 
 	if (!bgp) {
 		vty_out(vty, "%% No BGP instance found\n");
@@ -1127,18 +1250,18 @@ DEFUN(show_midr_neighbors,
 
 	nodes = &bgp->midr_nds_info->global_view->nodes;
 
-	vty_out(vty, "%-18s %-8s %-14s %-6s %-10s %-15s %s\n",
+	vty_out(vty, "%-39s %-8s %-14s %-6s %-10s %-15s %s\n",
 		"Neighbor", "ASN", "State", "LS", "Group-ID", "Origin",
 		"Capabilities");
-	vty_out(vty, "%-18s %-8s %-14s %-6s %-10s %-15s %s\n",
-		"------------------", "--------", "--------------", "------",
+	vty_out(vty, "%-39s %-8s %-14s %-6s %-10s %-15s %s\n",
+		"---------------------------------------", "--------", "--------------", "------",
 		"----------", "---------------", "------------");
 
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
 		struct midr_node_entry *ne = NULL;
 		const struct midr_session_ledger_entry *le = NULL;
 		const char *nbr_disp;
-		char taddr[INET_ADDRSTRLEN];
+		char taddr[IPADDR_STRING_SIZE];
 		char state_buf[32];
 		char origin[20];
 
@@ -1154,6 +1277,15 @@ DEFUN(show_midr_neighbors,
 			continue;
 
 		any = true;
+		if (!peer->connection) {
+			vty_out(vty, "%-39s %-8u %-14s %-6s %-10s %-15s %s\n",
+				peer->host ? peer->host : "-", peer->as,
+				"no-connection",
+				peer->afc[AFI_BGP_LS][SAFI_MIDR_LS] ? "yes"
+								     : "no",
+				"-", "-", "-");
+			continue;
+		}
 		if (peer->connection->status == Established)
 			established++;
 
@@ -1219,7 +1351,7 @@ DEFUN(show_midr_neighbors,
 
 		/* LS 列：这条 MIDR 会话到底载没载 MIDR-LS。no = 异常（会话是
 		 * MIDR 自建的、却没激活拓扑族，拓扑情报根本传不了）。 */
-		vty_out(vty, "%-18s %-8u %-14s %-6s ", nbr_disp, peer->as,
+		vty_out(vty, "%-39s %-8u %-14s %-6s ", nbr_disp, peer->as,
 			state_buf,
 			peer->afc[AFI_BGP_LS][SAFI_MIDR_LS] ? "yes" : "no");
 
@@ -1235,31 +1367,31 @@ DEFUN(show_midr_neighbors,
 			 *   -        会话还没建起来，压根没交换过身份（没收过 OPEN、
 			 *            remote_id 是 0，节点表无从查起）。正常等待，
 			 *            与 Origin 列的 `-` 同义：不适用。
-			 *   no-nlri  会话在，但没收到过它的 Node NLRI。
+			 *   no-view  会话在，但权威 remote-view 尚无对端 Node 条目。
 			 *
-			 * no-nlri **不等于故障**：专职引导节点按设计就不发 Node NLRI
-			 * （保底轮 2 批 5 起），指向引导的边一律长这样；对端不是 MIDR
-			 * 节点、或刚建连尚未收敛，也都会落到这一档。要判它是不是问题，
+			 * no-view **不等于故障**：专职引导节点按设计不发布自身 Node
+			 * fact，指向引导的边通常长这样；对端不是 MIDR 节点、或权威视图
+			 * 尚未收敛，也都会落到这一档。要判它是不是问题，
 			 * 看同一行的 Origin（ATTACH = 指向引导，属预期）。
 			 */
 			const char *why = peer->connection->status == Established
-						  ? "no-nlri"
+						  ? "no-view"
 						  : "-";
 
 			if (peer->connection->status == Established)
-				no_nlri++;
+				no_remote_view++;
 			vty_out(vty, "%-10s %-15s %s\n", why, origin, why);
 		}
 	}
 
 	if (!any) {
-		vty_out(vty, "%% No MIDR (BGP-LS) sessions\n");
+		vty_out(vty, "%% No NDS-owned MIDR overlay sessions\n");
 		return CMD_SUCCESS;
 	}
 
 	/*
 	 * C-11：口径说明必须落在输出里——排查的人看终端不翻文档。
-	 * 本表列的是"激活了 BGP-LS 的 peer"，不区分建没建起来：拆过又被对端
+	 * 本表列的是“NDS 拥有的 overlay peer”，不区分建没建起来：拆过又被对端
 	 * 重连的、跨群 ANCHOR 探测留下的，都会以非 Established 状态长期挂在
 	 * 表内。数"有几条会话可用"必须看下面这个数，不能数行数。
 	 *
@@ -1272,11 +1404,11 @@ DEFUN(show_midr_neighbors,
 		"共 %u 条会话处于已建立状态（State 列为其他状态的行也在表内，别按行数计）\n",
 		established);
 
-	/* 同 C-11 的道理：no-nlri 这一档不解释，看表的人会当成故障去查。 */
-	if (no_nlri)
+	/* 同 C-11 的道理：no-view 这一档不解释，看表的人会当成故障去查。 */
+	if (no_remote_view)
 		vty_out(vty,
-			"其中 %u 条会话已建立、但节点表里没有对端条目（两列印 no-nlri）：对端没发 Node NLRI（专职引导节点即如此）、不是 MIDR 节点、或尚未收敛——不一定是故障，对照 Origin 列判断\n",
-			no_nlri);
+			"其中 %u 条会话已建立、但权威 remote-view 里没有对端 Node 条目（两列印 no-view）：专职引导节点即如此；对端不是 MIDR 节点或视图尚未收敛时也会出现——不一定是故障，对照 Origin 列判断\n",
+			no_remote_view);
 
 	return CMD_SUCCESS;
 }
@@ -1387,12 +1519,17 @@ DEFUN(show_midr_self,
 	}
 	mi = bgp->midr_nds_info;
 
-	vty_out(vty, "Router-ID         : %pI4\n", &bgp->router_id);
+	vty_out(vty, "BGP Identifier    : %pI4\n", &bgp->router_id);
 	if (mi->transport_addr_set)
-		vty_out(vty, "Transport-Addr    : %pI4\n",
+		vty_out(vty, "Configured locator: %pIA\n",
 			&mi->local_transport_addr);
 	else
-		vty_out(vty, "Transport-Addr    : - （未配 midr transport-address）\n");
+		vty_out(vty, "Configured locator: - （未配 midr transport-address）\n");
+	if (mi->transport_active)
+		vty_out(vty, "Active locator    : %pIA\n",
+			&mi->active_transport_addr);
+	else
+		vty_out(vty, "Active locator    : - （Control endpoint inactive）\n");
 	vty_out(vty, "ASN               : %u\n", bgp->as);
 	vty_out(vty, "Group-ID          : %u\n", mi->local_group_id);
 	/* 配置值与运行值分离，口径同 `show midr join`：未配印 "-"，免得与群 0
@@ -1493,8 +1630,14 @@ DEFUN(show_midr_group2_remote,
 				&rid, e->capabilities, caps);
 			diff++;
 		}
-		if (has_transport && e->has_transport_addr &&
-		    !midr_ipaddr_same(&e->transport_addr, &transport)) {
+		if (e->has_transport_addr != has_transport) {
+			vty_out(vty,
+				"  ✗ %pI4 transport 存在性不一致（我方 %s / 第二组 %s）\n",
+				&rid, e->has_transport_addr ? "有" : "无",
+				has_transport ? "有" : "无");
+			diff++;
+		} else if (has_transport &&
+			   !midr_ipaddr_same(&e->transport_addr, &transport)) {
 			vty_out(vty, "  ✗ %pI4 transport 不一致（我方 %pIA / 第二组 %pIA）\n",
 				&rid, &e->transport_addr, &transport);
 			diff++;
@@ -1645,9 +1788,8 @@ DEFUN(show_midr_group2_snapshot,
 			l->metrics.rtt_us, l->metrics.loss_ppm,
 			l->metrics.available_bandwidth_kbps,
 			l->metrics.measurement_seqno, l->version);
-		vty_out(vty, "     addr %pI4 -> %pI4\n",
-			&l->link_local_address.ipaddr_v4,
-			&l->link_remote_address.ipaddr_v4);
+		vty_out(vty, "     addr %pIA -> %pIA\n",
+			&l->link_local_address, &l->link_remote_address);
 	}
 
 	midr_topology_snapshot_release(ctx, &snapshot);
@@ -1688,7 +1830,7 @@ DEFUN(show_midr_join,
 			idx++;
 			/* rid 列（批 5 R 系列）：挂靠挑台按它排环、拉黑按它认人，
 			 * 排查时得看得见。池内恒非 0，故不设"-"分支。 */
-			vty_out(vty, "  %u. %-15pI4 AS %-10u rid %-15pI4 [%s]%s%s\n",
+			vty_out(vty, "  %u. %pIA AS %-10u rid %-15pI4 [%s]%s%s\n",
 				idx, &be->transport, be->asn, &be->rid,
 				be->source == MIDR_BOOTSTRAP_SEED ? "seed"
 								  : "manual",
@@ -1787,8 +1929,8 @@ DEFUN(show_midr_join,
 		vty_out(vty, "  %-16s -> %-15pIA  retries_left=%d%s\n",
 			midr_ctrl_msg_type_str(pend->type),
 			&pend->target_transport, pend->retries_left,
-			midr_bgp_rib_covers(bgp, &p) ? ""
-						     : "  [no BGP route]");
+			midr_bgp_rib_covers(bgp, family2afi(p.family), &p)
+				? "" : "  [no BGP route]");
 	}
 	return CMD_SUCCESS;
 }
@@ -1819,19 +1961,19 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 		C_RST);
 	vty_out(vty, "    %smidr group-id <0-4294967295>%s\n", C_CMD, C_RST);
 	vty_out(vty, "        设置本节点 MIDR 群组 ID\n");
-	vty_out(vty, "    %smidr transport-address <IP>%s\n", C_CMD, C_RST);
-	vty_out(vty, "        设置本节点可达地址(TLV 1188,实际填 loopback)\n");
-	vty_out(vty, "    %sno midr transport-address [<IP>]%s\n", C_CMD, C_RST);
+	vty_out(vty, "    %smidr transport-address <IPv4|IPv6>%s\n", C_CMD, C_RST);
+	vty_out(vty, "        设置本节点显式可达 locator（通常配置 loopback 地址）\n");
+	vty_out(vty, "    %sno midr transport-address [<IPv4|IPv6>]%s\n", C_CMD, C_RST);
 	vty_out(vty, "        清除本节点的 transport-address\n");
-	vty_out(vty, "    %smidr session <IP> remote-as <ASN>%s\n", C_CMD, C_RST);
+	vty_out(vty, "    %smidr session <IPv4|IPv6> remote-as <ASN>%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        手动建一条 MIDR overlay 会话(逃生舱/调试用;正常加群走 midr group-id / midr bootstrap)\n");
 	vty_out(vty,
 		"        旧名 midr neighbor 过渡期仍可用(不再出现在补全里)\n");
-	vty_out(vty, "    %sno midr session <IP>%s\n", C_CMD, C_RST);
+	vty_out(vty, "    %sno midr session <IPv4|IPv6>%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        拆一条 MIDR 会话并清账，且持久排除该地址(不会被下次自动重收敛连回来；"
-		"带守卫:运维会话拒删；重敲 midr session <IP> remote-as <ASN> 可解除排除；旧名 no midr neighbor 同上)\n");
+		"带守卫:运维会话拒删；重敲 midr session <IPv4|IPv6> remote-as <ASN> 可解除排除；旧名 no midr neighbor 同上)\n");
 	vty_out(vty, "    %smidr role bootstrap%s\n", C_CMD, C_RST);
 	vty_out(vty, "        将本节点设为 bootstrap(引导)节点\n");
 	vty_out(vty, "    %sno midr role bootstrap%s\n", C_CMD, C_RST);
@@ -1840,11 +1982,12 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty, "        将本节点设为群代表(group-rep)\n");
 	vty_out(vty, "    %sno midr role group-rep%s\n", C_CMD, C_RST);
 	vty_out(vty, "        取消本节点的群代表角色\n");
-	vty_out(vty, "    %smidr bootstrap <IP> remote-as <ASN>%s\n", C_CMD,
-		C_RST);
+	vty_out(vty,
+		"    %smidr bootstrap <IPv4|IPv6> remote-as <ASN> router-id <BGP-ID>%s\n",
+		C_CMD, C_RST);
 	vty_out(vty,
 		"        作为新节点,经 bootstrap 节点入网(命令 O;可多次配置多个候选,失败自动 failover)\n");
-	vty_out(vty, "    %sno midr bootstrap <IP>%s\n", C_CMD, C_RST);
+	vty_out(vty, "    %sno midr bootstrap <IPv4|IPv6>%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        删除一个 bootstrap 候选(正在尝试的被删则顺移到下一候选)\n");
 	vty_out(vty, "    %sno midr bootstrap%s\n", C_CMD, C_RST);
@@ -1863,7 +2006,7 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 		"        显示本机自身的 MIDR 状态(身份/群号/能力位/导出开关;直接读运行态,不经节点表)\n");
 	vty_out(vty, "    %sshow midr nodes%s\n", C_CMD, C_RST);
 	vty_out(vty,
-		"        显示 MIDR 节点表(由 BGP-LS Node NLRI 学到的**其它**节点;本机自己看上一条)\n");
+		"        显示 MIDR 节点表(第二组远端视图及 Control 临时学习的其它节点;本机自己看上一条)\n");
 	vty_out(vty, "    %sshow midr reps%s\n", C_CMD, C_RST);
 	vty_out(vty,
 		"        列全网群代表(按 GROUP_REP 能力位过滤节点表) + 本地 rep 目录\n");
@@ -1873,7 +2016,7 @@ static void bgp_midr_print_help(struct vty *vty, bool color)
 	vty_out(vty,
 		"        列持久化种子表(bgpd.db,重启自举的第一跳清单;与上一条不同:那个是运行时视图,这个是跨重启记忆)\n");
 	vty_out(vty, "    %sshow midr neighbors%s\n", C_CMD, C_RST);
-	vty_out(vty, "        显示已建立的 MIDR(BGP-LS)直连会话\n");
+	vty_out(vty, "        显示已建立的 MIDR(MIDR-LS) overlay 会话\n");
 	vty_out(vty, "    %sshow midr join%s\n", C_CMD, C_RST);
 	vty_out(vty, "        显示新节点入网状态\n");
 	vty_out(vty, "    %smidr help [plain]%s\n", C_CMD, C_RST);
@@ -1949,12 +2092,53 @@ DEFUN(midr_help,
 	return CMD_SUCCESS;
 }
 
+/* Persist only explicit operator intent.  Runtime ledger entries, learned
+ * seeds and dynamically derived roles/groups must never leak into frr.conf. */
+static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node;
+	struct midr_bootstrap_entry *bootstrap;
+	struct midr_manual_session *session;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return 0;
+	mi = bgp->midr_nds_info;
+
+	if (mi->config_group_id)
+		vty_out(vty, " midr group-id %u\n", mi->config_group_id);
+	if (mi->transport_addr_set &&
+	    midr_ipaddr_valid_locator(&mi->local_transport_addr))
+		vty_out(vty, " midr transport-address %pIA\n",
+			&mi->local_transport_addr);
+
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, bootstrap)) {
+		if (bootstrap->source != MIDR_BOOTSTRAP_MANUAL ||
+		    !midr_ipaddr_valid_locator(&bootstrap->transport) ||
+		    bootstrap->rid.s_addr == INADDR_ANY)
+			continue;
+		vty_out(vty,
+			" midr bootstrap %pIA remote-as %u router-id %pI4\n",
+			&bootstrap->transport, bootstrap->asn, &bootstrap->rid);
+	}
+
+	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session)) {
+		if (!midr_ipaddr_valid_locator(&session->transport) ||
+		    !session->remote_asn)
+			continue;
+		vty_out(vty, " midr session %pIA remote-as %u\n",
+			&session->transport, session->remote_asn);
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
 void bgp_midr_nds_vty_init(void)
 {
+	hook_register(bgp_inst_config_write, midr_nds_config_write);
 	install_element(BGP_NODE, &midr_group_id_cmd);
 	install_element(BGP_NODE, &midr_session_cmd);
 	install_element(BGP_NODE, &no_midr_session_cmd);

@@ -2,13 +2,11 @@
 /*
  * MIDR core (NDS - Neighbor Discovery & Selection).
  *
- * Owns bgp->midr_nds_info: the global view (node/link/group tables), the
- * node-table keepalive/expire timers (migrated from the old
- * bgp_midr_node.c), and the internal interfaces I-3 / I-5 / I-7 plus the
- * BGP-LS export E-1.
- *
- * Skeleton stage: node-table + timers are fully wired; PM/CL/E-1 bodies
- * are stubs that maintain just enough state to keep the call chain alive.
+ * Owns bgp->midr_nds_info: the NDS global view and local lifecycle, consumes
+ * authoritative remote-view callbacks, coordinates Control/PM/CL through the
+ * internal interfaces, and publishes local topology facts through E-1.
+ * Remote liveness follows BGP/session and explicit withdraw events; the old
+ * NDS keepalive/expiry source is no longer authoritative.
  */
 
 #include <zebra.h>
@@ -47,6 +45,7 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_ENTRY, "MIDR rep directory entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_BOOTSTRAP_ENTRY, "MIDR bootstrap candidate");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_EXCLUDE, "MIDR excluded session");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_LEDGER, "MIDR session ledger entry");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_MANUAL_SESSION, "MIDR manual session config");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ATTACH_DOWN, "MIDR attach down-pending");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_DOWN, "MIDR session down-pending");
 
@@ -98,17 +97,14 @@ static bool midr_prefix_is_self(struct bgp *bgp, const struct prefix *p)
 	       IPV4_ADDR_SAME(&p->u.prefix4, &bgp->router_id);
 }
 
-/*
- * Effective locator for an entry: the real reachable address used to peer
- * with / probe / display the node.  Uses the advertised transport address
- * (TLV 1188) when present, otherwise falls back to node_id (router-id).
- */
+/* Resolve only the advertised reachable locator.  Router ID is identity and
+ * must never silently become a socket destination or link endpoint. */
 void midr_node_get_locator(const struct midr_node_entry *e, struct prefix *out)
 {
-	if (e->has_transport_addr)
-		midr_ipaddr_to_host_prefix(&e->transport_addr, out);
-	else
-		prefix_copy(out, &e->node_id);
+	memset(out, 0, sizeof(*out));
+	if (e && e->has_transport_addr &&
+	    midr_ipaddr_valid_locator(&e->transport_addr))
+		(void)midr_ipaddr_to_host_prefix(&e->transport_addr, out);
 }
 
 /*
@@ -117,9 +113,10 @@ void midr_node_get_locator(const struct midr_node_entry *e, struct prefix *out)
  * self、字段不全者一律跳过。调用点：收包侧的变化分支（学到/变了才写）、
  * periodic_sync 定时器（每 30s 顺路刷种子库的墙钟）。
  *
- * ⚠ 这两个调用点都靠"引导节点自报 Node NLRI"供数——批 5 让引导不再发 NLRI 之后
- * 它们自然断料。届时种子表的活水改由 BOOTSTRAP_LIST 收包侧那条新路提供
- * （midr_nds_bootstrap_learn），本路留着不删（显式删除归对接轮清理批）。
+ * 当前专职引导不发布自身 Node fact，第二组远端视图也不保证回灌群 0 pending，
+ * 因而种子表的正常活水来自 BOOTSTRAP_LIST 收包侧
+ *（midr_nds_bootstrap_learn）。本辅助路径仅在将来的权威远端视图确实提供一条
+ * BOOTSTRAP 能力事实时作为兼容补充。
  */
 static void midr_maybe_save_bootstrap_seed(struct bgp *bgp,
 					   const struct midr_node_entry *entry)
@@ -155,9 +152,8 @@ static void midr_maybe_save_bootstrap_seed(struct bgp *bgp,
 	/* 子稿 §4-1：落库的同时补进内存候选池，修"运行期新认识的引导进不了
 	 * bootstrap_list"的缺口——否则它只有等下次重启读种子才成为可试候选。
 	 * 去重键 = transport，已在池中则只刷 ASN（MANUAL 条目不会被降级）。
-	 * rid 取节点表条目的 node_id（本路的料就是一条 Node NLRI，天然有真名）。
-	 * 08-21 起引导照发 Node NLRI，这条路是全网自动学引导的正路（原"引导不发
-	 * NLRI 后断料、由清理批删"的计划随之作废）。 */
+	 * rid 取节点表条目的 node_id；只有权威远端视图明确提供该 BOOTSTRAP
+	 * 身份时本兼容路径才会触发。 */
 	midr_bootstrap_list_add(bgp->midr_nds_info, entry->transport_addr,
 				entry->asn, rid, MIDR_BOOTSTRAP_SEED);
 }
@@ -173,7 +169,7 @@ static struct midr_global_view *midr_global_view_new(void)
 	gv = XCALLOC(MTYPE_MIDR_GLOBAL_VIEW, sizeof(*gv));
 	midr_node_hash_init(&gv->nodes);
 	gv->links = list_new();
-	gv->groups = NULL; /* skeleton: CL not wired yet */
+	gv->groups = NULL; /* reserved; CL currently derives groups from nodes */
 
 	return gv;
 }
@@ -380,7 +376,8 @@ midr_nds_ledger_lookup(struct bgp *bgp, struct ipaddr transport)
 
 void midr_nds_ledger_note(struct bgp *bgp, struct ipaddr transport,
 			  enum midr_session_reason reason,
-			  struct in_addr remote_rid, uint32_t remote_group)
+			  struct in_addr remote_rid, as_t remote_asn,
+			  uint32_t remote_group)
 {
 	struct bgp_midr_nds *mi;
 	struct midr_session_ledger_entry *e;
@@ -406,6 +403,8 @@ void midr_nds_ledger_note(struct bgp *bgp, struct ipaddr transport,
 			e->reason = reason;
 		if (remote_rid.s_addr != INADDR_ANY)
 			e->remote_rid = remote_rid;
+		if (remote_asn)
+			e->remote_asn = remote_asn;
 		if (remote_group)
 			e->remote_group = remote_group;
 		return;
@@ -415,6 +414,7 @@ void midr_nds_ledger_note(struct bgp *bgp, struct ipaddr transport,
 	e->transport = transport;
 	e->reason = reason;
 	e->remote_rid = remote_rid;
+	e->remote_asn = remote_asn;
 	e->remote_group = remote_group;
 	listnode_add(mi->session_ledger, e);
 
@@ -554,7 +554,7 @@ static void midr_nds_ledger_age_scan(struct bgp *bgp)
  * 判定一个【发现阶段】学到的节点是否属于"本节点应与之建会话"的集合。
  *
  * 这是派生函数、不是决策函数（责任划分见 docs/decisions/
- * midr-connect-responsibility.md）：会话图的用途是 BGP-LS 泛洪连通、不是质量
+ * midr-connect-responsibility.md）：会话图的用途是 MIDR-LS 传播连通、不是质量
  * 优选，故此处不读也不该读性能指标——带"选"的判定（要不要跨群持续联络、
  * 联络哪些群、按什么指标取舍）归 CL，经 I-7 决策词下达集合级意图，本函数
  * 只把落定的集合翻译成"连不连"。
@@ -569,6 +569,15 @@ bool midr_discovery_should_peer(struct bgp *bgp,
 				const struct midr_node_entry *entry)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct ipaddr local;
+
+	if (!mi || !entry->has_transport_addr ||
+	    !midr_ipaddr_valid_locator(&entry->transport_addr) ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    ipaddr_family(&local) != ipaddr_family(&entry->transport_addr) ||
+	    !midr_nds_locator_unique(bgp, &entry->node_id,
+				      &entry->transport_addr))
+		return false;
 
 	/*
 	 * 自己不是自己的邻居。三个老调用点都在外面先挡了 is_self（收包侧
@@ -615,10 +624,9 @@ bool midr_discovery_should_peer(struct bgp *bgp,
  * 解除与一个节点的探测/邻居关系：I-2 停探 + 清残留 link_entry + 清 is_adjacent，
  * 可选拆掉动态会话。节点条目本身的去留由调用方决定（本函数不动 node 表）。
  *
- * 双键清理：发现阶段的探测入口按 locator(transport /32) 建 link，而 PM 周期
- * loop 按 node_id(router-id) 回灌又建一条——同一节点最多两条 link，两个键都删。
- * 有 transport 时二者不同、各删一次；无 transport 时 locator 回落到 node_id，
- * prefix_same 为真只删一次。del_link 未命中返回 false，故本函数天然幂等。
+ * 双键清理：历史路径可能按 locator 建 link，而 PM 周期 loop 按
+ * node_id(router-id) 回灌又建一条——同一节点最多两条 link，两个键都删。
+ * locator 缺失时仍必须删 node_id 键；del_link 未命中返回 false，故天然幂等。
  */
 /*
  * 这条边是不是 CL 下达的群间锚点边（台账 reason == CL_ANCHOR）。
@@ -674,20 +682,25 @@ static void midr_nds_detach_node(struct bgp *bgp, struct midr_node_entry *entry,
 	struct prefix locator;
 
 	midr_node_get_locator(entry, &locator);
-	/* I-2 停探。键必须与 I-1 配对：add 侧按 node_id 建探测 ctx（join 占位
-	 * 条目 node_id==locator，仍一致），故删也统一按 node_id——按 locator 删
+	/* I-2 停探。键必须与 I-1 配对：add 侧按 node_id 建探测 ctx，故删也统一
+	 * 按 node_id——按 locator 删
 	 * 会在 transport≠router-id 的节点上找不到 ctx → 探测泄漏。 */
 	midr_pm_remove_target(bgp, &entry->node_id, reason);
 	/*
-	 * 轮 2：链路事实随之作废 —— 报过就发 link_withdraw，然后删事实表条目。
+	 * 轮 2：链路事实随之作废 —— 报过就发 link_withdraw；事实表保留 version
+	 * 墓碑，防止同一稳定 identity 恢复后从低版本重报被第二组丢弃。
 	 * 这是「链路生死归会话/节点级」的**清理路径**那一半（另一半是轮 4/5 要挂
 	 * 的 peer_status_changed 钩子）；指标层已不再有任何 withdraw 触发点。
 	 * 不做的话事实表只增不减，轮 3 的 snapshot 会把早就拆掉的链路重报一遍。
 	 */
 	midr_nds_report_link_withdraw(bgp, &entry->node_id);
-	midr_global_view_del_link(gv, &locator);
-	if (!prefix_same(&locator, &entry->node_id))
-		midr_global_view_del_link(gv, &entry->node_id);
+	/* node_id is the canonical PM/fact key and must always be retired, even
+	 * when the node has no usable locator.  Remove a distinct historical
+	 * locator key as well. */
+	midr_global_view_del_link(gv, &entry->node_id);
+	if ((locator.family == AF_INET || locator.family == AF_INET6) &&
+	    !prefix_same(&locator, &entry->node_id))
+		midr_global_view_del_link(gv, &locator);
 	entry->is_adjacent = false;
 	if (teardown_session)
 		midr_ctrl_on_node_remove(bgp, entry);
@@ -719,8 +732,8 @@ static void midr_nds_on_node_discovered(struct bgp *bgp,
 
 
 /*
- * 收包侧反应链，**数据源无关**——旧 Node NLRI 与第二组 remote_node_update 回调
- * 共用（轮 4 件③抽出）。字段解包各源自己做，本函数只管"表变了之后做什么"。
+ * 节点表反应链。权威数据源是第二组 remote_node_update 回调；Control
+ * list/request 的临时学习入口也复用其中的邻接动作。本函数只管"表变了之后做什么"。
  *
  * 已知节点的 keepalive 刷新（既非 new 也非 changed）只更新 last_seen，不进这里，
  * 所以反应链不会每 5s 重跑一遍。自己的回声（is_self）同样跳过。
@@ -734,6 +747,12 @@ void midr_nds_node_react(struct bgp *bgp, struct midr_node_entry *entry,
 		 * 因为下面两分支只在 is_new/changed 进入）。 */
 		if (is_new || changed)
 			midr_maybe_save_bootstrap_seed(bgp, entry);
+		/* A node that has become a bootstrap/backbone endpoint is no longer
+		 * eligible for topology Link facts.  Retire any fact from its former
+		 * role immediately instead of waiting for a metric tick or resync. */
+		if ((is_new || changed) &&
+		    midr_nds_link_is_backbone(bgp, &entry->node_id))
+			midr_nds_report_link_withdraw(bgp, &entry->node_id);
 
 		if (is_new) {
 			/* 同群就补边（见函数头）；随后统一告知 CL 视图变了。 */
@@ -789,6 +808,10 @@ void midr_nds_node_react(struct bgp *bgp, struct midr_node_entry *entry,
 				}
 			}
 
+			/* locator/能力变化也可能让一个此前不可连接的同群节点变得
+			 * 可连接。统一再过一次发现闸门；已有邻接或非本群会短路。 */
+			midr_nds_on_node_discovered(bgp, entry);
+
 			/* 收包侧只更新事实，动作交给对端的 PEER_REQUEST；此处统一
 			 * 通知 CL 一次（成员视图变了，与建没建邻居无关）。 */
 			midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
@@ -802,11 +825,48 @@ void midr_nds_node_react(struct bgp *bgp, struct midr_node_entry *entry,
  * 只是叫醒者换了 —— 见文件末尾回调壳里那份。〕
  */
 
+/* Control-list/request data is transient and must not silently migrate the
+ * authoritative node identity to another locator.  Such a migration requires
+ * the teardown/re-key transaction in midr_nds_remote_node_update_cb(). */
+static bool
+midr_nds_control_locator_usable(struct bgp *bgp, const struct prefix *owner,
+				const struct midr_node_entry *existing,
+				const struct ipaddr *transport,
+				const char *source)
+{
+	struct ipaddr local;
+
+	if (!bgp || !owner || !transport)
+		return false;
+
+	if (owner->family != AF_INET ||
+	    midr_prefix_is_self(bgp, owner) ||
+	    !midr_ipaddr_valid_locator(transport) ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    ipaddr_family(&local) != ipaddr_family(transport) ||
+	    midr_ipaddr_same(&local, transport) ||
+	    !midr_nds_locator_unique(bgp, owner, transport)) {
+		zlog_warn("MIDR %s：拒绝 node %pFX 的 locator %pIA（无效、异族或不唯一）",
+			  source, owner, transport);
+		return false;
+	}
+
+	if (existing && existing->has_transport_addr &&
+	    midr_ipaddr_valid_locator(&existing->transport_addr) &&
+	    !midr_ipaddr_same(&existing->transport_addr, transport)) {
+		zlog_warn("MIDR %s：node %pFX 已绑定 locator %pIA，拒绝由控制消息改写为 %pIA；等待远端视图执行迁移",
+			  source, owner, &existing->transport_addr, transport);
+		return false;
+	}
+
+	return true;
+}
+
 /*
  * 把一个群成员（来自 MEMBER_LIST_RESP）灌入 global_view 并标记为邻居，再 I-1
  * 启动探测。NDS 拥有 global_view，故灌入统一由 NDS 负责（ctrl 侧只把 wire 解出
  * 的字段交进来）。已存在则刷新字段。注意：这里显式置 is_adjacent=true；后续
- * 该节点的 Node NLRI 泛洪到达时，on_node_nlri 只逐字段刷新、不碰 is_adjacent。
+ * 远端视图更新只逐字段刷新、不碰 is_adjacent。
  */
 void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 			   struct ipaddr transport, uint32_t group_id)
@@ -815,13 +875,16 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
 
-	if (!bgp || !bgp->midr_nds_info)
+	if (!bgp || !bgp->midr_nds_info || rid.s_addr == INADDR_ANY)
 		return;
 
 	gv = bgp->midr_nds_info->global_view;
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!midr_nds_control_locator_usable(bgp, &key.node_id, entry,
+					     &transport, "成员名单"))
+		return;
 	if (!entry) {
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
@@ -858,13 +921,16 @@ void midr_nds_learn_anchor_candidate(struct bgp *bgp, struct in_addr rid,
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
 
-	if (!bgp || !bgp->midr_nds_info)
+	if (!bgp || !bgp->midr_nds_info || rid.s_addr == INADDR_ANY)
 		return;
 
 	gv = bgp->midr_nds_info->global_view;
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!midr_nds_control_locator_usable(bgp, &key.node_id, entry,
+					     &transport, "锚点候选名单"))
+		return;
 	if (!entry) {
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
@@ -906,6 +972,9 @@ void midr_nds_adopt_group_peer(struct bgp *bgp, struct in_addr rid, as_t asn,
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!midr_nds_control_locator_usable(bgp, &key.node_id, entry,
+					     &transport, "同群建连"))
+		return;
 	if (!entry) {
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
@@ -967,8 +1036,8 @@ void midr_nds_cleanup_by_transport(struct bgp *bgp, struct ipaddr transport,
 /*
  * 收到 REP_LIST_REQ / MEMBER_LIST_REQ 时调用：请求方在其自身的 join 流程里会
  * 反过来对我们发 PM 探测包，而 midr_pm_recv() 的 pm_is_known_transport() 只
- * 接受 global_view 里已知的来源地址——请求方此时还没有 BGP-LS 会话，我们的
- * global_view 里没有它，探测包会被当成未知来源静默丢弃。
+ * 接受 global_view 里已知的来源地址——请求方此时还没有权威 remote-view
+ * 条目，我们的 global_view 里没有它，探测包会被当成未知来源静默丢弃。
  * 这里用请求帧自带的身份（router-id/transport/asn）灌一条最小条目，仅用于
  * 通过来源校验；不置 is_adjacent、不触发 I-1——是否真正建邻居仍由 CL 决定。
  */
@@ -979,13 +1048,16 @@ void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid, as_t asn,
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
 
-	if (!bgp || !bgp->midr_nds_info)
+	if (!bgp || !bgp->midr_nds_info || rid.s_addr == INADDR_ANY)
 		return;
 
 	gv = bgp->midr_nds_info->global_view;
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
 	entry = midr_node_hash_find(&gv->nodes, &key);
+	if (!midr_nds_control_locator_usable(bgp, &key.node_id, entry,
+					     &transport, "请求方学习"))
+		return;
 	if (!entry) {
 		entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 		entry->node_id = key.node_id;
@@ -999,8 +1071,8 @@ void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid, as_t asn,
 }
 
 /*
- * Refresh the local self-entry from local configuration.
- * Called after bgp_ls_originate_bgp_node() succeeds.
+ * Refresh the local self-entry from local configuration.  The topology-fact
+ * publisher calls this before applying any publication suppression gate.
  */
 void midr_nds_local_node_update(struct bgp *bgp)
 {
@@ -1046,9 +1118,13 @@ void midr_nds_local_node_update(struct bgp *bgp)
 	entry->asn = bgp->as;
 	entry->group_id = bgp->midr_nds_info->local_group_id;
 	entry->capabilities = bgp->midr_nds_info->local_capabilities;
-	if (bgp->midr_nds_info->transport_addr_set) {
-		entry->transport_addr = bgp->midr_nds_info->local_transport_addr;
+	if (bgp->midr_nds_info->transport_active) {
+		entry->transport_addr =
+			bgp->midr_nds_info->active_transport_addr;
 		entry->has_transport_addr = true;
+	} else {
+		SET_IPADDR_NONE(&entry->transport_addr);
+		entry->has_transport_addr = false;
 	}
 	entry->last_update = monotime(NULL);
 	entry->is_self = true;
@@ -1072,7 +1148,9 @@ bool midr_nds_link_is_backbone(struct bgp *bgp,
 	struct listnode *node;
 	uint32_t rid;
 
-	if (!bgp || !bgp->midr_nds_info || !remote_node_id)
+	if (!bgp || !bgp->midr_nds_info || !remote_node_id ||
+	    remote_node_id->family != AF_INET ||
+	    remote_node_id->prefixlen != IPV4_MAX_BITLEN)
 		return false;
 
 	mi = bgp->midr_nds_info;
@@ -1155,7 +1233,7 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
 {
 	struct bgp_midr_nds *mi;
 	bool was_rep, is_rep;
-	bool is_boot;
+	bool was_boot, is_boot;
 
 	if (!bgp || !bgp->midr_nds_info)
 		return;
@@ -1163,6 +1241,7 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
 	mi = bgp->midr_nds_info;
 	was_rep = !!(mi->local_capabilities & MIDR_CAP_GROUP_REP);
 	is_rep = !!(new_caps & MIDR_CAP_GROUP_REP);
+	was_boot = !!(mi->local_capabilities & MIDR_CAP_BOOTSTRAP);
 	is_boot = !!(new_caps & MIDR_CAP_BOOTSTRAP);
 
 	/*
@@ -1176,6 +1255,10 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
 			 new_caps);
 
 	mi->local_capabilities = new_caps;
+	/* Bootstrap nodes do not originate topology links.  Withdraw the old
+	 * role's links at the same transition that withdraws the local Node fact. */
+	if (is_boot && !was_boot)
+		midr_nds_facts_withdraw_all_links(bgp);
 	midr_nds_report_node(bgp, MIDR_ORIGIN_CAP_UPDATE);
 
 	/*
@@ -1204,7 +1287,7 @@ void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps)
 		 * 补拉（见 midr_nds_attach_after_cfg），与 BGP 原生治顺序的两件套
 		 * 同款：peer_create 时置 shut_during_cfg 压住不连，config_end 时由
 		 * peer_unshut_after_cfg 统一放行。
-		 * 能力位照置、Node NLRI 照发，推迟的只有"去拉名单"这个动作。
+		 * 能力位照置、Node fact 照常刷新，推迟的只有"去拉名单"这个动作。
 		 */
 		if (bgp_config_inprocess()) {
 			zlog_info("MIDR 挂靠：本机%s群代表（群 %u），但配置仍在加载中——挂靠推迟到配置读完",
@@ -1575,7 +1658,7 @@ static void midr_join_rep_probe_done_cb(struct event *t)
  * Periodic-sync timer: hand the global view to CL for a full re-evaluation
  * on a fixed cadence (independent of probe/membership events).
  */
-/* Count established sessions carrying the BGP-LS AF -- group members and
+/* Count established sessions carrying the MIDR-LS AF -- group members and
  * anchor connections alike, both use it, so this one count covers "any
  * working MIDR session" regardless of which kind.
  *
@@ -1590,7 +1673,8 @@ static unsigned int midr_established_session_count(struct bgp *bgp)
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
 		if (!peer->afc[AFI_BGP_LS][SAFI_MIDR_LS])
 			continue;
-		if (peer->connection->status == Established)
+		if (peer->connection &&
+		    peer->connection->status == Established)
 			count++;
 	}
 	return count;
@@ -1662,7 +1746,6 @@ static void midr_nds_reconnect_missing_peers(struct bgp *bgp)
 
 	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
 		union sockunion su;
-		struct prefix locator;
 		struct peer *peer;
 
 		if (n >= MIDR_AGE_SCAN_MAX)
@@ -1670,10 +1753,11 @@ static void midr_nds_reconnect_missing_peers(struct bgp *bgp)
 		if (!midr_discovery_should_peer(bgp, entry))
 			continue;
 
-		midr_node_get_locator(entry, &locator);
-		prefix2sockunion(&locator, &su);
+		if (!midr_ipaddr_to_sockunion(&entry->transport_addr, &su))
+			continue;
 		peer = peer_lookup(bgp, &su);
-		if (peer && peer->connection->status == Established &&
+		if (peer && peer->connection &&
+		    peer->connection->status == Established &&
 		    midr_nds_peer_is_overlay(peer))
 			continue; /* overlay 通着 */
 
@@ -1710,6 +1794,12 @@ static void midr_periodic_sync_timer(struct event *t)
 	 * 放在最前面是因为它是其余一切下行数据的前提。
 	 */
 	midr_nds_remote_view_register(bgp);
+
+	/* 配置的 locator 可能在命令执行时尚未出现在本机接口上。失败态不向任何
+	 * 运行模块暴露该地址；定时重试让接口随后就绪时可以自动激活。 */
+	if (mi->transport_addr_set && !mi->transport_active &&
+	    !mi->transport_reconfiguring && !mi->shutdown)
+		(void)midr_nds_transport_reconcile(bgp);
 
 	midr_nds_notify_cl(bgp, MIDR_TRIGGER_PERIODIC_SYNC);
 
@@ -1753,11 +1843,16 @@ struct peer *midr_node_established_peer(struct bgp *bgp,
 	struct peer *peer;
 	struct listnode *node;
 
+	if (!bgp || !node_id || node_id->family != AF_INET ||
+	    node_id->prefixlen != IPV4_MAX_BITLEN)
+		return NULL;
+
 	/* Locate the BGP peer by its advertised router-id (TLV 516). */
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
 		if (CHECK_FLAG(peer->sflags, PEER_STATUS_GROUP))
 			continue;
-		if (peer->connection->status != Established)
+		if (!peer->connection ||
+		    peer->connection->status != Established)
 			continue;
 		if (!midr_nds_peer_is_overlay(peer))
 			continue;
@@ -1984,15 +2079,20 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 	if (!bgp || !bgp->midr_nds_info)
 		return;
 
+	/* A group-0 node has no publishable topology membership.  Retire all
+	 * previously active Link facts before refreshing/withdrawing its Node fact. */
+	if (!new_group_id)
+		midr_nds_facts_withdraw_all_links(bgp);
+
 	bgp->midr_nds_info->local_group_id = new_group_id;
 	/* B1：唯一写手，见 struct bgp_midr_nds.group_settled_at 处注释。 */
 	bgp->midr_nds_info->group_settled_at = monotime(NULL);
 
-	/* Re-originate the local Node NLRI carrying the new TLV 1185 */
+	/* Refresh the local Node fact carrying the new group id. */
 	midr_nds_report_node(bgp, MIDR_ORIGIN_GROUP_UPDATE);
 
 	if (BGP_DEBUG(midr, MIDR))
-		zlog_debug("MIDR: group-id %u -> %u re-originated", old_group_id,
+		zlog_debug("MIDR: group-id %u -> %u; local fact refreshed", old_group_id,
 			   new_group_id);
 }
 
@@ -2009,7 +2109,7 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
  *
  * 判据用"群里有没有别的成员"而非"rep_dir 里有没有该群代表"：rep_dir 是某一个
  * 引导节点的二手目录、可能不全（暂存区 B-5），据它判"群不存在"会在目录漏收时
- * 误自任；global_view 的成员是一手的（BGP-LS 泛洪 + MEMBER_LIST 两条来源）。
+	 * 误自任；global_view 的成员来自第二组 remote view 与 MEMBER_LIST。
  * 反向漏判不存在——探代表阶段每个代表都已灌进 global_view 并带自己的群号，
  * 有代表必有成员。已知残留：群里有人却一个代表都没有（真·死群）时这里不补位，
  * 那属换届/选举语义（任务丙 I-7 选举通道），不该由一个新成员单方面自任。
@@ -2050,7 +2150,7 @@ static void midr_join_settle_group(struct bgp *bgp, uint32_t gid)
 	 * 成员而走 else 分支，setter 一次都不被调用，挂靠补拉也就无从触发。
 	 * 放行它没有副作用：caps 值原样传进 setter，事实没变，
 	 * midr_nds_report_node() 的幂等守卫（!changed && node_reported）挡住重报，
-	 * 不会多发一条 Node NLRI；要的只是让 setter 里那道"是代表就确保达标"过一遍。
+		 * 不会多发一条 Node fact；要的只是让 setter 里那道"是代表就确保达标"过一遍。
 	 */
 	if (alone || was_rep) {
 		midr_nds_set_capability(bgp, mi->local_capabilities |
@@ -2425,8 +2525,8 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		/*
 		 * 本节点当选群代表。CL 判定算法尚未实现（稳态优化待办），这里
 		 * 先接好 NDS 侧执行：幂等检查（已是代表则短路，避免重复置位/
-		 * 重复通告）→ 置 GROUP_REP 位 → 通告全网（set_capability 内部
-		 * 发 Node NLRI）。能力位只改自己的，ownership 无碍。
+		 * 重复通告）→ 置 GROUP_REP 位 → 刷新拓扑事实（set_capability 内部
+		 * 上报 Node fact）。能力位只改自己的，ownership 无碍。
 		 */
 		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
 			MIDR_LOG("MIDR I-7：REP_ELECT 但本节点已是群代表，忽略");
@@ -2465,9 +2565,10 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		 * 删掉自己那条。只做这一刀：来源一/来源二的整体结构留到对接第
 		 * 二组、来源二改成从他们视图取数时一起审视（核对档 A-3 乙）。
 		 */
-		if (midr_ipaddr_valid_locator(&mi->local_transport_addr))
+		if (mi->transport_active &&
+		    midr_ipaddr_valid_locator(&mi->active_transport_addr))
 			midr_rep_dir_del(bgp, mi->local_group_id,
-					 mi->local_transport_addr);
+					 mi->active_transport_addr);
 		zlog_info("MIDR I-7：REP_RESIGN 群 %u，本节点卸任代表",
 			  mi->local_group_id);
 		break;
@@ -2589,10 +2690,9 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 /* ===========================================================================
  * Group-representative directory
  *
- * Two roles share mi->rep_dir:
- *   - bootstrap node: statically configured (`midr rep group ...`), served to
- *     joining nodes in REP_LIST_RESP;
- *   - joining node: rebuilt from the bootstrap's REP_LIST_RESP.
+ * mi->rep_dir is runtime state rebuilt from REP_LIST_RESP.  When a bootstrap
+ * answers, the Control layer may merge this cache with representatives derived
+ * from the current remote view; there is no persisted `midr rep group` source.
  * =========================================================================*/
 
 void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
@@ -2603,18 +2703,19 @@ void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
 	struct listnode *node;
 	struct midr_rep_entry *r;
 
-	if (!bgp || !bgp->midr_nds_info || !bgp->midr_nds_info->rep_dir)
+	if (!bgp || !bgp->midr_nds_info || !bgp->midr_nds_info->rep_dir ||
+	    !group_id || rep_rid.s_addr == INADDR_ANY ||
+	    !midr_ipaddr_valid_locator(&rep_transport))
 		return;
 	mi = bgp->midr_nds_info;
 
-	/* Dedup on (group_id, rep_transport); refresh ASN if it already exists.
-	 * rid 只在非 0 时刷新——后到的无 rid 条目不得抹掉已知真名。 */
+	/* Dedup on (group_id, rep_transport); refresh the v4-mandatory identity
+	 * and ASN if it already exists. */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r))
 		if (r->group_id == group_id &&
 		    midr_ipaddr_same(&r->rep_transport, &rep_transport)) {
 			r->rep_asn = rep_asn;
-			if (rep_rid.s_addr != INADDR_ANY)
-				r->rep_rid = rep_rid;
+			r->rep_rid = rep_rid;
 			return;
 		}
 
@@ -2681,8 +2782,8 @@ struct midr_rep_entry *midr_rep_dir_find_group(struct bgp *bgp,
 }
 
 /*
- * "Table A": every non-self node in `group_id`, derived from the BGP-LS global
- * view.  Single source of truth — when BGP-LS propagation scoping changes,
+ * "Table A": every non-self node in `group_id`, derived from the MIDR global
+ * view.  Single source of truth — when MIDR-LS propagation scoping changes,
  * only this function changes.  `out` collects borrowed entry pointers (caller
  * owns the list; entries stay owned by the hash).
  */
@@ -2704,13 +2805,12 @@ void midr_group_members(struct bgp *bgp, uint32_t group_id, struct list *out)
 
 /*
  * rep 目录推导（任务甲）：收集有资格进 REP_LIST 应答的节点——GROUP_REP 位
- * + 活性 + 群号/ASN/transport 三字段可用。含 self（引导节点自兼群代表）。
+ * + 活性 + 非零群号 + 显式 transport。含 self（本机作为群代表时）。
  * 不走 midr_node_get_locator 回落：router-id 可能不可路由，rep 目录是新
- * 节点入网第一跳，宁缺毋黑洞（比 MEMBER_LIST 组装的回落处理更严）。
+ * 节点入网第一跳，宁缺毋黑洞；MEMBER_LIST 同样禁止回落。
  * `out` 收 borrowed 指针（list 归调用方，条目归 hash）。
  * 目前唯一消费者 = midr_ctrl_build_rep_list；未来 bootstrap failover /
- * 目录持久化复用。数据源随传播面 backend 迁移（现 = 自有收包路径灌的
- * global_view，迁移后换第二组 remote view）。
+ * 目录持久化复用。当前候选来自第二组 remote view 驱动的 global_view。
  */
 void midr_rep_candidates(struct bgp *bgp, struct list *out)
 {
@@ -2779,6 +2879,7 @@ bool midr_nds_local_transport_get(const struct bgp *bgp,
 				  struct ipaddr *transport)
 {
 	const struct bgp_midr_nds *mi;
+	struct prefix self_id;
 
 	if (!transport)
 		return false;
@@ -2787,11 +2888,14 @@ bool midr_nds_local_transport_get(const struct bgp *bgp,
 		return false;
 
 	mi = bgp->midr_nds_info;
-	if (!mi->transport_addr_set ||
-	    !midr_ipaddr_valid_locator(&mi->local_transport_addr))
+	if (!mi->transport_active ||
+	    !midr_ipaddr_valid_locator(&mi->active_transport_addr))
+		return false;
+	midr_prefix_from_in_addr(&self_id, bgp->router_id);
+	if (!midr_nds_locator_unique(bgp, &self_id, &mi->active_transport_addr))
 		return false;
 
-	*transport = mi->local_transport_addr;
+	*transport = mi->active_transport_addr;
 	return true;
 }
 
@@ -2801,6 +2905,7 @@ bool midr_nds_node_transport_get(const struct bgp *bgp,
 {
 	struct midr_node_entry key = {};
 	struct midr_node_entry *entry;
+	struct ipaddr local;
 
 	if (!transport)
 		return false;
@@ -2813,43 +2918,219 @@ bool midr_nds_node_transport_get(const struct bgp *bgp,
 	entry = midr_node_hash_find(&bgp->midr_nds_info->global_view->nodes,
 				    &key);
 	if (!entry || !entry->has_transport_addr ||
-	    !midr_ipaddr_valid_locator(&entry->transport_addr))
+	    !midr_ipaddr_valid_locator(&entry->transport_addr) ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    ipaddr_family(&local) != ipaddr_family(&entry->transport_addr) ||
+	    !midr_nds_locator_unique(bgp, node_id, &entry->transport_addr))
 		return false;
 
 	*transport = entry->transport_addr;
 	return true;
 }
 
+static struct midr_manual_session *
+midr_manual_session_find(struct bgp_midr_nds *mi, struct ipaddr transport)
+{
+	struct listnode *node;
+	struct midr_manual_session *session;
+
+	if (!mi || !mi->manual_sessions)
+		return NULL;
+	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session))
+		if (midr_ipaddr_same(&session->transport, &transport))
+			return session;
+	return NULL;
+}
+
+/* A manual session is configured by locator + ASN, so its RID can be unknown
+ * until the first successful BGP OPEN.  Bind that learned identity only after
+ * applying the same single-locator constraints as control-plane discoveries;
+ * never let an ambiguous OPEN silently rewrite the authoritative node view. */
+static bool midr_manual_session_note_identity(struct bgp *bgp,
+					      struct ipaddr transport,
+					      struct in_addr remote_rid)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_manual_session *session;
+	struct midr_session_ledger_entry *ledger;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *existing;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return false;
+	mi = bgp->midr_nds_info;
+	session = midr_manual_session_find(mi, transport);
+	if (!session)
+		return true;
+	if (remote_rid.s_addr == INADDR_ANY ||
+	    midr_nds_is_session_excluded(bgp, remote_rid))
+		return false;
+
+	midr_prefix_from_in_addr(&key.node_id, remote_rid);
+	existing = midr_node_hash_find(&mi->global_view->nodes, &key);
+	if (!midr_nds_control_locator_usable(bgp, &key.node_id, existing,
+					     &transport, "手工会话身份回填"))
+		return false;
+
+	session->remote_rid = remote_rid;
+	ledger = midr_ledger_find(mi, transport);
+	if (ledger && ledger->reason == MIDR_SESSION_MANUAL)
+		ledger->remote_rid = remote_rid;
+	return true;
+}
+
+void midr_nds_manual_session_set(struct bgp *bgp, struct ipaddr transport,
+				 as_t remote_asn,
+				 struct in_addr remote_rid)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_manual_session *session;
+
+	if (!bgp || !bgp->midr_nds_info ||
+	    !midr_ipaddr_valid_locator(&transport) || !remote_asn)
+		return;
+	mi = bgp->midr_nds_info;
+	session = midr_manual_session_find(mi, transport);
+	if (!session) {
+		session = XCALLOC(MTYPE_MIDR_MANUAL_SESSION, sizeof(*session));
+		session->transport = transport;
+		listnode_add(mi->manual_sessions, session);
+	}
+	session->remote_asn = remote_asn;
+	/* A repeated command may now describe a different peer behind the same
+	 * locator.  Do not retain an identity learned by an older generation when
+	 * the current peer/node table cannot resolve it. */
+	session->remote_rid = remote_rid;
+}
+
+bool midr_nds_manual_session_del(struct bgp *bgp, struct ipaddr transport)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node, *nnode;
+	struct midr_manual_session *session;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return false;
+	mi = bgp->midr_nds_info;
+	if (!mi->manual_sessions)
+		return false;
+
+	for (ALL_LIST_ELEMENTS(mi->manual_sessions, node, nnode, session)) {
+		if (!midr_ipaddr_same(&session->transport, &transport))
+			continue;
+		list_delete_node(mi->manual_sessions, node);
+		XFREE(MTYPE_MIDR_MANUAL_SESSION, session);
+		return true;
+	}
+	return false;
+}
+
+void midr_nds_manual_sessions_restore(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node;
+	struct midr_manual_session *session;
+	struct ipaddr local;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	mi = bgp->midr_nds_info;
+	if (mi->shutdown || mi->transport_reconfiguring ||
+	    !midr_nds_local_transport_get(bgp, &local))
+		return;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session)) {
+		struct midr_node_entry target = {};
+		struct in_addr resolved_rid;
+
+		if (!midr_ipaddr_valid_locator(&session->transport) ||
+		    ipaddr_family(&session->transport) != ipaddr_family(&local))
+			continue;
+		/* frr.conf stores a manual session as locator + ASN, so its cached
+		 * RID is normally zero after restart.  If the authoritative node
+		 * directory is already populated, resolve it before the uniqueness
+		 * gate; otherwise RID 0 remains the deliberate pre-OPEN MANUAL case. */
+		resolved_rid = midr_nds_rid_by_transport(bgp,
+						    session->transport);
+		if (resolved_rid.s_addr != INADDR_ANY)
+			session->remote_rid = resolved_rid;
+		target.node_id.family = AF_INET;
+		target.node_id.prefixlen = IPV4_MAX_BITLEN;
+		target.node_id.u.prefix4 = session->remote_rid;
+		target.transport_addr = session->transport;
+		target.has_transport_addr = true;
+		target.asn = session->remote_asn;
+		midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+	}
+}
+
+bool midr_nds_locator_unique(const struct bgp *bgp,
+			     const struct prefix *owner,
+			     const struct ipaddr *transport)
+{
+	struct midr_node_entry *entry;
+
+	if (!bgp || !bgp->midr_nds_info ||
+	    !bgp->midr_nds_info->global_view || !owner ||
+	    owner->family != AF_INET ||
+	    owner->prefixlen != IPV4_MAX_BITLEN ||
+	    !midr_ipaddr_valid_locator(transport))
+		return false;
+
+	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes,
+		  entry) {
+		if (prefix_same(&entry->node_id, owner) ||
+		    !entry->has_transport_addr ||
+		    !midr_ipaddr_valid_locator(&entry->transport_addr))
+			continue;
+		if (midr_ipaddr_same(&entry->transport_addr, transport))
+			return false;
+	}
+	return true;
+}
+
 /*
- * 按 transport 地址反查节点真名（router-id）。给 build_rep_list 应答时刻回填
- * 手配条目的 rid 用（护栏②）：手配 `midr rep group ...` 命令里没有 rid 栏，
- * 借节点表补——含 self（引导节点手配自己当代表是标准姿势，self 条目启动即有，
- * 反查必中）。查不到返回 0，wire 上 0 = 未知，收方走旧占位路径。
+ * 按 transport 地址反查节点真名（router-id）。供 `no midr session` 在 BGP
+ * OPEN 尚未提供 remote_id 时，把运维输入的 locator 解析回稳定身份；查不到
+ * 返回 0。Control v4 列表不使用本回落，线上 RID 必须非 0。
  */
 struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
 					 struct ipaddr transport)
 {
 	struct in_addr zero = { .s_addr = INADDR_ANY };
+	struct in_addr found = { .s_addr = INADDR_ANY };
 	struct midr_node_entry *entry;
 
-	if (!bgp || !bgp->midr_nds_info)
+	if (!bgp || !bgp->midr_nds_info ||
+	    !bgp->midr_nds_info->global_view ||
+	    !midr_ipaddr_valid_locator(&transport))
 		return zero;
 
 	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes, entry) {
-		if (!entry->has_transport_addr)
+		if (!entry->has_transport_addr ||
+		    !midr_ipaddr_valid_locator(&entry->transport_addr))
 			continue;
-		if (entry->node_id.family != AF_INET)
+		if (entry->node_id.family != AF_INET ||
+		    entry->node_id.prefixlen != IPV4_MAX_BITLEN ||
+		    entry->node_id.u.prefix4.s_addr == INADDR_ANY)
 			continue;
-		if (midr_ipaddr_same(&entry->transport_addr, &transport))
-			return entry->node_id.u.prefix4;
+		if (!midr_ipaddr_same(&entry->transport_addr, &transport))
+			continue;
+		/* A reverse lookup is usable only when the locator identifies one
+		 * stable RID.  Treat an inconsistent directory as unresolved rather
+		 * than selecting whichever hash entry happens to be visited first. */
+		if (found.s_addr != INADDR_ANY &&
+		    found.s_addr != entry->node_id.u.prefix4.s_addr)
+			return zero;
+		found = entry->node_id.u.prefix4;
 	}
-	return zero;
+	return found;
 }
 
 /*
  * 同款反查的候选池版（批 5 R 系列）：按 transport 在 bootstrap 候选池里找 rid。
  * 它是 `no midr session <IP>` 反查链的**第三级**——前两级（会话 remote_id、
- * 节点表）对引导节点不保证翻得到：节点表要等它的 Node NLRI 传过来，挂靠没建成
+ * 节点表）对引导节点不保证翻得到：专职引导通常没有 remote-view Node 条目，挂靠没建成
  * 的半边也没有 remote_id。池内每条都带 rid（"rid 恒非 0"不变量），正好补上。
  * 查不到返回 0。
  */
@@ -2871,9 +3152,9 @@ struct in_addr midr_nds_bootstrap_rid_by_transport(struct bgp *bgp,
  * 条目，查到则走 midr_nds_detach_node 全套（I-2 停探 + 双键删 link + 清
  * is_adjacent + 拆会话），返回 true；查不到返回 false（调用方退化为只拆会话）。
  *
- * 按 locator 比对而非仅 transport：节点无 transport 时 locator 回落 router-id，
- * 两种键都能命中。detach 内部保持 static——只经此 wrapper 对 VTY 暴露一个动作，
- * 不把停探/清账的原语散出去。
+ * 只按显式 transport 比对；router-id 是身份，绝不能回落成套接字目标。detach
+ * 内部保持 static——只经此 wrapper 对 VTY 暴露一个动作，不把停探/清账的原语
+ * 散出去。
  */
 bool midr_nds_detach_by_locator(struct bgp *bgp, struct ipaddr addr)
 {
@@ -2883,13 +3164,10 @@ bool midr_nds_detach_by_locator(struct bgp *bgp, struct ipaddr addr)
 		return false;
 
 	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes, entry) {
-		struct ipaddr loc;
-
-		if (entry->has_transport_addr)
-			loc = entry->transport_addr;
-		else if (!midr_ipaddr_from_prefix(&entry->node_id, &loc))
+		if (!entry->has_transport_addr ||
+		    !midr_ipaddr_valid_locator(&entry->transport_addr))
 			continue;
-		if (midr_ipaddr_same(&loc, &addr)) {
+		if (midr_ipaddr_same(&entry->transport_addr, &addr)) {
 			midr_nds_detach_node(bgp, entry,
 					     MIDR_STOP_GRACEFUL_SHUTDOWN, true);
 			return true;
@@ -2901,13 +3179,13 @@ bool midr_nds_detach_by_locator(struct bgp *bgp, struct ipaddr addr)
 /* ===========================================================================
  * New-node join (bootstrap) — hierarchical discovery
  *
- * Stage 0: `midr bootstrap <IP> ...` -> REP_LIST_REQ to the bootstrap (TCP
+ * Stage 0: `midr bootstrap <locator> ...` -> REP_LIST_REQ to the bootstrap (TCP
  *          list exchange).
  * Stage 1 (midr_join_on_rep_list): probe reps (I-1), pick a group, then
  *          MEMBER_LIST_REQ to that group's representative (TCP).
  * Stage 3 (in bgp_midr_ctrl.c, on MEMBER_LIST_RESP): connect every member
  *          (the representative included).
- * No BGP-LS session is opened to the bootstrap, so there is no full-table dump.
+ * No MIDR-LS session is opened to the bootstrap, so there is no full-table dump.
  * =========================================================================*/
 
 /* ---------------------------------------------------------------------------
@@ -2951,9 +3229,10 @@ static unsigned int midr_bootstrap_index(struct bgp_midr_nds *mi,
 }
 
 /*
- * 追加/刷新候选（去重键 = transport）。已存在只刷新 ASN/来源（MANUAL 覆盖
- * SEED，位置不动——移动会使游标悬空，不值得）；新增时 MANUAL 插在首个 SEED
- * 之前、SEED 追加到尾，维持"手配在前、种子在后"。
+ * 追加/刷新候选（去重键 = transport）。已存在时 MANUAL 可覆盖 SEED；SEED
+ * 不得改写 MANUAL 的 ASN/RID，否则一份远端名单会悄悄改变并持久化运维意图。
+ * 条目位置不动（移动会使游标悬空）；新增时 MANUAL 插在首个 SEED 之前、SEED
+ * 追加到尾，维持"手配在前、种子在后"。
  */
 static void midr_bootstrap_list_add(struct bgp_midr_nds *mi, struct ipaddr addr,
 				    as_t asn, struct in_addr rid,
@@ -2969,6 +3248,10 @@ static void midr_bootstrap_list_add(struct bgp_midr_nds *mi, struct ipaddr addr,
 	 * 的来源；它是**协议收口的规矩**（收侧永不吸收无名条目），防将来实现失误
 	 * 或坏包，出事时有日志可查。别把它当死代码删掉，也别据此以为 rid 可以为 0。
 	 */
+	if (!mi || !midr_ipaddr_valid_locator(&addr)) {
+		zlog_warn("MIDR bootstrap：拒收无效 locator %pIA", &addr);
+		return;
+	}
 	if (rid.s_addr == INADDR_ANY) {
 		zlog_warn("MIDR bootstrap：拒收无 router-id 的候选 %pIA（AS %u）——引导候选必须带 rid（对端版本过旧？）",
 			  &addr, asn);
@@ -2977,6 +3260,9 @@ static void midr_bootstrap_list_add(struct bgp_midr_nds *mi, struct ipaddr addr,
 
 	b = midr_bootstrap_find(mi, addr, NULL);
 	if (b) {
+		if (b->source == MIDR_BOOTSTRAP_MANUAL &&
+		    source == MIDR_BOOTSTRAP_SEED)
+			return;
 		b->asn = asn;
 		b->rid = rid;
 		if (source == MIDR_BOOTSTRAP_MANUAL)
@@ -3007,9 +3293,25 @@ static void midr_bootstrap_start_attempt(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_bootstrap_entry *b;
+	struct ipaddr local;
 
-	if (!mi->bootstrap_cur)
+	/* Keep the cursor parked while no local endpoint is active.  Transport
+	 * reconcile will restart the round after a successful bind. */
+	if (!midr_nds_local_transport_get(bgp, &local))
 		return;
+	while (mi->bootstrap_cur) {
+		b = listgetdata(mi->bootstrap_cur);
+		if (midr_ipaddr_valid_locator(&b->transport) &&
+		    ipaddr_family(&b->transport) == ipaddr_family(&local))
+			break;
+		b->failed = true;
+		mi->bootstrap_cur = listnextnode(mi->bootstrap_cur);
+	}
+	if (!mi->bootstrap_cur) {
+		zlog_warn("MIDR JOIN: no bootstrap candidate matches active locator family %u",
+			  ipaddr_family(&local));
+		return;
+	}
 	b = listgetdata(mi->bootstrap_cur);
 	midr_ctrl_send_rep_request(bgp, b->transport);
 	MIDR_FLOW_LOG("MIDR JOIN: sent REP_LIST_REQ to bootstrap %pIA [%s]（第 %u/%u 个候选）",
@@ -3132,11 +3434,11 @@ void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 
 	mi = bgp->midr_nds_info;
 
-	if (su->sa.sa_family != AF_INET) {
-		zlog_warn("MIDR JOIN: bootstrap address must be IPv4");
+	if (!midr_sockunion_to_ipaddr(su, &locator) ||
+	    !midr_ipaddr_valid_locator(&locator)) {
+		zlog_warn("MIDR JOIN: bootstrap address is not a valid unicast locator");
 		return;
 	}
-	midr_sockunion_to_ipaddr(su, &locator);
 
 	/* §8.32：命令语义 = 追加候选（不再是覆盖单值）。
 	 * rid 由命令必选参数带入（批 5 R 系列）：手配这一刻还没跟对方通上，学不到
@@ -3331,7 +3633,7 @@ void midr_bootstrap_clear(struct bgp *bgp)
  * 静态邻居都不在台账，天然不碰（判据 3 守的就是这条）。
  *
  * MANUAL 也拆（2026-08-21 拍板）：退网是运维显式敲的命令、与手配同级，留一条还在
- * 收发 BGP-LS 的会话对上层影响说不清。对端那半边收到的是 withdraw、走自动路径，
+ * 收发 MIDR-LS 的会话对上层影响说不清。对端那半边收到的是 withdraw、走自动路径，
  * 仍被 α 豁免拦下（只 warn 不拆，判据 1）。
  */
 static unsigned int midr_shutdown_teardown_sessions(struct bgp *bgp,
@@ -3365,7 +3667,7 @@ static unsigned int midr_shutdown_teardown_sessions(struct bgp *bgp,
 	for (i = 0; i < n; i++) {
 		if (doomed_manual[i]) {
 			manual++;
-			zlog_warn("MIDR 退网：拆除运维手配会话 %pI4（台账 MANUAL）——重入后如仍需要，请重敲 midr session",
+			zlog_warn("MIDR 退网：拆除运维手配会话 %pIA（台账 MANUAL）——配置意图保留，重入后自动恢复",
 				  &doomed_t[i]);
 		}
 		midr_ctrl_detach_transport(bgp, doomed_t[i], doomed_rid[i],
@@ -3434,8 +3736,9 @@ unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
 	 * 漏拆（结论 1"拆边凭台账认边"）。
 	 *
 	 * MANUAL 也拆（2026-08-21 拍板，推翻"本端也豁免"的原案）：退网是运维显式
-	 * 敲的命令、与手配同级，留一条还在收发 BGP-LS 的会话，对上层（CL / 第二组
-	 * 拓扑视图）的影响说不清，拆干净是保守方向；拆时提醒运维重入后重敲。
+ * 敲的命令、与手配同级，留一条还在收发 MIDR-LS 的会话，对上层（CL / 第二组
+	 * 拓扑视图）的影响说不清，拆干净是保守方向；显式配置意图保留，重入后由
+	 * manual_sessions 自动恢复。
 	 * 对端那半边不受影响——它收到的是 withdraw、走自动路径，仍被 α 豁免拦下
 	 * （只 warn 不拆，判据 1）。
 	 *
@@ -3563,6 +3866,8 @@ bool midr_nds_shutdown_exit(struct bgp *bgp)
 
 	/* ② 重新通告自己（群号 = 退网时回落的配置值）。 */
 	midr_nds_report_node(bgp, MIDR_ORIGIN_REJOIN);
+	/* 手工会话是配置意图，不随退网时的运行态 ledger 一起消失。 */
+	midr_nds_manual_sessions_restore(bgp);
 
 	/*
 	 * ③ 重新入网。退网把节点表和群号都清了，光恢复通告等于一个谁也不认识的孤
@@ -3607,7 +3912,8 @@ static bool midr_nds_transport_session_up(struct bgp *bgp,
 	prefix2sockunion(&p, &su);
 	peer = peer_lookup(bgp, &su);
 
-	return peer && peer->connection->status == Established;
+	return peer && peer->connection &&
+	       peer->connection->status == Established;
 }
 
 void midr_nds_bootstrap_learn(struct bgp *bgp, struct ipaddr transport,
@@ -3624,11 +3930,11 @@ void midr_nds_bootstrap_learn(struct bgp *bgp, struct ipaddr transport,
 	 * asn 也会是 0，名单条目照收。 */
 	if (!midr_ipaddr_valid_locator(&transport))
 		return;
-	/* 无名条目不吸收（"池内 rid 恒非 0"不变量，批 5 R 系列）：v3 起 wire 条目
+	/* 无名条目不吸收（"池内 rid 恒非 0"不变量，批 5 R 系列）：v4 wire 条目
 	 * 必带 rid，收到 0 说明对端实现有误或包被改坏——告警留证后跳过该条，其余
 	 * 条目照收。 */
 	if (rid.s_addr == INADDR_ANY) {
-		zlog_warn("MIDR 引导名单：条目 %pIA（AS %u）无 router-id，跳过（协议 v3 起必带 rid）",
+		zlog_warn("MIDR 引导名单：条目 %pIA（AS %u）无 router-id，跳过（协议 v4 必带 rid）",
 			  &transport, asn);
 		return;
 	}
@@ -3636,8 +3942,8 @@ void midr_nds_bootstrap_learn(struct bgp *bgp, struct ipaddr transport,
 
 	/* 别把自己学成候选（应答里含应答方自己，见 build_bootstrap_list；本机
 	 * 也可能带 BOOTSTRAP 位、出现在别人的名单里）。 */
-	if (mi->transport_addr_set &&
-	    midr_ipaddr_same(&transport, &mi->local_transport_addr))
+	if (mi->transport_active &&
+	    midr_ipaddr_same(&transport, &mi->active_transport_addr))
 		return;
 
 	midr_bootstrap_list_add(mi, transport, asn, rid, MIDR_BOOTSTRAP_SEED);
@@ -3793,9 +4099,10 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 					  unsigned int n, unsigned int want,
 					  bool second)
 {
+	struct ipaddr local;
 	unsigned int i, start, picked = 0;
 
-	if (!n || !want)
+	if (!n || !want || !midr_nds_local_transport_get(bgp, &local))
 		return 0;
 
 	/*
@@ -3814,7 +4121,8 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		struct midr_node_entry e = {};
 
 		/* asn 不再列为必需（轮 4 放宽，见 midr_ctrl_connect）。 */
-		if (!midr_ipaddr_valid_locator(&cand->transport))
+		if (!midr_ipaddr_valid_locator(&cand->transport) ||
+		    ipaddr_family(&cand->transport) != ipaddr_family(&local))
 			continue;
 		/*
 		 * 本轮已试过且挂不上的跳过（D2 failover），这才谈得上"绕环一圈"。
@@ -3853,7 +4161,7 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		}
 
 		/*
-		 * 拼临时条目：引导不在节点表里（不发 Node NLRI），没有现成条目可传。
+		 * 拼临时条目：专职引导通常不在 remote-view 节点表里，没有现成条目可传。
 		 * 同 midr_ctrl_udp_recv 收 PEER_REQUEST 回配那条路的做法——信息自带、
 		 * 不依赖节点表。node_id 取候选的 rid（池内恒非 0），排除名单查得到、
 		 * 第二道按 rid 去重也正常。group_id 置 0：引导不属任何群。
@@ -4065,9 +4373,22 @@ static void midr_nds_bootstrap_probe_attempt(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct midr_bootstrap_entry *b;
+	struct ipaddr local;
 
-	if (!mi->bootstrap_probe_cur)
+	if (!midr_nds_local_transport_get(bgp, &local))
 		return;
+	while (mi->bootstrap_probe_cur) {
+		b = listgetdata(mi->bootstrap_probe_cur);
+		if (midr_ipaddr_valid_locator(&b->transport) &&
+		    ipaddr_family(&b->transport) == ipaddr_family(&local))
+			break;
+		mi->bootstrap_probe_cur =
+			listnextnode(mi->bootstrap_probe_cur);
+	}
+	if (!mi->bootstrap_probe_cur) {
+		zlog_warn("MIDR 引导名单：无候选与本机 active locator 同族");
+		return;
+	}
 	b = listgetdata(mi->bootstrap_probe_cur);
 	midr_ctrl_send_bootstrap_list_request(bgp, b->transport);
 	MIDR_FLOW_LOG("MIDR 引导名单：向候选 %pIA [%s] 要名单（第 %u/%u 个候选，兜底遍历）",
@@ -4201,10 +4522,10 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		struct midr_node_entry *entry;
 
 		/*
-		 * 群代表此时尚未有 BGP-LS 会话（bootstrap 只是 UDP 通道），
-		 * global_view 里还没有它的条目，而 midr_pm_add_target() 要求
+		 * 群代表此时尚未有权威 remote-view 条目（bootstrap 交换只提供目录），
+		 * 而 midr_pm_add_target() 要求
 		 * 探测目标已存在于 global_view 才会启动探测，故先灌一条条目。
-		 * 键恒取真名（router-id）：稍后该代表的 Node NLRI / MEMBER_LIST
+		 * 键恒取真名（router-id）：稍后该代表的权威 Node fact / MEMBER_LIST
 		 * 正式条目同键命中同一条，一台机器不占两条表项、两个探测 ctx 不会
 		 * 抢同一地址的回复。
 		 *
@@ -4221,7 +4542,7 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		 * self 条目启动即有，无需也不该在此重建/重探）。
 		 */
 		if (r->rep_rid.s_addr == INADDR_ANY) {
-			zlog_warn("MIDR 加入：群 %u 代表 %pI4 的目录条目无 router-id（rid=0），跳过该条——不建占位条目",
+			zlog_warn("MIDR 加入：群 %u 代表 %pIA 的目录条目无 router-id（rid=0），跳过该条——不建占位条目",
 				  r->group_id, &r->rep_transport);
 			continue;
 		}
@@ -4231,6 +4552,10 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		midr_prefix_from_in_addr(&locator, r->rep_rid);
 		key.node_id = locator;
 		entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+		if (!midr_nds_control_locator_usable(
+			    bgp, &key.node_id, entry, &r->rep_transport,
+			    "群代表目录"))
+			continue;
 		if (!entry) {
 			entry = XCALLOC(MTYPE_MIDR_NODE_ENTRY, sizeof(*entry));
 			entry->node_id = locator;
@@ -4257,7 +4582,7 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		midr_ctrl_send_announce(bgp, r->rep_transport);
 
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
-		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pI4（群 %u）",
+		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pIA（群 %u）",
 			      &r->rep_transport, r->group_id);
 	}
 
@@ -4346,17 +4671,10 @@ static void midr_nds_attach_note_down(struct bgp *bgp, struct ipaddr transport)
 }
 
 /*
- * 会话建立上沿的 link 首报（轮 4 A-2）。
- *
- * PM 要 60s 热身才有真值，这段空窗里第二组视图看不到这条边。上沿先报一条占位
- * 指标把边亮出来，PM 真值一到即覆盖（version 就地递增）。已有真值就报真值。
- *
- * 占位值刻意取得很差（100ms / 10%），远超 CL 的入群门槛（20ms / 5%）——覆盖前
- * 不至于被当成优质链路选中；同时都在第二组值域内（loss_ppm < 1e6、bw 非 0）。
+ * 会话建立上沿的 link 首报。只有当前 locator 世代已经取得真实测量值时才上报；
+ * 否则等待 PM 的首次回灌。不得为新会话沿用旧 locator 的指标，也不得用占位值
+ * 制造一条上层看来已经可度量的链路。
  */
-#define MIDR_LINK_PLACEHOLDER_RTT_US 100000 /* 100ms */
-#define MIDR_LINK_PLACEHOLDER_LOSS 0.10	    /* 10% */
-
 static void midr_nds_report_link_on_established(struct bgp *bgp,
 						struct ipaddr peer_addr)
 {
@@ -4365,7 +4683,6 @@ static void midr_nds_report_link_on_established(struct bgp *bgp,
 	frr_each (midr_node_hash, &bgp->midr_nds_info->global_view->nodes,
 		  entry) {
 		struct midr_link_entry *le;
-		struct midr_link_entry placeholder = {};
 		if (!entry->has_transport_addr ||
 		    !midr_ipaddr_same(&entry->transport_addr, &peer_addr))
 			continue;
@@ -4374,15 +4691,7 @@ static void midr_nds_report_link_on_established(struct bgp *bgp,
 						&entry->node_id);
 		if (le && le->short_term.rtt_us) {
 			midr_nds_report_link(bgp, le);
-			return;
 		}
-
-		placeholder.remote_node_id = entry->node_id;
-		placeholder.short_term.rtt_us = MIDR_LINK_PLACEHOLDER_RTT_US;
-		placeholder.short_term.loss_rate = MIDR_LINK_PLACEHOLDER_LOSS;
-		midr_nds_report_link(bgp, &placeholder);
-		MIDR_LOG("MIDR facts: 会话建立，link 首报占位指标 (%pFX)",
-			 &entry->node_id);
 		return;
 	}
 }
@@ -4402,6 +4711,7 @@ static void midr_nds_report_link_on_established(struct bgp *bgp,
 struct midr_session_down {
 	struct ipaddr transport;
 	struct in_addr rid;
+	bool invalid_identity;
 };
 
 static void midr_session_reap_cb(struct event *t)
@@ -4420,6 +4730,13 @@ static void midr_session_reap_cb(struct event *t)
 
 		list_delete_node(mi->session_down_pending, node);
 		XFREE(MTYPE_MIDR_SESSION_DOWN, sd);
+		if (cur.invalid_identity) {
+			/* Defer peer deletion until outside peer_status_changed. */
+			(void)midr_nds_detach_by_locator(bgp, cur.transport);
+			midr_nds_ledger_drop(bgp, cur.transport);
+			midr_ctrl_forget_target(bgp, cur.transport);
+			continue;
+		}
 
 		zlog_info("MIDR 会话掉线：%pIA（rid %pI4）掉出 Established，拆边清账",
 			  &cur.transport, &cur.rid);
@@ -4481,6 +4798,8 @@ static int midr_nds_peer_status_hook(struct peer *peer)
 
 	if (!peer || !peer->bgp || !peer->bgp->midr_nds_info || !peer->connection)
 		return 0;
+	if (peer->bgp->midr_nds_info->transport_reconfiguring)
+		return 0;
 	if (!CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
 		return 0; /* 非 MIDR 建的会话，与挂靠、台账都无关 */
 
@@ -4490,6 +4809,20 @@ static int midr_nds_peer_status_hook(struct peer *peer)
 		return 0;
 
 	if (peer->connection->status == Established) {
+		if (!midr_manual_session_note_identity(peer->bgp, transport,
+						      peer->remote_id)) {
+			struct bgp_midr_nds *mi = peer->bgp->midr_nds_info;
+			struct midr_session_down *slot;
+
+			slot = XCALLOC(MTYPE_MIDR_SESSION_DOWN, sizeof(*slot));
+			slot->transport = transport;
+			slot->rid = peer->remote_id;
+			slot->invalid_identity = true;
+			listnode_add(mi->session_down_pending, slot);
+			event_add_event(bm->master, midr_session_reap_cb,
+					peer->bgp, 0, &mi->t_session_reap);
+			return 0;
+		}
 		midr_ledger_note_up(peer->bgp, transport);
 		midr_nds_report_link_on_established(peer->bgp, transport);
 		return 0;
@@ -4514,11 +4847,11 @@ static int midr_nds_peer_status_hook(struct peer *peer)
 }
 
 /* ===========================================================================
- * 件③：第二组 remote-view 回调（轮 4）—— 节点表的第二个数据源
+ * 件③：第二组 remote-view 回调（轮 4）—— 节点表的权威数据源
  *
- * 与旧 Node NLRI 源**并存**（双源期），两条路写同一张表、共用 midr_nds_node_react
- * 的反应链。回调侧在写入前把"回调值 vs 表内现值"逐字段比一遍并打对照日志，档 2
- * 的对照脚本 grep 它即可，不必另建影子表。件② 删旧线后本源单干。
+ * 旧 Node NLRI 收包入口已经删除。本回调写 global_view 并复用
+ * midr_nds_node_react 的反应链；Control list/request 只允许临时补全且不能迁移
+ * 已有身份的 locator。
  *
  * ⚠ 回调签名不带 bgp（第二组接口所定），只能取默认实例。
  * ⚠ asn 他们的对象里没有（membership 只有 group/transport/caps），故换源后
@@ -4595,7 +4928,7 @@ static void midr_nds_remote_seen_update(struct bgp *bgp, struct in_addr rid)
  *   rid —— 他们的 node_id 与 router_id.s_addr 同为网络序 4 字节，**勿再套 htonl**；
  *   caps —— cap_flags 是 uint64，我方 capabilities 是 uint32，取低 32 位（与上行
  *           facts 层"低 32 位放能力位"对称）；
- *   transport —— 只认 IPv4，has_transport_address 为假或非 v4 一律当没有。
+ *   transport —— 接受合法 IPv4/IPv6 单播 locator；缺失或非法一律当没有。
  */
 void midr_nds_remote_node_decode(const struct midr_remote_node_info *node,
 				 struct in_addr *rid, uint32_t *caps,
@@ -4610,6 +4943,258 @@ void midr_nds_remote_node_decode(const struct midr_remote_node_info *node,
 		SET_IPADDR_NONE(transport);
 }
 
+struct midr_remote_locator_intent {
+	bool present;
+	enum midr_session_reason reason;
+	struct in_addr remote_rid;
+	as_t remote_asn;
+	uint32_t remote_group;
+};
+
+/* Drop deferred peer-down work for an address whose locator generation has
+ * ended.  Otherwise the zero-delay callbacks can later delete the replacement
+ * edge after the node entry has already moved to its new address. */
+static void midr_nds_remote_clear_deferred(struct bgp_midr_nds *mi,
+					   struct ipaddr old_transport)
+{
+	struct listnode *node, *nnode;
+	struct ipaddr *attach;
+	struct midr_session_down *down;
+
+	for (ALL_LIST_ELEMENTS(mi->attach_down_pending, node, nnode, attach)) {
+		if (!midr_ipaddr_same(attach, &old_transport))
+			continue;
+		list_delete_node(mi->attach_down_pending, node);
+		XFREE(MTYPE_MIDR_ATTACH_DOWN, attach);
+	}
+	if (list_isempty(mi->attach_down_pending))
+		event_cancel(&mi->t_attach_reap);
+
+	for (ALL_LIST_ELEMENTS(mi->session_down_pending, node, nnode, down)) {
+		if (!midr_ipaddr_same(&down->transport, &old_transport))
+			continue;
+		list_delete_node(mi->session_down_pending, node);
+		XFREE(MTYPE_MIDR_SESSION_DOWN, down);
+	}
+	if (list_isempty(mi->session_down_pending))
+		event_cancel(&mi->t_session_reap);
+}
+
+/* rep_dir is learned runtime state, so entries that identify this node move
+ * with its advertised locator.  A missing/conflicting replacement removes
+ * them.  The second pass folds any duplicate created by the re-key. */
+static void midr_nds_remote_rekey_rep_dir(struct bgp_midr_nds *mi,
+					  struct in_addr rid,
+					  const struct ipaddr *old_transport,
+					  const struct ipaddr *new_transport)
+{
+	struct listnode *node, *nnode;
+	struct midr_rep_entry *rep;
+	bool old_valid = midr_ipaddr_valid_locator(old_transport);
+	bool new_valid = midr_ipaddr_valid_locator(new_transport);
+
+	for (ALL_LIST_ELEMENTS(mi->rep_dir, node, nnode, rep)) {
+		bool match_rid = rep->rep_rid.s_addr == rid.s_addr;
+		bool match_old = old_valid &&
+				 midr_ipaddr_same(&rep->rep_transport,
+						   old_transport);
+
+		if (!match_rid && !match_old)
+			continue;
+		if (!new_valid) {
+			list_delete_node(mi->rep_dir, node);
+			XFREE(MTYPE_MIDR_REP_ENTRY, rep);
+			continue;
+		}
+		rep->rep_transport = *new_transport;
+		rep->rep_rid = rid;
+	}
+
+	for (ALL_LIST_ELEMENTS(mi->rep_dir, node, nnode, rep)) {
+		struct listnode *scan;
+		struct midr_rep_entry *prior;
+
+		for (scan = listhead(mi->rep_dir); scan && scan != node;
+		     scan = listnextnode(scan)) {
+			prior = listgetdata(scan);
+			if (prior->group_id != rep->group_id ||
+			    !midr_ipaddr_same(&prior->rep_transport,
+						  &rep->rep_transport))
+				continue;
+			if (!prior->rep_asn)
+				prior->rep_asn = rep->rep_asn;
+			if (prior->rep_rid.s_addr == INADDR_ANY)
+				prior->rep_rid = rep->rep_rid;
+			list_delete_node(mi->rep_dir, node);
+			XFREE(MTYPE_MIDR_REP_ENTRY, rep);
+			break;
+		}
+	}
+}
+
+/* Learned seed entries follow a node identity.  MANUAL entries are persistent
+ * exact-address operator intent: preserve their text, but skip a stale one in
+ * an in-flight traversal so it cannot block failover forever. */
+static void midr_nds_remote_rekey_bootstraps(struct bgp *bgp,
+					     struct in_addr rid,
+					     const struct ipaddr *old_transport,
+					     const struct ipaddr *new_transport)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct listnode *node, *nnode;
+	struct midr_bootstrap_entry *bootstrap;
+	bool old_valid = midr_ipaddr_valid_locator(old_transport);
+	bool new_valid = midr_ipaddr_valid_locator(new_transport);
+	bool restart_join = false, restart_probe = false;
+
+	for (ALL_LIST_ELEMENTS(mi->bootstrap_list, node, nnode, bootstrap)) {
+		struct listnode *duplicate_node = NULL;
+		struct midr_bootstrap_entry *duplicate = NULL;
+		bool match_rid = bootstrap->rid.s_addr == rid.s_addr;
+		bool match_old = old_valid &&
+				 midr_ipaddr_same(&bootstrap->transport,
+						   old_transport);
+
+		if (!match_rid && !match_old)
+			continue;
+
+		if (bootstrap->source == MIDR_BOOTSTRAP_MANUAL) {
+			if (new_valid &&
+			    midr_ipaddr_same(&bootstrap->transport, new_transport))
+				continue;
+			bootstrap->failed = true;
+			bootstrap->attach_failed = true;
+			if (mi->bootstrap_cur == node) {
+				mi->bootstrap_cur = nnode;
+				restart_join = true;
+			}
+			if (mi->bootstrap_probe_cur == node) {
+				mi->bootstrap_probe_cur = nnode;
+				restart_probe = true;
+			}
+			continue;
+		}
+
+		if (new_valid)
+			duplicate = midr_bootstrap_find(mi, *new_transport,
+							 &duplicate_node);
+		if (duplicate == bootstrap) {
+			bootstrap->rid = rid;
+			continue;
+		}
+
+		if (new_valid && duplicate &&
+		    duplicate->rid.s_addr == rid.s_addr) {
+			if (!duplicate->asn)
+				duplicate->asn = bootstrap->asn;
+			duplicate->in_last_list |= bootstrap->in_last_list;
+			if (mi->bootstrap_cur == node) {
+				mi->bootstrap_cur = duplicate_node;
+				restart_join = true;
+			}
+			if (mi->bootstrap_probe_cur == node) {
+				mi->bootstrap_probe_cur = duplicate_node;
+				restart_probe = true;
+			}
+			list_delete_node(mi->bootstrap_list, node);
+			XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, bootstrap);
+			continue;
+		}
+
+		if (new_valid && !duplicate) {
+			bootstrap->transport = *new_transport;
+			bootstrap->rid = rid;
+			if (mi->bootstrap_cur == node)
+				restart_join = true;
+			if (mi->bootstrap_probe_cur == node)
+				restart_probe = true;
+			continue;
+		}
+
+		/* No usable replacement, or the new locator is already owned by a
+		 * different configured identity. */
+		if (mi->bootstrap_cur == node) {
+			mi->bootstrap_cur = nnode;
+			restart_join = true;
+		}
+		if (mi->bootstrap_probe_cur == node) {
+			mi->bootstrap_probe_cur = nnode;
+			restart_probe = true;
+		}
+		list_delete_node(mi->bootstrap_list, node);
+		XFREE(MTYPE_MIDR_BOOTSTRAP_ENTRY, bootstrap);
+	}
+
+	if (restart_join && mi->join_intent) {
+		if (mi->bootstrap_cur)
+			midr_bootstrap_start_attempt(bgp);
+		else
+			zlog_warn("MIDR JOIN: locator 变更后已无可继续尝试的引导候选（加入意图保留）");
+	}
+	if (restart_probe && mi->bootstrap_probe_cur)
+		midr_nds_bootstrap_probe_attempt(bgp);
+}
+
+static bool midr_nds_remote_take_ledger(struct bgp *bgp,
+					struct ipaddr old_transport,
+					struct midr_remote_locator_intent *intent)
+{
+	const struct midr_session_ledger_entry *ledger;
+
+	memset(intent, 0, sizeof(*intent));
+	ledger = midr_nds_ledger_lookup(bgp, old_transport);
+	if (!ledger)
+		return false;
+	intent->present = true;
+	intent->reason = ledger->reason;
+	intent->remote_rid = ledger->remote_rid;
+	intent->remote_asn = ledger->remote_asn;
+	intent->remote_group = ledger->remote_group;
+	midr_nds_ledger_drop(bgp, old_transport);
+	return true;
+}
+
+static void midr_nds_remote_restore_intent(
+	struct bgp *bgp, struct midr_node_entry *entry,
+	const struct midr_remote_locator_intent *intent)
+{
+	struct midr_node_entry target;
+	bool send_nudge;
+
+	if (!intent->present || intent->reason == MIDR_SESSION_MANUAL ||
+	    !entry->has_transport_addr ||
+	    !midr_ipaddr_valid_locator(&entry->transport_addr) ||
+	    !midr_nds_locator_unique(bgp, &entry->node_id,
+				     &entry->transport_addr))
+		return;
+	/* SAME_GROUP is durable membership intent, not a statement that the edge
+	 * can be opened under the locator currently active locally.  In particular,
+	 * preserve it across an IPv4/IPv6 mismatch so a later local transport
+	 * switch can restore the edge.  Re-check only family-independent membership
+	 * invariants here; midr_ctrl_connect() remains the fail-closed runtime gate. */
+	if (intent->reason == MIDR_SESSION_SAME_GROUP &&
+	    (!entry->group_id ||
+	     entry->group_id != bgp->midr_nds_info->local_group_id ||
+	     entry->is_self ||
+	     !midr_nds_locator_unique(bgp, &entry->node_id,
+				      &entry->transport_addr)))
+		return;
+	if (midr_nds_is_session_excluded(bgp, entry->node_id.u.prefix4))
+		return;
+
+	/* Record intent even when the currently active local locator is another
+	 * family; a later local transport switch can then restore it. */
+	midr_nds_ledger_note(bgp, entry->transport_addr, intent->reason,
+			     entry->node_id.u.prefix4,
+			     entry->asn ? entry->asn : intent->remote_asn,
+			     entry->group_id);
+	target = *entry;
+	if (!target.asn)
+		target.asn = intent->remote_asn;
+	send_nudge = intent->reason != MIDR_SESSION_PEER_REQ_REPLY;
+	midr_ctrl_connect(bgp, &target, intent->reason, send_nudge);
+}
+
 static void midr_nds_remote_node_update(const struct midr_remote_node_info *node)
 {
 	struct bgp *bgp = midr_nds_remote_bgp();
@@ -4619,8 +5204,11 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 	struct in_addr rid;
 	uint32_t caps;
 	struct ipaddr transport = {};
+	struct ipaddr old_transport = midr_ipaddr_none();
+	struct midr_remote_locator_intent intent = {};
 	bool has_transport;
 	bool is_new = false, changed = false, group_changed = false;
+	bool old_has_transport, locator_changed, locator_conflict = false;
 	uint32_t prev_gid = 0;
 
 	if (!bgp || !node)
@@ -4629,12 +5217,24 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 	/* 退网守卫（与 on_node_nlri 开头那道同源，一字不改的语义）：本机退网期间
 	 * 一律不吃远端节点事实，否则刚清空的节点表会被回调灌回来。 */
 	if (bgp->midr_nds_info->shutdown) {
-		MIDR_LOG("MIDR 退网：丢弃收到的远端 Node NLRI（本机已退网）");
+		MIDR_LOG("MIDR 退网：丢弃收到的远端 Node fact（本机已退网）");
 		return;
 	}
 
 	midr_nds_remote_node_decode(node, &rid, &caps, &transport,
 				    &has_transport);
+	/* Reject a mixed-family update before touching identity or metadata. */
+	if (has_transport && bgp->midr_nds_info->transport_addr_set &&
+	    ipaddr_family(&transport) !=
+		    ipaddr_family(&bgp->midr_nds_info->local_transport_addr)) {
+		zlog_warn("MIDR remote view: ignoring mixed-family Node locator %pIA",
+			  &transport);
+		return;
+	}
+	if (rid.s_addr == INADDR_ANY) {
+		zlog_warn("MIDR 远端视图：拒收 router-id 0.0.0.0 的 Node 事实");
+		return;
+	}
 	midr_prefix_from_in_addr(&key.node_id, rid);
 
 	/* is_self：防自己的回声。他们那侧也按 originator == router_id 滤过一道
@@ -4669,12 +5269,81 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 		entry->cap_seqno = node->ls_sequence;
 	}
 
-	if (has_transport) {
-		if (!entry->has_transport_addr ||
-		    !midr_ipaddr_same(&entry->transport_addr, &transport))
-			changed = true;
+	old_has_transport = entry->has_transport_addr &&
+			    midr_ipaddr_valid_locator(&entry->transport_addr);
+	if (old_has_transport)
+		old_transport = entry->transport_addr;
+
+	/* A locator is a unique routable endpoint, not merely an address-shaped
+	 * attribute.  On conflict fail closed and retire the previous generation. */
+	if (has_transport &&
+	    ((bgp->midr_nds_info->transport_active &&
+	      midr_ipaddr_same(&transport,
+			       &bgp->midr_nds_info->active_transport_addr)) ||
+	     !midr_nds_locator_unique(bgp, &entry->node_id, &transport))) {
+		zlog_warn("MIDR 远端视图：node %pI4 的 locator %pIA 与其它节点或本机冲突，拒绝激活",
+			  &rid, &transport);
+		/* Retain the advertised claim so neither RID wins by arrival order.
+		 * All runtime users must pass the uniqueness gate. */
+		locator_conflict = true;
+	}
+
+	locator_changed = old_has_transport != has_transport ||
+			   (old_has_transport && has_transport &&
+			    !midr_ipaddr_same(&old_transport, &transport)) ||
+			   (entry->has_transport_addr && !old_has_transport);
+	if (locator_changed) {
+		changed = true;
+		if (old_has_transport) {
+			(void)midr_nds_remote_take_ledger(bgp, old_transport,
+						  &intent);
+			midr_nds_detach_node(bgp, entry, MIDR_STOP_SESSION_DOWN,
+					     false);
+			midr_ctrl_forget_target(bgp, old_transport);
+			midr_nds_remote_clear_deferred(bgp->midr_nds_info,
+						       old_transport);
+		}
+
+		if (has_transport) {
+			entry->transport_addr = transport;
+			entry->has_transport_addr = true;
+		} else {
+			SET_IPADDR_NONE(&entry->transport_addr);
+			entry->has_transport_addr = false;
+		}
+
+		midr_nds_remote_rekey_rep_dir(bgp->midr_nds_info, rid,
+					       &old_transport,
+					       has_transport && !locator_conflict
+						       ? &transport : NULL);
+		midr_nds_remote_rekey_bootstraps(
+			bgp, rid, &old_transport,
+			has_transport && !locator_conflict ? &transport : NULL);
+	} else if (has_transport) {
 		entry->transport_addr = transport;
 		entry->has_transport_addr = true;
+	} else {
+		SET_IPADDR_NONE(&entry->transport_addr);
+		entry->has_transport_addr = false;
+	}
+
+	if (locator_conflict) {
+		struct midr_node_entry *claimant;
+
+		/* Retire every old user, including the earlier claimant.  Keep node
+		 * identities/claims for future authoritative updates or withdraws. */
+		frr_each (midr_node_hash, &gv->nodes, claimant) {
+			if (claimant->is_self || !claimant->has_transport_addr ||
+			    !midr_ipaddr_same(&claimant->transport_addr, &transport))
+				continue;
+			midr_nds_detach_node(bgp, claimant, MIDR_STOP_SESSION_DOWN,
+					     false);
+			midr_nds_remote_rekey_rep_dir(bgp->midr_nds_info,
+				claimant->node_id.u.prefix4, &transport, NULL);
+		}
+		midr_nds_ledger_drop(bgp, transport);
+		midr_ctrl_forget_target(bgp, transport);
+		midr_nds_remote_clear_deferred(bgp->midr_nds_info, transport);
 	}
 
 	entry->last_update = monotime(NULL);
@@ -4690,6 +5359,12 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 
 	midr_nds_node_react(bgp, entry, is_new, changed, group_changed,
 			    prev_gid);
+	if (locator_changed)
+		midr_nds_remote_restore_intent(bgp, entry, &intent);
+	if (locator_conflict && bgp->midr_nds_info->transport_active &&
+	    midr_ipaddr_same(&transport,
+			     &bgp->midr_nds_info->active_transport_addr))
+		(void)midr_nds_transport_reconcile(bgp);
 }
 
 static void midr_nds_remote_node_withdraw(uint32_t node_id, uint64_t ls_sequence)
@@ -4705,7 +5380,7 @@ static void midr_nds_remote_node_withdraw(uint32_t node_id, uint64_t ls_sequence
 	if (!bgp)
 		return;
 	if (bgp->midr_nds_info->shutdown) {
-		MIDR_LOG("MIDR 退网：丢弃收到的远端 Node NLRI（本机已退网）");
+		MIDR_LOG("MIDR 退网：丢弃收到的远端 Node withdraw（本机已退网）");
 		return;
 	}
 
@@ -4839,13 +5514,222 @@ static void midr_nds_remote_view_register(struct bgp *bgp)
 	mi->remote_view_registered = true;
 	if (mi->remote_view_reg_failed)
 		zlog_warn("MIDR 远端视图：回调注册在重试中恢复成功 —— 此前失败期间学到的远端信息可能不全");
-	zlog_info("MIDR 远端视图：已向第二组注册 node/link 回调（双源期，与 Node NLRI 并存）");
+	zlog_info("MIDR 远端视图：已向第二组注册 node/link 权威回调");
 }
 
 /* config_end 补注册（init 期 ctx 尚未就绪，见上）。 */
 static int midr_nds_remote_view_after_cfg(struct bgp *bgp)
 {
 	midr_nds_remote_view_register(bgp);
+	return 0;
+}
+
+static void midr_nds_transport_clear_deferred(struct bgp_midr_nds *mi)
+{
+	struct listnode *node, *nnode;
+	struct ipaddr *transport;
+	struct midr_session_down *down;
+
+	event_cancel(&mi->t_attach_reap);
+	event_cancel(&mi->t_session_reap);
+	for (ALL_LIST_ELEMENTS(mi->attach_down_pending, node, nnode,
+			       transport)) {
+		list_delete_node(mi->attach_down_pending, node);
+		XFREE(MTYPE_MIDR_ATTACH_DOWN, transport);
+	}
+	for (ALL_LIST_ELEMENTS(mi->session_down_pending, node, nnode, down)) {
+		list_delete_node(mi->session_down_pending, node);
+		XFREE(MTYPE_MIDR_SESSION_DOWN, down);
+	}
+}
+
+static void midr_nds_transport_clear_measurements(struct bgp_midr_nds *mi)
+{
+	struct listnode *node, *nnode;
+	struct midr_link_entry *link;
+
+	for (ALL_LIST_ELEMENTS(mi->global_view->links, node, nnode, link)) {
+		list_delete_node(mi->global_view->links, node);
+		XFREE(MTYPE_MIDR_LINK_ENTRY, link);
+	}
+}
+
+/* Reconcile configured transport with runtime state as one fail-closed
+ * transaction.  Ledger/config intent survives; old sockets, async requests,
+ * probes, measurements and NDS-owned peers do not. */
+int midr_nds_transport_reconcile(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+	struct prefix self_id;
+	struct peer **doomed = NULL;
+	struct peer *peer;
+	struct midr_node_entry *view_entry;
+	struct listnode *node;
+	struct midr_session_ledger_entry *ledger;
+	struct ipaddr desired = midr_ipaddr_none();
+	bool want_transport, desired_unique = true, restart_join;
+	size_t peer_cap, peer_count = 0;
+	int ret = 0;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return -EINVAL;
+	mi = bgp->midr_nds_info;
+	want_transport = mi->transport_addr_set;
+	if (want_transport) {
+		desired = mi->local_transport_addr;
+		if (!midr_ipaddr_valid_locator(&desired))
+			return -EINVAL;
+		midr_prefix_from_in_addr(&self_id, bgp->router_id);
+		desired_unique = midr_nds_locator_unique(bgp, &self_id,
+						   &desired);
+	}
+
+	if ((!want_transport && !mi->transport_active) ||
+	    (want_transport && desired_unique && mi->transport_active &&
+	     midr_ipaddr_same(&desired, &mi->active_transport_addr))) {
+		midr_nds_manual_sessions_restore(bgp);
+		return 0;
+	}
+
+	restart_join = mi->join_intent || mi->join_in_progress ||
+		       mi->join_phase != MIDR_JOIN_IDLE;
+	mi->transport_reconfiguring = true;
+
+	/* Withdraw endpoints while the old active locator is still available. */
+	midr_nds_facts_withdraw_all_links(bgp);
+	midr_pm_finish(bgp);
+	midr_ctrl_close(bgp);
+	midr_nds_transport_clear_deferred(mi);
+	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_member_probe_done);
+	midr_nds_anchor_ctx_clear(bgp);
+	midr_rep_dir_clear(bgp);
+	mi->join_phase = MIDR_JOIN_IDLE;
+	mi->join_in_progress = false;
+	mi->join_group_id = 0;
+	mi->bootstrap_cur = NULL;
+	mi->bootstrap_probe_cur = NULL;
+
+	/* Deleting a peer mutates bgp->peer, so snapshot pointers first. */
+	peer_cap = listcount(bgp->peer);
+	if (peer_cap)
+		doomed = XCALLOC(MTYPE_TMP, peer_cap * sizeof(*doomed));
+	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
+		if (midr_nds_peer_is_overlay(peer))
+			doomed[peer_count++] = peer;
+	for (size_t i = 0; i < peer_count; i++)
+		peer_delete(doomed[i]);
+	XFREE(MTYPE_TMP, doomed);
+	/* is_adjacent describes a live session/probe relationship, not durable
+	 * membership intent.  Every such relationship belonged to the locator
+	 * generation just torn down; compatible SAME_GROUP ledgers set it again
+	 * through midr_ctrl_connect() below. */
+	frr_each (midr_node_hash, &mi->global_view->nodes, view_entry)
+		view_entry->is_adjacent = false;
+	midr_nds_transport_clear_measurements(mi);
+
+	mi->transport_active = false;
+	SET_IPADDR_NONE(&mi->active_transport_addr);
+
+	if (want_transport && desired_unique && midr_ctrl_open(bgp, &desired)) {
+		mi->active_transport_addr = desired;
+		mi->transport_active = true;
+	} else if (want_transport) {
+		if (!desired_unique) {
+			zlog_err("MIDR transport: configured locator %pIA belongs to another node; runtime remains disabled",
+				 &desired);
+			ret = -EADDRINUSE;
+		} else {
+			zlog_err("MIDR transport: configured locator %pIA could not become active; runtime remains disabled",
+				 &desired);
+			ret = -EADDRNOTAVAIL;
+		}
+	}
+
+	/* PM owns its socket implementation.  Reinitialising through its public
+	 * lifecycle lets the PM branch bind the same newly active family. */
+	midr_pm_init(bgp);
+	midr_nds_local_node_update(bgp);
+	midr_nds_report_node(bgp, MIDR_ORIGIN_TRANSPORT_UPDATE);
+
+	mi->transport_reconfiguring = false;
+	if (mi->transport_active) {
+		/* Restore durable edge intent without carrying old peer objects or
+		 * measurements across the locator generation. */
+		for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, ledger)) {
+			struct midr_node_entry target = {};
+			bool send_nudge;
+
+			if (!midr_ipaddr_valid_locator(&ledger->transport) ||
+			    ipaddr_family(&ledger->transport) !=
+				    ipaddr_family(&mi->active_transport_addr))
+				continue;
+			target.node_id.family = AF_INET;
+			target.node_id.prefixlen = IPV4_MAX_BITLEN;
+			target.node_id.u.prefix4 = ledger->remote_rid;
+			target.transport_addr = ledger->transport;
+			target.has_transport_addr = true;
+			target.asn = ledger->remote_asn;
+			target.group_id = ledger->remote_group;
+			ledger->down_since = 0;
+			send_nudge = ledger->reason != MIDR_SESSION_MANUAL &&
+				      ledger->reason != MIDR_SESSION_PEER_REQ_REPLY;
+			midr_ctrl_connect(bgp, &target, ledger->reason,
+					  send_nudge);
+		}
+		midr_nds_manual_sessions_restore(bgp);
+		midr_pm_on_transport_addr_set(bgp);
+		if (restart_join && !list_isempty(mi->bootstrap_list))
+			midr_join_round_start(bgp);
+	}
+
+	return ret;
+}
+
+int midr_nds_transport_configure(struct bgp *bgp,
+				 const struct ipaddr *transport)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node;
+	struct midr_bootstrap_entry *bootstrap;
+	struct midr_manual_session *session;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return -EINVAL;
+	if (transport && !midr_ipaddr_valid_locator(transport))
+		return -EINVAL;
+	mi = bgp->midr_nds_info;
+	if (transport) {
+		/* Keep the public setter fail-closed even outside the VTY path. */
+		int family = ipaddr_family(transport);
+
+		if ((mi->transport_addr_set &&
+		     family != ipaddr_family(&mi->local_transport_addr)) ||
+		    (mi->transport_active &&
+		     family != ipaddr_family(&mi->active_transport_addr)))
+			return -EAFNOSUPPORT;
+		for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, bootstrap))
+			if (family != ipaddr_family(&bootstrap->transport))
+				return -EAFNOSUPPORT;
+		for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session))
+			if (family != ipaddr_family(&session->transport))
+				return -EAFNOSUPPORT;
+		mi->local_transport_addr = *transport;
+		mi->transport_addr_set = true;
+	} else {
+		SET_IPADDR_NONE(&mi->local_transport_addr);
+		mi->transport_addr_set = false;
+	}
+
+	/* During frr.conf loading, later lines may still change dependent state. */
+	if (bgp_config_inprocess())
+		return 0;
+	return midr_nds_transport_reconcile(bgp);
+}
+
+static int midr_nds_transport_after_cfg(struct bgp *bgp)
+{
+	(void)midr_nds_transport_reconcile(bgp);
 	return 0;
 }
 
@@ -4866,6 +5750,7 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	 *   bgp_routerid_update → rid 就绪后重放一笔（守卫要求 rid 非 0）。 */
 	if (!hooks_registered) {
 		hook_register(peer_status_changed, midr_nds_peer_status_hook);
+		hook_register(bgp_config_end, midr_nds_transport_after_cfg);
 		hook_register(bgp_config_end, midr_nds_attach_after_cfg);
 		hook_register(bgp_config_end, midr_nds_bootstrap_after_cfg);
 		hook_register(bgp_config_end, midr_nds_remote_view_after_cfg);
@@ -4885,11 +5770,14 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	mi->bootstrap_list = list_new(); /* §8.32 候选引导节点清单 */
 	mi->session_blacklist = list_new(); /* 会话排除名单 */
 	mi->session_ledger = list_new();    /* 会话台账（结论 20） */
+	mi->manual_sessions = list_new();   /* `midr session` 持久配置意图 */
 	mi->attach_down_pending = list_new(); /* 钩子 (b) 待处理掉线（D4） */
 	mi->session_down_pending = list_new(); /* 件④ 掉沿清账待办 */
 	mi->remote_withdrawn = list_new();    /* 件③ 虚报观察探针 */
 	mi->perf_seqno = 0;
 	mi->cap_seqno = 0;
+	SET_IPADDR_NONE(&mi->local_transport_addr);
+	SET_IPADDR_NONE(&mi->active_transport_addr);
 
 	bgp->midr_nds_info = mi;
 
@@ -4898,7 +5786,7 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	mi->g2_ctx = midr_context_get_default();
 	midr_nds_facts_init(bgp);
 
-	/* 件③：注册 remote-view 回调（节点表的第二个数据源，与 Node NLRI 并存）。
+	/* 件③：注册 remote-view 回调（节点表的权威远端数据源）。
 	 * 排在 facts_init 之后、各子模块之前——回调一旦注册就可能立刻被叫。 */
 	midr_nds_remote_view_register(bgp);
 
@@ -4986,9 +5874,17 @@ void bgp_midr_nds_finish(struct bgp *bgp)
 			XFREE(MTYPE_MIDR_SESSION_LEDGER, e);
 		list_delete(&mi->session_ledger);
 	}
+	if (mi->manual_sessions) {
+		struct listnode *node, *nnode;
+		struct midr_manual_session *session;
+
+		for (ALL_LIST_ELEMENTS(mi->manual_sessions, node, nnode, session))
+			XFREE(MTYPE_MIDR_MANUAL_SESSION, session);
+		list_delete(&mi->manual_sessions);
+	}
 	if (mi->attach_down_pending) { /* 钩子 (b) 待处理掉线（D4） */
 		struct listnode *node, *nnode;
-		struct in_addr *a;
+		struct ipaddr *a;
 
 		for (ALL_LIST_ELEMENTS(mi->attach_down_pending, node, nnode, a))
 			XFREE(MTYPE_MIDR_ATTACH_DOWN, a);
