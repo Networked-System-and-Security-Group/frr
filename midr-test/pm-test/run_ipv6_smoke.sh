@@ -209,6 +209,8 @@ ip -n "$NS_A" "$IP_FLAG" route add "$TRANSPORT_B/$TRANSPORT_PREFIX" \
     via "$LINK_B" dev "$IF_A"
 ip -n "$NS_B" "$IP_FLAG" route add "$TRANSPORT_A/$TRANSPORT_PREFIX" \
     via "$LINK_A" dev "$IF_B"
+ip -n "$NS_B" "$IP_FLAG" route add "$UNKNOWN_A/$TRANSPORT_PREFIX" \
+    via "$LINK_A" dev "$IF_B"
 
 ip netns exec "$NS_A" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_B" >/dev/null
 ip netns exec "$NS_B" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_A" >/dev/null
@@ -228,7 +230,12 @@ ip netns exec "$NS_A" "$SMOKE_BIN" client "$TRANSPORT_A" "$TRANSPORT_B" \
 ip netns exec "$NS_A" "$SMOKE_BIN" unknown "$UNKNOWN_A" "$TRANSPORT_B" \
     | tee "$ARTIFACT_DIR/unknown.log"
 
-wait "$SERVER_PID"
+if ! wait "$SERVER_PID"; then
+    SERVER_PID=""
+    echo "[pm-smoke] FAIL: standalone server rejected the test sequence" >&2
+    sed -n '1,120p' "$ARTIFACT_DIR/server.log" >&2
+    exit 1
+fi
 SERVER_PID=""
 stop_pid "$TCPDUMP_PID"
 TCPDUMP_PID=""
