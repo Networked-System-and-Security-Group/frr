@@ -5681,6 +5681,11 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 		midr_pm_on_transport_addr_set(bgp);
 		if (restart_join && !list_isempty(mi->bootstrap_list))
 			midr_join_round_start(bgp);
+		/* close() also cancelled any bootstrap-list fetch before it could
+		 * create an ATTACH ledger.  Replay alone cannot recover that work;
+		 * resume the representative's existing attachment policy as well. */
+		if (!mi->shutdown)
+			midr_nds_attach_ensure(bgp, "transport activated");
 	}
 
 	return ret;
