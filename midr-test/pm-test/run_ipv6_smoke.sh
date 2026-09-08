@@ -60,6 +60,7 @@ case "$ADDRESS_FAMILY" in
         IP_FLAG=-4
         PING_FLAG=-4
         PCAP_FILTER='ip and udp port 5860'
+        ADDR_FLAGS=()
         ;;
     ipv6)
         NS_A="midr-pms6-a"
@@ -76,6 +77,7 @@ case "$ADDRESS_FAMILY" in
         IP_FLAG=-6
         PING_FLAG=-6
         PCAP_FILTER='ip6 and udp port 5860'
+        ADDR_FLAGS=(nodad)
         ;;
     *)
         echo "Unsupported address family: $ADDRESS_FAMILY" >&2
@@ -235,11 +237,16 @@ done
 
 ip -n "$NS_A" link set "$IF_A" up
 ip -n "$NS_B" link set "$IF_B" up
-ip -n "$NS_A" addr add "$LINK_A/$LINK_PREFIX" dev "$IF_A"
-ip -n "$NS_B" addr add "$LINK_B/$LINK_PREFIX" dev "$IF_B"
-ip -n "$NS_A" addr add "$TRANSPORT_A/$TRANSPORT_PREFIX" dev lo
-ip -n "$NS_B" addr add "$TRANSPORT_B/$TRANSPORT_PREFIX" dev lo
-ip -n "$NS_A" addr add "$UNKNOWN_A/$TRANSPORT_PREFIX" dev lo
+ip -n "$NS_A" addr add "$LINK_A/$LINK_PREFIX" dev "$IF_A" \
+    "${ADDR_FLAGS[@]}"
+ip -n "$NS_B" addr add "$LINK_B/$LINK_PREFIX" dev "$IF_B" \
+    "${ADDR_FLAGS[@]}"
+ip -n "$NS_A" addr add "$TRANSPORT_A/$TRANSPORT_PREFIX" dev lo \
+    "${ADDR_FLAGS[@]}"
+ip -n "$NS_B" addr add "$TRANSPORT_B/$TRANSPORT_PREFIX" dev lo \
+    "${ADDR_FLAGS[@]}"
+ip -n "$NS_A" addr add "$UNKNOWN_A/$TRANSPORT_PREFIX" dev lo \
+    "${ADDR_FLAGS[@]}"
 ip -n "$NS_A" "$IP_FLAG" route add "$TRANSPORT_B/$TRANSPORT_PREFIX" \
     via "$LINK_B" dev "$IF_A"
 ip -n "$NS_B" "$IP_FLAG" route add "$TRANSPORT_A/$TRANSPORT_PREFIX" \
@@ -247,8 +254,20 @@ ip -n "$NS_B" "$IP_FLAG" route add "$TRANSPORT_A/$TRANSPORT_PREFIX" \
 ip -n "$NS_B" "$IP_FLAG" route add "$UNKNOWN_A/$TRANSPORT_PREFIX" \
     via "$LINK_A" dev "$IF_B"
 
-ip netns exec "$NS_A" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_B" >/dev/null
-ip netns exec "$NS_B" ping "$PING_FLAG" -c 2 -W 1 "$TRANSPORT_A" >/dev/null
+if ! ip netns exec "$NS_A" ping "$PING_FLAG" -c 2 -W 1 \
+    "$TRANSPORT_B" >/dev/null; then
+    echo "[pm-smoke] FAIL: node-a cannot reach $TRANSPORT_B" >&2
+    ip -n "$NS_A" addr show >&2
+    ip -n "$NS_A" "$IP_FLAG" route show >&2
+    exit 1
+fi
+if ! ip netns exec "$NS_B" ping "$PING_FLAG" -c 2 -W 1 \
+    "$TRANSPORT_A" >/dev/null; then
+    echo "[pm-smoke] FAIL: node-b cannot reach $TRANSPORT_A" >&2
+    ip -n "$NS_B" addr show >&2
+    ip -n "$NS_B" "$IP_FLAG" route show >&2
+    exit 1
+fi
 
 ip netns exec "$NS_A" tcpdump -U -c 3 -i "$IF_A" -s 0 \
     -w "$ARTIFACT_DIR/pm-smoke.pcap" "$PCAP_FILTER" \
