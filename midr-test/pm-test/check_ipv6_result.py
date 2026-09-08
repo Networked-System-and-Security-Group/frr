@@ -142,6 +142,12 @@ def main():
                 "unknown IPv6 source is rejected", failures)
         require("bad magic 0xdeadbeef from fd00:99::a, dropped" in log_b,
                 "bad PM magic is rejected", failures)
+        require("invalid packet type 9 from fd00:99::a, dropped" in log_b,
+                "unknown PM packet type is rejected", failures)
+        require("fd00:99::a:5861 has invalid source port" in log_b,
+                "unexpected PM source port is rejected", failures)
+        require("invalid packet length (8 B) from fd00:99::a, dropped"
+                in log_b, "invalid PM packet length is rejected", failures)
         require(("seqno mismatch from fd00:99::a" in log_b
                  or "late/duplicate reply from fd00:99::a" in log_b),
                 "unexpected reply cannot update a probe context", failures)
