@@ -356,13 +356,6 @@ router bgp 65001
   bgp router-id 10.255.0.1
   no bgp ebgp-requires-policy
   no bgp network import-check
-  neighbor $LINK_B remote-as 65002
-  neighbor $LINK_B ebgp-multihop 5
-  neighbor $LINK_B update-source $LINK_A
-  address-family link-state link-state
-    distribute bgp-fabric-link-state
-    neighbor $LINK_B activate
-  exit-address-family
   midr transport-address $TRANSPORT_A
   midr group-id 1
   midr role group-rep
@@ -382,13 +375,6 @@ router bgp 65002
   bgp router-id 10.255.0.2
   no bgp ebgp-requires-policy
   no bgp network import-check
-  neighbor $LINK_A remote-as 65001
-  neighbor $LINK_A ebgp-multihop 5
-  neighbor $LINK_A update-source $LINK_B
-  address-family link-state link-state
-    distribute bgp-fabric-link-state
-    neighbor $LINK_A activate
-  exit-address-family
   midr transport-address $TRANSPORT_B
   midr group-id 1
 !
@@ -448,9 +434,9 @@ run_vty() {
 wait_for_file "$VTY_A/bgpd.vty" 20
 wait_for_file "$VTY_B/bgpd.vty" 20
 wait_for_pattern "$ARTIFACT_DIR/bgpd-a.log" \
-    'registered node/link callbacks|已向第二组注册 node/link 回调' 75
+    'registered node/link callbacks|已向第二组注册 node/link .*回调' 75
 wait_for_pattern "$ARTIFACT_DIR/bgpd-b.log" \
-    'registered node/link callbacks|已向第二组注册 node/link 回调' 75
+    'registered node/link callbacks|已向第二组注册 node/link .*回调' 75
 
 echo "[run_ipv6_test] creating symmetric $ADDRESS_FAMILY MIDR overlay sessions"
 run_vty "$NS_A" "$VTY_A" -c 'configure terminal' -c 'router bgp 65001' \
