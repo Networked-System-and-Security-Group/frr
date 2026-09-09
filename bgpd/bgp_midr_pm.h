@@ -143,6 +143,9 @@ extern int midr_pm_remove_all_targets(struct bgp *bgp,
  * call was silently dropped because the socket was not ready at the time. */
 extern void midr_pm_on_transport_addr_set(struct bgp *bgp);
 
+/* Called after the local transport address is removed. */
+extern void midr_pm_on_transport_addr_unset(struct bgp *bgp);
+
 /* Module lifecycle: open/close PM socket and arm/cancel probe timers.
  * Called from bgp_midr_nds_init() / bgp_midr_nds_finish(). */
 extern void midr_pm_init(struct bgp *bgp);

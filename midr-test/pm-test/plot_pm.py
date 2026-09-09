@@ -29,6 +29,7 @@ this script) so the output is readable when embedded full-page in slides.
 import re
 import sys
 import argparse
+import csv
 from datetime import datetime
 
 import numpy as np
@@ -54,11 +55,12 @@ plt.rcParams.update({
 
 TS_PAT  = r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)'
 RTT_PAT = re.compile(
-    TS_PAT + r'.*MIDR PM: reply from [\d.]+ rtt=(\d+)us')
+    TS_PAT + r'.*MIDR PM: reply from \S+ rtt=(\d+)us')
 I5_PAT  = re.compile(
-    TS_PAT + r'.*MIDR PM I-5: node=([\d./]+) status=(\d+) failures=(\d+) '
+    TS_PAT + r'.*MIDR PM I-5: node=(\S+) status=(\d+) failures=(\d+) '
              r'st_rtt_us=(\d+) st_loss=([\d.]+) st_bw=(\d+) '
              r'lt_rtt_us=(\d+) lt_loss=([\d.]+) lt_bw=(\d+)')
+
 
 def parse_ts(s):
     return datetime.strptime(s, "%Y/%m/%d %H:%M:%S.%f")
@@ -100,8 +102,45 @@ def parse_log(path):
         "i5_status": i5_status, "i5_failures": i5_failures,
     }
 
+
 def relative_secs(ts_list, t0):
     return [(t - t0).total_seconds() for t in ts_list]
+
+
+def parse_events(path, t0):
+    if path is None:
+        return {}
+    with open(path, newline="") as event_file:
+        rows = csv.DictReader(event_file)
+        return {
+            row["event"]: (parse_ts(row["timestamp"]) - t0).total_seconds()
+            for row in rows
+        }
+
+
+def mark_test_phases(ax, events, show_labels=False):
+    forced = events.get("forced-loss-start")
+    impaired = events.get("impairment-start")
+    recovered = events.get("recovery-start")
+    injected = events.get("injection-start")
+
+    if forced is not None and impaired is not None:
+        ax.axvspan(forced, impaired, color="red", alpha=0.10, zorder=0)
+        if show_labels:
+            ax.axvline(forced, color="red", ls=":", lw=2,
+                       label="连续超时")
+    if impaired is not None and recovered is not None:
+        ax.axvspan(impaired, recovered, color="orange", alpha=0.12,
+                   zorder=0)
+        if show_labels:
+            ax.axvline(impaired, color="darkorange", ls=":", lw=2,
+                       label="链路损伤")
+            ax.axvline(recovered, color="green", ls=":", lw=2,
+                       label="链路恢复")
+    if injected is not None:
+        ax.axvline(injected, color="purple", ls=":", lw=2,
+                   label="异常报文注入" if show_labels else None)
+
 
 def shade_iperf_window(ax, start, duration):
     """Mark the UDP-iperf active window on a time-series axis."""
@@ -110,11 +149,12 @@ def shade_iperf_window(ax, start, duration):
     ax.axvspan(start, start + duration, color="purple", alpha=0.12, zorder=0)
     ymin, ymax = ax.get_ylim()
     ax.text(start + duration / 2.0, ymax * 0.96, "iperf UDP 打满链路",
-            ha="center", va="top", fontsize=14, color="purple",
+            ha="center", va="top", fontsize=24, color="purple",
             fontweight="bold")
     ax.set_ylim(ymin, ymax)
 
-def plot(data, output, iperf_start=None, iperf_duration=None):
+def plot(data, output, iperf_start=None, iperf_duration=None,
+         events_file=None):
     if not data["raw_ts"] and not data["i5_ts"]:
         print("No MIDR PM data found — check that 'debug bgp midr' is in the config.")
         sys.exit(1)
@@ -127,6 +167,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     raw_t   = np.array(relative_secs(data["raw_ts"], t0))
     i5_t    = np.array(relative_secs(data["i5_ts"],  t0))
     raw_rtt = np.array(data["raw_rtt"])
+    events = parse_events(events_file, t0)
 
     # Large canvas: designed to fill a 16:9 beamer frame at full size.
     fig = plt.figure(figsize=(20, 16))
@@ -142,6 +183,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax0.set_xlabel("实验时间 (s)")
     ax0.set_title("往返时延 RTT")
     shade_iperf_window(ax0, iperf_start, iperf_duration)
+    mark_test_phases(ax0, events, show_labels=True)
     ax0.legend(loc="upper right")
     ax0.grid(True, alpha=0.3)
 
@@ -153,6 +195,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax1.set_xlabel("实验时间 (s)")
     ax1.set_title("丢包率")
     shade_iperf_window(ax1, iperf_start, iperf_duration)
+    mark_test_phases(ax1, events)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
@@ -164,6 +207,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax2.set_xlabel("实验时间 (s)")
     ax2.set_title(r"带宽分数")
     shade_iperf_window(ax2, iperf_start, iperf_duration)
+    mark_test_phases(ax2, events)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
@@ -175,6 +219,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax3.set_xlabel("实验时间 (s)")
     ax3.set_title("探测失败计数")
     shade_iperf_window(ax3, iperf_start, iperf_duration)
+    mark_test_phases(ax3, events)
     ax3.legend()
     ax3.grid(True, alpha=0.3)
 
@@ -195,6 +240,7 @@ def plot(data, output, iperf_start=None, iperf_duration=None):
     ax4.set_ylabel("链路状态")
     ax4.set_xlabel("实验时间 (s)")
     ax4.set_title("链路状态时间线")
+    mark_test_phases(ax4, events)
     ax4.set_yticks([])
     handles, labels = ax4.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
@@ -223,9 +269,12 @@ def main():
                          "(shades the window on all plots)")
     ap.add_argument("--iperf-duration", type=float, default=None,
                     help="duration in seconds of the iperf3 UDP flow")
+    ap.add_argument("--events-file", default=None,
+                    help="CSV file containing test phase timestamps")
     args = ap.parse_args()
     data = parse_log(args.logfile)
-    plot(data, args.output, args.iperf_start, args.iperf_duration)
+    plot(data, args.output, args.iperf_start, args.iperf_duration,
+         args.events_file)
 
 if __name__ == "__main__":
     main()
