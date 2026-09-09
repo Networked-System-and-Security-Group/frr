@@ -2182,6 +2182,45 @@ static void midr_join_settle_group(struct bgp *bgp, uint32_t gid)
  */
 static void midr_join_round_start(struct bgp *bgp); /* forward */
 
+static bool midr_rep_identity_resolve(
+	struct bgp *bgp, const struct midr_rep_identity *identity,
+	struct ipaddr *transport)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_rep_entry *entry;
+	struct listnode *node;
+	struct ipaddr local;
+	struct ipaddr resolved;
+	bool found = false;
+
+	if (!bgp || !bgp->midr_nds_info || !identity || !transport ||
+	    identity->group_id == 0 || identity->node_id.family != AF_INET ||
+	    identity->node_id.prefixlen != IPV4_MAX_BITLEN ||
+	    identity->node_id.u.prefix4.s_addr == INADDR_ANY ||
+	    !midr_nds_local_transport_get(bgp, &local))
+		return false;
+
+	mi = bgp->midr_nds_info;
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, entry)) {
+		if (entry->group_id != identity->group_id ||
+		    !IPV4_ADDR_SAME(&entry->rep_rid,
+				    &identity->node_id.u.prefix4))
+			continue;
+		if (!midr_ipaddr_valid_locator(&entry->rep_transport) ||
+		    ipaddr_family(&entry->rep_transport) != ipaddr_family(&local))
+			return false;
+		if (found &&
+		    !midr_ipaddr_same(&resolved, &entry->rep_transport))
+			return false;
+		resolved = entry->rep_transport;
+		found = true;
+	}
+
+	if (found)
+		*transport = resolved;
+	return found;
+}
+
 void midr_nds_on_cluster_decision(struct bgp *bgp,
 				  const struct midr_cluster_decision *decision)
 {
@@ -2207,13 +2246,19 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 	switch (decision->decision_type) {
 	case MIDR_DECISION_RECOMMEND: {
 		uint32_t target_gid = decision->new_group_id;
+		struct midr_rep_identity recommended = {
+			.group_id = decision->new_group_id,
+			.node_id = decision->recommended_rep_id,
+		};
+		struct ipaddr recommended_transport;
 		struct ipaddr rep_transport;
 
-		if (!midr_ipaddr_from_prefix(&decision->recommended_rep,
-					       &rep_transport)) {
-			zlog_warn("MIDR I-7: RECOMMEND has no valid representative locator");
+		if (!midr_rep_identity_resolve(bgp, &recommended,
+					       &recommended_transport)) {
+			zlog_warn("MIDR I-7: RECOMMEND representative identity cannot be resolved to a unique same-family locator");
 			break;
 		}
+		rep_transport = recommended_transport;
 
 		/*
 		 * §1.1 第一段产物：CL 选定群代表。幂等 guard——只在"探群代表"阶段
@@ -2236,6 +2281,7 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		if (mi->config_group_id != 0) {
 			struct midr_rep_entry *r = midr_rep_dir_find_group(
 				bgp, mi->config_group_id);
+			struct midr_rep_identity configured;
 
 			if (!r) {
 				/*
@@ -2251,8 +2297,16 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 				midr_join_settle_group(bgp, mi->config_group_id);
 				break;
 			}
+			configured.group_id = r->group_id;
+			configured.node_id.family = AF_INET;
+			configured.node_id.prefixlen = IPV4_MAX_BITLEN;
+			configured.node_id.u.prefix4 = r->rep_rid;
+			if (!midr_rep_identity_resolve(bgp, &configured,
+						       &rep_transport)) {
+				zlog_warn("MIDR I-7: configured group representative identity cannot be resolved to a unique same-family locator");
+				break;
+			}
 			target_gid = mi->config_group_id;
-			rep_transport = r->rep_transport;
 			MIDR_FLOW_LOG("MIDR I-7：不采纳 RECOMMEND 群 %u——按配置群 %u 走，向其代表 %pIA 要成员表",
 				      decision->new_group_id, target_gid,
 				      &rep_transport);
@@ -2297,20 +2351,26 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 
 			/* 第 1 名：CL 推荐的群及其代表。 */
 			pool_gid[npool] = decision->new_group_id;
-			pool_transport[npool] = rep_transport;
+			pool_transport[npool] = recommended_transport;
 			npool++;
 
-			/* 第 2/3 名：CL 回灌的次优代表（借用指针，仅本次调用有效）。 */
+			/* Resolve the second- and third-ranked stable identities. */
 			if (decision->anchor_reps) {
 				struct listnode *an;
-				struct midr_rep_entry *ar;
+				struct midr_rep_identity *ar;
+				struct ipaddr anchor_transport;
 
 				for (ALL_LIST_ELEMENTS_RO(decision->anchor_reps,
 							  an, ar)) {
 					if (npool >= 3)
 						break;
+					if (!midr_rep_identity_resolve(
+						    bgp, ar, &anchor_transport)) {
+						zlog_warn("MIDR I-7: anchor representative identity cannot be resolved to a unique same-family locator");
+						continue;
+					}
 					pool_gid[npool] = ar->group_id;
-					pool_transport[npool] = ar->rep_transport;
+					pool_transport[npool] = anchor_transport;
 					npool++;
 				}
 			}

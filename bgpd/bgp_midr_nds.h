@@ -426,17 +426,22 @@ struct midr_node_evidence {
 	struct midr_nds_link_metrics metrics;
 };
 
+struct midr_rep_identity {
+	uint32_t group_id;
+	struct prefix node_id;
+};
+
 struct midr_cluster_decision {
 	enum midr_decision_type decision_type;
 	uint32_t new_group_id;
 	uint32_t old_group_id;
-	struct prefix recommended_rep; /* only for RECOMMEND */
+	struct prefix recommended_rep_id; /* only for RECOMMEND */
 	struct list *evidence;	       /* list of struct midr_node_evidence */
 	/*
-	 * 仅 RECOMMEND 有效，最多 2 个次优代表（探测中顺带得到，未被选中的
-	 * 第 2/3 名）。元素是借用指针，指向 mi->rep_dir 里的
-	 * struct midr_rep_entry，只在本次 I-7 同步调用期间有效——NDS 拿它去发
-	 * MEMBER_LIST_REQ，不得跨调用保存。候选不足 2 个时可能只有 0/1 个。
+	 * Valid only for RECOMMEND. Contains up to two borrowed
+	 * struct midr_rep_identity pointers for the second- and third-ranked
+	 * representatives. The identities are valid only during the synchronous
+	 * I-7 callback and contain no locator.
 	 */
 	struct list *anchor_reps;
 };

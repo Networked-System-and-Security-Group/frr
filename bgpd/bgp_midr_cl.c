@@ -34,6 +34,7 @@
 #include "bgpd/bgp_midr_cl.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_IDENTITY, "MIDR representative identity");
 
 /* ===========================================================================
  * CL 策略阈值
@@ -55,24 +56,30 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
  * 内部辅助函数
  * =========================================================================*/
 
-/*
- * 在全局视图链路列表中按 IPv4 地址查找链路条目。
- * 用于 REP_PROBE_DONE：群代表的探测 key 是 transport addr（locator），
- * 不一定有对应的 node 条目。
- */
+/* Find a link by its stable 32-bit BGP Identifier. */
 static struct midr_link_entry *
-cl_find_link_by_ipv4(const struct midr_global_view *gv,
-		     const struct in_addr *addr)
+cl_find_link_by_rid(const struct midr_global_view *gv,
+		    const struct in_addr *rid)
 {
 	struct listnode *n;
 	struct midr_link_entry *link;
 
 	for (ALL_LIST_ELEMENTS_RO(gv->links, n, link)) {
 		if (link->remote_node_id.family == AF_INET &&
-		    IPV4_ADDR_SAME(&link->remote_node_id.u.prefix4, addr))
+		    IPV4_ADDR_SAME(&link->remote_node_id.u.prefix4, rid))
 			return link;
 	}
 	return NULL;
+}
+
+static void cl_identity_from_rep(struct midr_rep_identity *identity,
+				 const struct midr_rep_entry *rep)
+{
+	memset(identity, 0, sizeof(*identity));
+	identity->group_id = rep->group_id;
+	identity->node_id.family = AF_INET;
+	identity->node_id.prefixlen = IPV4_MAX_BITLEN;
+	identity->node_id.u.prefix4 = rep->rep_rid;
 }
 
 /*
@@ -211,7 +218,7 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		 *   键，不如直接跳过来得容易发现。〕 */
 		if (r->rep_rid.s_addr == INADDR_ANY)
 			continue;
-		link = cl_find_link_by_ipv4(gv, &r->rep_rid);
+		link = cl_find_link_by_rid(gv, &r->rep_rid);
 		if (!cl_link_has_data(link))
 			continue;
 
@@ -238,33 +245,45 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 			"MIDR CL: REP_PROBE_DONE → 无可用群代表，CREATE 新群 %u",
 			new_gid);
 	} else {
+		struct listnode *node, *nnode;
+		struct midr_rep_identity *identity;
+
 		d.decision_type = MIDR_DECISION_RECOMMEND;
 		d.new_group_id = top_rep[0]->group_id;
 		d.old_group_id = mi->local_group_id;
-		midr_ipaddr_to_host_prefix(&top_rep[0]->rep_transport,
-					   &d.recommended_rep);
+		d.recommended_rep_id.family = AF_INET;
+		d.recommended_rep_id.prefixlen = IPV4_MAX_BITLEN;
+		d.recommended_rep_id.u.prefix4 = top_rep[0]->rep_rid;
 
-		/* 第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
+		/* Pass only stable identities across I-7. */
 		d.anchor_reps = list_new();
-		if (top_rep[1])
-			listnode_add(d.anchor_reps, top_rep[1]);
-		if (top_rep[2])
-			listnode_add(d.anchor_reps, top_rep[2]);
+		for (i = 1; i < 3; i++) {
+			if (!top_rep[i])
+				continue;
+			identity = XCALLOC(MTYPE_MIDR_REP_IDENTITY,
+					   sizeof(*identity));
+			cl_identity_from_rep(identity, top_rep[i]);
+			listnode_add(d.anchor_reps, identity);
+		}
 
 		MIDR_FLOW_LOG(
-			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pIA"
+			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pI4"
 			"（rtt=%u us, loss=%.4f, bw=%u），另有 %d 个次优群锚点候选",
-			top_rep[0]->group_id, &top_rep[0]->rep_transport,
+			top_rep[0]->group_id, &top_rep[0]->rep_rid,
 			top_link[0]->long_term.rtt_us,
 			top_link[0]->long_term.loss_rate,
 			top_link[0]->long_term.bw_score,
 			listcount(d.anchor_reps));
+
+		midr_nds_on_cluster_decision(bgp, &d);
+
+		for (ALL_LIST_ELEMENTS(d.anchor_reps, node, nnode, identity))
+			XFREE(MTYPE_MIDR_REP_IDENTITY, identity);
+		list_delete(&d.anchor_reps);
+		return;
 	}
 
 	midr_nds_on_cluster_decision(bgp, &d);
-
-	if (d.anchor_reps)
-		list_delete(&d.anchor_reps); /* 元素是借用指针，只清链表节点 */
 }
 
 /* ===========================================================================
