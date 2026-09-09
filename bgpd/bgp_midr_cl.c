@@ -211,6 +211,8 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 	int i;
 
 	for (i = 0; i < 3; i++) {
+		if (i > 0 && !top_rep[i - 1])
+			break;
 		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
 			struct midr_link_entry *link;
 			struct midr_rep_identity identity;
