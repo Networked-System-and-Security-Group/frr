@@ -44,6 +44,7 @@ POST_CONVERGENCE_TIMEOUT="${MIDR_POST_CONVERGENCE_TIMEOUT:-120}"
 CAPTURE_RUN_ID="${MIDR_CAPTURE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 CAPTURE_ROOT="${MIDR_CAPTURE_ROOT:-$TESTDIR/artifacts/$CAPTURE_RUN_ID}"
 CONFIG_DIR="$CAPTURE_ROOT/configs"
+DB_DIR="$CAPTURE_ROOT/db"
 export MIDR_CAPTURE_RUN_ID="$CAPTURE_RUN_ID"
 export MIDR_CAPTURE_ROOT="$CAPTURE_ROOT"
 
@@ -119,7 +120,7 @@ fi
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
 # so bgpd must be launched with TESTDIR as its cwd.
 cd "$TESTDIR"
-mkdir -p "$CAPTURE_ROOT"
+mkdir -p "$CAPTURE_ROOT" "$DB_DIR"
 exec > >(tee "$CAPTURE_ROOT/console.log") 2>&1
 
 cleanup() {
@@ -203,6 +204,7 @@ start_node() {
     mkdir -p "/tmp/midr-cl-vty/$node"
     ip netns exec "ns-$node" "$BGPD" \
         -f "$CONFIG_DIR/bgpd-${node}.conf" \
+        --db_file "$DB_DIR/bgpd-${node}.db" \
         -Z -S \
         -i "/tmp/bgpd-cl-${node}.pid" \
         --vty_socket "/tmp/midr-cl-vty/$node" \
