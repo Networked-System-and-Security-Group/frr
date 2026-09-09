@@ -5223,6 +5223,10 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 
 	midr_nds_remote_node_decode(node, &rid, &caps, &transport,
 				    &has_transport);
+	if (node->has_transport_address && !has_transport) {
+		zlog_warn("MIDR remote view: ignoring Node with invalid locator");
+		return;
+	}
 	/* Reject a mixed-family update before touching identity or metadata. */
 	if (has_transport && bgp->midr_nds_info->transport_addr_set &&
 	    ipaddr_family(&transport) !=
@@ -5421,6 +5425,7 @@ static void midr_nds_remote_link_update(const struct midr_remote_link_info *link
 {
 	struct bgp *bgp = midr_nds_remote_bgp();
 	struct in_addr local, remote;
+	struct ipaddr local_transport;
 
 	if (!bgp || !link)
 		return;
@@ -5430,6 +5435,16 @@ static void midr_nds_remote_link_update(const struct midr_remote_link_info *link
 	 * 洞就张开了。 */
 	if (bgp->midr_nds_info->shutdown) {
 		MIDR_LOG("MIDR 退网：丢弃收到的远端 Link 事实（本机已退网）");
+		return;
+	}
+	if (!midr_nds_local_transport_get(bgp, &local_transport) ||
+	    !midr_ipaddr_valid_locator(&link->link_local_address) ||
+	    !midr_ipaddr_valid_locator(&link->link_remote_address) ||
+	    ipaddr_family(&link->link_local_address) !=
+		    ipaddr_family(&local_transport) ||
+	    ipaddr_family(&link->link_remote_address) !=
+		    ipaddr_family(&local_transport)) {
+		zlog_warn("MIDR remote view: ignoring Link with invalid or mixed-family endpoints");
 		return;
 	}
 
