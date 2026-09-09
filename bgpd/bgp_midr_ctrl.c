@@ -6,9 +6,9 @@
  * peer FSM (peer_remote_as / peer_delete) accordingly.
  *
  * 控制通道双传输 (端口 5859, 语义在此、TCP 传输在 bgp_midr_ctrl_tcp.c):
- *  - UDP: PEER_REQUEST —— 新节点选群后向各群成员 transport 单播 "请反向建连"
- *    通知, 成员反向发起多跳 eBGP, 双向建立 (独立于 PM 探测通道)。
- *  - TCP 短连接: REP_LIST / MEMBER_LIST 列表交换 —— 本文件负责消息构造 / 资格
+ *  - UDP: 固定长控制消息（PEER_REQUEST / ATTACH_REQUEST / PEER_REJECT /
+ *    ANNOUNCE）——负责反向建连、拒绝和请求方身份预告（独立于 PM 通道）。
+ *  - TCP 短连接: REP_LIST / MEMBER_LIST / BOOTSTRAP_LIST 列表交换 —— 本文件负责消息构造 / 资格
  *    闸门 / 列表内容组装 (on_tcp_request/on_tcp_response 回调), 连接机制在
  *    bgp_midr_ctrl_tcp.c。载荷随规模增长撞 UDP 尺寸墙故迁 TCP, 决策见
  *    docs/decisions/midr-preexchange-transport-udp-vs-tcp.md。
@@ -25,6 +25,7 @@
 #include "stream.h"
 #include "prefix.h"
 #include "log.h"
+#include "iana_afi.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
@@ -89,7 +90,8 @@ static bool midr_ctrl_transport_session_up(struct bgp *bgp,
 		return false;
 	peer = peer_lookup(bgp, &su);
 
-	return peer && peer->connection->status == Established;
+	return peer && peer->connection &&
+	       peer->connection->status == Established;
 }
 
 const char *midr_ctrl_msg_type_str(uint8_t type)
@@ -105,6 +107,8 @@ const char *midr_ctrl_msg_type_str(uint8_t type)
 		return "MEMBER_LIST_REQ";
 	case MIDR_CTRL_MEMBER_LIST_RESP:
 		return "MEMBER_LIST_RESP";
+	case MIDR_CTRL_ANNOUNCE:
+		return "ANNOUNCE";
 	case MIDR_CTRL_PEER_REJECT:
 		return "PEER_REJECT";
 	case MIDR_CTRL_BOOTSTRAP_LIST_REQ:
@@ -119,7 +123,7 @@ const char *midr_ctrl_msg_type_str(uint8_t type)
 }
 
 /*
- * "建连类"请求 = PEER_REQUEST 与 ATTACH_REQUEST（批 5 前置①）：同一个 20B 帧、
+ * "建连类"请求 = PEER_REQUEST 与 ATTACH_REQUEST（批 5 前置①）：同一个 36B 帧、
  * 同走 UDP、同一套重传与死心语义，唯一差别是收方要不要过引导负面守卫。凡按
  * 类型分流传输、判死心、清 pending 的地方一律用本判据，**别再逐处写
  * `== MIDR_CTRL_PEER_REQUEST`** —— 散着写将来必漏一处（本批实测：⓪ 清单点名
@@ -131,54 +135,266 @@ static bool midr_ctrl_is_peer_req_like(uint8_t type)
 	       type == MIDR_CTRL_ATTACH_REQUEST;
 }
 
+static bool midr_ctrl_is_udp_type(uint8_t type)
+{
+	return midr_ctrl_is_peer_req_like(type) || type == MIDR_CTRL_ANNOUNCE ||
+	       type == MIDR_CTRL_PEER_REJECT;
+}
+
+static bool midr_ctrl_is_tcp_request_type(uint8_t type)
+{
+	return type == MIDR_CTRL_REP_LIST_REQ ||
+	       type == MIDR_CTRL_MEMBER_LIST_REQ ||
+	       type == MIDR_CTRL_BOOTSTRAP_LIST_REQ;
+}
+
+static bool midr_ctrl_is_request_type(uint8_t type)
+{
+	return midr_ctrl_is_udp_type(type) ||
+	       midr_ctrl_is_tcp_request_type(type);
+}
+
+static void midr_ctrl_put_u16(uint8_t *p, uint16_t value)
+{
+	value = htons(value);
+	memcpy(p, &value, sizeof(value));
+}
+
+static void midr_ctrl_put_u32(uint8_t *p, uint32_t value)
+{
+	value = htonl(value);
+	memcpy(p, &value, sizeof(value));
+}
+
+static uint16_t midr_ctrl_get_u16(const uint8_t *p)
+{
+	uint16_t value;
+
+	memcpy(&value, p, sizeof(value));
+	return ntohs(value);
+}
+
+static uint32_t midr_ctrl_get_u32(const uint8_t *p)
+{
+	uint32_t value;
+
+	memcpy(&value, p, sizeof(value));
+	return ntohl(value);
+}
+
+/* Version-4 locator: IANA AFI (2), reserved (2), fixed 16-byte address area. */
+static bool midr_ctrl_encode_locator(uint8_t *wire,
+				     const struct ipaddr *locator)
+{
+	if (!wire || !midr_ipaddr_valid_locator(locator))
+		return false;
+
+	memset(wire, 0, MIDR_CTRL_LOCATOR_LEN);
+	if (IS_IPADDR_V4(locator)) {
+		midr_ctrl_put_u16(wire, IANA_AFI_IPV4);
+		memcpy(wire + 4, &locator->ipaddr_v4,
+		       sizeof(locator->ipaddr_v4));
+		return true;
+	}
+	if (IS_IPADDR_V6(locator)) {
+		midr_ctrl_put_u16(wire, IANA_AFI_IPV6);
+		memcpy(wire + 4, &locator->ipaddr_v6,
+		       sizeof(locator->ipaddr_v6));
+		return true;
+	}
+	return false;
+}
+
+static bool midr_ctrl_decode_locator(const uint8_t *wire,
+				     struct ipaddr *locator)
+{
+	uint16_t afi;
+	static const uint8_t zero_tail[12];
+
+	if (!wire || !locator)
+		return false;
+	SET_IPADDR_NONE(locator);
+	if (midr_ctrl_get_u16(wire + 2) != 0)
+		return false;
+
+	afi = midr_ctrl_get_u16(wire);
+	if (afi == IANA_AFI_IPV4) {
+		if (memcmp(wire + 8, zero_tail, sizeof(zero_tail)) != 0)
+			return false;
+		locator->ipa_type = IPADDR_V4;
+		memcpy(&locator->ipaddr_v4, wire + 4,
+		       sizeof(locator->ipaddr_v4));
+	} else if (afi == IANA_AFI_IPV6) {
+		locator->ipa_type = IPADDR_V6;
+		memcpy(&locator->ipaddr_v6, wire + 4,
+		       sizeof(locator->ipaddr_v6));
+	} else {
+		return false;
+	}
+
+	if (!midr_ipaddr_valid_locator(locator)) {
+		SET_IPADDR_NONE(locator);
+		return false;
+	}
+	return true;
+}
+
+/* Encode each list item completely before touching the output stream.  This
+ * keeps a failed locator conversion from leaving an uncounted partial item in
+ * the frame. */
+static bool midr_ctrl_stream_put_rep_item(struct stream *s, uint32_t group_id,
+					  const struct ipaddr *locator,
+					  as_t asn, struct in_addr rid)
+{
+	uint8_t wire[MIDR_CTRL_LOCATOR_LEN];
+
+	if (!s || !group_id || rid.s_addr == INADDR_ANY ||
+	    !midr_ctrl_encode_locator(wire, locator))
+		return false;
+	stream_putl(s, group_id);
+	stream_put(s, wire, sizeof(wire));
+	stream_putl(s, (uint32_t)asn);
+	stream_put(s, &rid, sizeof(rid));
+	return true;
+}
+
+static bool midr_ctrl_stream_put_member_item(struct stream *s,
+					     struct in_addr rid,
+					     const struct ipaddr *locator,
+					     as_t asn, uint32_t group_id)
+{
+	uint8_t wire[MIDR_CTRL_LOCATOR_LEN];
+
+	if (!s || !group_id || rid.s_addr == INADDR_ANY ||
+	    !midr_ctrl_encode_locator(wire, locator))
+		return false;
+	stream_put(s, &rid, sizeof(rid));
+	stream_put(s, wire, sizeof(wire));
+	stream_putl(s, (uint32_t)asn);
+	stream_putl(s, group_id);
+	return true;
+}
+
+static bool midr_ctrl_stream_put_bootstrap_item(
+	struct stream *s, const struct ipaddr *locator, as_t asn,
+	struct in_addr rid)
+{
+	uint8_t wire[MIDR_CTRL_LOCATOR_LEN];
+
+	if (!s || rid.s_addr == INADDR_ANY ||
+	    !midr_ctrl_encode_locator(wire, locator))
+		return false;
+	stream_put(s, wire, sizeof(wire));
+	stream_putl(s, (uint32_t)asn);
+	stream_put(s, &rid, sizeof(rid));
+	return true;
+}
+
+static bool midr_ctrl_same_active_family(struct bgp *bgp,
+					 const struct ipaddr *locator)
+{
+	struct ipaddr local;
+	struct prefix owner = {};
+
+	if (!midr_nds_local_transport_get(bgp, &local) ||
+	    !midr_ipaddr_valid_locator(locator) ||
+	    ipaddr_family(&local) != ipaddr_family(locator))
+		return false;
+	owner.family = AF_INET;
+	owner.prefixlen = IPV4_MAX_BITLEN;
+	owner.u.prefix4 = midr_nds_rid_by_transport(bgp, *locator);
+	return midr_nds_locator_unique(bgp, &owner, locator);
+}
+
+bool midr_ctrl_encode_request(struct bgp *bgp, uint8_t *payload, size_t len,
+			      uint8_t type, uint32_t target_group)
+{
+	struct ipaddr local;
+
+	if (!bgp || !payload || len != MIDR_CTRL_REQUEST_LEN ||
+	    !midr_ctrl_is_request_type(type) ||
+	    bgp->router_id.s_addr == INADDR_ANY ||
+	    !midr_nds_local_transport_get(bgp, &local))
+		return false;
+
+	memset(payload, 0, len);
+	payload[0] = MIDR_CTRL_MSG_VERSION;
+	payload[1] = type;
+	memcpy(payload + 4, &bgp->router_id, sizeof(bgp->router_id));
+	if (!midr_ctrl_encode_locator(payload + 8, &local))
+		return false;
+	midr_ctrl_put_u32(payload + 28, (uint32_t)bgp->as);
+	midr_ctrl_put_u32(payload + 32, target_group);
+	return true;
+}
+
+static bool midr_ctrl_list_identity_usable(struct bgp *bgp,
+					 struct in_addr rid,
+					 const struct ipaddr *transport);
+
+static bool midr_ctrl_decode_request(struct bgp *bgp, const uint8_t *payload,
+				     size_t len, struct ipaddr source,
+				     struct midr_ctrl_request *request)
+{
+	if (!bgp || !payload || !request || len != MIDR_CTRL_REQUEST_LEN ||
+	    payload[0] != MIDR_CTRL_MSG_VERSION ||
+	    !midr_ctrl_is_request_type(payload[1]) ||
+	    midr_ctrl_get_u16(payload + 2) != 0)
+		return false;
+
+	memset(request, 0, sizeof(*request));
+	request->type = payload[1];
+	memcpy(&request->requester_rid, payload + 4,
+	       sizeof(request->requester_rid));
+	if (request->requester_rid.s_addr == INADDR_ANY ||
+	    !midr_ctrl_decode_locator(payload + 8,
+				      &request->requester_transport))
+		return false;
+	request->requester_asn = (as_t)midr_ctrl_get_u32(payload + 28);
+	request->target_group = midr_ctrl_get_u32(payload + 32);
+
+	/* Clients bind their active locator, so the observed source must be
+	 * exactly the locator asserted in the payload. */
+	if (!midr_ipaddr_valid_locator(&source) ||
+	    !midr_ipaddr_same(&source, &request->requester_transport) ||
+	    !midr_ctrl_same_active_family(bgp,
+					 &request->requester_transport) ||
+	    IPV4_ADDR_SAME(&request->requester_rid, &bgp->router_id) ||
+	    !midr_ctrl_list_identity_usable(bgp, request->requester_rid,
+					    &request->requester_transport))
+		return false;
+	return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Peer-request UDP control channel                                     */
 /* ------------------------------------------------------------------ */
 
-/* Fill a 20B request frame (PEER_REQUEST / REP_LIST_REQ / MEMBER_LIST_REQ) with
- * our identity + target_group.  Shared by the UDP path (midr_ctrl_send_req) and
- * the TCP path (bgp_midr_ctrl_tcp.c); each field is already in wire order so the
- * caller can copy the struct out verbatim. */
-void midr_ctrl_fill_msg(struct bgp *bgp, struct midr_ctrl_msg *msg, uint8_t type,
-			uint32_t target_group)
-{
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-
-	memset(msg, 0, sizeof(*msg));
-	msg->version = MIDR_CTRL_MSG_VERSION;
-	msg->type = type;
-	msg->requester_rid = bgp->router_id;
-	(void)midr_ipaddr_to_ipv4(&mi->local_transport_addr,
-				    &msg->requester_transport);
-	msg->requester_asn = htonl(bgp->as);
-	msg->target_group = htonl(target_group);
-}
-
-/* Low-level send: build a request frame (PEER_REQUEST / REP_LIST_REQ /
- * MEMBER_LIST_REQ) carrying our identity and unicast it. */
+/* Low-level UDP send for fixed-size control requests.  List requests are
+ * dispatched to the TCP short-connection transport by request_attempt(). */
 static void midr_ctrl_send_req(struct bgp_midr_nds *mi, struct ipaddr dst,
 			       uint8_t type, uint32_t target_group)
 {
-	struct midr_ctrl_msg msg = {};
-	struct sockaddr_in sa = {};
-	struct in_addr dst4;
+	uint8_t payload[MIDR_CTRL_REQUEST_LEN];
+	union sockunion su;
 
-	if (mi->ctrl_sock < 0 || !mi->transport_addr_set)
+	if (!mi || !mi->bgp || mi->ctrl_sock < 0 ||
+	    !midr_ctrl_is_udp_type(type) ||
+	    !midr_ipaddr_valid_locator(&dst) ||
+	    !midr_ctrl_same_active_family(mi->bgp, &dst))
 		return;
-	if (!midr_ipaddr_to_ipv4(&dst, &dst4)) {
-		zlog_warn("MIDR ctrl: protocol v3 cannot send request type %u to %pIA",
-			  type, &dst);
+	if (!midr_ctrl_encode_request(mi->bgp, payload, sizeof(payload), type,
+				      target_group))
 		return;
-	}
+	if (!midr_ipaddr_to_sockunion(&dst, &su))
+		return;
+	if (sockunion_family(&su) == AF_INET)
+		su.sin.sin_port = htons(MIDR_CTRL_UDP_PORT);
+	else
+		su.sin6.sin6_port = htons(MIDR_CTRL_UDP_PORT);
 
-	midr_ctrl_fill_msg(mi->bgp, &msg, type, target_group);
-
-	sa.sin_family = AF_INET;
-	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
-	sa.sin_addr = dst4;
-
-	if (sendto(mi->ctrl_sock, &msg, sizeof(msg), 0, (struct sockaddr *)&sa,
-		   sizeof(sa)) < 0)
+	if (sendto(mi->ctrl_sock, payload, sizeof(payload), 0,
+		   (struct sockaddr *)&su, sockunion_sizeof(&su)) < 0)
 		zlog_warn("MIDR ctrl: request type %u sendto %pIA failed: %s",
 			  type, &dst, safe_strerror(errno));
 }
@@ -196,9 +412,11 @@ static void midr_ctrl_send_req(struct bgp_midr_nds *mi, struct ipaddr dst,
 static void midr_ctrl_request_attempt(struct bgp *bgp, struct ipaddr dst,
 				      uint8_t type, uint32_t target_group)
 {
-	if (midr_ctrl_is_peer_req_like(type))
+	if (!bgp || !bgp->midr_nds_info)
+		return;
+	if (midr_ctrl_is_udp_type(type))
 		midr_ctrl_send_req(bgp->midr_nds_info, dst, type, target_group);
-	else
+	else if (midr_ctrl_is_tcp_request_type(type))
 		midr_ctrl_tcp_client_start(bgp, dst, type, target_group);
 }
 
@@ -208,16 +426,26 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct ipaddr dst,
 				      uint8_t type, uint32_t target_group,
 				      const struct midr_ctrl_retx_params *rp)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct bgp_midr_nds *mi;
 	struct listnode *node;
 	struct midr_ctrl_pending *p;
 
+	if (!bgp || !bgp->midr_nds_info ||
+	    !bgp->midr_nds_info->ctrl_pending ||
+	    !midr_ctrl_is_request_type(type) ||
+	    !midr_ipaddr_valid_locator(&dst))
+		return;
+	mi = bgp->midr_nds_info;
+
 	if (!rp)
 		rp = &midr_ctrl_retx_default;
+	if (rp->interval_ms <= 0 || rp->count <= 0)
+		return;
 
-	if (!mi->transport_addr_set) {
-		zlog_warn("MIDR ctrl: local transport-address unset; cannot send request type %u",
-			  type);
+	if (!mi->transport_active ||
+	    !midr_ctrl_same_active_family(bgp, &dst)) {
+		zlog_warn("MIDR ctrl: no active same-family transport; cannot send request type %u to %pIA",
+			  type, &dst);
 		return;
 	}
 
@@ -261,7 +489,8 @@ void midr_ctrl_set_retx_budget(struct bgp *bgp, struct ipaddr dst,
 	struct listnode *node;
 	struct midr_ctrl_pending *p;
 
-	if (!bgp || !bgp->midr_nds_info || retries <= 0)
+	if (!bgp || !bgp->midr_nds_info ||
+	    !bgp->midr_nds_info->ctrl_pending || retries <= 0)
 		return;
 	mi = bgp->midr_nds_info;
 
@@ -349,6 +578,9 @@ static void midr_ctrl_drop_pending(struct bgp_midr_nds *mi, struct ipaddr dst,
 	struct listnode *node, *nnode;
 	struct midr_ctrl_pending *p;
 
+	if (!mi || !mi->ctrl_pending)
+		return;
+
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p))
 		if (p->type == type &&
 		    midr_ipaddr_same(&p->target_transport, &dst)) {
@@ -370,6 +602,9 @@ static uint8_t midr_ctrl_pending_peer_req_type(struct bgp_midr_nds *mi,
 	struct listnode *node;
 	struct midr_ctrl_pending *p;
 
+	if (!mi || !mi->ctrl_pending)
+		return 0;
+
 	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_pending, node, p))
 		if (midr_ctrl_is_peer_req_like(p->type) &&
 		    midr_ipaddr_same(&p->target_transport, &dst))
@@ -386,11 +621,10 @@ static void midr_ctrl_send_peer_request(struct bgp *bgp,
 					enum midr_session_reason reason)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct prefix locator;
 	uint8_t type;
 
-	midr_node_get_locator(entry, &locator);
-	if (locator.family != AF_INET)
+	if (!entry->has_transport_addr ||
+	    !midr_ctrl_same_active_family(bgp, &entry->transport_addr))
 		return;
 
 	/*
@@ -417,17 +651,16 @@ static void midr_ctrl_send_peer_request(struct bgp *bgp,
  * 目标地址取请求帧里的 requester_transport（发起方自报的可达地址）——它正是
  * 我们回配时会去连的那个地址，也正是发起方 ctrl_pending 里那条的键，两边对得上。
  */
-static void midr_ctrl_send_peer_reject(struct bgp *bgp, struct in_addr dst)
+static void midr_ctrl_send_peer_reject(struct bgp *bgp, struct ipaddr dst)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct ipaddr locator = midr_ipaddr_from_ipv4(dst);
 
-	if (dst.s_addr == INADDR_ANY)
+	if (!midr_ipaddr_valid_locator(&dst))
 		return; /* 请求帧没自报 transport，无处可回 */
 
-	midr_ctrl_send_req(mi, locator, MIDR_CTRL_PEER_REJECT,
+	midr_ctrl_send_req(mi, dst, MIDR_CTRL_PEER_REJECT,
 			   mi->local_group_id);
-	MIDR_FLOW_LOG("MIDR ctrl: sent PEER_REJECT to %pI4", &dst);
+	MIDR_FLOW_LOG("MIDR ctrl: sent PEER_REJECT to %pIA", &dst);
 }
 
 /*
@@ -518,7 +751,8 @@ static void midr_ctrl_retx_timer(struct event *t)
 			if (!midr_ipaddr_to_sockunion(&p->target_transport, &su))
 				continue;
 			peer = peer_lookup(bgp, &su);
-			if (peer && peer->connection->status == Established) {
+			if (peer && peer->connection &&
+			    peer->connection->status == Established) {
 				list_delete_node(mi->ctrl_pending, node);
 				XFREE(MTYPE_MIDR_CTRL_PENDING, p);
 				continue;
@@ -648,27 +882,32 @@ static void midr_ctrl_retx_timer(struct event *t)
 }
 
 /*
- * 已写入 REP_LIST 应答的条目里是否存在 (group_id, transport)——判重键与
- * midr_rep_dir_add 一致 (学侧/配侧/合并三处同键)。直接读回 stream 已写区,
- * 免维护第二份集合; memcpy 取条目规避对齐/别名问题, 条数小 O(n²) 无碍。
+ * Control v4 requires RID and locator to form a duplicate-free one-to-one
+ * mapping within each list.  Read back the already encoded items so all three
+ * builders can preserve their existing source order while dropping a later
+ * conflicting identity.  State tables are already list-backed and small; the
+ * receive side still uses the bounded O(n log n) whole-frame validator for
+ * untrusted maximum-sized input.
  */
-static bool midr_ctrl_rep_list_contains(const struct stream *s, uint32_t count,
-					uint32_t group_id,
-					struct ipaddr transport)
+static bool midr_ctrl_list_has_identity(const struct stream *s, uint32_t count,
+					size_t item_len,
+					size_t locator_offset,
+					size_t rid_offset,
+					struct in_addr rid,
+					const struct ipaddr *transport)
 {
-	const uint8_t *base =
-		STREAM_DATA(s) + sizeof(struct midr_ctrl_list_hdr);
-	struct midr_ctrl_rep_item it;
-	struct in_addr transport4;
-
-	if (!midr_ipaddr_to_ipv4(&transport, &transport4))
-		return false;
+	const uint8_t *base = STREAM_DATA(s) + MIDR_CTRL_LIST_HDR_LEN;
 
 	for (uint32_t i = 0; i < count; i++) {
-		memcpy(&it, base + (size_t)i * sizeof(it), sizeof(it));
+		const uint8_t *item = base + (size_t)i * item_len;
+		struct ipaddr decoded;
+		struct in_addr decoded_rid;
 
-		if (ntohl(it.group_id) == group_id &&
-		    it.rep_transport.s_addr == transport4.s_addr)
+		memcpy(&decoded_rid, item + rid_offset, sizeof(decoded_rid));
+		if (!midr_ctrl_decode_locator(item + locator_offset, &decoded))
+			return true; /* encoded prefix is corrupt: fail closed */
+		if (IPV4_ADDR_SAME(&decoded_rid, &rid) ||
+		    midr_ipaddr_same(&decoded, transport))
 			return true;
 	}
 	return false;
@@ -683,10 +922,10 @@ static bool midr_ctrl_rep_list_contains(const struct stream *s, uint32_t count,
  *   1) mi->rep_dir (手配/学来) 全量排前——CL 现为"取首条"占位策略, 应答条目序
  *      = 客户端目录序, 排前即"人工覆盖/应急兜底"的实际生效机制; 真 CL 按链路
  *      质量选优后自动退化为并列候选, 无需再改。
- *   2) midr_rep_candidates() 从 global_view 按 GROUP_REP 位推导的候选, 与已写
- *      条目 (group_id, transport) 重合的跳过。
+ *   2) midr_rep_candidates() 从 global_view 按 GROUP_REP 位推导的候选；RID
+ *      或 locator 与已写条目冲突的跳过，维持 v4 一对一身份映射。
  * 合并后 0 条则返回 NULL = 不回包 (沉默同闸门): 回空表会让客户端清目录+销重
- * 试项后一次性"放弃加入", 沉默则 3s×5 重试可等 BGP-LS 收敛自愈——自动化使
+ * 试项后一次性"放弃加入", 沉默则 3s×5 重试可等远端视图收敛自愈——自动化使
  * "目录空"成为引导节点重启后的必经收敛窗口, 必须保住重试。
  *
  * 注意: 用 stream_new() 按精确条数预分配, 不用 stream_new_expandable()。因为
@@ -711,8 +950,8 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 	maxn = listcount(mi->rep_dir) + listcount(derived);
 	if (maxn > 65535)
 		maxn = 65535;
-	s = stream_new(sizeof(struct midr_ctrl_list_hdr) +
-		       (size_t)maxn * sizeof(struct midr_ctrl_rep_item));
+	s = stream_new(MIDR_CTRL_LIST_HDR_LEN +
+		       (size_t)maxn * MIDR_CTRL_REP_ITEM_LEN);
 
 	stream_putc(s, MIDR_CTRL_MSG_VERSION);
 	stream_putc(s, MIDR_CTRL_REP_LIST_RESP);
@@ -721,48 +960,51 @@ static struct stream *midr_ctrl_build_rep_list(struct bgp *bgp,
 
 	/* 来源一: rep_dir 全量, 排前 (覆盖生效机制, 见函数头) */
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
-		struct midr_ctrl_rep_item item;
-
 		if (count >= 65535) {
 			zlog_warn("MIDR ctrl: rep directory exceeds 65535 — REP_LIST_RESP truncated");
 			break;
 		}
-		if (!midr_ipaddr_to_ipv4(&r->rep_transport,
-					   &item.rep_transport))
+		if (!midr_ctrl_same_active_family(bgp, &r->rep_transport) ||
+		    r->rep_rid.s_addr == INADDR_ANY)
 			continue;
-		item.group_id = htonl(r->group_id);
-		item.rep_asn = htonl((uint32_t)r->rep_asn);
-		/* v2 真名栏: rep_dir 里的条目一律自带 rid——手配来源已随
+		if (midr_ctrl_list_has_identity(
+			    s, count, MIDR_CTRL_REP_ITEM_LEN, 4, 28,
+			    r->rep_rid, &r->rep_transport)) {
+			n_dedup++;
+			continue;
+		}
+		if (!midr_ctrl_stream_put_rep_item(
+			    s, r->group_id, &r->rep_transport, r->rep_asn,
+			    r->rep_rid))
+			continue;
+		/* v4 真名栏: rep_dir 里的条目一律自带 rid——手配来源已随
 		 * `midr rep group` 删除 (2026-08-11 批 1.5), 剩下的唯一来源是
 		 * "收 REP_LIST_RESP 全量替换", 那些条目的 rid 由对端按节点表真名
-		 * 键填好。原先"手配条目 rid=0 → 应答时刻按 transport 反查回填"的
-		 * 那一步随之取消 (反查不中会发 0, 正是影子条目的源头)。 */
-		item.rep_rid = r->rep_rid;
-		stream_put(s, &item, sizeof(item));
+		 * 键填好。v4 不编码 rid=0 的兼容占位。 */
 		count++;
 		n_dir++;
 	}
 
 	/* 来源二: 推导候选 (has_transport_addr 已由 midr_rep_candidates 保证) */
 	for (ALL_LIST_ELEMENTS_RO(derived, node, ne)) {
-		struct midr_ctrl_rep_item item;
-
 		if (count >= 65535) {
 			zlog_warn("MIDR ctrl: rep directory exceeds 65535 — REP_LIST_RESP truncated");
 			break;
 		}
-		if (midr_ctrl_rep_list_contains(s, count, ne->group_id,
-						ne->transport_addr)) {
+		if (ne->node_id.family != AF_INET ||
+		    ne->node_id.u.prefix4.s_addr == INADDR_ANY ||
+		    !midr_ctrl_same_active_family(bgp, &ne->transport_addr))
+			continue;
+		if (midr_ctrl_list_has_identity(
+			    s, count, MIDR_CTRL_REP_ITEM_LEN, 4, 28,
+			    ne->node_id.u.prefix4, &ne->transport_addr)) {
 			n_dedup++;
 			continue;
 		}
-		if (!midr_ipaddr_to_ipv4(&ne->transport_addr,
-					   &item.rep_transport))
+		if (!midr_ctrl_stream_put_rep_item(
+			    s, ne->group_id, &ne->transport_addr, ne->asn,
+			    ne->node_id.u.prefix4))
 			continue;
-		item.group_id = htonl(ne->group_id);
-		item.rep_asn = htonl((uint32_t)ne->asn);
-		item.rep_rid = ne->node_id.u.prefix4; /* 节点表按真名为键, rid 现成 */
-		stream_put(s, &item, sizeof(item));
 		count++;
 		n_derived++;
 	}
@@ -790,7 +1032,6 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 						  struct ipaddr dst,
 						  uint32_t group_id)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct stream *s;
 	struct list *members;
 	struct listnode *node;
@@ -806,8 +1047,8 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 	maxn = 1 + listcount(members);
 	if (maxn > 65535)
 		maxn = 65535;
-	s = stream_new(sizeof(struct midr_ctrl_list_hdr) +
-		       (size_t)maxn * sizeof(struct midr_ctrl_member_item));
+	s = stream_new(MIDR_CTRL_LIST_HDR_LEN +
+		       (size_t)maxn * MIDR_CTRL_MEMBER_ITEM_LEN);
 
 	stream_putc(s, MIDR_CTRL_MSG_VERSION);
 	stream_putc(s, MIDR_CTRL_MEMBER_LIST_RESP);
@@ -815,36 +1056,35 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 	stream_putw(s, 0);
 
 	/* Ourselves (the representative) first. */
-	if (mi->transport_addr_set) {
-		struct midr_ctrl_member_item item;
+	{
+		struct ipaddr local;
 
-		if (midr_ipaddr_to_ipv4(&mi->local_transport_addr,
-					  &item.transport)) {
-			item.rid = bgp->router_id;
-			item.asn = htonl(bgp->as);
-			item.group_id = htonl(group_id);
-			stream_put(s, &item, sizeof(item));
+		if (bgp->router_id.s_addr != INADDR_ANY &&
+		    midr_nds_local_transport_get(bgp, &local) &&
+		    midr_ctrl_stream_put_member_item(
+			    s, bgp->router_id, &local, bgp->as, group_id))
 			count++;
-		}
 	}
 
 	for (ALL_LIST_ELEMENTS_RO(members, node, entry)) {
-		struct prefix locator;
-		struct midr_ctrl_member_item item;
-
 		if (count >= 65535) {
 			zlog_warn("MIDR ctrl: group %u members exceed 65535 — MEMBER_LIST_RESP truncated",
 				  group_id);
 			break;
 		}
-		midr_node_get_locator(entry, &locator);
-		if (locator.family != AF_INET)
+		if (entry->node_id.family != AF_INET ||
+		    entry->node_id.u.prefix4.s_addr == INADDR_ANY ||
+		    !entry->has_transport_addr ||
+		    !midr_ctrl_same_active_family(bgp, &entry->transport_addr))
 			continue;
-		item.rid = entry->node_id.u.prefix4;
-		item.transport = locator.u.prefix4;
-		item.asn = htonl(entry->asn);
-		item.group_id = htonl(group_id);
-		stream_put(s, &item, sizeof(item));
+		if (midr_ctrl_list_has_identity(
+			    s, count, MIDR_CTRL_MEMBER_ITEM_LEN, 4, 0,
+			    entry->node_id.u.prefix4, &entry->transport_addr))
+			continue;
+		if (!midr_ctrl_stream_put_member_item(
+			    s, entry->node_id.u.prefix4, &entry->transport_addr,
+			    entry->asn, group_id))
+			continue;
 		count++;
 	}
 	list_delete(&members);
@@ -856,12 +1096,12 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 }
 
 /*
- * 引导侧：组装 BOOTSTRAP_LIST_RESP（hdr + 8B 条目），子稿 §2②。
+ * 引导侧：组装 BOOTSTRAP_LIST_RESP（hdr + 28B 条目），子稿 §2②。
  *
  * 内容 = **手配名单 ∩ 自己骨干会话活性** + **本机自己**：
  *   - 手配名单 = 本机 bootstrap_list（`midr bootstrap` 逐条配的，引导之间互配）。
- *     运维登记是主来源；08-21 起引导也发 Node NLRI，学到带 BOOTSTRAP 位的条目会
- *     以 SEED 身份补进同一个池（midr_maybe_save_bootstrap_seed），本函数一视同仁。
+ *     运维登记是主来源；收到 BOOTSTRAP_LIST 后学到的条目以 SEED 身份补进同一
+ *     个池，本函数一视同仁。权威 remote-view 若提供引导事实，也可作为兼容来源。
  *   - 活性过滤 = 到该地址的 BGP 会话是否 Established（判活统一走会话状态，子稿
  *     §1 前提二）。运维 `no midr session` 拆掉的骨干边，会话一没就自然掉出名单，
  *     不必另查排除名单（排除只管建连、不管发名单，答疑 69）。
@@ -880,7 +1120,6 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 	struct stream *s;
 	struct listnode *node;
 	struct midr_bootstrap_entry *b;
-	struct midr_ctrl_bootstrap_item item;
 	uint32_t count = 0, n_skip = 0;
 	uint32_t maxn;
 	size_t count_pos;
@@ -890,22 +1129,25 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 	maxn = 1 + listcount(mi->bootstrap_list);
 	if (maxn > 65535)
 		maxn = 65535;
-	s = stream_new(sizeof(struct midr_ctrl_list_hdr) +
-		       (size_t)maxn * sizeof(struct midr_ctrl_bootstrap_item));
+	s = stream_new(MIDR_CTRL_LIST_HDR_LEN +
+		       (size_t)maxn * MIDR_CTRL_BOOTSTRAP_ITEM_LEN);
 
 	stream_putc(s, MIDR_CTRL_MSG_VERSION);
 	stream_putc(s, MIDR_CTRL_BOOTSTRAP_LIST_RESP);
 	count_pos = stream_get_endp(s);
 	stream_putw(s, 0); /* count 占位，末尾回填 */
 
-	if (mi->transport_addr_set &&
-	    midr_ipaddr_to_ipv4(&mi->local_transport_addr, &item.transport)) {
-		item.asn = htonl(bgp->as);
-		/* 自己这条的 rid 直接取本机 router-id——最权威的来源，不必绕候选池
-		 * （批 5 R 系列，协议 v3 条目三栏）。 */
-		item.rid = bgp->router_id;
-		stream_put(s, &item, sizeof(item));
-		count++;
+	{
+		struct ipaddr local;
+
+		if (bgp->router_id.s_addr != INADDR_ANY &&
+		    midr_nds_local_transport_get(bgp, &local) &&
+		    midr_ctrl_stream_put_bootstrap_item(
+			    s, &local, bgp->as, bgp->router_id)) {
+			/* 自己这条的 rid 直接取本机 router-id——最权威的来源，不必绕候选池
+			 * （批 5 R 系列，协议 v4 条目三栏）。 */
+			count++;
+		}
 	}
 
 	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b)) {
@@ -914,21 +1156,26 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 			break;
 		}
 		/* 自己已在首条（手配名单理论上不含自己，防御性去重）。 */
-		if (mi->transport_addr_set && midr_ipaddr_same(
-						      &b->transport,
-						      &mi->local_transport_addr))
+		if (mi->transport_active && midr_ipaddr_same(
+						   &b->transport,
+						   &mi->active_transport_addr))
 			continue;
 		if (!midr_ctrl_transport_session_up(bgp, b->transport)) {
 			n_skip++;
 			continue;
 		}
-		if (!midr_ipaddr_to_ipv4(&b->transport, &item.transport))
+		if (b->rid.s_addr == INADDR_ANY ||
+		    !midr_ctrl_same_active_family(bgp, &b->transport))
 			continue;
-		item.asn = htonl((uint32_t)b->asn);
+		if (midr_ctrl_list_has_identity(
+			    s, count, MIDR_CTRL_BOOTSTRAP_ITEM_LEN, 0, 24,
+			    b->rid, &b->transport))
+			continue;
 		/* rid 来自候选池条目，而池内 rid 恒非 0（入口把关，见
 		 * midr_bootstrap_list_add）——运维手配 `midr bootstrap` 时必填。 */
-		item.rid = b->rid;
-		stream_put(s, &item, sizeof(item));
+		if (!midr_ctrl_stream_put_bootstrap_item(
+			    s, &b->transport, b->asn, b->rid))
+			continue;
 		count++;
 	}
 
@@ -945,76 +1192,281 @@ static struct stream *midr_ctrl_build_bootstrap_list(struct bgp *bgp,
 	return s;
 }
 
-/* 代表侧：收下一份活引导名单——逐条吸收（候选池 + 种子库），再交 NDS 汇总。 */
+struct midr_ctrl_rep_decoded {
+	uint32_t group_id;
+	struct ipaddr transport;
+	as_t asn;
+	struct in_addr rid;
+};
+
+struct midr_ctrl_member_decoded {
+	struct in_addr rid;
+	struct ipaddr transport;
+	as_t asn;
+	uint32_t group_id;
+};
+
+struct midr_ctrl_bootstrap_decoded {
+	struct ipaddr transport;
+	as_t asn;
+	struct in_addr rid;
+};
+
+/* Read-only semantic validation performed before a decoded list is allowed to
+ * mutate NDS state.  Control traffic may refresh metadata, but only the
+ * authoritative remote-view transaction may migrate an existing identity to
+ * another locator. */
+static bool midr_ctrl_list_identity_usable(struct bgp *bgp,
+					   struct in_addr rid,
+					   const struct ipaddr *transport)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *existing;
+	struct ipaddr local;
+
+	if (!bgp || !bgp->midr_nds_info ||
+	    !bgp->midr_nds_info->global_view || !transport ||
+	    rid.s_addr == INADDR_ANY ||
+	    !midr_nds_local_transport_get(bgp, &local) ||
+	    !midr_ipaddr_valid_locator(transport) ||
+	    ipaddr_family(&local) != ipaddr_family(transport))
+		return false;
+
+	key.node_id.family = AF_INET;
+	key.node_id.prefixlen = IPV4_MAX_BITLEN;
+	key.node_id.u.prefix4 = rid;
+	mi = bgp->midr_nds_info;
+
+	/* A list may describe us (MEMBER_LIST commonly does), but that identity
+	 * must name the active local locator exactly.  A remote identity must
+	 * never claim the local locator. */
+	if (IPV4_ADDR_SAME(&rid, &bgp->router_id))
+		return midr_ipaddr_same(&local, transport) &&
+		       midr_nds_locator_unique(bgp, &key.node_id, transport);
+	if (midr_ipaddr_same(&local, transport))
+		return false;
+
+	existing = midr_node_hash_find(&mi->global_view->nodes, &key);
+	if (existing && existing->has_transport_addr &&
+	    midr_ipaddr_valid_locator(&existing->transport_addr) &&
+	    !midr_ipaddr_same(&existing->transport_addr, transport))
+		return false;
+
+	return midr_nds_locator_unique(bgp, &key.node_id, transport);
+}
+
+/* A learned bootstrap list may refresh a known candidate, but it must not
+ * relabel an operator-configured (or previously learned) locator as another
+ * BGP identity.  Check this before list_begin() so a conflicting frame cannot
+ * partially age or replace the current candidate set. */
+static bool midr_ctrl_bootstrap_locator_binding_usable(
+	const struct bgp_midr_nds *mi, struct in_addr rid,
+	const struct ipaddr *transport)
+{
+	struct listnode *node;
+	struct midr_bootstrap_entry *candidate;
+
+	if (!mi || !mi->bootstrap_list || !transport)
+		return false;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, candidate)) {
+		bool same_rid = candidate->rid.s_addr == rid.s_addr;
+		bool same_locator =
+			midr_ipaddr_same(&candidate->transport, transport);
+
+		/* An existing candidate may be refreshed only as the very same
+		 * identity binding.  Reject both locator relabeling and RID migration;
+		 * the latter must arrive through the authoritative Node update path. */
+		if (same_rid || same_locator)
+			return same_rid && same_locator;
+	}
+	return true;
+}
+
+struct midr_ctrl_identity_key {
+	struct in_addr rid;
+	uint8_t locator[MIDR_CTRL_LOCATOR_LEN];
+};
+
+static int midr_ctrl_identity_cmp_rid(const void *a, const void *b)
+{
+	const struct midr_ctrl_identity_key *ka = a;
+	const struct midr_ctrl_identity_key *kb = b;
+
+	return memcmp(&ka->rid, &kb->rid, sizeof(ka->rid));
+}
+
+static int midr_ctrl_identity_cmp_locator(const void *a, const void *b)
+{
+	const struct midr_ctrl_identity_key *ka = a;
+	const struct midr_ctrl_identity_key *kb = b;
+
+	return memcmp(ka->locator, kb->locator, sizeof(ka->locator));
+}
+
+/* Within one frame, node identity and locator are a duplicate-free one-to-one
+ * mapping.  Sorting a temporary key array keeps this check bounded by
+ * O(count log count), including for a legal maximum-sized frame. */
+static bool midr_ctrl_list_identities_unique(
+	struct midr_ctrl_identity_key *keys, uint16_t count)
+{
+	uint16_t i;
+
+	if (count < 2)
+		return true;
+
+	qsort(keys, count, sizeof(*keys), midr_ctrl_identity_cmp_rid);
+	for (i = 1; i < count; i++)
+		if (memcmp(&keys[i - 1].rid, &keys[i].rid,
+			   sizeof(keys[i].rid)) == 0)
+			return false;
+
+	qsort(keys, count, sizeof(*keys), midr_ctrl_identity_cmp_locator);
+	for (i = 1; i < count; i++)
+		if (memcmp(keys[i - 1].locator, keys[i].locator,
+			   sizeof(keys[i].locator)) == 0)
+			return false;
+	return true;
+}
+
+static bool midr_ctrl_decode_list_header(const uint8_t *buf, size_t len,
+					 uint8_t type, size_t item_len,
+					 uint16_t *count)
+{
+	size_t expected;
+
+	if (!buf || !count || len < MIDR_CTRL_LIST_HDR_LEN ||
+	    buf[0] != MIDR_CTRL_MSG_VERSION || buf[1] != type)
+		return false;
+	*count = midr_ctrl_get_u16(buf + 2);
+	if (*count > (SIZE_MAX - MIDR_CTRL_LIST_HDR_LEN) / item_len)
+		return false;
+	expected = MIDR_CTRL_LIST_HDR_LEN + (size_t)*count * item_len;
+	return len == expected;
+}
+
+/* 代表侧：整帧校验后吸收活引导名单，不允许部分列表落状态。 */
 static void midr_ctrl_recv_bootstrap_list(struct bgp *bgp, const uint8_t *buf,
 					  ssize_t n, struct ipaddr src)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	const struct midr_ctrl_list_hdr *hdr =
-		(const struct midr_ctrl_list_hdr *)buf;
-	const struct midr_ctrl_bootstrap_item *items;
+	struct midr_ctrl_bootstrap_decoded *items = NULL;
+	struct midr_ctrl_identity_key *identities = NULL;
 	uint16_t count, i;
 
-	if (n < (ssize_t)sizeof(*hdr))
-		return;
-	count = ntohs(hdr->count);
-	/* 严格等长（同 REP_LIST_RESP）：不匹配 = 对端 bug / 损坏，丢弃。 */
-	if (n != (ssize_t)(sizeof(*hdr) + (size_t)count * sizeof(*items))) {
-		MIDR_LOG("MIDR ctrl: BOOTSTRAP_LIST_RESP length %zd != expected for count %u — dropping",
-			 (ssize_t)n, count);
+	if (n < 0 || !midr_ctrl_decode_list_header(
+			     buf, (size_t)n, MIDR_CTRL_BOOTSTRAP_LIST_RESP,
+			     MIDR_CTRL_BOOTSTRAP_ITEM_LEN, &count) ||
+	    !midr_ctrl_same_active_family(bgp, &src)) {
+		MIDR_LOG("MIDR ctrl: invalid BOOTSTRAP_LIST_RESP from %pIA — dropping whole frame",
+			 &src);
 		return;
 	}
-	items = (const struct midr_ctrl_bootstrap_item *)(buf + sizeof(*hdr));
+	if (count) {
+		items = XCALLOC(MTYPE_TMP, (size_t)count * sizeof(*items));
+		identities = XCALLOC(MTYPE_TMP,
+				     (size_t)count * sizeof(*identities));
+	}
+	for (i = 0; i < count; i++) {
+		const uint8_t *item = buf + MIDR_CTRL_LIST_HDR_LEN +
+				      (size_t)i * MIDR_CTRL_BOOTSTRAP_ITEM_LEN;
+
+		if (!midr_ctrl_decode_locator(item, &items[i].transport) ||
+		    !midr_ctrl_same_active_family(bgp, &items[i].transport))
+			goto invalid;
+		items[i].asn = (as_t)midr_ctrl_get_u32(item + 20);
+		memcpy(&items[i].rid, item + 24, sizeof(items[i].rid));
+		if (!midr_ctrl_list_identity_usable(
+			    bgp, items[i].rid, &items[i].transport) ||
+		    !midr_ctrl_bootstrap_locator_binding_usable(
+			    mi, items[i].rid, &items[i].transport))
+			goto invalid;
+		identities[i].rid = items[i].rid;
+		if (!midr_ctrl_encode_locator(identities[i].locator,
+					      &items[i].transport))
+			goto invalid;
+	}
+	if (!midr_ctrl_list_identities_unique(identities, count))
+		goto invalid;
 
 	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_BOOTSTRAP_LIST_REQ);
-
-	/* 开收：先清上一份的批次标记，下面逐条置回（批 6 缺口 A 的"减法"半边——
-	 * 少了它，名单只做加法，已下线的引导永远留在候选池里且照样被优先挑中）。 */
 	midr_nds_bootstrap_list_begin(bgp);
-
-	/* 用完即弃语义：名单不落任何常驻表（不进 global_view，子稿 §5 已否决），
-	 * 只喂候选池与种子库——前者供 failover/挂靠挑选，后者供重启自举。 */
 	for (i = 0; i < count; i++)
-		midr_nds_bootstrap_learn(bgp,
-					 midr_ipaddr_from_ipv4(items[i].transport),
-					 (as_t)ntohl(items[i].asn),
+		midr_nds_bootstrap_learn(bgp, items[i].transport, items[i].asn,
 					 items[i].rid);
-
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
 	midr_nds_on_bootstrap_list(bgp, src, count);
+	return;
+
+invalid:
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
+	MIDR_LOG("MIDR ctrl: invalid BOOTSTRAP_LIST_RESP item from %pIA — dropping whole frame",
+		 &src);
 }
 
-/* New node: store the bootstrap's rep directory, then run join stage 1. */
+/* New node: validate the complete directory before replacing the old one. */
 static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
 				    ssize_t n, struct ipaddr src)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	const struct midr_ctrl_list_hdr *hdr =
-		(const struct midr_ctrl_list_hdr *)buf;
-	const struct midr_ctrl_rep_item *items;
+	struct midr_ctrl_rep_decoded *items = NULL;
+	struct midr_ctrl_identity_key *identities = NULL;
 	uint16_t count, i;
 
-	if (n < (ssize_t)sizeof(*hdr))
-		return;
-	count = ntohs(hdr->count);
-	/* TCP 帧长由本端定义, 收紧为严格等长 (不匹配 = 对端 bug / 损坏, 丢弃)。
-	 * 原 UDP 版的 LIST_MAX clamp 已随迁移删除——不删则 >80 成员仍被砍。 */
-	if (n != (ssize_t)(sizeof(*hdr) + (size_t)count * sizeof(*items))) {
-		MIDR_LOG("MIDR ctrl: REP_LIST_RESP length %zd != expected for count %u — dropping",
-			 (ssize_t)n, count);
+	if (n < 0 || !midr_ctrl_decode_list_header(
+			     buf, (size_t)n, MIDR_CTRL_REP_LIST_RESP,
+			     MIDR_CTRL_REP_ITEM_LEN, &count) ||
+	    !midr_ctrl_same_active_family(bgp, &src)) {
+		MIDR_LOG("MIDR ctrl: invalid REP_LIST_RESP from %pIA — dropping whole frame",
+			 &src);
 		return;
 	}
-	items = (const struct midr_ctrl_rep_item *)(buf + sizeof(*hdr));
+	if (count) {
+		items = XCALLOC(MTYPE_TMP, (size_t)count * sizeof(*items));
+		identities = XCALLOC(MTYPE_TMP,
+				     (size_t)count * sizeof(*identities));
+	}
+	for (i = 0; i < count; i++) {
+		const uint8_t *item = buf + MIDR_CTRL_LIST_HDR_LEN +
+				      (size_t)i * MIDR_CTRL_REP_ITEM_LEN;
+
+		items[i].group_id = midr_ctrl_get_u32(item);
+		if (!items[i].group_id ||
+		    !midr_ctrl_decode_locator(item + 4, &items[i].transport) ||
+		    !midr_ctrl_same_active_family(bgp, &items[i].transport))
+			goto invalid;
+		items[i].asn = (as_t)midr_ctrl_get_u32(item + 24);
+		memcpy(&items[i].rid, item + 28, sizeof(items[i].rid));
+		if (!midr_ctrl_list_identity_usable(
+			    bgp, items[i].rid, &items[i].transport))
+			goto invalid;
+		identities[i].rid = items[i].rid;
+		if (!midr_ctrl_encode_locator(identities[i].locator,
+					      &items[i].transport))
+			goto invalid;
+	}
+	if (!midr_ctrl_list_identities_unique(identities, count))
+		goto invalid;
 
 	midr_rep_dir_clear(bgp);
 	for (i = 0; i < count; i++)
-		midr_rep_dir_add(bgp, ntohl(items[i].group_id),
-				 midr_ipaddr_from_ipv4(items[i].rep_transport),
-				 (as_t)ntohl(items[i].rep_asn),
-				 items[i].rep_rid);
-
+		midr_rep_dir_add(bgp, items[i].group_id, items[i].transport,
+				 items[i].asn, items[i].rid);
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
 	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_REP_LIST_REQ);
 	MIDR_FLOW_LOG("MIDR ctrl: REP_LIST_RESP with %u reps — starting join", count);
 	midr_join_on_rep_list(bgp);
+	return;
+
+invalid:
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
+	MIDR_LOG("MIDR ctrl: invalid REP_LIST_RESP item from %pIA — dropping whole frame",
+		 &src);
 }
 
 /*
@@ -1034,23 +1486,49 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 				       ssize_t n, struct ipaddr src)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	const struct midr_ctrl_list_hdr *hdr =
-		(const struct midr_ctrl_list_hdr *)buf;
-	const struct midr_ctrl_member_item *items;
+	struct midr_ctrl_member_decoded *items = NULL;
+	struct midr_ctrl_identity_key *identities = NULL;
 	uint16_t count, i;
 	uint32_t resp_group;
 	bool is_join_candidate, is_anchor;
 
-	if (n < (ssize_t)sizeof(*hdr))
-		return;
-	count = ntohs(hdr->count);
-	/* 严格等长 (同 REP_LIST_RESP); LIST_MAX clamp 已删。 */
-	if (n != (ssize_t)(sizeof(*hdr) + (size_t)count * sizeof(*items))) {
-		MIDR_LOG("MIDR ctrl: MEMBER_LIST_RESP length %zd != expected for count %u — dropping",
-			 (ssize_t)n, count);
+	if (n < 0 || !midr_ctrl_decode_list_header(
+			     buf, (size_t)n, MIDR_CTRL_MEMBER_LIST_RESP,
+			     MIDR_CTRL_MEMBER_ITEM_LEN, &count) ||
+	    !midr_ctrl_same_active_family(bgp, &src)) {
+		MIDR_LOG("MIDR ctrl: invalid MEMBER_LIST_RESP from %pIA — dropping whole frame",
+			 &src);
 		return;
 	}
-	items = (const struct midr_ctrl_member_item *)(buf + sizeof(*hdr));
+	if (count) {
+		items = XCALLOC(MTYPE_TMP, (size_t)count * sizeof(*items));
+		identities = XCALLOC(MTYPE_TMP,
+				     (size_t)count * sizeof(*identities));
+	}
+	for (i = 0; i < count; i++) {
+		const uint8_t *item = buf + MIDR_CTRL_LIST_HDR_LEN +
+				      (size_t)i * MIDR_CTRL_MEMBER_ITEM_LEN;
+
+		memcpy(&items[i].rid, item, sizeof(items[i].rid));
+		if (items[i].rid.s_addr == INADDR_ANY ||
+		    !midr_ctrl_decode_locator(item + 4, &items[i].transport) ||
+		    !midr_ctrl_same_active_family(bgp, &items[i].transport))
+			goto invalid;
+		items[i].asn = (as_t)midr_ctrl_get_u32(item + 24);
+		items[i].group_id = midr_ctrl_get_u32(item + 28);
+		if (!items[i].group_id ||
+		    (i && items[i].group_id != items[0].group_id))
+			goto invalid;
+		if (!midr_ctrl_list_identity_usable(
+			    bgp, items[i].rid, &items[i].transport))
+			goto invalid;
+		identities[i].rid = items[i].rid;
+		if (!midr_ctrl_encode_locator(identities[i].locator,
+					      &items[i].transport))
+			goto invalid;
+	}
+	if (!midr_ctrl_list_identities_unique(identities, count))
+		goto invalid;
 
 	/* 收到响应 → 停止对这个目的地重传（不管下面判到哪一路）。 */
 	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_MEMBER_LIST_REQ);
@@ -1058,10 +1536,12 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	if (count == 0) {
 		MIDR_LOG("MIDR ctrl: MEMBER_LIST_RESP from %pIA 为空，无法判断所属群，忽略",
 			 &src);
+		XFREE(MTYPE_TMP, identities);
+		XFREE(MTYPE_TMP, items);
 		return;
 	}
 	/* 代表自己那条（组装时放最前）自带真实群号，用它判定这是哪一路响应。 */
-	resp_group = ntohl(items[0].group_id);
+	resp_group = items[0].group_id;
 	is_join_candidate =
 		mi->join_group_id != 0 && resp_group == mi->join_group_id;
 	is_anchor = !is_join_candidate && resp_group != 0 &&
@@ -1071,6 +1551,8 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	if (!is_join_candidate && !is_anchor) {
 		MIDR_LOG("MIDR ctrl: MEMBER_LIST_RESP 群 %u 与当前候选群/锚点群都不符（过期响应？），忽略",
 			 resp_group);
+		XFREE(MTYPE_TMP, identities);
+		XFREE(MTYPE_TMP, items);
 		return;
 	}
 
@@ -1081,21 +1563,21 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	 * midr_ctrl_connect，见 midr_nds_on_cluster_decision）。
 	 */
 	for (i = 0; i < count; i++) {
-		uint32_t item_gid = ntohl(items[i].group_id);
+		uint32_t item_gid = items[i].group_id;
 
 		if (IPV4_ADDR_SAME(&items[i].rid, &bgp->router_id))
 			continue; /* 跳过描述自己的条目 */
 
 		if (is_join_candidate) {
 			midr_nds_learn_member(
-				bgp, items[i].rid, ntohl(items[i].asn),
-				midr_ipaddr_from_ipv4(items[i].transport), item_gid);
+				bgp, items[i].rid, items[i].asn,
+				items[i].transport, item_gid);
 			MIDR_FLOW_LOG("MIDR 加入：I-1 探测成员 %pI4（群 %u）",
 				      &items[i].rid, item_gid);
 		} else {
 			midr_nds_learn_anchor_candidate(
-				bgp, items[i].rid, ntohl(items[i].asn),
-				midr_ipaddr_from_ipv4(items[i].transport), item_gid);
+				bgp, items[i].rid, items[i].asn,
+				items[i].transport, item_gid);
 			MIDR_FLOW_LOG("MIDR 锚点：I-1 探测锚点候选 %pI4（次优群 %u）",
 				      &items[i].rid, item_gid);
 		}
@@ -1107,9 +1589,10 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 		 * 自报身份，让它记住我们——不等回复、不触发建连。两条路径的候选
 		 * 都需要，语义相同。
 		 */
-		midr_ctrl_send_req(mi, midr_ipaddr_from_ipv4(items[i].transport),
-				   MIDR_CTRL_ANNOUNCE, 0);
+		midr_ctrl_send_req(mi, items[i].transport, MIDR_CTRL_ANNOUNCE, 0);
 	}
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
 
 	if (is_join_candidate) {
 		/*
@@ -1137,6 +1620,13 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 				bgp, MIDR_JOIN_PROBE_WAIT_SECS,
 				&mi->t_anchor_probe_done);
 	}
+	return;
+
+invalid:
+	XFREE(MTYPE_TMP, identities);
+	XFREE(MTYPE_TMP, items);
+	MIDR_LOG("MIDR ctrl: invalid MEMBER_LIST_RESP item from %pIA — dropping whole frame",
+		 &src);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1144,37 +1634,37 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 /* ------------------------------------------------------------------ */
 
 /*
- * 传输层收到一个完整请求帧 (20B midr_ctrl_msg) 后回调。返回响应 payload stream
+ * 传输层收到一个完整请求帧（36B version-4 request）后回调。返回响应 payload stream
  * (不含长度前缀, 由传输层封帧发出); 返回 NULL = 不回包 (闸门不过, 沉默同 UDP)。
  * 闸门逻辑与日志文案照搬 UDP 版 midr_ctrl_udp_recv 的对应分支。
  */
 struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 					size_t len, struct ipaddr remote)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct midr_ctrl_msg msg;
+	struct bgp_midr_nds *mi;
+	struct midr_ctrl_request request;
 
-	if (!mi)
+	if (!bgp || !bgp->midr_nds_info)
 		return NULL;
-	if (len != sizeof(msg)) {
-		MIDR_LOG("MIDR ctrl: TCP request bad length %zu (want %zu) from %pIA",
-			 len, sizeof(msg), &remote);
+	mi = bgp->midr_nds_info;
+	if (!midr_ctrl_decode_request(bgp, payload, len, remote, &request)) {
+		MIDR_LOG("MIDR ctrl: invalid TCP request from %pIA — dropping",
+			 &remote);
 		return NULL;
 	}
-	memcpy(&msg, payload, sizeof(msg));
-	if (msg.version != MIDR_CTRL_MSG_VERSION)
-		return NULL;
 
 	/* 退网守卫（TCP 请求侧，同 UDP 那道的理由）：退网了就不再以引导/代表身份
 	 * 应答任何列表请求。返回 NULL = 沉默不回包，与闸门不过时同款处置。 */
 	if (mi->shutdown) {
 		MIDR_LOG("MIDR 退网：丢弃控制通道 TCP 请求 type=%u（本机已退网）",
-			 msg.type);
+			 request.type);
 		return NULL;
 	}
 
-	switch (msg.type) {
+	switch (request.type) {
 	case MIDR_CTRL_REP_LIST_REQ:
+		if (request.target_group != 0)
+			return NULL;
 		/* Only a bootstrap node answers (闸门照 MEMBER_LIST 的
 		 * GROUP_REP 模式, 无组匹配项; BOOTSTRAP 位由此升"闸门+通告+
 		 * 目录数据源"三职) */
@@ -1205,14 +1695,14 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 		 * 按 BOOTSTRAP 位取指标的逻辑；兼任引导仍被 ANNOUNCE 兜住；终态引导
 		 * 专职后压根不进 rep 目录（midr_rep_candidates 双重排除）。
 		 */
-		MIDR_FLOW_LOG("MIDR ctrl: REP_LIST_REQ from %pI4 — replying with rep directory",
-			      &msg.requester_transport);
+		MIDR_FLOW_LOG("MIDR ctrl: REP_LIST_REQ from %pIA — replying with rep directory",
+			      &request.requester_transport);
 		return midr_ctrl_build_rep_list(bgp, remote);
 	case MIDR_CTRL_MEMBER_LIST_REQ: {
-		uint32_t group = ntohl(msg.target_group);
+		uint32_t group = request.target_group;
 
 		/* Only a representative of this group answers. */
-		if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP) ||
+		if (!group || !(mi->local_capabilities & MIDR_CAP_GROUP_REP) ||
 		    group != mi->local_group_id) {
 			MIDR_LOG("MIDR ctrl: ignoring MEMBER_LIST_REQ for group %u (caps 0x%x our-group %u)",
 				 group, mi->local_capabilities,
@@ -1221,13 +1711,15 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 		}
 		/* 同 REP_LIST_REQ: 先学请求方身份, 放行其后续 PM 探测。 */
 		midr_nds_learn_requester(
-			bgp, msg.requester_rid, (as_t)ntohl(msg.requester_asn),
-			midr_ipaddr_from_ipv4(msg.requester_transport));
-		MIDR_FLOW_LOG("MIDR ctrl: MEMBER_LIST_REQ for group %u from %pI4 — replying",
-			      group, &msg.requester_transport);
+			bgp, request.requester_rid, request.requester_asn,
+			request.requester_transport);
+		MIDR_FLOW_LOG("MIDR ctrl: MEMBER_LIST_REQ for group %u from %pIA — replying",
+			      group, &request.requester_transport);
 		return midr_ctrl_build_member_list(bgp, remote, group);
 	}
 	case MIDR_CTRL_BOOTSTRAP_LIST_REQ:
+		if (request.target_group != 0)
+			return NULL;
 		/* 只有引导节点答（闸门同 REP_LIST_REQ：BOOTSTRAP 位既是资格也是
 		 * 数据源）。不学请求方身份——这条路径之后没有 PM 探测要放行
 		 * （拿名单是为了建挂靠会话，不是为了探测）。 */
@@ -1236,12 +1728,12 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
 				 &remote, mi->local_capabilities);
 			return NULL;
 		}
-		MIDR_FLOW_LOG("MIDR ctrl: BOOTSTRAP_LIST_REQ from %pI4 — replying with live bootstrap list",
-			      &msg.requester_transport);
+		MIDR_FLOW_LOG("MIDR ctrl: BOOTSTRAP_LIST_REQ from %pIA — replying with live bootstrap list",
+			      &request.requester_transport);
 		return midr_ctrl_build_bootstrap_list(bgp, remote);
 	default:
 		MIDR_LOG("MIDR ctrl: TCP unexpected request type %u from %pIA",
-			 msg.type, &remote);
+			 request.type, &remote);
 		return NULL;
 	}
 }
@@ -1250,32 +1742,36 @@ struct stream *midr_ctrl_on_tcp_request(struct bgp *bgp, const uint8_t *payload,
  * 传输层收到一个完整响应帧后回调。req_type = 本端当初发出的请求类型 (响应类型
  * 配对校验, 防串台); src = 响应来源 (并发多路 MEMBER_LIST_REQ 时, 供
  * drop_pending 精确清对应 (dst,type) 条目, 见 bgp_midr_ctrl.h 声明处注释);
- * 转现有 recv_rep_list / recv_member_list 灌视图 + 推进 join。
+ * 转现有 recv_rep_list / recv_member_list / recv_bootstrap_list 灌视图
+ * + 推进 join。
  */
 void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 			       const uint8_t *payload, size_t len,
 			       struct ipaddr src)
 {
-	const struct midr_ctrl_list_hdr *hdr;
+	uint8_t response_type;
 
-	if (len < sizeof(*hdr)) {
+	if (!bgp || !bgp->midr_nds_info || !payload)
+		return;
+	if (len < MIDR_CTRL_LIST_HDR_LEN) {
 		MIDR_LOG("MIDR ctrl: TCP response too short (%zu)", len);
 		return;
 	}
-	hdr = (const struct midr_ctrl_list_hdr *)payload;
-	if (hdr->version != MIDR_CTRL_MSG_VERSION)
+	if (payload[0] != MIDR_CTRL_MSG_VERSION)
 		return;
+	response_type = payload[1];
 
-	/* 退网守卫（TCP 响应侧）：退网时 join 状态已清空，迟到的 REP/MEMBER_LIST_RESP
+	/* 退网守卫（TCP 响应侧）：退网时相关状态已清空，迟到的 REP/MEMBER/
+	 * BOOTSTRAP_LIST_RESP
 	 * 不该再灌视图、更不该推进一个已经不存在的 join（join_intent 那道守卫只拦
 	 * REP_LIST_RESP 那一路，这里一并堵死）。 */
 	if (bgp->midr_nds_info && bgp->midr_nds_info->shutdown) {
 		MIDR_LOG("MIDR 退网：丢弃控制通道 TCP 响应 type=%u（本机已退网）",
-			 hdr->type);
+			 response_type);
 		return;
 	}
 
-	switch (hdr->type) {
+	switch (response_type) {
 	case MIDR_CTRL_REP_LIST_RESP:
 		if (req_type != MIDR_CTRL_REP_LIST_REQ) {
 			MIDR_LOG("MIDR ctrl: REP_LIST_RESP but our request was type %u — dropping",
@@ -1301,34 +1797,48 @@ void midr_ctrl_on_tcp_response(struct bgp *bgp, uint8_t req_type,
 		midr_ctrl_recv_bootstrap_list(bgp, payload, (ssize_t)len, src);
 		break;
 	default:
-		MIDR_LOG("MIDR ctrl: TCP unexpected response type %u", hdr->type);
+		MIDR_LOG("MIDR ctrl: TCP unexpected response type %u",
+			 response_type);
 		break;
 	}
 }
 
-/* Read one control datagram and dispatch on its type.  UDP now only carries
- * PEER_REQUEST (20B); list exchange (REP/MEMBER_LIST) moved to TCP. */
+/* Read one fixed-size control datagram and dispatch on its type.  List
+ * exchange (REP/MEMBER/BOOTSTRAP_LIST) uses TCP short connections. */
 static void midr_ctrl_udp_recv(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	uint8_t buf[sizeof(struct midr_ctrl_msg)];
-	struct midr_ctrl_msg msg;
+	uint8_t buf[MIDR_CTRL_REQUEST_LEN + 1];
+	struct midr_ctrl_request request;
+	union sockunion source_su = {};
+	struct ipaddr source = midr_ipaddr_none();
+	socklen_t source_len = sizeof(source_su);
 	ssize_t n;
 
 	/* Keep listening regardless of how this datagram is handled. */
 	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, mi->ctrl_sock,
 		       &mi->t_ctrl_read);
 
-	n = recvfrom(mi->ctrl_sock, buf, sizeof(buf), 0, NULL, NULL);
-	if (n < 2) {
+	n = recvfrom(mi->ctrl_sock, buf, sizeof(buf), 0,
+		     (struct sockaddr *)&source_su, &source_len);
+	if (n < 0) {
 		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
 			zlog_warn("MIDR ctrl: recvfrom failed: %s",
 				  safe_strerror(errno));
 		return;
 	}
-	if (buf[0] != MIDR_CTRL_MSG_VERSION)
+	if (!midr_sockunion_to_ipaddr(&source_su, &source) ||
+	    !midr_ctrl_decode_request(bgp, buf, (size_t)n, source, &request)) {
+		MIDR_LOG("MIDR ctrl: invalid UDP request from %pIA — dropping",
+			 &source);
 		return;
+	}
+	if (!midr_ctrl_is_udp_type(request.type)) {
+		MIDR_LOG("MIDR ctrl: request type %s is not permitted over UDP",
+			 midr_ctrl_msg_type_str(request.type));
+		return;
+	}
 
 	/*
 	 * 退网守卫之三（控制通道入站）。**必须放在 recvfrom 之后**：提前 return
@@ -1346,26 +1856,21 @@ static void midr_ctrl_udp_recv(struct event *t)
 	 */
 	if (mi->shutdown) {
 		MIDR_LOG("MIDR 退网：丢弃控制通道 UDP 消息 type=%u（本机已退网）",
-			 buf[1]);
+			 request.type);
 		return;
 	}
 
-	switch (buf[1]) {
+	switch (request.type) {
 	case MIDR_CTRL_PEER_REQUEST:
 	case MIDR_CTRL_ATTACH_REQUEST: {
-		uint32_t target_group;
+		uint32_t target_group = request.target_group;
 		struct midr_node_entry req = {};
 		enum midr_session_reason reason;
 		/*
 		 * 批 5 前置①：挂靠走专用类型，两类共用本分支——帧结构与回配动作
 		 * 完全一致，**唯一差别是挂靠跳过引导负面守卫**（见下面 ③′）。
 		 */
-		bool is_attach = (buf[1] == MIDR_CTRL_ATTACH_REQUEST);
-
-		if (n < (ssize_t)sizeof(msg))
-			return;
-		memcpy(&msg, buf, sizeof(msg));
-		target_group = ntohl(msg.target_group);
+		bool is_attach = (request.type == MIDR_CTRL_ATTACH_REQUEST);
 
 		/*
 		 * ===== 接收侧过滤（方案定稿结论 15 终形，08-11 批 2 重写）=====
@@ -1390,8 +1895,8 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * PEER_REQUEST 目前无任何身份校验：谁都能伪造 requester_rid/
 		 * transport 让本机去建一条会话。当前威胁模型是实验室与受控组网，
 		 * 故后置；**真实部署前必须补上**（时点：骨干网完成 + 合并第一组 +
-		 * 合并第二组之后）。届时走协议 v2→v3 加签名头，与本批"帧不动"
-		 * 的约束不冲突——那是另一个专题。
+		 * 合并第二组之后）。届时必须再升协议版本并加签名头；当前 v4 帧不
+		 * 预留隐式扩展，避免新旧实现误解同一版本。
 		 */
 
 		/*
@@ -1402,12 +1907,13 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * 键正好对得上：名单以 router-id 为键（批 2 换键），而报文自带
 		 * requester_rid。
 		 */
-		if (midr_nds_is_session_excluded(bgp, msg.requester_rid)) {
+		if (midr_nds_is_session_excluded(bgp,
+						 request.requester_rid)) {
 			MIDR_LOG("MIDR ctrl: 拒绝 %s —— 发起方 rid %pI4 在会话排除名单中",
-				 midr_ctrl_msg_type_str(buf[1]),
-				 &msg.requester_rid);
+				 midr_ctrl_msg_type_str(request.type),
+				 &request.requester_rid);
 			midr_ctrl_send_peer_reject(bgp,
-						   msg.requester_transport);
+						   request.requester_transport);
 			return;
 		}
 
@@ -1422,11 +1928,11 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * 判据 = 查节点表，**明确识别**为普通成员（既非 BOOTSTRAP 又非
 		 * GROUP_REP）才拒；**查不到一律放行**——宁放勿拒，为的是兜住挂靠的
 		 * 时序：代表刚翻上 GROUP_REP 位就来挂靠，而本机可能还没收到它那条
-		 * 带新能力位的 Node NLRI。
+		 * 带新能力位的权威 Node fact。
 		 *
-		 * 最坏误拒窗（定稿结论 15 记）：对端能力位变化到本机看见之间。轮 2~4
-		 * 期间该窗口 = 节点表 expire 15s；轮 4 挂上第二组回调后，优雅下线是
-		 * 秒级、猝死则为 holdtime。窗口内被误拒的一方会重试（3s×5），通常
+		 * 最坏误拒窗（定稿结论 15 记）：对端能力位变化到权威 remote-view
+		 * 更新到达之间；优雅下线通常秒级，猝死则受 BGP holdtime 约束。
+		 * 窗口内被误拒的一方会重试（3s×5），通常
 		 * 下一轮就过。
 		 *
 		 * **挂靠请求（ATTACH_REQUEST）跳过本守卫**（批 5 前置①）：它自报
@@ -1440,16 +1946,16 @@ static void midr_ctrl_udp_recv(struct event *t)
 
 			rkey.node_id.family = AF_INET;
 			rkey.node_id.prefixlen = IPV4_MAX_BITLEN;
-			rkey.node_id.u.prefix4 = msg.requester_rid;
+			rkey.node_id.u.prefix4 = request.requester_rid;
 			rentry = midr_node_hash_find(&mi->global_view->nodes,
 						     &rkey);
 			if (rentry &&
 			    !(rentry->capabilities &
 			      (MIDR_CAP_BOOTSTRAP | MIDR_CAP_GROUP_REP))) {
 				MIDR_LOG("MIDR ctrl: 拒绝 PEER_REQUEST —— 本机是引导节点，而发起方 %pI4 在节点表里是普通成员（无 BOOTSTRAP/GROUP_REP 位）",
-					 &msg.requester_rid);
+					 &request.requester_rid);
 				midr_ctrl_send_peer_reject(
-					bgp, msg.requester_transport);
+					bgp, request.requester_transport);
 				return;
 			}
 		}
@@ -1459,16 +1965,16 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * peer back; no dependency on the BGP-LS node table. */
 		req.node_id.family = AF_INET;
 		req.node_id.prefixlen = IPV4_MAX_BITLEN;
-		req.node_id.u.prefix4 = msg.requester_rid;
-		req.asn = ntohl(msg.requester_asn);
+		req.node_id.u.prefix4 = request.requester_rid;
+		req.asn = request.requester_asn;
 		req.group_id = target_group;
-		req.transport_addr =
-			midr_ipaddr_from_ipv4(msg.requester_transport);
+		req.transport_addr = request.requester_transport;
 		req.has_transport_addr = true;
 
-		MIDR_FLOW_LOG("MIDR ctrl: %s from rid %pI4 transport %pI4 AS %u group %u — peering back",
-			  midr_ctrl_msg_type_str(buf[1]), &msg.requester_rid,
-			  &msg.requester_transport, (unsigned int)req.asn,
+		MIDR_FLOW_LOG("MIDR ctrl: %s from rid %pI4 transport %pIA AS %u group %u — peering back",
+			  midr_ctrl_msg_type_str(request.type),
+			  &request.requester_rid,
+			  &request.requester_transport, (unsigned int)req.asn,
 			  target_group);
 
 		/*
@@ -1508,9 +2014,9 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * ctrl_pending 里按 (建连类, 发送者 transport) 查，查不到
 		 * **直接丢**。伪造者得先知道我此刻正朝谁建连，窗口极小；何况伪造
 		 * PEER_REQUEST 的危害本来就更大，不因本特性变差。
-		 * 判据用帧里自报的 transport 而非 UDP 源地址：overlay 是多跳的，
-		 * 源地址取决于 underlay 选路，未必等于对端 transport（也就未必等于
-		 * pending 的键）。
+		 * v4 解码已强制 UDP 源地址与帧内 transport 完全一致，因此用帧内字段
+		 * 查 pending 与按数据报来源查是同一个键；不接受 underlay 自动选出的
+		 * 其它源地址。
 		 *
 		 * 处理 = **提前死心**，与 3s×5 超时死心完全同款语义（结论 23）：
 		 * 停重传 + 拆自己预配的半边 + warn 到此为止。区别只是快——秒级，
@@ -1519,27 +2025,22 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * PEER_REQUEST 不换（指名连这一个，无替补池）；ATTACH_REQUEST 换
 		 * （D2 failover：盖 attach_failed 章 + 立即重挑下一台引导）。
 		 */
-		if (n < (ssize_t)sizeof(msg))
-			return;
-		memcpy(&msg, buf, sizeof(msg));
-
 		/* 在途的可能是 PEER_REQUEST 也可能是 ATTACH_REQUEST（挂靠被拒），
 		 * 查出是哪一种：既作防伪判据，也用来清对应那条 pending。 */
 		req_type = midr_ctrl_pending_peer_req_type(
-			mi, midr_ipaddr_from_ipv4(msg.requester_transport));
+			mi, request.requester_transport);
 		if (!req_type) {
-			MIDR_LOG("MIDR ctrl: 丢弃 PEER_REJECT —— 本机并未朝 %pI4 发建连请求（防伪判据）",
-				 &msg.requester_transport);
+			MIDR_LOG("MIDR ctrl: 丢弃 PEER_REJECT —— 本机并未朝 %pIA 发建连请求（防伪判据）",
+				 &request.requester_transport);
 			return;
 		}
 
-		zlog_info("MIDR ctrl: %pI4 拒绝了本机的 %s（rid %pI4），提前死心：停止重传并拆除半边会话（拒绝原因见对端日志）",
-			  &msg.requester_transport,
-			  midr_ctrl_msg_type_str(req_type), &msg.requester_rid);
-		midr_ctrl_drop_pending(
-			mi, midr_ipaddr_from_ipv4(msg.requester_transport), req_type);
-		midr_ctrl_drop_half_peer(
-			bgp, midr_ipaddr_from_ipv4(msg.requester_transport),
+		zlog_info("MIDR ctrl: %pIA 拒绝了本机的 %s（rid %pI4），提前死心：停止重传并拆除半边会话（拒绝原因见对端日志）",
+			  &request.requester_transport,
+			  midr_ctrl_msg_type_str(req_type),
+			  &request.requester_rid);
+		midr_ctrl_drop_pending(mi, request.requester_transport, req_type);
+		midr_ctrl_drop_half_peer(bgp, request.requester_transport,
 					 "对端明确回了 PEER_REJECT（提前死心）");
 		/* 挂靠被拒 → 换一台（D2）。此处不在遍历 ctrl_pending，盖章后
 		 * 直接重挑是安全的。 */
@@ -1548,20 +2049,11 @@ static void midr_ctrl_udp_recv(struct event *t)
 
 			/* 重挑从死者所在批次继续（批 6 的 A-3）。 */
 			batch = midr_nds_attach_mark_failed(
-				bgp, midr_ipaddr_from_ipv4(msg.requester_transport));
+				bgp, request.requester_transport);
 			midr_nds_attach_pick_from(bgp, batch);
 		}
 		break;
 	}
-	case MIDR_CTRL_REP_LIST_REQ:
-	case MIDR_CTRL_REP_LIST_RESP:
-	case MIDR_CTRL_MEMBER_LIST_REQ:
-	case MIDR_CTRL_MEMBER_LIST_RESP:
-		/* 列表交换已迁 TCP; 收到 UDP 列表报文多半来自旧版本节点 (混跑不
-		 * 兼容, 既定决策)。留此提示便于将来误用混版本时定位。 */
-		MIDR_LOG("MIDR ctrl: 忽略 UDP 列表报文 type=%s —— 列表交换已迁 TCP (旧版本节点?)",
-			 midr_ctrl_msg_type_str(buf[1]));
-		break;
 	case MIDR_CTRL_ANNOUNCE:
 		/*
 		 * 一个候选群成员在被灌入某加入节点的探测列表前，双方从未交换过
@@ -1569,14 +2061,11 @@ static void midr_ctrl_udp_recv(struct event *t)
 		 * 的探测包当作未知来源丢弃。这里只是记住发送者身份，不回复、不
 		 * 建连（保持"探成员阶段只探不连"）。
 		 */
-		if (n < (ssize_t)sizeof(msg))
-			return;
-		memcpy(&msg, buf, sizeof(msg));
 		midr_nds_learn_requester(
-			bgp, msg.requester_rid, (as_t)ntohl(msg.requester_asn),
-			midr_ipaddr_from_ipv4(msg.requester_transport));
-		MIDR_FLOW_LOG("MIDR ctrl: ANNOUNCE from %pI4 — noted for PM source validation",
-			  &msg.requester_transport);
+			bgp, request.requester_rid, request.requester_asn,
+			request.requester_transport);
+		MIDR_FLOW_LOG("MIDR ctrl: ANNOUNCE from %pIA — noted for PM source validation",
+			  &request.requester_transport);
 		break;
 	default:
 		break;
@@ -1585,69 +2074,144 @@ static void midr_ctrl_udp_recv(struct event *t)
 
 void midr_ctrl_init(struct bgp *bgp)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct sockaddr_in sa = {};
-	int sock;
+	struct bgp_midr_nds *mi;
 
-	if (!mi)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
 
 	mi->ctrl_sock = -1;
 	mi->ctrl_pending = list_new();
-
-	/* 开 TCP 列表交换通道 (监听失败记 err)。先于 UDP 建立, 使二者互不依赖
-	 * ——UDP bind 失败的早返回不应连带跳过 TCP。 */
 	midr_ctrl_tcp_init(bgp);
+}
 
-	sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		zlog_err("MIDR ctrl: UDP socket() failed: %s",
-			 safe_strerror(errno));
+void midr_ctrl_close(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node, *nnode;
+	struct midr_ctrl_pending *p;
+
+	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
+
+	event_cancel(&mi->t_ctrl_read);
+	event_cancel(&mi->t_ctrl_retx);
+	mi->ctrl_retx_tick_ms = 0;
+	if (mi->ctrl_sock >= 0) {
+		close(mi->ctrl_sock);
+		mi->ctrl_sock = -1;
+	}
+	midr_ctrl_tcp_close(bgp);
+
+	if (mi->ctrl_pending)
+		for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p)) {
+			list_delete_node(mi->ctrl_pending, node);
+			XFREE(MTYPE_MIDR_CTRL_PENDING, p);
+		}
+}
+
+void midr_ctrl_forget_target(struct bgp *bgp, struct ipaddr transport)
+{
+	struct bgp_midr_nds *mi;
+	struct listnode *node, *nnode;
+	struct midr_ctrl_pending *pending;
+	union sockunion su;
+	struct peer *peer;
+
+	if (!bgp || !bgp->midr_nds_info ||
+	    !midr_ipaddr_valid_locator(&transport))
+		return;
+	mi = bgp->midr_nds_info;
+
+	if (mi->ctrl_pending)
+		for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, pending)) {
+			if (!midr_ipaddr_same(&pending->target_transport,
+					      &transport))
+				continue;
+			list_delete_node(mi->ctrl_pending, node);
+			XFREE(MTYPE_MIDR_CTRL_PENDING, pending);
+		}
+	if (!mi->ctrl_pending || list_isempty(mi->ctrl_pending)) {
+		event_cancel(&mi->t_ctrl_retx);
+		mi->ctrl_retx_tick_ms = 0;
+	}
+
+	midr_ctrl_tcp_cancel_target(bgp, transport);
+	if (!midr_ipaddr_to_sockunion(&transport, &su))
+		return;
+	peer = peer_lookup(bgp, &su);
+	if (peer && midr_nds_peer_is_overlay(peer))
+		peer_delete(peer);
+}
+
+bool midr_ctrl_open(struct bgp *bgp, const struct ipaddr *local)
+{
+	struct bgp_midr_nds *mi;
+	union sockunion su;
+	int sock;
+
+	if (!bgp || !bgp->midr_nds_info ||
+	    !midr_ipaddr_valid_locator(local))
+		return false;
+	mi = bgp->midr_nds_info;
+
+	/* The two transports form one active control endpoint.  A partial open
+	 * is closed and reported as failure to the NDS reconcile transaction. */
+	midr_ctrl_close(bgp);
+	if (!midr_ctrl_tcp_open(bgp, local))
+		return false;
+
+	sock = socket(ipaddr_family(local), SOCK_DGRAM, 0);
+	if (sock < 0) {
+		zlog_err("MIDR ctrl: UDP socket(%pIA) failed: %s", local,
+			 safe_strerror(errno));
+		goto fail;
 	}
 	sockopt_reuseaddr(sock);
+	if (IS_IPADDR_V6(local)) {
+		int one = 1;
 
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(INADDR_ANY);
-	sa.sin_port = htons(MIDR_CTRL_UDP_PORT);
-	if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		zlog_err("MIDR ctrl: UDP bind(:%u) failed: %s",
+		if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &one,
+			       sizeof(one)) < 0) {
+			zlog_err("MIDR ctrl: UDP IPV6_V6ONLY(%pIA) failed: %s",
+				 local, safe_strerror(errno));
+			close(sock);
+			goto fail;
+		}
+	}
+	if (!midr_ipaddr_to_sockunion(local, &su) ||
+	    sockunion_bind(sock, &su, MIDR_CTRL_UDP_PORT, &su) < 0) {
+		zlog_err("MIDR ctrl: UDP bind(%pIA:%u) failed: %s", local,
 			 MIDR_CTRL_UDP_PORT, safe_strerror(errno));
 		close(sock);
-		return;
+		goto fail;
 	}
 	set_nonblocking(sock);
 	mi->ctrl_sock = sock;
 	event_add_read(bm->master, midr_ctrl_udp_recv, bgp, sock,
 		       &mi->t_ctrl_read);
+	MIDR_LOG("MIDR ctrl: UDP channel ready on %pIA:%u", local,
+		 MIDR_CTRL_UDP_PORT);
+	return true;
 
-	MIDR_LOG("MIDR ctrl: peer-request UDP channel on :%u",
-		  MIDR_CTRL_UDP_PORT);
+fail:
+	midr_ctrl_tcp_close(bgp);
+	return false;
 }
 
 void midr_ctrl_finish(struct bgp *bgp)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct listnode *node, *nnode;
-	struct midr_ctrl_pending *p;
+	struct bgp_midr_nds *mi;
 
-	if (!mi)
+	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
 
-	/* 关 TCP 列表交换通道 (监听 + 所有活动连接)。 */
+	midr_ctrl_close(bgp);
 	midr_ctrl_tcp_finish(bgp);
-
-	event_cancel(&mi->t_ctrl_read);
-	event_cancel(&mi->t_ctrl_retx);
-	if (mi->ctrl_sock >= 0) {
-		close(mi->ctrl_sock);
-		mi->ctrl_sock = -1;
-	}
-	if (mi->ctrl_pending) {
-		for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p))
-			XFREE(MTYPE_MIDR_CTRL_PENDING, p);
+	if (mi->ctrl_pending)
 		list_delete(&mi->ctrl_pending);
-	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1662,20 +2226,20 @@ void midr_ctrl_finish(struct bgp *bgp)
  *   - multihop：MIDR 对等体多为非直连（transport 对 transport）；
  *   - update-source：TCP 源地址绑本端 transport（loopback）。不绑则内核
  *     用出口网卡地址做源，对端按源地址查邻居表对不上号，多跳会话卡 Active；
- *   - 激活 BGP-LS：拓扑信息在 MIDR 对等体间直接流动，不必绕中继；
- *   - 撤销 IPv4 单播：FRR 建 peer 时按 bgp->default_af 自动附送（bgpd.c
+ *   - 激活 (AFI_BGP_LS, SAFI_MIDR_LS)：拓扑信息在 MIDR 对等体间直接流动；
+ *   - 撤销 IPv4/IPv6 单播：FRR 建 peer 时按 bgp->default_af 自动附送（bgpd.c
  *     peer_create，在 peer_remote_as() 内部就已完成、无从阻止，只能建完
  *     再撤）。不撤的后果：overlay 多跳会话把远端路由以更短 AS path 注入
  *     underlay——本端向邻居通告"其实必须借道该邻居才走得通"的路径，形成
  *     控制面无环、转发面成环的递归下一跳环路（07-21 十节点实测 g1b/g1c
  *     互指、g2c 探测全丢；见 docs/decisions/midr-overlay-underlay-layering.md）。
- *     MIDR 会话只承载 BGP-LS——谁提供转发可达性，谁才开 IPv4 单播。
+ *     MIDR 会话只承载 MIDR-LS——谁提供转发可达性，谁才开单播地址族。
  *
  * 此时会话尚未 Established，peer_deactivate 只清配置位、不触发 reset。
  */
 void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct ipaddr local;
 
 	/*
 	 * Stamp ownership FIRST: this is the single point both the auto-connect
@@ -1688,17 +2252,17 @@ void midr_nds_ctrl_setup_overlay_peer(struct bgp *bgp, struct peer *peer)
 	peer_ebgp_multihop_set(peer, MAXTTL);
 	/* 死亡感知 15s（复刻旧 expire 灵敏度）。定位与取舍见宏定义处注释。 */
 	peer_timers_set(peer, MIDR_OVERLAY_KEEPALIVE, MIDR_OVERLAY_HOLDTIME);
-	if (mi && mi->transport_addr_set) {
+	if (midr_nds_local_transport_get(bgp, &local)) {
 		union sockunion local_su;
 
-		if (midr_ipaddr_to_sockunion(&mi->local_transport_addr,
-					     &local_su))
+		if (midr_ipaddr_to_sockunion(&local, &local_su))
 			peer_update_source_addr_set(peer, &local_su);
 	}
 	/* MIDR overlay 会话只载 (4,9) MIDR-LS —— 件②（轮 4）退役了我方自有的
 	 * (4,8) BGP-LS 那一族，拓扑情报全部由第二组编码传播。 */
 	peer_activate(peer, AFI_BGP_LS, SAFI_MIDR_LS);
 	peer_deactivate(peer, AFI_IP, SAFI_UNICAST);
+	peer_deactivate(peer, AFI_IP6, SAFI_UNICAST);
 }
 
 /*
@@ -1729,13 +2293,39 @@ bool midr_nds_peer_is_overlay(struct peer *peer)
 void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 		       enum midr_session_reason reason, bool send_nudge)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct bgp_midr_nds *mi;
+	struct midr_node_entry key = {};
+	struct midr_node_entry *known;
 	union sockunion su;
-	struct prefix locator;
+	struct ipaddr local;
 	struct peer *peer;
 	struct in_addr remote_rid = { .s_addr = INADDR_ANY };
-	as_t asn = entry->asn;
+	bool has_remote_rid;
+	as_t asn;
 	int ret;
+
+	if (!bgp || !bgp->midr_nds_info || !entry)
+		return;
+	mi = bgp->midr_nds_info;
+	asn = entry->asn;
+	if (entry->node_id.family != AF_INET ||
+	    entry->node_id.prefixlen != IPV4_MAX_BITLEN) {
+		zlog_warn("MIDR ctrl: invalid remote router-id %pFX; refusing session",
+			  &entry->node_id);
+		return;
+	}
+	remote_rid = entry->node_id.u.prefix4;
+	has_remote_rid = remote_rid.s_addr != INADDR_ANY;
+	/* `midr session` is keyed by the operator-supplied locator and has no RID
+	 * argument.  On its first start (and after a cold config restore), the
+	 * remote BGP Identifier is therefore legitimately unresolved until OPEN.
+	 * Every automatic/control-message path carries an identity and must remain
+	 * fail-closed; only MANUAL may temporarily record RID 0. */
+	if (!has_remote_rid && reason != MIDR_SESSION_MANUAL) {
+		zlog_warn("MIDR ctrl: missing remote router-id for automatic session to %pIA; refusing session",
+			  &entry->transport_addr);
+		return;
+	}
 
 	/* 轮 4 放宽：不再要求 asn 非 0。建连走 AS_EXTERNAL，只校验"对端 AS ≠ 本机
 	 * AS"、随后用对端 OPEN 的真实 AS 覆盖（bgp_packet.c:2037），传什么都不参与
@@ -1748,18 +2338,43 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	 * MIDR 节点不配 `midr transport-address` 本身就是运维事故，正确反应是把事故
 	 * 亮出来，而不是静默拿 router-id 顶上去建一条大概率连不通的会话（router-id
 	 * 只是身份，未必可路由——真分离基线下它通常压根不在转发面里）。
-	 * 展示类调用点（show 命令）仍走 midr_node_get_locator 的回落：显示 router-id
-	 * 比显示空白有用。
+	 * 展示同样只显示显式 locator；缺失即显示未配置，避免身份与端点混淆。
 	 */
-	if (!entry->has_transport_addr) {
+	if (!entry->has_transport_addr ||
+	    !midr_ipaddr_valid_locator(&entry->transport_addr)) {
 		zlog_warn("MIDR ctrl: %pFX 没有 transport 地址，不建连——该节点多半漏配了 midr transport-address（router-id 只是身份、未必可路由，不作回落）",
 			  &entry->node_id);
 		return;
 	}
 
-	/* Peer with the node's real reachable address (TLV 1188), not its
-	 * router-id; router-id is only an identity and may be unroutable. */
-	midr_node_get_locator(entry, &locator);
+	if (!mi || mi->transport_reconfiguring || mi->shutdown ||
+	    !midr_nds_local_transport_get(bgp, &local))
+		return;
+	if (ipaddr_family(&local) != ipaddr_family(&entry->transport_addr)) {
+		zlog_warn("MIDR ctrl: local %pIA and remote %pIA transport families differ; refusing session",
+			  &local, &entry->transport_addr);
+		return;
+	}
+	known = NULL;
+	if (has_remote_rid) {
+		key.node_id = entry->node_id;
+		known = midr_node_hash_find(&mi->global_view->nodes, &key);
+	}
+	if (known && known != entry && known->has_transport_addr &&
+	    midr_ipaddr_valid_locator(&known->transport_addr) &&
+	    !midr_ipaddr_same(&known->transport_addr,
+			       &entry->transport_addr)) {
+		zlog_warn("MIDR ctrl: router-id %pI4 is already bound to locator %pIA; refusing transient rewrite to %pIA",
+			  &remote_rid, &known->transport_addr,
+			  &entry->transport_addr);
+		return;
+	}
+	if (!midr_nds_locator_unique(bgp, &entry->node_id,
+				      &entry->transport_addr)) {
+		zlog_warn("MIDR ctrl: locator %pIA is claimed by multiple node identities; refusing session",
+			  &entry->transport_addr);
+		return;
+	}
 
 	/*
 	 * 自连闸：谁也不许跟本机建会话（判据 = rid 撞本机 router-id 或目标撞本机
@@ -1768,11 +2383,11 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	 * （`midr bootstrap <本机地址>` 即可造出）。不拦则发给本机 5859 的请求被
 	 * 自己收下、再走回配，自己给自己记账、自己探自己。
 	 */
-	if ((entry->node_id.family == AF_INET &&
+	if ((has_remote_rid &&
 	     IPV4_ADDR_SAME(&entry->node_id.u.prefix4, &bgp->router_id)) ||
-	    (mi && mi->transport_addr_set &&
+	    (mi->transport_active &&
 	     midr_ipaddr_same(&entry->transport_addr,
-			       &mi->local_transport_addr))) {
+			       &mi->active_transport_addr))) {
 		zlog_warn("MIDR ctrl: 拒绝与本机自身建会话（%pFX）——请检查 bootstrap / session 配置是否把本机填成了对端",
 			  &entry->node_id);
 		return;
@@ -1783,17 +2398,18 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	 * connect_group 换组/退群重收敛、CL 的 ANCHOR、挂靠）都不得在这里悄悄
 	 * 把会话建回来。跨群那几条路本就绕开 midr_discovery_should_peer（定稿
 	 * 结论 15：它是成员判断不是闸门），所以本处是唯一能覆盖全部调用路径的
-	 * 地方，两道一个都不能丢。`midr session`（手工 escape hatch）不走本函数，
-	 * 不受影响。键 = router-id（08-11 批 2 由地址换来）。
+	 * 地方，两道一个都不能丢。`midr session` 同样走本函数，但 MANUAL 原因显式
+	 * 绕过本守卫。键 = router-id（08-11 批 2 由地址换来）。
 	 */
-	if (entry->node_id.family == AF_INET &&
+	if (reason != MIDR_SESSION_MANUAL && has_remote_rid &&
 	    midr_nds_is_session_excluded(bgp, entry->node_id.u.prefix4)) {
 		MIDR_LOG("MIDR ctrl: %pFX 在会话排除名单中，跳过自动建连",
 			 &entry->node_id);
 		return;
 	}
 
-	prefix2sockunion(&locator, &su);
+	if (!midr_ipaddr_to_sockunion(&entry->transport_addr, &su))
+		return;
 
 	/*
 	 * 台账家规①：登记放在下面两道去重检查【之前】。"MIDR 需要这条边"和
@@ -1805,10 +2421,8 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	 * 无条件销账共同实现，账里不再存 reused 标记（08-10 定案：复用会话根本
 	 * 不打 OVERLAY 标、⑦ 认人不靠账，该字段功能性为零）。
 	 */
-	if (entry->node_id.family == AF_INET)
-		remote_rid = entry->node_id.u.prefix4;
 	midr_nds_ledger_note(bgp, entry->transport_addr, reason, remote_rid,
-			     entry->group_id);
+			     asn, entry->group_id);
 
 	/*
 	 * SAME_GROUP 状态动作：这条边因同群而建，就在此把对端纳入本群邻居——回配与
@@ -1826,6 +2440,13 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 					  entry->group_id);
 		midr_mark_topology(bgp, entry);
 	}
+	/* Locator replacement retires the old PM context.  Cross-group anchors
+	 * are deliberately not is_adjacent, so the PM neighbor sweep cannot
+	 * restore them.  Reissue I-1 through the common connect path, including
+	 * ledger replay, without turning an anchor into a same-group neighbor. */
+	if (reason == MIDR_SESSION_CL_ANCHOR)
+		midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
+				   entry->capabilities);
 
 	/*
 	 * 反向建连 nudge：请对端也建一条回来。由函数末尾提到去重之前——去重 return
@@ -1877,7 +2498,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	MIDR_FLOW_LOG("MIDR ctrl: peering initiated with %pFX AS %u",
 		  &entry->node_id, asn);
 
-	/* 整形成 overlay 会话（multihop + update-source + 只载 BGP-LS），
+	/* 整形成 overlay 会话（multihop + update-source + 只载 MIDR-LS），
 	 * 定义与理由见 midr_nds_ctrl_setup_overlay_peer 头注释。 */
 	peer = peer_lookup(bgp, &su);
 	if (peer)
@@ -1889,12 +2510,13 @@ static void midr_try_disconnect(struct bgp *bgp,
 				bool force)
 {
 	union sockunion su;
-	struct prefix locator;
 	struct ipaddr transport;
 
-	midr_node_get_locator(entry, &locator);
-	prefix2sockunion(&locator, &su);
-	if (!midr_ipaddr_from_prefix(&locator, &transport))
+	if (!entry->has_transport_addr ||
+	    !midr_ipaddr_valid_locator(&entry->transport_addr))
+		return;
+	transport = entry->transport_addr;
+	if (!midr_ipaddr_to_sockunion(&transport, &su))
 		return;
 
 	/*
@@ -1920,8 +2542,9 @@ static void midr_try_disconnect(struct bgp *bgp,
 	 * force 旁路（退网专题，2026-08-21）：α 防的是**自动侧**越权拆运维的账，
 	 * 而本端 `midr shutdown` 是运维显式敲的命令、与手配同级——退网要把本机的
 	 * MIDR 会话拆净（留一条还在收发 LS 的会话，对上层的影响说不清），故那一条
-	 * 路径传 force=true 走旁路。**除退网外一律传 false**：expire / 对端 withdraw /
-	 * 换组 / 挂靠卸任 / B1 老化都是自动侧，豁免照旧。对端那半边收到的是
+	 * 路径传 force=true 走旁路。显式 `no midr session` 在先删除持久 MANUAL
+	 * 意图后也传 true；其余自动路径（对端 withdraw / 换组 / 挂靠卸任 /
+	 * B1 老化）一律传 false，豁免照旧。对端那半边收到的是
 	 * withdraw、走的正是自动路径，所以仍被 α 拦下（只 warn 不拆，判据 1）。
 	 */
 	if (!force) {
@@ -1970,7 +2593,7 @@ static void midr_try_disconnect(struct bgp *bgp,
 
 void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
 {
-	/* 自动路径（expire / 对端 withdraw / 换组清理）：α 豁免照旧生效。 */
+	/* 自动路径（对端 withdraw / locator 换代 / 换组清理）：α 豁免照旧生效。 */
 	midr_try_disconnect(bgp, entry, false);
 }
 
@@ -1978,14 +2601,14 @@ void midr_ctrl_on_node_remove(struct bgp *bgp, struct midr_node_entry *entry)
  * 按 transport 拆一条 MIDR 边（批 5 挂靠钩子用）。
  *
  * 为什么需要这个入口：拆边的既有出口 midr_try_disconnect() 收的是**节点表条目**，
- * 而挂靠的对端是引导节点——它不发 Node NLRI，节点表里永远没有它，拿不到条目。
+ * 而挂靠的对端是专职引导——它通常没有 remote-view Node 条目，拿不到现成条目。
  * 这里按 connect 侧同款做法拼一个临时条目（信息自带、不查表），其余一概复用
  * try_disconnect：MANUAL 豁免（α）、销账、⑦ 归属守卫，一个都不绕过。
  *
  * rid 用于日志可读（"拆的是谁"）；给 0 也能工作（locator 由 transport 决定）。
  *
- * force 见 midr_try_disconnect 内的 α 说明：只有本端退网（运维显式命令）传 true，
- * 自动路径一律 false。
+ * force 见 midr_try_disconnect 内的 α 说明：本端退网和显式
+ * `no midr session` 传 true，自动路径一律 false。
  */
 void midr_ctrl_detach_transport(struct bgp *bgp, struct ipaddr transport,
 				struct in_addr rid, bool force,
@@ -1998,8 +2621,6 @@ void midr_ctrl_detach_transport(struct bgp *bgp, struct ipaddr transport,
 	    !midr_ipaddr_valid_locator(&transport))
 		return;
 
-	if (display_rid.s_addr == INADDR_ANY)
-		(void)midr_ipaddr_to_ipv4(&transport, &display_rid);
 	e.node_id.family = AF_INET;
 	e.node_id.prefixlen = IPV4_MAX_BITLEN;
 	e.node_id.u.prefix4 = display_rid;

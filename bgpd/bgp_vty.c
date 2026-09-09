@@ -21039,8 +21039,11 @@ static void bgp_config_write_peer_global(struct vty *vty, struct bgp *bgp,
 	int if_pg_printed = false;
 	int if_ras_printed = false;
 
-	/* Skip dynamic neighbors. */
-	if (peer_dynamic_neighbor(peer))
+	/* NDS writes persistent manual intent as `midr session`.  Serializing
+	 * its runtime peers as ordinary neighbors loses overlay ownership on
+	 * reload and prevents NDS from restoring or managing those sessions. */
+	if (peer_dynamic_neighbor(peer) ||
+	    CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
 		return;
 
 	if (peer->conf_if)
@@ -21468,8 +21471,9 @@ static void bgp_config_write_peer_af(struct vty *vty, struct bgp *bgp,
 	if (IS_BGP_INSTANCE_HIDDEN(bgp))
 		return;
 
-	/* Skip dynamic neighbors. */
-	if (peer_dynamic_neighbor(peer))
+	/* Overlay AF state is restored by NDS along with the owned peer. */
+	if (peer_dynamic_neighbor(peer) ||
+	    CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
 		return;
 
 	if (peer->conf_if)
@@ -21848,6 +21852,7 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			bgp_config_write_peer_damp(vty, group->conf, afi, safi);
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
 		if (peer_is_config_node(peer) &&
+		    !CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY) &&
 		    peer_af_flag_check(peer, afi, safi, PEER_FLAG_CONFIG_DAMPENING))
 			bgp_config_write_peer_damp(vty, peer, afi, safi);
 

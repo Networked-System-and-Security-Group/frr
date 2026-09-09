@@ -137,9 +137,8 @@ bool midr_nds_facts_node_refresh(struct bgp *bgp)
 	next.group_id = mi->local_group_id;
 	next.cap_flags = mi->local_capabilities; /* 附录 A：低 32 位放现有能力位 */
 
-	if (mi->transport_addr_set) {
+	if (midr_nds_local_transport_get(bgp, &next.transport_address)) {
 		next.has_transport_address = true;
-		next.transport_address = mi->local_transport_addr;
 	} else {
 		/* 他们要求 has_transport_address 为假时 ipa_type 必须是
 		 * IPADDR_NONE（不能留脏值），XCALLOC 的 0 正好是它。 */
@@ -315,7 +314,8 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	}
 
 	/*
-	 * 引导节点不上报自己（专职化：只转发、不自产）。
+	 * 引导节点及尚未入群（运行群号 0）的普通节点不上报自己。前者是专职化：
+	 * 只转发、不自产；后者尚不具备进入权威拓扑的成员身份。
 	 *
 	 * 与 link 侧那道保险同因：现状引导什么都不发，靠的是"成为引导即自动关
 	 * distribute"，而那道判据只把守旧 NLRI 通道；轮 4 换第二组真实现后上报
@@ -325,7 +325,9 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	 * 报过之后才成为引导（`midr role bootstrap` 现配）的，先把自己撤干净再
 	 * 闭嘴 —— 否则对方视图里留着一条永不刷新的陈旧条目。
 	 */
-	if (midr_nds_is_bootstrap(bgp)) {
+	if (midr_nds_is_bootstrap(bgp) || !mi->local_group_id) {
+		bool bootstrap = midr_nds_is_bootstrap(bgp);
+
 		if (f->node_reported && f->node.node_id) {
 			if (facts_version_exhausted(bgp, f->node.version, why))
 				return;
@@ -334,18 +336,35 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 			ret = midr_topology_node_withdraw(ctx, f->node.node_id,
 							  f->node.version);
 			if (ret) {
-				FACTS_FAIL_LOG(facts_fail_prio(ret, false),
-					       "MIDR facts: 引导节点撤销自身上报失败 ret=%d (%s)",
-					       ret, why);
+				if (bootstrap)
+					FACTS_FAIL_LOG(
+						facts_fail_prio(ret, false),
+						"MIDR facts: 引导节点撤销自身上报失败 ret=%d (%s)",
+						ret, why);
+				else
+					FACTS_FAIL_LOG(
+						facts_fail_prio(ret, false),
+						"MIDR facts: 群号 0 时撤销自身上报失败 ret=%d (%s)",
+						ret, why);
 				return;
 			}
 			f->node_reported = false;
 			f->node_pending = false;
-			MIDR_LOG("MIDR facts: 本机是引导节点，撤销自身上报后闭嘴 (%s)",
-				 why);
+			if (bootstrap)
+				MIDR_LOG("MIDR facts: 本机是引导节点，撤销自身上报后闭嘴 (%s)",
+					 why);
+			else
+				MIDR_LOG("MIDR facts: 本机退至群号 0，撤销自身上报 (%s)",
+					 why);
 			return;
 		}
-		MIDR_LOG("MIDR facts: 本机是引导节点，node 上报跳过 (%s)", why);
+		f->node_pending = false;
+		if (bootstrap)
+			MIDR_LOG("MIDR facts: 本机是引导节点，node 上报跳过 (%s)",
+				 why);
+		else
+			MIDR_LOG("MIDR facts: 尚未入群（群号 0），node 上报抑制 (%s)",
+				 why);
 		return;
 	}
 
@@ -365,10 +384,6 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 	 * 群号取运行值 local_group_id：配置命令执行即写运行值、不等 join，未入网的
 	 * 纯默认节点恒为 0，join 落定 0->N 时自然过守卫并触发上报。
 	 */
-	if (!mi->local_group_id) {
-		MIDR_LOG("MIDR facts: 尚未入群（群号 0），node 上报抑制 (%s)", why);
-		return;
-	}
 	if (bgp_config_inprocess()) {
 		MIDR_LOG("MIDR facts: 配置加载中，node 上报推迟到配置读完 (%s)",
 			 why);
@@ -542,12 +557,9 @@ bool midr_nds_metrics_to_group2(const struct midr_nds_link_metrics *m,
 	if (!rtt_us)
 		return false;
 
-	/*
-	 * 满格丢包（loss_rate >= 1.0）**照报**，不再返回 false 转 withdraw
-	 * （2026-08-19 口径改定，全案见头文件本函数注释）：loss_ppm 已由
-	 * midr_nds_metric_loss_ppm() 夹到 999999，过得了他们的值域校验；链路
-	 * 生死归会话/节点级，指标层只管说"这条现在有多烂"。
-	 */
+	/* 本 helper 只负责数值换算，故对满格丢包仍产出一个合法范围内的值。
+	 * 生产出口 midr_nds_report_link() 在调用本函数前已经把该状态转成
+	 * withdraw，避免把“不可用”伪装成仍然 ACTIVE 的 999999 ppm。 */
 
 	memset(out, 0, sizeof(*out));
 	out->has_rtt_us = true;
@@ -576,7 +588,7 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	struct midr_node_entry key = {};
 	struct midr_node_entry *remote_node;
 	struct midr_link_metrics metrics = {};
-	struct prefix remote_locator;
+	struct ipaddr local_locator, remote_locator;
 	uint32_t local_rid, remote_rid;
 	uint64_t link_id, seqno;
 	int ret;
@@ -600,6 +612,12 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 			 &link->remote_node_id);
 		return;
 	}
+	if (!mi->local_group_id) {
+		midr_nds_report_link_withdraw(bgp, &link->remote_node_id);
+		MIDR_LOG("MIDR facts: 尚未入群（群号 0），link 上报抑制 (%pFX)",
+			 &link->remote_node_id);
+		return;
+	}
 
 	ctx = midr_nds_group2_ctx(bgp);
 	if (!ctx) {
@@ -614,18 +632,28 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	 * 与 node 是否已上报无关 —— 他们拿的就是 ctx->bgp->router_id.s_addr，
 	 * 不存在"先立户"这道前置。
 	 */
+	if (link->remote_node_id.family != AF_INET ||
+	    link->remote_node_id.prefixlen != IPV4_MAX_BITLEN)
+		return;
 	local_rid = bgp->router_id.s_addr;
 	remote_rid = link->remote_node_id.u.prefix4.s_addr;
 	if (!local_rid || !remote_rid || local_rid == remote_rid)
 		return;
 	prefix_copy(&key.node_id, &link->remote_node_id);
 	remote_node = midr_node_hash_find(&mi->global_view->nodes, &key);
-	if (!remote_node)
+	if (!remote_node ||
+	    !midr_nds_local_transport_get(bgp, &local_locator) ||
+	    !midr_nds_node_transport_get(bgp, &link->remote_node_id,
+					 &remote_locator) ||
+	    ipaddr_family(&local_locator) != ipaddr_family(&remote_locator) ||
+	    !midr_nds_locator_unique(bgp, &link->remote_node_id,
+				      &remote_locator)) {
+		/* If an earlier generation was reported, remove it by stable identity. */
+		midr_nds_report_link_withdraw(bgp, &link->remote_node_id);
+		MIDR_LOG("MIDR facts: link endpoints missing, mixed-family, or ambiguous; upsert skipped (%pFX)",
+			 &link->remote_node_id);
 		return;
-	midr_node_get_locator(remote_node, &remote_locator);
-	if (remote_locator.family != AF_INET ||
-	    !remote_locator.u.prefix4.s_addr)
-		return;
+	}
 
 	/*
 	 * 保险：引导自己不报，连引导/保底边也不报。
@@ -641,11 +669,13 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	 * 对方预告过"连引导的链路我方主动不上报"。
 	 */
 	if (midr_nds_is_bootstrap(bgp)) {
+		midr_nds_report_link_withdraw(bgp, &link->remote_node_id);
 		MIDR_LOG("MIDR facts: 本机是引导节点，link 上报跳过 (%pFX)",
 			 &link->remote_node_id);
 		return;
 	}
 	if (midr_nds_link_is_backbone(bgp, &link->remote_node_id)) {
+		midr_nds_report_link_withdraw(bgp, &link->remote_node_id);
 		MIDR_LOG("MIDR facts: 保底边（对端引导），link 上报跳过 (%pFX)",
 			 &link->remote_node_id);
 		return;
@@ -688,7 +718,7 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 
 	/*
 	 * 闸门② 指标可用。热身期（rtt=0）不报 —— 报了也过不了他们的校验，还会
-	 * 污染视图。满格丢包**不再走这里退出**（口径改定，见 to_group2 注释）。
+	 * 污染视图。满格丢包已在上方先行转 withdraw，不会走到这里。
 	 *
 	 * seqno 先填 0，过了闸门再补真值：递增必须发生在**确定要发**之后，否则
 	 * 热身期被挡下的那几次会白白吃掉序号（实测过：seqno 会恒领先 version 1）。
@@ -709,20 +739,13 @@ void midr_nds_report_link(struct bgp *bgp, const struct midr_link_entry *link)
 	metrics.measurement_seqno = seqno;
 
 	/*
-	 * 链路两端地址：他们的校验要求两个都 present 且同族（IPv4）。overlay
-	 * 链路没有"接口地址"这一说，用两端的 locator —— 本端取 transport（没配
-	 * 则回落 router-id，与 midr_node_get_locator 的口径一致）、对端同样取
-	 * Membership 中的 transport locator，缺失时才回落 router-id。
+	 * 链路两端地址：两端真实 locator 均已在入口验证为 present、有效、唯一且
+	 * 同族。Router ID 永不作为 endpoint 回落值。
 	 * local_ifindex 恒 0（多跳链路出口由路由表现算，文档
 	 * 约定填 0 = 不适用），XCALLOC 已置 0。
 	 */
-	fl->data.link_local_address =
-		mi->transport_addr_set
-			? mi->local_transport_addr
-			: midr_ipaddr_from_ipv4(bgp->router_id);
-	if (!midr_ipaddr_from_prefix(&remote_locator,
-				       &fl->data.link_remote_address))
-		return;
+	fl->data.link_local_address = local_locator;
+	fl->data.link_remote_address = remote_locator;
 	fl->data.metrics = metrics;
 	fl->data.policy_state = MIDR_POLICY_ALLOWED;
 
@@ -756,7 +779,8 @@ void midr_nds_report_link_withdraw(struct bgp *bgp,
 	int ret;
 
 	f = facts_of(bgp);
-	if (!f || !remote_node_id)
+	if (!f || !remote_node_id || remote_node_id->family != AF_INET ||
+	    remote_node_id->prefixlen != IPV4_MAX_BITLEN)
 		return;
 
 	remote_rid = remote_node_id->u.prefix4.s_addr;
@@ -817,6 +841,26 @@ void midr_nds_report_link_withdraw(struct bgp *bgp,
 		 remote_node_id, fl->data.version);
 }
 
+void midr_nds_facts_withdraw_all_links(struct bgp *bgp)
+{
+	struct midr_nds_facts *f = facts_of(bgp);
+	struct midr_nds_fact_link *fl;
+	struct listnode *node;
+
+	if (!f)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(f->links, node, fl)) {
+		struct prefix remote = {};
+
+		if (!fl->reported || !fl->data.key.remote_node_id)
+			continue;
+		remote.family = AF_INET;
+		remote.prefixlen = IPV4_MAX_BITLEN;
+		remote.u.prefix4.s_addr = fl->data.key.remote_node_id;
+		midr_nds_report_link_withdraw(bgp, &remote);
+	}
+}
+
 /* ===========================================================================
  * snapshot provider（轮 3）—— **反方向**：我方实现、第二组调用
  *
@@ -858,18 +902,33 @@ static void snapshot_prefix_from_rid(struct prefix *p, uint32_t rid)
 static bool snapshot_node_eligible(struct bgp *bgp,
 				   const struct midr_nds_facts *f)
 {
+	struct ipaddr active;
+	bool has_active;
+
 	/* pending = 报过但被拒，仍属"当前有效"，必须进快照——缺席会被对方按
 	 * "已失效"生成权威撤销（理由见头文件 pending 位注释）。 */
 	if ((!f->node_reported && !f->node_pending) || !f->node_valid)
 		return false;
 
-	/* 引导专职化 / 优雅下线期间本就不报（与 midr_nds_report_node 同判据）。
-	 * 正常路径下这两种情况 node_reported 已被 withdraw 打回假，这里是复核。 */
-	if (midr_nds_is_bootstrap(bgp) || bgp->midr_nds_info->shutdown)
+	/* 引导专职化 / 未入群 / 优雅下线期间本就不报（与 report 出口同判据）。
+	 * 正常路径下这些情况 node_reported 已被 withdraw 打回假，这里是复核。 */
+	if (midr_nds_is_bootstrap(bgp) || !bgp->midr_nds_info->local_group_id ||
+	    bgp->midr_nds_info->shutdown)
 		return false;
 
 	/* 键合法：他们拿 ctx->bgp->router_id.s_addr 逐位比。 */
 	if (!f->node.node_id || f->node.node_id != bgp->router_id.s_addr)
+		return false;
+	if (f->node.group_id != bgp->midr_nds_info->local_group_id ||
+	    f->node.cap_flags != bgp->midr_nds_info->local_capabilities)
+		return false;
+
+	/* As with Link endpoints, never replay a Node locator from an older
+	 * transport generation. */
+	has_active = midr_nds_local_transport_get(bgp, &active);
+	if (f->node.has_transport_address != has_active ||
+	    (has_active &&
+	     !midr_ipaddr_same(&f->node.transport_address, &active)))
 		return false;
 
 	return true;
@@ -878,7 +937,13 @@ static bool snapshot_node_eligible(struct bgp *bgp,
 static bool snapshot_link_eligible(struct bgp *bgp,
 				   const struct midr_nds_fact_link *fl)
 {
+	struct bgp_midr_nds *mi;
 	struct prefix remote;
+	struct ipaddr local_locator, remote_locator;
+
+	if (!bgp || !bgp->midr_nds_info)
+		return false;
+	mi = bgp->midr_nds_info;
 
 	/* 墓碑（撤过）与从没报过的占位条目都在这一关滤掉；pending（报过被拒）
 	 * 例外，仍属"当前有效"必须进快照（同 node 侧）。 */
@@ -899,8 +964,21 @@ static bool snapshot_link_eligible(struct bgp *bgp,
 
 	snapshot_prefix_from_rid(&remote, fl->data.key.remote_node_id);
 
-	/* 保底边不报（引导侧同理由，见 midr_nds_report_link 的保险段）。 */
-	if (midr_nds_link_is_backbone(bgp, &remote))
+	/* 引导专职化、退网和保底边均不进入拓扑基线。正常增量路径会先
+	 * withdraw；这里复核，避免事件交错把旧 reported 条目带回快照。 */
+	if (midr_nds_is_bootstrap(bgp) || !mi->local_group_id || mi->shutdown ||
+	    midr_nds_link_is_backbone(bgp, &remote))
+		return false;
+
+	/* 快照只能携带当前 transport generation 的真实端点。事实表里存着
+	 * 上一代 locator（例如撤销 API 暂时失败）时，缺席即由权威快照完成撤销；
+	 * 绝不能把旧地址重新灌回当前基线。 */
+	if (!midr_nds_local_transport_get(bgp, &local_locator) ||
+	    !midr_nds_node_transport_get(bgp, &remote, &remote_locator) ||
+	    ipaddr_family(&local_locator) != ipaddr_family(&remote_locator) ||
+	    !midr_nds_locator_unique(bgp, &remote, &remote_locator) ||
+	    !midr_ipaddr_same(&fl->data.link_local_address, &local_locator) ||
+	    !midr_ipaddr_same(&fl->data.link_remote_address, &remote_locator))
 		return false;
 
 	/* 闸门① 会话 Established —— 会话没了就不该继续声称这条链路在。 */
@@ -941,6 +1019,8 @@ static const char *snapshot_node_selfcheck(const struct midr_node_update *node)
 	if (node->has_transport_address) {
 		if (!snapshot_ipaddr_present(&node->transport_address))
 			return "transport 地址族缺失";
+		if (!midr_ipaddr_valid_locator(&node->transport_address))
+			return "transport locator 非法";
 	} else if (node->transport_address.ipa_type != IPADDR_NONE) {
 		return "has_transport_address 为假但地址非空";
 	}
@@ -955,8 +1035,11 @@ static const char *snapshot_link_selfcheck(const struct midr_link_update *link)
 	if (!snapshot_ipaddr_present(&link->link_local_address) ||
 	    !snapshot_ipaddr_present(&link->link_remote_address))
 		return "链路两端地址缺失";
-	if (link->link_local_address.ipa_type !=
-	    link->link_remote_address.ipa_type)
+	if (!midr_ipaddr_valid_locator(&link->link_local_address) ||
+	    !midr_ipaddr_valid_locator(&link->link_remote_address))
+		return "链路端点 locator 非法";
+	if (ipaddr_family(&link->link_local_address) !=
+	    ipaddr_family(&link->link_remote_address))
 		return "链路两端地址族不一致";
 	if (!link->metrics.has_rtt_us || !link->metrics.has_loss_ppm ||
 	    !link->metrics.has_available_bandwidth_kbps)

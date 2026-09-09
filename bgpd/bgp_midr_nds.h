@@ -4,10 +4,12 @@
  *
  * Central MIDR instance state hung off bgp->midr_nds_info.  Owns the global
  * view (node table + link table + group map), drives the internal
- * interfaces (I-3 / I-5 / I-7) and the BGP-LS export (E-1).
+ * interfaces (I-1 / I-2 / I-3 / I-5 / I-7) and publishes local topology
+ * facts through the second group's provider API.
  *
- * The node table is populated from BGP-LS Node NLRIs carrying TLV 1185 /
- * TLV 1187; two timers (keepalive / expire-check) keep it fresh.
+ * Authoritative remote nodes arrive through the second group's remote-view
+ * callbacks.  Control list/request learning may add transient entries, while
+ * remote-view withdraw callbacks own authoritative retirement.
  */
 
 #ifndef _FRR_BGP_MIDR_NDS_H
@@ -194,7 +196,7 @@ enum midr_link_status {
 
 /* §2.2 One probed link in the global view */
 struct midr_link_entry {
-	struct prefix remote_node_id; /* peer node IP */
+	struct prefix remote_node_id; /* peer's 32-bit BGP Identifier */
 	enum midr_link_status status;
 	uint32_t consecutive_failures;
 	time_t last_probe_time;
@@ -215,27 +217,28 @@ PREDECL_HASH(midr_node_hash);
 
 /*
  * §2.3 One node in the global view.
- * Key: node_id (the node IP — same identity the old code called router_id,
- * here widened to struct prefix per the design doc).
+ * Key: node_id, a 32-bit BGP Identifier stored in an AF_INET host prefix for
+ * compatibility with existing hash/callback interfaces.  It is identity, not
+ * a reachable IPv4 locator.
  */
 struct midr_node_entry {
 	/*
-	 * Hash key = node router-id (from the Node NLRI node descriptor).
-	 * This MUST be the NLRI identity, because a BGP-LS WITHDRAW (MP_UNREACH)
-	 * carries only the NLRI — not attributes — so the transport address
-	 * (an attribute, TLV 1188) is unavailable at withdraw time and cannot
-	 * serve as the key.
+	 * Hash key = remote-view node_id (the peer's BGP Identifier).  The
+	 * authoritative withdraw callback carries this stable identity even when
+	 * the node's independently versioned locator has changed or disappeared;
+	 * the locator therefore must not be used as the hash key.
 	 */
 	struct prefix node_id;
 	as_t asn;		/* AS number (needed for auto-peering) */
-	uint32_t group_id;	/* TLV 1185 */
-	uint32_t capabilities;	/* TLV 1187 */
+	uint32_t group_id;	/* group carried by the remote Node fact */
+	uint32_t capabilities;	/* capability bitmap in the remote Node fact */
 	uint64_t cap_seqno;	/* capability sequence number */
 	/*
-	 * Real reachable address (locator, TLV 1188): what we peer with /
-	 * probe / display.  Falls back to node_id (router-id) when the node
-	 * does not advertise one.  Kept separate from the key so the address
-	 * can change without changing identity.
+	 * Real reachable address (explicit Node-fact locator): what we peer with /
+	 * probe / display.  Missing transport is represented only by
+	 * has_transport_addr=false; operational paths never fall back to node_id.
+	 * Kept separate from the key so the address can change without changing
+	 * identity.
 	 */
 	struct ipaddr transport_addr;
 	bool has_transport_addr;
@@ -253,10 +256,10 @@ struct midr_node_entry {
 	 */
 	bool is_self;		/* this entry describes the local node */
 	/*
-	 * 是否为本节点的"邻居"：仅经 BGP-LS 泛洪收到（view-only）= false；
+	 * 是否为本节点的"邻居"：仅存在于远端视图（view-only）= false；
 	 * 与本节点建立了探测/会话关系 = true。CL/PM 的"邻居质量全图"只看
 	 * is_adjacent==true 的子集；跨群全量信息仍可遍历整张 nodes 表。
-	 * 本字段与 on_node_nlri 的逐字段更新正交，泛洪不会把它清掉。
+	 * 本字段与 remote-view 的逐字段更新正交，普通事实刷新不会把它清掉。
 	 */
 	bool is_adjacent;
 
@@ -265,7 +268,7 @@ struct midr_node_entry {
 
 /*
  * 角色判定的唯一入口（裁撤 is_group_rep 字段后的替代，见上方注释）。
- * 真值源 = 节点自己经 TLV 1187 通告的能力位；rep 目录推导、MEMBER_LIST
+ * 真值源 = 节点自己的远端 Node fact 能力位；rep 目录推导、MEMBER_LIST
  * 应答闸门、show midr reps 过滤本就都按这个位判，这里只是给它一个名字。
  */
 static inline bool midr_node_is_group_rep(const struct midr_node_entry *e)
@@ -288,17 +291,16 @@ struct midr_global_view {
 };
 
 /*
- * A group-representative directory entry.  Two roles share this structure:
- *   - on a bootstrap node: the statically-configured directory (`midr rep
- *     group ...`) served in REP_LIST_RESP;
- *   - on a joining node: the directory learned from the bootstrap's response.
+ * One group-representative directory entry learned at runtime from a
+ * bootstrap response.  A bootstrap may also merge these cached entries with
+ * representatives derived from its current remote view when answering.
  */
 struct midr_rep_entry {
 	uint32_t group_id;
-	struct ipaddr rep_transport; /* rep's reachable address (UDP + peering) */
+	struct ipaddr rep_transport; /* rep's reachable IPv4/IPv6 locator */
 	as_t rep_asn;
-	struct in_addr rep_rid; /* rep's router-id (真名)；0 = 未知（探测退回
-				 * 占位路径，wire 上对应 v2 rep_rid 栏） */
+	struct in_addr rep_rid; /* rep's IPv4 router-id identity；Control v4
+				 * decoder rejects zero */
 };
 
 /*
@@ -359,9 +361,9 @@ enum midr_attach_batch {
 enum midr_trigger_type {
 	MIDR_TRIGGER_REP_PROBE_DONE = 1,    /* rep probe finished */
 	MIDR_TRIGGER_MEMBER_PROBE_DONE = 2, /* member probe finished */
-	MIDR_TRIGGER_CAPABILITY_UPDATE = 3, /* TLV 1187 capability update */
+	MIDR_TRIGGER_CAPABILITY_UPDATE = 3, /* Node-fact capability update */
 	MIDR_TRIGGER_PERIODIC_SYNC = 4,	    /* periodic sync timer */
-	MIDR_TRIGGER_NODE_CHANGE = 5,	    /* node join/leave/expire */
+	MIDR_TRIGGER_NODE_CHANGE = 5,	    /* node update/withdraw */
 	/*
 	 * 两个次优群的候选成员限时探测完成。NDS 在 RECOMMEND 阶段向两个次优
 	 * 代表要来成员列表、探测 MIDR_JOIN_PROBE_WAIT_SECS 秒后发出，交 CL
@@ -487,6 +489,7 @@ struct midr_session_ledger_entry {
 	struct ipaddr transport; /* 键 */
 	enum midr_session_reason reason;
 	struct in_addr remote_rid; /* 值：认人（show / 对账"这条边对面是谁"） */
+	as_t remote_asn;            /* 值：重配恢复 / MANUAL 配置写回 */
 	uint32_t remote_group;	   /* 值：对端群号 */
 	/*
 	 * B1 断连老化（批 5c）：会话掉出 Established 的时刻（monotime），
@@ -495,6 +498,16 @@ struct midr_session_ledger_entry {
 	 * MANUAL 账永不计时（掉线只 warn，拆边归运维）。
 	 */
 	time_t down_since;
+};
+
+/* Persistent operator intent from `midr session`.  Unlike the runtime
+ * ledger, this list survives peer teardown, transport reconfiguration and
+ * `midr shutdown`, and is the source used by the config writer. */
+struct midr_manual_session {
+	struct ipaddr transport;
+	as_t remote_asn;
+	/* May be 0 until the first successful BGP OPEN; identity is still IPv4. */
+	struct in_addr remote_rid;
 };
 
 /* §2.7 MIDR instance state, hung off bgp->midr_nds_info */
@@ -510,7 +523,7 @@ struct bgp_midr_nds {
 	struct event *t_pm_read;     /* read event on pm_sock */
 
 	/* === CL === */
-	uint32_t local_group_id;     /* local group-id (TLV 1185)：运行值，
+	uint32_t local_group_id;     /* local group-id in the Node fact：运行值，
 				      * I-7 JOIN/CREATE 会改它 */
 	uint32_t config_group_id;    /* `midr group-id N` 的配置值，0 = 未配置。
 				      * 与运行值分离（决策 midr-shutdown-semantics §5.1）：
@@ -518,7 +531,7 @@ struct bgp_midr_nds {
 				      * 可查。两个用途：① 走 join 但群号听配置（I-7 的
 				      * RECOMMEND/CREATE 分支不采纳 CL 群号）；② 退网时
 				      * local_group_id 回落到它。 */
-	uint32_t local_capabilities; /* local capability bitmap (TLV 1187) */
+	uint32_t local_capabilities; /* local Node-fact capability bitmap */
 	struct list *rep_dir;	     /* list of struct midr_rep_entry (rep directory) */
 	midr_global_view_cb cl_callback;
 	/*
@@ -532,7 +545,7 @@ struct bgp_midr_nds {
 
 	/*
 	 * `no midr session` 持久排除名单——list of `struct in_addr *`
-	 * （locator，与 midr session 命令按同一地址操作）。只影响"自动重连"
+	 * （router-id identity）。只影响"自动重连"
 	 * （midr_ctrl_connect / midr_discovery_should_peer），不影响运维用
 	 * `midr session` 手工显式重连（那条路径先移出名单）。
 	 */
@@ -546,14 +559,22 @@ struct bgp_midr_nds {
 	 * midr_nds_ledger_note()。
 	 */
 	struct list *session_ledger;
+	/* Persistent `midr session` configuration, separate from runtime ledger. */
+	struct list *manual_sessions;
 
-	/* === Local transport address (TLV 1188) + graceful shutdown === */
-	struct ipaddr local_transport_addr; /* our reachable locator */
-	bool transport_addr_set;	     /* operator configured one */
+	/* === Local explicit transport locator + graceful shutdown === */
+	/* Configured intent survives a bind failure and is written to config. */
+	struct ipaddr local_transport_addr;
+	bool transport_addr_set;
+	/* Runtime users may consume only a locator whose complete Control endpoint
+	 * was bound successfully. */
+	struct ipaddr active_transport_addr;
+	bool transport_active;
+	bool transport_reconfiguring; /* suppress peer-hook teardown side effects */
 	bool shutdown;			     /* graceful shutdown: stop advertising self */
-	/* === TLV sequence numbers === */
-	uint32_t perf_seqno; /* TLV 1186 seqno */
-	uint32_t cap_seqno;  /* TLV 1187 seqno */
+	/* === Fact sequence numbers === */
+	uint32_t perf_seqno; /* performance sequence number */
+	uint32_t cap_seqno;  /* capability sequence number */
 
 	/* === Timers === */
 	/* ⚠ 件④ 删了 keepalive/expire，**这个不能跟着删**：它还扛着递交 CL、
@@ -582,7 +603,7 @@ struct bgp_midr_nds {
 	struct list *session_down_pending;
 
 	/*
-	 * === 件③ 第二组 remote-view（轮 4，双源期）===
+	 * === 件③ 第二组 authoritative remote-view（轮 4）===
 	 * remote_withdrawn: 最近被回调撤销的对象（struct midr_remote_withdrawn *），
 	 *   用于"虚报观察"——撤销后短窗内同对象又 update 就计一笔。它只是探针：
 	 *   我方按 07-30 定案走纯 BGP 判活、不为虚报预建缓冲，先看频率高不高。
@@ -595,7 +616,7 @@ struct bgp_midr_nds {
 	uint64_t remote_link_events;   /* link 回调到达数（本轮只观察不消费） */
 	uint64_t remote_suspect_count; /* 疑似虚报撤销（撤后短窗内又 update） */
 
-	/* === New-node join (bootstrap, UDP hierarchical discovery) === */
+	/* === New-node join (bootstrap, TCP list discovery) === */
 	struct list *bootstrap_list;	/* 候选引导节点（struct midr_bootstrap_entry），
 					 * 手配在前、种子在后，次序即尝试优先级（§8.32） */
 	struct listnode *bootstrap_cur; /* 游标：当前正在尝试第一跳的候选；
@@ -642,8 +663,8 @@ struct bgp_midr_nds {
 
 	/* === Control channel — independent of PM ===
 	 * 端口 5859 上并存两条传输 (内核 TCP/UDP 端口空间独立):
-	 *  - UDP: PEER_REQUEST (反向建连 nudge) + ctrl_pending 重传队列;
-	 *  - TCP 短连接: REP_LIST / MEMBER_LIST 列表交换 (传输层在
+	 *  - UDP: 固定长 PEER/ATTACH/REJECT/ANNOUNCE 消息 + ctrl_pending 重传;
+	 *  - TCP 短连接: REP_LIST / MEMBER_LIST / BOOTSTRAP_LIST 列表交换 (传输层在
 	 *    bgp_midr_ctrl_tcp.c)。
 	 * 各自 socket/格式，PM 另有自己的通道。见 bgp_midr_ctrl.{c,h}。
 	 */
@@ -743,14 +764,14 @@ extern void midr_nds_learn_requester(struct bgp *bgp, struct in_addr rid,
 				     as_t asn,
 				     struct ipaddr transport);
 
-/* Refresh the local self-entry after originating the local Node NLRI */
+/* Refresh the local self-entry before publishing the local Node fact. */
 extern void midr_nds_local_node_update(struct bgp *bgp);
 
-/* Effective locator (real reachable addr, TLV 1188; falls back to node_id) */
+/* Explicit reachable locator from the Node fact; never falls back to node_id. */
 extern void midr_node_get_locator(const struct midr_node_entry *e,
 				  struct prefix *out);
 
-/* Update local capability / group-id and re-originate immediately */
+/* Update local capability / group-id and refresh the topology fact immediately. */
 extern void midr_nds_set_capability(struct bgp *bgp, uint32_t new_caps);
 extern void midr_nds_set_group_id(struct bgp *bgp, uint32_t new_gid);
 
@@ -769,8 +790,8 @@ extern void midr_nds_anchor_ctx_clear(struct bgp *bgp);
  * enter：置 shutdown 位 → 撤自身通告 → 凭台账拆光自建会话（含 MANUAL，运维意志）
  *        → 全量停探 → 清节点表（除 self）→ 群号回落配置值 + 清群代表位 / join /
  *        锚点残留。bgpd 与 underlay 一动不动。
- *        返回**被拆掉的 MANUAL 会话条数**，供 vty 提醒运维重入后重敲。
- * exit ：清位 → 重新通告 → 走与新节点相同的 join。
+ *        返回**被拆掉的 MANUAL 会话条数**，供 vty 说明暂时停用。
+ * exit ：清位 → 重新通告 → 恢复持久 MANUAL 会话 → 走与新节点相同的 join。
  *        返回是否真的发起了加入（候选清单为空时只 warn 并返回 false）。
  */
 extern unsigned int midr_nds_shutdown_enter(struct bgp *bgp);
@@ -824,7 +845,7 @@ extern struct peer *midr_node_established_peer(struct bgp *bgp,
 extern void midr_nds_on_cluster_decision(
 	struct bgp *bgp, const struct midr_cluster_decision *decision);
 
-/* Re-originate the local Node NLRI carrying a (new) group-id (TLV 1185) */
+/* Refresh the local Node fact after a group-id change. */
 extern void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 					uint32_t old_group_id);
 
@@ -834,7 +855,7 @@ extern void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 
 /*
  * Command O: point this node at a bootstrap node and kick off hierarchical
- * discovery — send a REP_LIST_REQ over the UDP control channel (NO BGP-LS to
+ * discovery — send a REP_LIST_REQ over a TCP control connection (NO MIDR-LS to
  * the bootstrap, so no full-table dump).  The rest is response-driven.
  */
 extern void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
@@ -849,7 +870,7 @@ extern void midr_join_via_bootstrap(struct bgp *bgp, const union sockunion *su,
 extern void midr_join_bootstrap_failed(struct bgp *bgp,
 				       struct ipaddr failed);
 
-/* `no midr bootstrap A.B.C.D`：删指定候选（true=找到并删除）；正在尝试的
+/* `no midr bootstrap <locator>`：删指定候选（true=找到并删除）；正在尝试的
  * 被删则顺移到下一候选。 */
 extern bool midr_bootstrap_list_del(struct bgp *bgp,
 				    struct ipaddr addr);
@@ -883,9 +904,8 @@ extern void midr_nds_bootstrap_list_fetch(struct bgp *bgp);
 
 /*
  * ctrl 层收到 BOOTSTRAP_LIST_RESP 的一条条目时回调：进候选池（SEED 来源）+ 落
- * 种子库。这是种子库填充的**新路**——批 5 让引导不再发 Node NLRI 之后，
- * 原来那条"periodic_sync 遍历全局表"的旧路自然断料（旧路本轮一行不动，两路
- * 并行则批 3–5 之间种子表持续有源、§8.31 自举零空窗）。
+ * 种子库。这是当前种子库填充的主路；专职引导不发布自身 Node fact，旧的
+ * periodic_sync 节点表遍历只在权威视图未来明确提供引导条目时作为兼容补充。
  */
 extern void midr_nds_bootstrap_learn(struct bgp *bgp,
 				     struct ipaddr transport, as_t asn,
@@ -958,7 +978,7 @@ extern bool midr_nds_link_is_backbone(struct bgp *bgp,
 
 /*
  * 把"引导节点该有的样子"坐实（幂等；非引导直接返回）：清群代表位、清群号、
- * 关掉 BGP-LS 本地拓扑导出。冲突配置一律**引导优先**，被清的项各打一条 warn。
+ * 撤销本机 Node/Link 拓扑事实。冲突配置一律**引导优先**，被清的项各打一条 warn。
  * 调用点两个：`bgp_config_end` 钩子（配置期收尾，治 conf 行序）与 vty 的
  * `midr role bootstrap`（运行期当场生效）。
  */
@@ -995,20 +1015,20 @@ extern void midr_join_on_rep_list(struct bgp *bgp);
 /*
  * Collect borrowed pointers to every non-self node in `group_id` into `out`
  * (a caller-owned list).  Single source of truth for "table A"; today derived
- * from the BGP-LS global view, swappable here if propagation scoping changes.
+ * from the MIDR global view, swappable here if propagation scoping changes.
  */
 extern void midr_group_members(struct bgp *bgp, uint32_t group_id,
 			       struct list *out);
 
 /*
  * Collect borrowed pointers to nodes qualified for the served rep directory
- * (REP_LIST): GROUP_REP bit + alive + usable group/asn/transport.  Includes
+ * (REP_LIST): GROUP_REP bit + alive + usable group/transport.  Includes
  * self.  Single source of truth for the derived directory view (任务甲).
  */
 extern void midr_rep_candidates(struct bgp *bgp, struct list *out);
 
-/* Group-representative directory (bootstrap config + learned).
- * rep_rid: 代表的 router-id；手配来源无从得知时传 0（wire 亦以 0 表未知）。 */
+/* Learned group-representative directory.  Control v4 requires nonzero
+ * rep_rid and a valid IPv4/IPv6 locator for every entry. */
 extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
 			     struct ipaddr rep_transport, as_t rep_asn,
 			     struct in_addr rep_rid);
@@ -1019,8 +1039,8 @@ extern void midr_rep_dir_add(struct bgp *bgp, uint32_t group_id,
 extern struct in_addr midr_nds_bootstrap_rid_by_transport(struct bgp *bgp,
 							  struct ipaddr transport);
 
-/* 按 transport 地址在节点表反查 router-id（真名）；查不到返回 0。
- * build_rep_list 应答时刻给手配条目回填 rid 用（护栏②，批注 55）。 */
+/* 按 transport 地址在节点表反查 router-id（真名）；查不到返回 0。供 VTY 在
+ * peer 尚无 remote_id 时将 locator 解析回排除名单使用的稳定身份。 */
 extern struct in_addr midr_nds_rid_by_transport(struct bgp *bgp,
 						struct ipaddr transport);
 
@@ -1078,12 +1098,19 @@ extern void midr_nds_ledger_note(struct bgp *bgp,
 				 struct ipaddr transport,
 				 enum midr_session_reason reason,
 				 struct in_addr remote_rid,
+				 as_t remote_asn,
 				 uint32_t remote_group);
 extern void midr_nds_ledger_drop(struct bgp *bgp,
 				 struct ipaddr transport);
 extern const struct midr_session_ledger_entry *
 midr_nds_ledger_lookup(struct bgp *bgp, struct ipaddr transport);
 extern const char *midr_session_reason_str(enum midr_session_reason reason);
+extern void midr_nds_manual_session_set(struct bgp *bgp,
+					struct ipaddr transport, as_t remote_asn,
+					struct in_addr remote_rid);
+extern bool midr_nds_manual_session_del(struct bgp *bgp,
+					struct ipaddr transport);
+extern void midr_nds_manual_sessions_restore(struct bgp *bgp);
 
 extern bool midr_rep_dir_del(struct bgp *bgp, uint32_t group_id,
 			     struct ipaddr rep_transport);
@@ -1098,7 +1125,7 @@ extern struct midr_rep_entry *midr_rep_dir_find_group(struct bgp *bgp,
 /* The NDS-maintained global view, or NULL if MIDR is not initialised. */
 extern struct midr_global_view *midr_get_global_view(struct bgp *bgp);
 
-/* This node's local group-id (TLV 1185); 0 if MIDR is not initialised. */
+/* This node's runtime group-id; 0 if MIDR is not initialised. */
 extern uint32_t midr_local_group_id(struct bgp *bgp);
 
 /* Look up `node_id` in the node table; on hit, write its group-id to *out and
@@ -1109,8 +1136,16 @@ extern bool midr_node_group_id(struct bgp *bgp, const struct prefix *node_id,
 /* Address-family-neutral transport accessors for PM and other consumers. */
 extern bool midr_nds_local_transport_get(const struct bgp *bgp,
 					 struct ipaddr *transport);
+/* Set/clear configured intent and apply it through one lifecycle path. */
+extern int midr_nds_transport_configure(struct bgp *bgp,
+					const struct ipaddr *transport);
+extern int midr_nds_transport_reconcile(struct bgp *bgp);
 extern bool midr_nds_node_transport_get(const struct bgp *bgp,
 					const struct prefix *node_id,
 					struct ipaddr *transport);
+/* True when no other node identity advertises the same full locator. */
+extern bool midr_nds_locator_unique(const struct bgp *bgp,
+				    const struct prefix *owner,
+				    const struct ipaddr *transport);
 
 #endif /* _FRR_BGP_MIDR_NDS_H */
