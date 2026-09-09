@@ -1512,14 +1512,24 @@ DEFUN(show_midr_self,
 	struct bgp *bgp = bgp_get_default();
 	struct bgp_midr_nds *mi;
 	char caps_buf[64];
+	const char *family;
 
 	if (!bgp || !bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
 	mi = bgp->midr_nds_info;
+	if (!mi->transport_addr_set)
+		family = "unset";
+	else if (IS_IPADDR_V4(&mi->local_transport_addr))
+		family = "IPv4";
+	else if (IS_IPADDR_V6(&mi->local_transport_addr))
+		family = "IPv6";
+	else
+		family = "invalid";
 
 	vty_out(vty, "BGP Identifier    : %pI4\n", &bgp->router_id);
+	vty_out(vty, "Address family    : %s\n", family);
 	if (mi->transport_addr_set)
 		vty_out(vty, "Configured locator: %pIA\n",
 			&mi->local_transport_addr);
