@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AF_TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BGPD="$REPO_ROOT/bgpd/bgpd"
 VTYSH="$REPO_ROOT/vtysh/vtysh"
@@ -108,10 +109,13 @@ done
 }
 
 RUN_ID="${MIDR_AF_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
-ARTIFACT_DIR="$SCRIPT_DIR/../artifacts/$RUN_ID/$ADDRESS_FAMILY/$SCENARIO"
+ARTIFACT_DIR="$AF_TEST_DIR/artifacts/$RUN_ID/$ADDRESS_FAMILY/$SCENARIO"
 VTY_DIR="$ARTIFACT_DIR/vty"
 VTY_RESTART_DIR="$ARTIFACT_DIR/vty-restart"
-mkdir -p "$ARTIFACT_DIR" "$VTY_DIR" "$VTY_RESTART_DIR"
+VTY_CONFIG_DIR="$ARTIFACT_DIR/vty-config"
+mkdir -p "$ARTIFACT_DIR" "$VTY_DIR" "$VTY_RESTART_DIR" \
+    "$VTY_CONFIG_DIR"
+touch "$VTY_CONFIG_DIR/vtysh.conf" "$VTY_CONFIG_DIR/frr.conf"
 exec > >(tee "$ARTIFACT_DIR/test.log") 2>&1
 
 BGPD_PID=""
@@ -204,7 +208,8 @@ wait_for_pattern() {
 run_vty() {
     local socket_dir="$1"
     shift
-    ip netns exec "$NAMESPACE" "$VTYSH" --vty_socket "$socket_dir" "$@"
+    ip netns exec "$NAMESPACE" "$VTYSH" \
+        --config_dir "$VTY_CONFIG_DIR" --vty_socket "$socket_dir" "$@"
 }
 
 assert_contains() {
@@ -239,6 +244,7 @@ start_bgpd() {
 
     ip netns exec "$NAMESPACE" "$BGPD" -f "$config" -Z -S \
         -i "$ARTIFACT_DIR/bgpd.pid" --vty_socket "$socket_dir" \
+        --db_file "$ARTIFACT_DIR/bgpd.db" \
         --log-level debug >"$console_log" 2>&1 &
     BGPD_PID=$!
     wait_for_file "$socket_dir/bgpd.vty" 20
@@ -322,11 +328,15 @@ if [[ "$SCENARIO" == "vty" ]]; then
         -c "midr bootstrap $REMOTE_TRANSPORT remote-as 65102 router-id 10.255.1.2" \
         -c "midr session $REMOTE_TRANSPORT remote-as 65102" \
         >"$ARTIFACT_DIR/configure-valid.txt"
-    run_vty "$VTY_DIR" -c 'configure terminal' -c 'router bgp 65101' \
-        -c "midr transport-address $FOREIGN_TRANSPORT" \
-        -c "midr bootstrap $FOREIGN_TRANSPORT remote-as 65102 router-id 10.255.1.2" \
-        -c "midr session $FOREIGN_TRANSPORT remote-as 65102" \
-        >"$ARTIFACT_DIR/family-guard.txt"
+    touch "$ARTIFACT_DIR/family-guard.txt"
+    for foreign_command in \
+        "midr transport-address $FOREIGN_TRANSPORT" \
+        "midr bootstrap $FOREIGN_TRANSPORT remote-as 65102 router-id 10.255.1.2" \
+        "midr session $FOREIGN_TRANSPORT remote-as 65102"; do
+        run_vty "$VTY_DIR" -c 'configure terminal' \
+            -c 'router bgp 65101' -c "$foreign_command" \
+            >>"$ARTIFACT_DIR/family-guard.txt" 2>&1 || true
+    done
     run_vty "$VTY_DIR" -c 'show running-config' \
         >"$ARTIFACT_DIR/running-config.txt"
     run_vty "$VTY_DIR" -c 'show midr self' \
