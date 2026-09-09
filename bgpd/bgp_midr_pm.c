@@ -342,6 +342,9 @@ static bool pm_is_known_transport(struct bgp_midr_nds *mi,
 			continue;
 		if (entry->has_transport_addr
 		    && midr_ipaddr_same(&entry->transport_addr, locator)) {
+			if (!midr_nds_locator_unique(mi->bgp, &entry->node_id,
+						      locator))
+				return false;
 			entry->last_update = monotime(NULL);
 			return true;
 		}
