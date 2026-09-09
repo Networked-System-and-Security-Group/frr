@@ -110,8 +110,8 @@ if [[ -n "$MISSING_LIBS" ]]; then
     echo "$MISSING_LIBS" >&2
     exit 2
 fi
-if ! strings "$VTYSH" | grep -qF 'show midr self' ||
-   ! strings "$VTYSH" | grep -qF 'show midr ted detail'; then
+if ! grep -aFq 'show midr self' "$VTYSH" ||
+   ! grep -aFq 'show midr ted detail' "$VTYSH"; then
     echo "[run_test] vtysh has a stale command table; run: make -j\$(nproc) vtysh/vtysh" >&2
     exit 2
 fi
