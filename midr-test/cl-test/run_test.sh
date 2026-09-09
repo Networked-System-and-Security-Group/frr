@@ -221,7 +221,7 @@ wait_bootstrap_ready() {
     local node="$1" timeout=90 elapsed=0
     echo "[run_test] Waiting for $node's remote-view callback registration..."
     while [[ $elapsed -lt $timeout ]]; do
-        if grep -q "已向第二组注册 node/link 回调" \
+        if grep -q "已向第二组注册 node/link.*回调" \
              "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
             echo "  ✓ $node ready at t=${elapsed}s"
             return 0
@@ -238,7 +238,8 @@ wait_rep_directory() {
     echo "[run_test] Waiting for $node's rep directory to list $want rep(s)..."
     while [[ $elapsed -lt $timeout ]]; do
         got=$("$VTYSH" --vty_socket "/tmp/midr-cl-vty/$node" \
-                  -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
+                  -c 'show midr reps' 2>/dev/null \
+                  | awk '$1 ~ /^10\.0\./ {count++} END {print count + 0}')
         if [[ "$got" -ge "$want" ]]; then
             echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
             return 0
