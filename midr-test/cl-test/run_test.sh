@@ -38,6 +38,7 @@ TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
 ADDRESS_FAMILY="ipv4"
+KEEP_RUNNING=0
 ANCHOR_ESTABLISH_TIMEOUT="${MIDR_ANCHOR_ESTABLISH_TIMEOUT:-60}"
 POST_CONVERGENCE_TIMEOUT="${MIDR_POST_CONVERGENCE_TIMEOUT:-120}"
 CAPTURE_RUN_ID="${MIDR_CAPTURE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
@@ -75,6 +76,10 @@ while (( $# > 0 )); do
         --timeout)
             TIMEOUT="${2:-}"
             shift 2
+            ;;
+        --keep-running)
+            KEEP_RUNNING=1
+            shift
             ;;
         *)
             echo "Unknown option: $1" >&2
@@ -121,10 +126,20 @@ cleanup() {
     status=$?
     trap - EXIT INT TERM
     archive_logs
-    bash "$TESTDIR/teardown.sh" || true
+    if [[ "$status" -ne 0 || "$KEEP_RUNNING" -eq 0 ]]; then
+        bash "$TESTDIR/teardown.sh" || true
+    fi
     exit "$status"
 }
-trap cleanup EXIT INT TERM
+interrupted() {
+    trap - EXIT INT TERM
+    capture_state interrupted
+    archive_logs
+    bash "$TESTDIR/teardown.sh" || true
+    exit 130
+}
+trap cleanup EXIT
+trap interrupted INT TERM
 
 # ---- 0. Reap any stale bgpd instances left running by a previous, ----------
 #         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
@@ -401,6 +416,8 @@ fi
 # either runner-up group's member list arrives), so it can land a few seconds
 # after JOIN. Give it up to 30 s before declaring it missing.
 anchor_decision_detected=0
+anchor_sessions_ready=0
+post_convergence_ready=0
 if [[ $elapsed -lt $TIMEOUT ]]; then
     echo "[run_test] Waiting up to 30s for the ANCHOR decision (group-3/group-2 anchor connections)..."
     anchor_elapsed=0
@@ -420,12 +437,14 @@ fi
 
 if [[ $join_detected -eq 1 && $anchor_decision_detected -eq 1 ]]; then
     if wait_anchor_sessions 4 "$ANCHOR_ESTABLISH_TIMEOUT"; then
+        anchor_sessions_ready=1
         capture_state after-anchor-sessions
     else
         capture_state anchor-session-timeout
     fi
 
     if wait_post_convergence "$POST_CONVERGENCE_TIMEOUT"; then
+        post_convergence_ready=1
         capture_state post-convergence
     else
         capture_state post-convergence-timeout
@@ -446,3 +465,9 @@ python3 "$TESTDIR/extract_decisions.py" \
     --address-family "$ADDRESS_FAMILY"
 ln -sfn "$CAPTURE_ROOT" "$TESTDIR/artifacts/latest-$ADDRESS_FAMILY"
 echo "[run_test] State artifacts: $CAPTURE_ROOT"
+if [[ "$join_detected" -ne 1 || "$anchor_decision_detected" -ne 1 ||
+      "$anchor_sessions_ready" -ne 1 || "$post_convergence_ready" -ne 1 ]]; then
+    echo "[run_test] FAIL: JOIN, ANCHOR, or convergence gate did not pass." >&2
+    exit 1
+fi
+echo "[run_test] PASS: $ADDRESS_FAMILY CL decision gate completed"
