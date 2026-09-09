@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import ipaddress
 import re
 import subprocess
 import sys
@@ -52,6 +53,8 @@ def read_events(path):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--address-family", choices=("ipv4", "ipv6"),
+                        required=True)
     parser.add_argument("--case", choices=("baseline", "impairment",
                                            "invalid-source"), required=True)
     parser.add_argument("--log-a", type=Path, required=True)
@@ -60,6 +63,9 @@ def main():
     parser.add_argument("--socket-b", type=Path, required=True)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--events", type=Path, required=True)
+    parser.add_argument("--transport-a", required=True)
+    parser.add_argument("--transport-b", required=True)
+    parser.add_argument("--unknown-source", required=True)
     parser.add_argument("--delay-ms", type=float, default=30.0)
     args = parser.parse_args()
 
@@ -69,31 +75,46 @@ def main():
     socket_b = args.socket_b.read_text(errors="replace")
     combined = log_a + "\n" + log_b
     failures = []
+    expected_version = 4 if args.address_family == "ipv4" else 6
+    other_family = "ipv6" if args.address_family == "ipv4" else "ipv4"
+    selected_filter = "ip" if args.address_family == "ipv4" else "ip6"
+    other_filter = "ip6" if args.address_family == "ipv4" else "ip"
 
-    require("probe socket ready on fd00:99::a:5860" in log_a,
-            "node-a binds UDP 5860 to its IPv6 transport", failures)
-    require("probe socket ready on fd00:99::b:5860" in log_b,
-            "node-b binds UDP 5860 to its IPv6 transport", failures)
-    require("[fd00:99::a]:5860" in socket_a,
-            "node-a socket table shows the exact IPv6 bind", failures)
-    require("[fd00:99::b]:5860" in socket_b,
-            "node-b socket table shows the exact IPv6 bind", failures)
-    require("MIDR PM: reply from fd00:99::b" in log_a,
-            "node-a receives IPv6 PM replies", failures)
-    require("MIDR PM: reply from fd00:99::a" in log_b,
-            "node-b receives IPv6 PM replies", failures)
+    require(f"probe socket ready on {args.transport_a}:5860" in log_a,
+            f"node-a binds UDP 5860 to its {args.address_family} transport",
+            failures)
+    require(f"probe socket ready on {args.transport_b}:5860" in log_b,
+            f"node-b binds UDP 5860 to its {args.address_family} transport",
+            failures)
+    require(args.transport_a in socket_a and ":5860" in socket_a,
+            f"node-a socket table shows the exact {args.address_family} bind",
+            failures)
+    require(args.transport_b in socket_b and ":5860" in socket_b,
+            f"node-b socket table shows the exact {args.address_family} bind",
+            failures)
+    require(f"MIDR PM: reply from {args.transport_b}" in log_a,
+            f"node-a receives {args.address_family} PM replies", failures)
+    require(f"MIDR PM: reply from {args.transport_a}" in log_b,
+            f"node-b receives {args.address_family} PM replies", failures)
 
     targets = TARGET_PATTERN.findall(combined)
-    require(bool(targets) and all(":" in target for target in targets),
-            "all probe contexts use IPv6 transport locators", failures)
+    require(bool(targets) and all(
+        ipaddress.ip_address(target).version == expected_version
+        for target in targets),
+        f"all probe contexts use {args.address_family} transport locators",
+        failures)
     require(len(I5_PATTERN.findall(log_a)) >= 5
             and len(I5_PATTERN.findall(log_b)) >= 5,
             "both nodes continuously publish I-5 metrics", failures)
 
-    ipv6_packets = packet_count(args.capture, "ip6 and udp port 5860")
-    ipv4_packets = packet_count(args.capture, "ip and udp port 5860")
-    require(ipv6_packets >= 10, "capture contains IPv6 PM traffic", failures)
-    require(ipv4_packets == 0, "capture contains no IPv4 PM traffic", failures)
+    selected_packets = packet_count(
+        args.capture, f"{selected_filter} and udp port 5860")
+    other_packets = packet_count(
+        args.capture, f"{other_filter} and udp port 5860")
+    require(selected_packets >= 10,
+            f"capture contains {args.address_family} PM traffic", failures)
+    require(other_packets == 0,
+            f"capture contains no {other_family} PM traffic", failures)
 
     if args.case == "impairment":
         measurements = [
@@ -138,25 +159,29 @@ def main():
                 "RTT returns near baseline after recovery", failures)
 
     if args.case == "invalid-source":
-        require("packet from unknown transport fd00:dead::1, dropped" in log_b,
-                "unknown IPv6 source is rejected", failures)
-        require("bad magic 0xdeadbeef from fd00:99::a, dropped" in log_b,
+        require((f"packet from unknown transport {args.unknown_source}, "
+                 "dropped") in log_b,
+                f"unknown {args.address_family} source is rejected", failures)
+        require((f"bad magic 0xdeadbeef from {args.transport_a}, "
+                 "dropped") in log_b,
                 "bad PM magic is rejected", failures)
-        require("invalid packet type 9 from fd00:99::a, dropped" in log_b,
+        require((f"invalid packet type 9 from {args.transport_a}, "
+                 "dropped") in log_b,
                 "unknown PM packet type is rejected", failures)
-        require("fd00:99::a:5861 has invalid source port" in log_b,
+        require((f"{args.transport_a}:5861 has invalid source port") in log_b,
                 "unexpected PM source port is rejected", failures)
-        require("invalid packet length (8 B) from fd00:99::a, dropped"
-                in log_b, "invalid PM packet length is rejected", failures)
-        require(("seqno mismatch from fd00:99::a" in log_b
-                 or "late/duplicate reply from fd00:99::a" in log_b),
+        require((f"invalid packet length (8 B) from {args.transport_a}, "
+                 "dropped") in log_b,
+                "invalid PM packet length is rejected", failures)
+        require((f"seqno mismatch from {args.transport_a}" in log_b
+                 or f"late/duplicate reply from {args.transport_a}" in log_b),
                 "unexpected reply cannot update a probe context", failures)
 
     if failures:
         print(f"\n{len(failures)} assertion(s) failed.")
         return 1
 
-    print("\nAll IPv6 PM assertions passed.")
+    print(f"\nAll {args.address_family} PM assertions passed.")
     return 0
 
 
