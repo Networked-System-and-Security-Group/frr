@@ -78,7 +78,6 @@ static const struct message attr_str[] = {
 	{BGP_ATTR_AIGP, "AIGP"},
 	{BGP_ATTR_NHC, "Next Hop Dependent Characteristics"},
 	{BGP_ATTR_MIDR_LS, "MIDR_LINK_STATE"},
-	{BGP_ATTR_MIDR_PROPAGATION_PATH, "MIDR_PROPAGATION_PATH"},
 	{0}};
 
 static const struct message attr_flag_str[] = {
@@ -1063,9 +1062,6 @@ unsigned int attrhash_key_make(const void *p)
 		MIX(bgp_ls_attr_hash_key(bgp_attr_get_ls_attr(attr)));
 	if (attr->midr_ls)
 		MIX(bgp_midr_ls_attr_hash_key(attr->midr_ls));
-	if (attr->midr_propagation_path)
-		MIX(bgp_midr_propagation_path_attr_hash_key(
-			attr->midr_propagation_path));
 
 	return key;
 }
@@ -1118,8 +1114,6 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    bgp_nhc_same(bgp_attr_get_nhc(attr1), bgp_attr_get_nhc(attr2)) &&
 		    bgp_ls_attr_same(attr1->ls_attr, attr2->ls_attr) &&
 		    attr1->midr_ls == attr2->midr_ls &&
-		    attr1->midr_propagation_path ==
-			    attr2->midr_propagation_path &&
 		    (attr1->pmsi_tnl_type == attr2->pmsi_tnl_type) &&
 		    IPV6_ADDR_SAME(&attr1->tunn_id, &attr2->tunn_id))
 			return true;
@@ -1381,7 +1375,6 @@ struct attr *bgp_attr_intern(struct attr *attr)
 	}
 
 	bgp_midr_ls_attr_intern_ref(&attr->midr_ls);
-	bgp_midr_propagation_path_attr_intern_ref(&attr->midr_propagation_path);
 
 	/* At this point, attr only contains intern'd pointers.  that means
 	 * if we find it in attrhash, it has all the same pointers and we
@@ -1623,8 +1616,6 @@ void bgp_attr_unintern_sub(struct attr *attr)
 	bgp_attr_set_ls_attr(attr, NULL);
 
 	bgp_midr_ls_attr_unintern(&attr->midr_ls);
-	bgp_midr_propagation_path_attr_unintern(
-		&attr->midr_propagation_path);
 }
 
 /* Clear cached intern_attr if it points to the attr that is being uninterned */
@@ -1742,8 +1733,6 @@ void bgp_attr_flush(struct attr *attr)
 	}
 
 	bgp_midr_ls_attr_flush(&attr->midr_ls);
-	bgp_midr_propagation_path_attr_flush(
-		&attr->midr_propagation_path);
 
 	nhc = bgp_attr_get_nhc(attr);
 	if (nhc && !nhc->refcnt) {
@@ -4292,8 +4281,9 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 			uint8_t flags;
 			bool present;
 			bool duplicate;
-		} ls, propagation_path;
+		} ls;
 	} midr_pending = {};
+	bool midr_reserved_attribute = false;
 	struct peer *peer = connection->peer;
 	enum bgp_attr_parse_ret ret;
 	uint8_t flag = 0;
@@ -4417,13 +4407,8 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 		 */
 
 		if (CHECK_BITMAP(seen, type)) {
-			if (type == BGP_ATTR_MIDR_LS ||
-			    type == BGP_ATTR_MIDR_PROPAGATION_PATH) {
-				if (type == BGP_ATTR_MIDR_LS)
-					midr_pending.ls.duplicate = true;
-				else
-					midr_pending.propagation_path
-						.duplicate = true;
+			if (type == BGP_ATTR_MIDR_LS) {
+				midr_pending.ls.duplicate = true;
 				stream_set_getp(
 					BGP_INPUT(connection),
 					attr_endp -
@@ -4577,12 +4562,9 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 			stream_forward_getp(BGP_INPUT(connection), length);
 			ret = BGP_ATTR_PARSE_PROCEED;
 			break;
-		case BGP_ATTR_MIDR_PROPAGATION_PATH:
-			midr_pending.propagation_path.value =
-				BGP_INPUT_PNT(connection);
-			midr_pending.propagation_path.length = length;
-			midr_pending.propagation_path.flags = flag;
-			midr_pending.propagation_path.present = true;
+		case 254U:
+			/* 254 was the retired second MIDR attribute. */
+			midr_reserved_attribute = true;
 			stream_forward_getp(BGP_INPUT(connection), length);
 			ret = BGP_ATTR_PARSE_PROCEED;
 			break;
@@ -4629,13 +4611,11 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 	if (bgp_midr_attr_family_is_midr(
 		    bgp_attr_exists(attr, BGP_ATTR_MP_REACH_NLRI),
 		    mp_update->afi, mp_update->safi)) {
-		if (midr_pending.ls.duplicate ||
-		    midr_pending.propagation_path.duplicate) {
+		if (midr_pending.ls.duplicate || midr_reserved_attribute) {
 			ret = BGP_ATTR_PARSE_WITHDRAW;
 			goto done;
 		}
-		if (!midr_pending.ls.present ||
-		    !midr_pending.propagation_path.present) {
+		if (!midr_pending.ls.present) {
 			ret = BGP_ATTR_PARSE_WITHDRAW;
 			goto done;
 		}
@@ -4645,16 +4625,6 @@ enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struc
 				midr_pending.ls.flags,
 				midr_pending.ls.value,
 				midr_pending.ls.length);
-			if (ret != BGP_ATTR_PARSE_PROCEED)
-				goto done;
-		}
-		if (midr_pending.propagation_path.present) {
-			ret = bgp_midr_attr_decode(
-				attr,
-				BGP_ATTR_MIDR_PROPAGATION_PATH,
-				midr_pending.propagation_path.flags,
-				midr_pending.propagation_path.value,
-				midr_pending.propagation_path.length);
 			if (ret != BGP_ATTR_PARSE_PROCEED)
 				goto done;
 		}

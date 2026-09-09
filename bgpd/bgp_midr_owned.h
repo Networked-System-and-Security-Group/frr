@@ -47,6 +47,8 @@ extern void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id
 
 extern int midr_owned_observe_self_sequence(struct midr_context *ctx,
 					    const struct midr_ls_object *object);
+extern int midr_owned_observe_self_sequence_number(struct midr_context *ctx,
+						   uint64_t sequence);
 extern int midr_owned_link_metadata_get(struct midr_context *ctx,
 					const struct midr_ls_object_key *key,
 					ifindex_t *local_ifindex);

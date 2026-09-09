@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "bgpd/bgp_midr_codec.h"
+#include "bgpd/bgp_midr_instance.h"
 
 #define MIDR_RIB_MAX_IDENTITIES 65536U
 
@@ -40,24 +41,32 @@ struct midr_rib_summary {
 };
 
 typedef int (*midr_rib_selected_cb)(
-	const struct midr_ls_object *object,
-	const struct midr_propagation_path *path, struct peer *peer,
-		void *arg);
+	const struct midr_instance *instance, struct peer *peer, void *arg);
 typedef int (*midr_rib_selected_entry_cb)(
-	const struct midr_ls_object *object,
-	const struct midr_propagation_path *path, struct peer *peer,
+	const struct midr_instance *instance, struct peer *peer,
 	struct bgp_dest *dest, struct bgp_path_info *selected, void *arg);
 
 extern int midr_rib_init(struct midr_context *ctx);
 extern void midr_rib_finish(struct midr_context *ctx);
 
-extern int midr_rib_path_upsert(
+/* Production MIDR input: one canonical instance per object identity. */
+extern int midr_rib_instance_upsert(
 	struct midr_context *ctx, struct peer *peer,
-	const struct midr_ls_object *object,
-	const struct midr_propagation_path *path);
-extern int midr_rib_path_withdraw(
+	const struct midr_instance *instance, uint32_t age_ms);
+extern int midr_rib_peer_withdraw(
 	struct midr_context *ctx, struct peer *peer,
 	const struct midr_ls_object_key *key);
+extern bool midr_rib_peer_advertisement_has(
+	struct midr_context *ctx, const struct midr_ls_object_key *key,
+	const struct peer *peer);
+extern int midr_rib_path_instance(
+	struct midr_context *ctx, const struct bgp_dest *dest,
+	const struct bgp_path_info *path, struct midr_instance *instance,
+	uint32_t *age_ms);
+extern int midr_rib_selected_instance_get(
+	struct midr_context *ctx, const struct midr_ls_object_key *key,
+	struct midr_instance *instance, uint32_t *age_ms,
+	struct peer **peer);
 
 extern void bgp_midr_rib_process_main(struct bgp *bgp,
 				      struct bgp_dest *dest);
@@ -73,10 +82,6 @@ midr_rib_dest_key(const struct bgp_dest *dest);
 extern int midr_rib_path_object(const struct bgp_dest *dest,
 				const struct bgp_path_info *path,
 				struct midr_ls_object *object);
-extern int midr_rib_selected_get(
-	struct midr_context *ctx, const struct midr_ls_object_key *key,
-	struct midr_ls_object *object,
-	const struct midr_propagation_path **path, struct peer **peer);
 extern int midr_rib_selected_foreach(struct midr_context *ctx,
 				     midr_rib_selected_cb callback,
 				     void *arg);

@@ -279,20 +279,35 @@ static void remote_link_withdraw(const struct midr_link_key *key, uint64_t seque
 
 static void install_remote(const struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = *object,
+	};
 
-	assert(midr_propagation_path_init(&path, remote_peer->remote_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, remote_peer, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, remote_peer, &instance, 0) == 0);
 }
 
 static void install_local(const struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = *object,
+	};
 
-	assert(midr_propagation_path_init(&path, bgp->router_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, bgp->peer_self, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, bgp->peer_self, &instance, 0) == 0);
+}
+
+static void withdraw_remote(const struct midr_ls_object *object)
+{
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_WITHDRAWN,
+		.object = *object,
+	};
+
+	instance.object.ls_sequence++;
+	instance.object.policy_tags = 0;
+	memset(&instance.object.payload, 0, sizeof(instance.object.payload));
+	assert(midr_rib_instance_upsert(ctx, remote_peer, &instance, 0) == 0);
 }
 
 static void assert_prefix_key_same(const struct midr_ted_prefix_key *left,
@@ -517,7 +532,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(midr_ted_snapshot_get(ctx, &snapshot) == 0);
 	assert(snapshot->prefix_group_count == 0);
 	midr_ted_snapshot_release(&snapshot);
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &nonrepresentative.key) == 0);
+	withdraw_remote(&nonrepresentative);
 	assert(midr_lsdb_test_process(ctx) == 0);
 
 	install_remote(&membership);
@@ -618,7 +633,7 @@ static void test_pending_activation_and_four_objects(void)
 	membership = remote_membership(5, 33);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
+	withdraw_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 3);
 	assert(callbacks.node_withdraws == 0);
@@ -632,13 +647,14 @@ static void test_pending_activation_and_four_objects(void)
 							   .remote_link_withdraw =
 								   remote_link_withdraw,
 						   }) == 0);
-	membership = remote_membership(6, 34);
+	/* Sequence 6 is already occupied by the canonical WITHDRAWN instance. */
+	membership = remote_membership(7, 34);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 4);
 	assert(callbacks.link_updates == 2);
 
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
+	withdraw_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	assert(lsdb.usable_count == 2);

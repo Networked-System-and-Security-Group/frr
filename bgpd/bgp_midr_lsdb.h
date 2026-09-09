@@ -72,6 +72,7 @@ extern int midr_lsdb_remote_snapshot_get(
 	struct midr_context *ctx, struct midr_remote_view_snapshot *snapshot);
 extern void midr_lsdb_remote_snapshot_release(
 	struct midr_remote_view_snapshot *snapshot);
+extern int midr_lsdb_remote_view_replay(struct midr_context *ctx);
 extern int midr_lsdb_summary_get(struct midr_context *ctx,
 				 struct midr_lsdb_summary *summary);
 extern void midr_show_lsdb(struct vty *vty, struct midr_context *ctx);

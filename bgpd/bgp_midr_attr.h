@@ -18,9 +18,14 @@ extern void bgp_midr_attr_init(void);
 extern void bgp_midr_attr_finish(void);
 
 extern struct bgp_midr_ls_attr *
-bgp_midr_ls_attr_intern(const struct midr_ls_attributes *attributes);
+bgp_midr_instance_attr_new(const struct midr_instance *instance,
+				   uint32_t age_ms);
 extern struct bgp_midr_ls_attr *
-bgp_midr_ls_attr_new(const struct midr_ls_attributes *attributes);
+bgp_midr_instance_attr_intern(const struct midr_instance *instance,
+				       uint32_t age_ms);
+extern struct bgp_midr_ls_attr *
+bgp_midr_instance_attr_intern_attributes(
+	const struct midr_instance_attributes *attributes);
 extern void
 bgp_midr_ls_attr_intern_ref(struct bgp_midr_ls_attr **attr);
 extern void bgp_midr_ls_attr_lock(struct bgp_midr_ls_attr *attr);
@@ -28,32 +33,13 @@ extern void bgp_midr_ls_attr_unintern(struct bgp_midr_ls_attr **attr);
 extern void bgp_midr_ls_attr_flush(struct bgp_midr_ls_attr **attr);
 extern const struct midr_ls_attributes *
 bgp_midr_ls_attr_value(const struct bgp_midr_ls_attr *attr);
+extern enum midr_instance_state
+bgp_midr_ls_attr_state(const struct bgp_midr_ls_attr *attr);
+extern uint32_t bgp_midr_ls_attr_age(const struct bgp_midr_ls_attr *attr);
 extern unsigned int
 bgp_midr_ls_attr_hash_key(const struct bgp_midr_ls_attr *attr);
 extern bool bgp_midr_ls_attr_same(const struct bgp_midr_ls_attr *a,
 				 const struct bgp_midr_ls_attr *b);
-
-extern struct bgp_midr_propagation_path_attr *
-bgp_midr_propagation_path_attr_intern(
-	const struct midr_propagation_path *path);
-extern struct bgp_midr_propagation_path_attr *
-bgp_midr_propagation_path_attr_new(const struct midr_propagation_path *path);
-extern void bgp_midr_propagation_path_attr_intern_ref(
-	struct bgp_midr_propagation_path_attr **attr);
-extern void bgp_midr_propagation_path_attr_lock(
-	struct bgp_midr_propagation_path_attr *attr);
-extern void bgp_midr_propagation_path_attr_unintern(
-	struct bgp_midr_propagation_path_attr **attr);
-extern void bgp_midr_propagation_path_attr_flush(
-	struct bgp_midr_propagation_path_attr **attr);
-extern const struct midr_propagation_path *
-bgp_midr_propagation_path_attr_value(
-	const struct bgp_midr_propagation_path_attr *attr);
-extern unsigned int bgp_midr_propagation_path_attr_hash_key(
-	const struct bgp_midr_propagation_path_attr *attr);
-extern bool bgp_midr_propagation_path_attr_same(
-	const struct bgp_midr_propagation_path_attr *a,
-	const struct bgp_midr_propagation_path_attr *b);
 
 extern enum bgp_attr_parse_ret
 bgp_midr_attr_decode(struct attr *attr, uint8_t type, uint8_t flags,

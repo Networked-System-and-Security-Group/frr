@@ -317,14 +317,16 @@ midr_lsdb_group_lookup(struct midr_lsdb_state *state, uint32_t group_id)
 }
 
 static int midr_lsdb_capture_selected(
-	const struct midr_ls_object *object,
-	const struct midr_propagation_path *path, struct peer *peer,
+	const struct midr_instance *instance, struct peer *peer,
 	struct bgp_dest *dest, struct bgp_path_info *selected, void *arg)
 {
 	struct midr_lsdb_state *state = arg;
 	struct midr_lsdb_entry *entry;
+	const struct midr_ls_object *object;
 
-	(void)path;
+	if (!instance || !selected || instance->state != MIDR_INSTANCE_ACTIVE)
+		return 0;
+	object = &instance->object;
 	entry = XCALLOC(MTYPE_MIDR_LSDB_ENTRY, sizeof(*entry));
 	entry->object = *object;
 	entry->peer = peer;
@@ -725,11 +727,11 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 			      const struct bgp_path_info *path,
 			      const struct peer *target)
 {
-	const struct midr_propagation_path *propagation;
 	const struct midr_ls_object_key *key;
 	struct midr_lsdb_entry *target_membership;
 	struct midr_lsdb_entry *entry;
 	struct midr_lsdb_state *state;
+	struct midr_instance instance;
 
 	if (!ctx || !ctx->lsdb_store || !dest || !path || !target ||
 	    target->bgp != ctx->bgp || target == ctx->bgp->peer_self ||
@@ -738,25 +740,27 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 		return false;
 	state = ctx->lsdb_store->current;
 	key = midr_rib_dest_key(dest);
-	if (!state || !key)
+	if (!state || !key || midr_rib_path_instance(ctx, dest, path,
+							&instance, NULL) != 0 ||
+	    instance.state != MIDR_INSTANCE_ACTIVE)
 		return false;
 	entry = midr_lsdb_state_entry(state, key);
 	if (!entry || !entry->usable || entry->selected != path ||
 	    entry->scope == MIDR_LSDB_SCOPE_LOCAL_ONLY)
 		return false;
 
-	propagation = bgp_midr_propagation_path_attr_value(
-		path->attr->midr_propagation_path);
-	if (!propagation ||
-	    midr_propagation_path_contains(propagation,
-					   target->remote_id.s_addr))
+	/* A peer that has advertised this identity must not receive it back as a
+	 * normal flood.  The relationship is independent of which peer currently
+	 * supplies the canonical instance. */
+	if (midr_rib_peer_advertisement_has(ctx, key, target))
+		return false;
+	target_membership = midr_lsdb_membership_lookup(state, target->remote_id.s_addr);
+	if (!target_membership)
 		return false;
 	if (entry->scope == MIDR_LSDB_SCOPE_GLOBAL)
 		return true;
-
-	target_membership = midr_lsdb_membership_lookup(state, target->remote_id.s_addr);
-	return target_membership &&
-	       target_membership->object.payload.membership.group_id == entry->scope_group_id;
+	return target_membership->object.payload.membership.group_id ==
+	       entry->scope_group_id;
 }
 
 static void midr_lsdb_announce_dirty(struct midr_lsdb_store *store)
@@ -780,14 +784,12 @@ static void midr_lsdb_announce_dirty(struct midr_lsdb_store *store)
 }
 
 static int midr_lsdb_announce_selected(
-	const struct midr_ls_object *object,
-	const struct midr_propagation_path *path, struct peer *peer,
+	const struct midr_instance *instance, struct peer *peer,
 	struct bgp_dest *dest, struct bgp_path_info *selected, void *arg)
 {
 	struct midr_lsdb_store *store = arg;
 
-	(void)object;
-	(void)path;
+	(void)instance;
 	(void)peer;
 	group_announce_route(store->ctx->bgp, AFI_BGP_LS, SAFI_MIDR_LS,
 			     dest, selected);
@@ -853,6 +855,7 @@ midr_lsdb_state_entry(struct midr_lsdb_state *state,
 struct midr_lsdb_remote_notify {
 	struct midr_lsdb_store *store;
 	struct midr_lsdb_state *other;
+	bool replay;
 };
 
 static void midr_lsdb_remote_withdraw_iter(struct hash_bucket *bucket,
@@ -909,7 +912,7 @@ static void midr_lsdb_remote_update_iter(struct hash_bucket *bucket,
 	    !store->ctx->midr->remote_callbacks_registered)
 		return;
 	old = midr_lsdb_state_entry(notify->other, &entry->object.key);
-	if (old && old->usable &&
+	if (!notify->replay && old && old->usable &&
 	    midr_ls_object_same(&old->object, &entry->object))
 		return;
 	callbacks = &store->ctx->midr->remote_callbacks;
@@ -963,6 +966,28 @@ static void midr_lsdb_remote_update_iter(struct hash_bucket *bucket,
 
 		callbacks->remote_link_update(&link);
 	}
+}
+
+int midr_lsdb_remote_view_replay(struct midr_context *ctx)
+{
+	struct midr_lsdb_remote_notify notify;
+	struct midr_lsdb_store *store;
+
+	if (!ctx || !ctx->lsdb_store)
+		return -ENOENT;
+	store = ctx->lsdb_store;
+	if (!ctx->midr->remote_callbacks_registered)
+		return 0;
+	if (!store->current || !store->current->ready)
+		return 0;
+	notify = (struct midr_lsdb_remote_notify){
+		.store = store,
+		.other = NULL,
+		.replay = true,
+	};
+	hash_iterate(store->current->identities, midr_lsdb_remote_update_iter,
+		     &notify);
+	return 0;
 }
 
 static void midr_lsdb_dirty_free(void *arg)
@@ -1026,6 +1051,7 @@ static int midr_lsdb_process(struct midr_lsdb_store *store)
 	if (changed) {
 		notify.store = store;
 		notify.other = store->current;
+		notify.replay = false;
 		if (old)
 			hash_iterate(old->identities,
 				     midr_lsdb_remote_withdraw_iter,

@@ -200,56 +200,66 @@ static struct midr_ls_object_key group_prefix_key(const struct prefix *prefix, u
 
 static uint64_t node_prefix_sequence(const struct prefix *prefix)
 {
-	const struct midr_propagation_path *path;
 	struct midr_ls_object_key key = node_prefix_key(prefix);
-	struct midr_ls_object object;
+	struct midr_instance instance;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, &key, &object, &path, &peer) == 0);
+	assert(midr_rib_selected_instance_get(ctx, &key, &instance, NULL, &peer) == 0);
 	assert(peer == bgp->peer_self);
-	assert(path->node_count == 1);
-	return object.ls_sequence;
+	return instance.object.ls_sequence;
 }
 
 static void assert_node_prefix_missing(const struct prefix *prefix)
 {
-	const struct midr_propagation_path *path;
 	struct midr_ls_object_key key = node_prefix_key(prefix);
-	struct midr_ls_object object;
+	struct midr_instance instance;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, &key, &object, &path, &peer) == -ENOENT);
+	assert(midr_rib_selected_instance_get(ctx, &key, &instance, NULL, &peer) == -ENOENT);
 }
 
 static uint64_t group_prefix_sequence(const struct prefix *prefix, uint32_t group_id)
 {
-	const struct midr_propagation_path *path;
 	struct midr_ls_object_key key = group_prefix_key(prefix, group_id);
-	struct midr_ls_object object;
+	struct midr_instance instance;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, &key, &object, &path, &peer) == 0);
+	assert(midr_rib_selected_instance_get(ctx, &key, &instance, NULL, &peer) == 0);
 	assert(peer == bgp->peer_self);
-	return object.ls_sequence;
+	return instance.object.ls_sequence;
 }
 
 static void assert_group_prefix_missing(const struct prefix *prefix, uint32_t group_id)
 {
-	const struct midr_propagation_path *path;
 	struct midr_ls_object_key key = group_prefix_key(prefix, group_id);
-	struct midr_ls_object object;
+	struct midr_instance instance;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, &key, &object, &path, &peer) == -ENOENT);
+	assert(midr_rib_selected_instance_get(ctx, &key, &instance, NULL, &peer) == -ENOENT);
 }
 
 static void install_remote_object(struct peer *peer, const struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.object = *object,
+		.state = MIDR_INSTANCE_ACTIVE,
+	};
 
-	assert(midr_propagation_path_init(&path, peer->remote_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, peer, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, peer, &instance, 0) == 0);
+}
+
+static void withdraw_remote_object(struct peer *peer,
+					 const struct midr_ls_object *object)
+{
+	struct midr_instance instance = {
+		.object = *object,
+		.state = MIDR_INSTANCE_WITHDRAWN,
+	};
+
+	instance.object.ls_sequence++;
+	instance.object.policy_tags = 0;
+	memset(&instance.object.payload, 0, sizeof(instance.object.payload));
+	assert(midr_rib_instance_upsert(ctx, peer, &instance, 0) == 0);
 }
 
 static void install_remote_membership(struct peer *peer, uint32_t group_id)
@@ -337,11 +347,13 @@ static void test_optional_policy_and_prefix_lifecycle(void)
 	assert_group_prefix_missing(&prefix, 10);
 
 	assert(midr_owned_takeover_delay_set(ctx, 3000) == 0);
-	assert(midr_rib_path_withdraw(ctx, lower_peer,
-				      &(const struct midr_ls_object_key){
-					      .type = MIDR_NLRI_TYPE_MEMBERSHIP,
-					      .originator_node_id = lower_peer->remote_id.s_addr,
-				      }) == 0);
+	withdraw_remote_object(lower_peer, &(const struct midr_ls_object){
+		.key = {
+			.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+			.originator_node_id = lower_peer->remote_id.s_addr,
+		},
+		.ls_sequence = 1,
+	});
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert_group_prefix_missing(&prefix, 10);
 	assert(midr_owned_summary_get(ctx, &owned) == 0);
@@ -376,7 +388,7 @@ static void test_optional_policy_and_prefix_lifecycle(void)
 	assert_node_prefix_missing(&prefix);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(group_prefix_sequence(&prefix, 10) == group_sequence);
-	assert(midr_rib_path_withdraw(ctx, higher_peer, &remote_prefix.key) == 0);
+	withdraw_remote_object(higher_peer, &remote_prefix);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert_group_prefix_missing(&prefix, 10);

@@ -132,7 +132,7 @@ int midr_remote_view_callbacks_register(struct midr_context *ctx,
 
 	ctx->midr->remote_callbacks = *callbacks;
 	ctx->midr->remote_callbacks_registered = true;
-	return 0;
+	return midr_lsdb_remote_view_replay(ctx);
 }
 
 static int midr_peer_status_changed(struct peer *peer)

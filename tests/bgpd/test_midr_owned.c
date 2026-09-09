@@ -123,22 +123,22 @@ static struct midr_link_update link_update(uint64_t version, uint32_t rtt_us)
 static uint64_t selected_sequence(const struct midr_ls_object_key *key,
 				  struct midr_ls_object *selected)
 {
-	const struct midr_propagation_path *path;
+	struct midr_instance instance;
+	uint32_t age;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, key, selected, &path, &peer) == 0);
+	assert(midr_rib_selected_instance_get(ctx, key, &instance, &age, &peer) == 0);
 	assert(peer == bgp->peer_self);
-	assert(path->node_count == 1);
-	return selected->ls_sequence;
+	*selected = instance.object;
+	return instance.object.ls_sequence;
 }
 
 static void assert_selected_missing(const struct midr_ls_object_key *key)
 {
-	const struct midr_propagation_path *path;
-	struct midr_ls_object selected;
+	struct midr_instance selected;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, key, &selected, &path, &peer) == -ENOENT);
+	assert(midr_rib_selected_instance_get(ctx, key, &selected, NULL, &peer) == -ENOENT);
 }
 
 static void test_origination_suppression_and_withdraw(void)
@@ -283,14 +283,16 @@ static void test_persistence_failure_and_fightback(void)
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(!summary.ready);
 	assert(summary.sequence_failures == 1);
-	assert_selected_missing(&membership_key);
+	assert(selected_sequence(&membership_key, &selected) > 0);
+	assert(selected.payload.membership.group_id == 10);
 	assert(midr_owned_test_set_sequence_store(ctx, &sequence_ops, &sequence_store) == -EBUSY);
 
 	node.version = 11;
 	node.group_id = 20;
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
-	assert_selected_missing(&membership_key);
+	assert(selected_sequence(&membership_key, &selected) > 0);
+	assert(selected.payload.membership.group_id == 10);
 
 	sequence_store.fail_save = false;
 	midr_owned_identity_start(ctx, bgp->router_id.s_addr);

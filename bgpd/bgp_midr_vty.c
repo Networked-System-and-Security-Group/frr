@@ -279,7 +279,7 @@ DEFUN(show_midr_rib_paths, show_midr_rib_paths_cmd,
       SHOW_STR
       "MIDR information\n"
       "MIDR SAFI RIB\n"
-      "All identity paths and propagation paths\n")
+		      "All canonical identity paths\n")
 {
 	struct midr_context *ctx = midr_vty_context(vty);
 

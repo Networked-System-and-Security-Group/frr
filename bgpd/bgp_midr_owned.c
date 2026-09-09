@@ -154,14 +154,26 @@ midr_owned_entry_lookup(struct midr_owned_store *store,
 	return hash_lookup(store->entries, &lookup);
 }
 
+static int midr_owned_next_sequence(struct midr_owned_store *store,
+				    uint64_t *sequence);
+
 static void midr_owned_path_withdraw(struct midr_owned_store *store,
 				     struct midr_owned_entry *entry)
 {
+	struct midr_instance instance = {};
+	uint64_t sequence;
+
 	if (!entry->advertised_present)
 		return;
 
-	(void)midr_rib_path_withdraw(store->ctx, store->ctx->bgp->peer_self,
-				     &entry->key);
+	if (midr_owned_next_sequence(store, &sequence) != 0)
+		return;
+	instance.state = MIDR_INSTANCE_WITHDRAWN;
+	instance.object.key = entry->key;
+	instance.object.ls_sequence = sequence;
+	if (midr_rib_instance_upsert(store->ctx, store->ctx->bgp->peer_self,
+				     &instance, 0) != 0)
+		return;
 	entry->advertised_present = false;
 	memset(&entry->advertised, 0, sizeof(entry->advertised));
 }
@@ -230,7 +242,6 @@ static int midr_owned_next_sequence(struct midr_owned_store *store,
 		ret = midr_owned_allocator_start(store,
 						store->ctx->bgp->router_id.s_addr);
 		if (ret) {
-			midr_owned_withdraw_all(store);
 			midr_owned_schedule_sequence_retry(store);
 			return ret;
 		}
@@ -242,7 +253,6 @@ static int midr_owned_next_sequence(struct midr_owned_store *store,
 
 	store->ready = false;
 	store->sequence_failures++;
-	midr_owned_withdraw_all(store);
 	midr_owned_schedule_sequence_retry(store);
 	return ret;
 }
@@ -262,7 +272,9 @@ static int midr_owned_publish(struct midr_owned_store *store,
 			      struct midr_owned_entry *entry,
 			      struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+	};
 	uint64_t sequence;
 	int ret;
 
@@ -274,13 +286,10 @@ static int midr_owned_publish(struct midr_owned_store *store,
 	if (ret)
 		return ret;
 	object->ls_sequence = sequence;
-
-	ret = midr_propagation_path_init(&path, store->owner_node_id);
-	if (ret)
-		return ret;
-	ret = midr_rib_path_upsert(store->ctx, store->ctx->bgp->peer_self,
-				   object, &path);
-	midr_propagation_path_fini(&path);
+	instance.object = *object;
+	ret = midr_rib_instance_upsert(store->ctx,
+				       store->ctx->bgp->peer_self,
+				       &instance, 0);
 	if (ret)
 		return ret;
 
@@ -815,28 +824,25 @@ void midr_owned_finish(struct midr_context *ctx)
 	XFREE(MTYPE_MIDR_OWNED_STORE, store);
 }
 
-int midr_owned_observe_self_sequence(struct midr_context *ctx,
-				     const struct midr_ls_object *object)
+int midr_owned_observe_self_sequence_number(struct midr_context *ctx,
+						   uint64_t sequence)
 {
 	struct midr_owned_store *store;
 	int ret;
 
 	if (!ctx || !ctx->owned_store)
 		return -ENOENT;
-	if (!object || object->key.originator_node_id !=
-			       ctx->bgp->router_id.s_addr ||
-	    midr_ls_object_validate(object) != 0)
+	if (!sequence)
 		return -EINVAL;
 	store = ctx->owned_store;
 	if (!store->ready)
 		return -EAGAIN;
 
 	ret = midr_sequence_allocator_advance_past(&store->allocator,
-						  object->ls_sequence);
+						  sequence);
 	if (ret) {
 		store->ready = false;
 		store->sequence_failures++;
-		midr_owned_withdraw_all(store);
 		midr_owned_schedule_sequence_retry(store);
 		return ret;
 	}
@@ -844,6 +850,19 @@ int midr_owned_observe_self_sequence(struct midr_context *ctx,
 	midr_owned_withdraw_all(store);
 	midr_owned_reconcile(ctx);
 	return 0;
+}
+
+int midr_owned_observe_self_sequence(struct midr_context *ctx,
+				     const struct midr_ls_object *object)
+{
+	if (!ctx || !ctx->owned_store)
+		return -ENOENT;
+	if (!object || !ctx->bgp ||
+	    object->key.originator_node_id != ctx->bgp->router_id.s_addr ||
+	    midr_ls_object_validate(object) != 0)
+		return -EINVAL;
+	return midr_owned_observe_self_sequence_number(ctx,
+						 object->ls_sequence);
 }
 
 int midr_owned_link_metadata_get(struct midr_context *ctx,

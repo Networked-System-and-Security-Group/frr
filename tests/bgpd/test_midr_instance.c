@@ -386,16 +386,11 @@ static void test_codec(void)
 	struct midr_instance i = sample(MIDR_NLRI_TYPE_LINK, true);
 	struct midr_instance decoded;
 	struct midr_instance_attributes attributes;
-	struct midr_ls_attributes legacy;
 	struct stream *s = stream_new(1024), *small = stream_new(1);
 
 	assert(midr_instance_attribute_encode(small, &i, 0) == MIDR_CODEC_NO_SPACE);
 	assert(!stream_get_endp(small));
 	stream_free(small);
-	assert(midr_ls_attribute_encode(s, &i.object) == MIDR_CODEC_OK);
-	assert(midr_instance_attribute_decode(s, stream_get_endp(s), &attributes) != MIDR_CODEC_OK);
-	assert(stream_get_getp(s) == 0);
-	stream_reset(s);
 	i = withdraw(i);
 	const uint8_t golden[] = {0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 100,
 				  0, 4, 0, 1, 2, 0, 5, 0, 4, 0, 0, 0, 123};
@@ -405,21 +400,26 @@ static void test_codec(void)
 	assert(memcmp(STREAM_DATA(s), golden, sizeof(golden)) == 0);
 	stream_reset(s);
 	assert(midr_instance_attribute_encode(s, &i, UINT32_MAX) == MIDR_CODEC_OK);
-	assert(midr_ls_attribute_decode(s, stream_get_endp(s), &legacy) == MIDR_CODEC_UNKNOWN_TLV);
-	assert(stream_get_getp(s) == 0);
+	assert(midr_instance_attribute_decode(s, stream_get_endp(s), &attributes) == MIDR_CODEC_OK);
+	assert(stream_get_getp(s) == stream_get_endp(s));
 	/* sequence TLV is 12 bytes, state TLV is 5, age TLV is 8. */
 	assert(stream_get_endp(s) == 25);
 	stream_putc_at(s, 16, 0);
+	stream_set_getp(s, 0);
 	assert(midr_instance_attribute_decode(s, 25, &attributes) == MIDR_CODEC_MALFORMED_ATTRIBUTE);
 	stream_putc_at(s, 16, MIDR_INSTANCE_WITHDRAWN);
 	stream_putw_at(s, 19, 3);
+	stream_set_getp(s, 0);
 	assert(midr_instance_attribute_decode(s, 25, &attributes) == MIDR_CODEC_MALFORMED_ATTRIBUTE);
 	stream_putw_at(s, 19, 4);
 	stream_putw_at(s, 17, MIDR_INSTANCE_TLV_STATE);
+	stream_set_getp(s, 0);
 	assert(midr_instance_attribute_decode(s, 25, &attributes) == MIDR_CODEC_MALFORMED_ATTRIBUTE);
 	stream_putw_at(s, 17, 999);
+	stream_set_getp(s, 0);
 	assert(midr_instance_attribute_decode(s, 25, &attributes) == MIDR_CODEC_UNKNOWN_TLV);
 	stream_putw_at(s, 17, MIDR_INSTANCE_TLV_AGE);
+	stream_set_getp(s, 0);
 	assert(midr_instance_attribute_decode(s, 25, &attributes) == MIDR_CODEC_OK);
 	assert(attributes.age_ms == UINT32_MAX);
 	attributes.ls.present |= MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/*
- * MIDR propagation scope and export eligibility tests.
- */
+/* MIDR export eligibility with canonical instances. */
 
 #include <zebra.h>
 
@@ -42,7 +40,7 @@ static struct ipaddr ip_address(const char *text)
 	return address;
 }
 
-static struct prefix ipv4_prefix(const char *text)
+static struct prefix prefix4(const char *text)
 {
 	struct prefix prefix;
 
@@ -50,99 +48,81 @@ static struct prefix ipv4_prefix(const char *text)
 	return prefix;
 }
 
-static struct peer *test_peer(const char *id)
+static struct peer *test_peer(const char *text)
 {
 	struct peer *peer = peer_create_accept(bgp, NULL);
 
 	assert(peer);
-	peer->remote_id.s_addr = router_id(id);
+	peer->remote_id.s_addr = router_id(text);
 	return peer;
 }
 
-static struct midr_ls_object membership(uint32_t node_id, uint32_t group_id, uint64_t sequence)
+static struct midr_instance membership(uint32_t originator, uint32_t group_id,
+					uint64_t sequence)
 {
-	return (struct midr_ls_object){
-		.key =
-			{
+	return (struct midr_instance){
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = {
+			.key = {
 				.type = MIDR_NLRI_TYPE_MEMBERSHIP,
-				.originator_node_id = node_id,
+				.originator_node_id = originator,
 			},
-		.ls_sequence = sequence,
-		.payload.membership =
-			{
+			.ls_sequence = sequence,
+			.payload.membership = {
 				.group_id = group_id,
 				.has_transport_address = true,
 				.transport_address = ip_address("192.0.2.1"),
+				.cap_flags = 1,
 			},
+		},
 	};
 }
 
-static struct midr_ls_object link_object(uint32_t local_node_id, uint32_t remote_node_id,
-					 uint64_t link_id)
+static struct midr_instance node_prefix(uint32_t originator)
 {
-	return (struct midr_ls_object){
-		.key =
-			{
-				.type = MIDR_NLRI_TYPE_LINK,
-				.originator_node_id = local_node_id,
-				.u.link =
-					{
-						.remote_node_id =
-							remote_node_id,
-						.link_id = link_id,
-					},
+	return (struct midr_instance){
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = {
+			.key = {
+				.type = MIDR_NLRI_TYPE_NODE_PREFIX,
+				.originator_node_id = originator,
+				.u.node_prefix = {
+					.afi = AFI_IP,
+					.safi = SAFI_UNICAST,
+					.prefix = prefix4("203.0.113.0/24"),
+				},
 			},
-		.ls_sequence = 1,
-		.payload.link =
-			{
-				.link_local_address =
-					ip_address("198.51.100.1"),
-				.link_remote_address =
-					ip_address("198.51.100.2"),
+			.ls_sequence = 1,
+		},
+	};
+}
+
+static struct midr_instance link_instance(uint32_t originator, uint32_t remote_id)
+{
+	return (struct midr_instance){
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = {
+			.key = {
+				.type = MIDR_NLRI_TYPE_LINK,
+				.originator_node_id = originator,
+				.u.link = {
+					.remote_node_id = remote_id,
+					.link_id = 1,
+				},
+			},
+			.ls_sequence = 1,
+			.payload.link = {
+				.link_local_address = ip_address("198.51.100.1"),
+				.link_remote_address = ip_address("198.51.100.2"),
 				.canonical_cost = 250,
 			},
+		},
 	};
 }
 
-static struct midr_ls_object node_prefix(uint32_t node_id)
+static void install(struct peer *peer, const struct midr_instance *instance)
 {
-	return (struct midr_ls_object){
-		.key =
-			{
-				.type = MIDR_NLRI_TYPE_NODE_PREFIX,
-				.originator_node_id = node_id,
-				.u.node_prefix =
-					{
-						.afi = AFI_IP,
-						.safi = SAFI_UNICAST,
-						.prefix =
-							ipv4_prefix(
-								"203.0.113.0/24"),
-					},
-			},
-		.ls_sequence = 1,
-	};
-}
-
-static void install_direct(struct peer *peer, const struct midr_ls_object *object)
-{
-	struct midr_propagation_path path = {};
-
-	assert(midr_propagation_path_init(&path, object->key.originator_node_id) == 0);
-	assert(midr_rib_path_upsert(ctx, peer, object, &path) == 0);
-	midr_propagation_path_fini(&path);
-}
-
-static void install_relayed(struct peer *peer, const struct midr_ls_object *object,
-			    uint32_t intermediate)
-{
-	struct midr_propagation_path path = {};
-
-	assert(midr_propagation_path_init(&path, object->key.originator_node_id) == 0);
-	assert(midr_propagation_path_append(&path, intermediate) == 0);
-	assert(midr_propagation_path_append(&path, peer->remote_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, peer, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, peer, instance, 0) == 0);
 }
 
 struct selected_ref {
@@ -151,47 +131,83 @@ struct selected_ref {
 	struct bgp_path_info *path;
 };
 
-static int find_selected(const struct midr_ls_object *object,
-			 const struct midr_propagation_path *path, struct peer *peer,
-			 struct bgp_dest *dest, struct bgp_path_info *selected, void *arg)
+static int find_selected(const struct midr_instance *instance, struct peer *peer,
+				 struct bgp_dest *dest, struct bgp_path_info *path,
+				 void *arg)
 {
 	struct selected_ref *ref = arg;
 
-	(void)path;
 	(void)peer;
-	if (midr_ls_object_key_same(&object->key, ref->key)) {
+	if (midr_ls_object_key_same(&instance->object.key, ref->key)) {
 		ref->dest = dest;
-		ref->path = selected;
+		ref->path = path;
 	}
 	return 0;
 }
 
-static struct selected_ref selected_ref(const struct midr_ls_object_key *key)
+static struct selected_ref selected(const struct midr_ls_object_key *key)
 {
-	struct selected_ref ref = {
-		.key = key,
-	};
+	struct selected_ref ref = {.key = key};
 
 	assert(midr_rib_selected_entry_foreach(ctx, find_selected, &ref) == 0);
 	assert(ref.dest && ref.path);
 	return ref;
 }
 
+static void test_advertisement_relationship(void)
+{
+	struct peer *same_group = test_peer("10.0.0.2");
+	struct peer *other_group = test_peer("10.0.0.3");
+	struct peer *relay = test_peer("10.0.0.4");
+	struct midr_instance local = membership(bgp->router_id.s_addr, 10, 1);
+	struct midr_instance same = membership(same_group->remote_id.s_addr, 10, 1);
+	struct midr_instance other = membership(other_group->remote_id.s_addr, 20, 1);
+	struct midr_instance link = link_instance(same_group->remote_id.s_addr,
+							other_group->remote_id.s_addr);
+	struct selected_ref ref;
+
+	install(bgp->peer_self, &local);
+	install(same_group, &same);
+	install(other_group, &other);
+	install(same_group, &link);
+	assert(midr_lsdb_test_process(ctx) == 0);
+
+	ref = selected(&link.object.key);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, other_group));
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, relay));
+
+	/* MP_UNREACH removes only the relationship; canonical remains selected. */
+	assert(midr_rib_peer_withdraw(ctx, same_group, &link.object.key) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+}
+
+static void test_scope_gate(void)
+{
+	struct peer *same_group = test_peer("10.0.0.5");
+	struct peer *other_group = test_peer("10.0.0.6");
+	struct midr_instance local = membership(bgp->router_id.s_addr, 10, 2);
+	struct midr_instance same = membership(same_group->remote_id.s_addr, 10, 2);
+	struct midr_instance other = membership(other_group->remote_id.s_addr, 20, 2);
+	struct midr_instance prefix = node_prefix(same_group->remote_id.s_addr);
+	struct selected_ref ref;
+
+	install(bgp->peer_self, &local);
+	install(same_group, &same);
+	install(other_group, &other);
+	install(same_group, &prefix);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	ref = selected(&prefix.object.key);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, other_group));
+	assert(midr_rib_peer_withdraw(ctx, same_group, &prefix.object.key) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+}
+
 int main(void)
 {
-	struct peer *owner_same;
-	struct peer *target_same;
-	struct peer *target_other;
-	struct peer *relay;
-	struct midr_ls_object local_membership;
-	struct midr_ls_object owner_membership;
-	struct midr_ls_object same_membership;
-	struct midr_ls_object other_membership;
-	struct midr_ls_object same_link;
-	struct midr_ls_object cross_link;
-	struct midr_ls_object loop_path_link;
-	struct midr_ls_object prefix;
-	struct selected_ref ref;
 	as_t asn = 65000;
 
 	qobj_init();
@@ -202,58 +218,13 @@ int main(void)
 	vrf_init(NULL, NULL, NULL, NULL);
 	bgp_option_set(BGP_OPT_NO_LISTEN);
 	bgp_attr_init();
-	assert(bgp_get(&bgp, &asn, NULL, BGP_INSTANCE_TYPE_DEFAULT, NULL, ASNOTATION_PLAIN) >= 0);
+	assert(bgp_get(&bgp, &asn, NULL, BGP_INSTANCE_TYPE_DEFAULT, NULL,
+		       ASNOTATION_PLAIN) >= 0);
 	bgp->router_id.s_addr = router_id("10.0.0.1");
 	ctx = &bgp->midr_info->ctx;
 
-	owner_same = test_peer("10.0.0.2");
-	target_same = test_peer("10.0.0.3");
-	target_other = test_peer("10.0.0.4");
-	relay = test_peer("10.0.0.5");
-
-	local_membership = membership(bgp->router_id.s_addr, 10, 1);
-	owner_membership = membership(owner_same->remote_id.s_addr, 10, 1);
-	same_membership = membership(target_same->remote_id.s_addr, 10, 1);
-	other_membership = membership(target_other->remote_id.s_addr, 20, 1);
-	install_direct(bgp->peer_self, &local_membership);
-	install_direct(owner_same, &owner_membership);
-	install_direct(target_same, &same_membership);
-	install_direct(target_other, &other_membership);
-
-	same_link = link_object(owner_same->remote_id.s_addr, target_same->remote_id.s_addr, 1);
-	cross_link = link_object(owner_same->remote_id.s_addr, target_other->remote_id.s_addr, 2);
-	loop_path_link = link_object(owner_same->remote_id.s_addr, target_other->remote_id.s_addr,
-				     3);
-	prefix = node_prefix(owner_same->remote_id.s_addr);
-	install_direct(owner_same, &same_link);
-	install_direct(owner_same, &cross_link);
-	install_relayed(relay, &loop_path_link, target_same->remote_id.s_addr);
-	install_direct(owner_same, &prefix);
-	assert(midr_lsdb_test_process(ctx) == 0);
-
-	ref = selected_ref(&same_link.key);
-	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_same));
-	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_other));
-	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, owner_same));
-
-	ref = selected_ref(&cross_link.key);
-	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_same));
-	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_other));
-
-	ref = selected_ref(&loop_path_link.key);
-	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_same));
-	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_other));
-
-	ref = selected_ref(&prefix.key);
-	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_same));
-	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_other));
-
-	same_membership = membership(target_same->remote_id.s_addr, 20, 2);
-	install_direct(target_same, &same_membership);
-	assert(midr_lsdb_test_process(ctx) == 0);
-	ref = selected_ref(&prefix.key);
-	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target_same));
-
-	puts("MIDR propagation scope tests passed");
+	test_advertisement_relationship();
+	test_scope_gate();
+	puts("MIDR scope tests passed");
 	return 0;
 }

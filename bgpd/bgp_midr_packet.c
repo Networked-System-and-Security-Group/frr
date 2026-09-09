@@ -22,7 +22,7 @@
 static int midr_packet_withdraw(struct midr_context *ctx, struct peer *peer,
 				const struct midr_ls_object_key *key)
 {
-	int ret = midr_rib_path_withdraw(ctx, peer, key);
+	int ret = midr_rib_peer_withdraw(ctx, peer, key);
 
 	return ret == -ENOENT ? 0 : ret;
 }
@@ -47,10 +47,11 @@ static bool midr_packet_peer_identity_valid(const struct peer *peer)
 
 int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *packet)
 {
-	const struct midr_propagation_path *path = NULL;
 	const struct midr_ls_attributes *attributes = NULL;
 	struct midr_context *ctx;
 	struct stream *stream;
+	struct midr_ls_object_key key;
+	enum midr_codec_result result;
 	int ret = BGP_NLRI_PARSE_OK;
 
 	if (!peer || !peer->bgp || !peer->bgp->midr_info || !packet || packet->afi != AFI_BGP_LS ||
@@ -62,8 +63,7 @@ int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	ctx = &peer->bgp->midr_info->ctx;
 	if (attr) {
 		attributes = bgp_midr_ls_attr_value(attr->midr_ls);
-		path = bgp_midr_propagation_path_attr_value(attr->midr_propagation_path);
-		if (!attributes || !path)
+		if (!attributes || !attr->midr_ls)
 			return BGP_NLRI_PARSE_ERROR;
 	}
 
@@ -71,64 +71,68 @@ int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 	stream_put(stream, packet->nlri, packet->length);
 	stream_set_getp(stream, 0);
 
-	while (STREAM_READABLE(stream)) {
-		struct midr_ls_object_key key;
-		enum midr_codec_result result;
+	/* P2 deliberately accepts one semantic object per UPDATE.  Decode the
+	 * complete NLRI before changing any RIB state. */
+	result = midr_nlri_decode(stream, &key);
+	if (result != MIDR_CODEC_OK) {
+		ret = bgp_midr_nlri_codec_result(result);
+		goto done;
+	}
+	if (STREAM_READABLE(stream)) {
+		ret = BGP_NLRI_PARSE_ERROR;
+		goto done;
+	}
 
-		result = midr_nlri_decode(stream, &key);
-		if (result == MIDR_CODEC_UNKNOWN_NLRI_TYPE)
-			continue;
+	if (!attr) {
+		ret = midr_packet_withdraw(ctx, peer, &key) == 0
+			      ? BGP_NLRI_PARSE_OK
+			      : BGP_NLRI_PARSE_ERROR;
+		goto done;
+	}
+
+	{
+		struct midr_instance_attributes wire = {
+			.ls = *attributes,
+			.state = bgp_midr_ls_attr_state(attr->midr_ls),
+			.age_ms = bgp_midr_ls_attr_age(attr->midr_ls),
+		};
+		struct midr_instance instance;
+
+		result = midr_instance_from_wire(&key, &wire, &instance);
 		if (result != MIDR_CODEC_OK) {
 			ret = bgp_midr_nlri_codec_result(result);
-			break;
-		}
-
-		if (!attr) {
-			(void)midr_packet_withdraw(ctx, peer, &key);
-			continue;
-		}
-
-		struct midr_ls_object object;
-
-		result = midr_ls_object_from_wire(&key, attributes, &object);
-		if (result != MIDR_CODEC_OK ||
-		    midr_propagation_path_validate(path, key.originator_node_id,
-						   peer->remote_id.s_addr,
-						   peer->bgp->router_id.s_addr) != 0) {
-			(void)midr_packet_withdraw(ctx, peer, &key);
-			continue;
+			goto done;
 		}
 
 		if (key.originator_node_id == peer->bgp->router_id.s_addr) {
-			(void)midr_owned_observe_self_sequence(ctx, &object);
-			(void)midr_packet_withdraw(ctx, peer, &key);
-			continue;
+			ret = midr_owned_observe_self_sequence_number(
+				ctx, instance.object.ls_sequence);
+			goto done;
 		}
 
-		if (midr_rib_path_upsert(ctx, peer, &object, path) == -EINVAL)
-			(void)midr_packet_withdraw(ctx, peer, &key);
+		ret = midr_rib_instance_upsert(ctx, peer, &instance,
+					       wire.age_ms) == 0
+			      ? BGP_NLRI_PARSE_OK
+			      : BGP_NLRI_PARSE_ERROR;
 	}
 
+done:
 	stream_free(stream);
 	return ret;
 }
 
 int bgp_midr_packet_attributes(struct stream *stream, struct bgp *bgp, struct bgp_path_info *path)
 {
-	const struct midr_propagation_path *stored_path;
-	struct midr_propagation_path propagated = {};
-	struct midr_ls_object object;
+	struct midr_instance instance;
+	uint32_t age_ms;
 	size_t start;
 	size_t length_pos;
 	size_t value_start;
 	int ret = -EINVAL;
 
-	if (!stream || !bgp || !path || !path->net ||
-	    midr_rib_path_object(path->net, path, &object) != 0)
-		return -EINVAL;
-
-	stored_path = bgp_midr_propagation_path_attr_value(path->attr->midr_propagation_path);
-	if (!stored_path)
+	if (!stream || !bgp || !bgp->midr_info || !path || !path->net ||
+	    midr_rib_path_instance(&bgp->midr_info->ctx, path->net, path,
+				   &instance, &age_ms) != 0)
 		return -EINVAL;
 
 	start = stream_get_endp(stream);
@@ -137,42 +141,16 @@ int bgp_midr_packet_attributes(struct stream *stream, struct bgp *bgp, struct bg
 	length_pos = stream_get_endp(stream);
 	stream_putw(stream, 0);
 	value_start = stream_get_endp(stream);
-	if (midr_ls_attribute_encode(stream, &object) != MIDR_CODEC_OK)
+	if (midr_instance_attribute_encode(stream, &instance, age_ms) !=
+	    MIDR_CODEC_OK)
 		goto rollback;
 	if (stream_get_endp(stream) - value_start > UINT16_MAX)
 		goto rollback;
 	stream_putw_at(stream, length_pos, stream_get_endp(stream) - value_start);
 
-	if (path->peer != bgp->peer_self) {
-		uint16_t index;
-
-		if (midr_propagation_path_init(&propagated, stored_path->nodes[0]) != 0)
-			goto rollback;
-		for (index = 1; index < stored_path->node_count; index++)
-			if (midr_propagation_path_append(&propagated, stored_path->nodes[index]) !=
-			    0)
-				goto rollback;
-		if (midr_propagation_path_append(&propagated, bgp->router_id.s_addr) != 0)
-			goto rollback;
-	} else {
-		propagated = *stored_path;
-	}
-
-	stream_putc(stream, BGP_ATTR_FLAG_OPTIONAL | BGP_ATTR_FLAG_EXTLEN);
-	stream_putc(stream, BGP_ATTR_MIDR_PROPAGATION_PATH);
-	length_pos = stream_get_endp(stream);
-	stream_putw(stream, 0);
-	value_start = stream_get_endp(stream);
-	if (midr_propagation_path_encode(stream, &propagated) != MIDR_CODEC_OK)
-		goto rollback;
-	if (stream_get_endp(stream) - value_start > UINT16_MAX)
-		goto rollback;
-	stream_putw_at(stream, length_pos, stream_get_endp(stream) - value_start);
 	ret = stream_get_endp(stream) - start;
 
 rollback:
-	if (path->peer != bgp->peer_self)
-		midr_propagation_path_fini(&propagated);
 	if (ret < 0)
 		stream_set_endp(stream, start);
 	return ret;

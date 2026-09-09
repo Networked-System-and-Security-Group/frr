@@ -15,9 +15,6 @@
 #include "prefix.h"
 
 #define BGP_ATTR_MIDR_LS 253U
-#define BGP_ATTR_MIDR_PROPAGATION_PATH 254U
-
-#define MIDR_PROPAGATION_PATH_MAX_NODES 512U
 
 enum midr_nlri_type {
 	MIDR_NLRI_TYPE_RESERVED = 0,

@@ -8,12 +8,7 @@
 #include <errno.h>
 
 #include "iana_afi.h"
-#include "memory.h"
-
-#include "bgpd/bgp_memory.h"
 #include "bgpd/bgp_midr_codec.h"
-
-DEFINE_MTYPE_STATIC(BGPD, MIDR_PROPAGATION_PATH, "MIDR propagation path");
 
 #define MIDR_NLRI_HEADER_LENGTH 4U
 #define MIDR_NLRI_ORIGINATOR_LENGTH 4U
@@ -275,19 +270,21 @@ static size_t midr_codec_ls_attribute_length(const struct midr_ls_object *object
 	return length;
 }
 
-static enum midr_codec_result midr_attribute_encode(struct stream *stream,
-				const struct midr_ls_object *object,
-				const struct midr_instance *instance, uint32_t age_ms)
+static enum midr_codec_result midr_attribute_encode(
+				struct stream *stream, const struct midr_instance *instance,
+				uint32_t age_ms)
 {
+	const struct midr_ls_object *object;
 	size_t length;
-	bool withdrawn = instance && instance->state == MIDR_INSTANCE_WITHDRAWN;
+	bool withdrawn;
 
-	if (instance ? midr_instance_validate(instance) != 0 : midr_ls_object_validate(object) != 0)
+	if (!instance || midr_instance_validate(instance) != 0)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	object = &instance->object;
+	withdrawn = instance->state == MIDR_INSTANCE_WITHDRAWN;
 
 	length = withdrawn ? MIDR_TLV_HEADER_LENGTH + 8 : midr_codec_ls_attribute_length(object);
-	if (instance)
-		length += 2 * MIDR_TLV_HEADER_LENGTH + 1 + 4;
+	length += 2 * MIDR_TLV_HEADER_LENGTH + 1 + 4;
 	if (!midr_codec_stream_can_write(stream, length))
 		return MIDR_CODEC_NO_SPACE;
 
@@ -297,12 +294,12 @@ static enum midr_codec_result midr_attribute_encode(struct stream *stream,
 		midr_codec_put_tlv_header(stream, MIDR_LS_TLV_POLICY_TAGS, 8);
 		stream_putq(stream, object->policy_tags);
 	}
-	if (instance) {
-		midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_STATE, 1);
-		stream_putc(stream, instance->state);
-		midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_AGE, 4);
-		stream_putl(stream, age_ms);
-	}
+	/* State and age precede object-specific TLVs so every encoded attribute
+	 * follows the same canonical ordering. */
+	midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_STATE, 1);
+	stream_putc(stream, instance->state);
+	midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_AGE, 4);
+	stream_putl(stream, age_ms);
 	if (withdrawn)
 		return MIDR_CODEC_OK;
 
@@ -336,18 +333,10 @@ static enum midr_codec_result midr_attribute_encode(struct stream *stream,
 	return MIDR_CODEC_OK;
 }
 
-enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
-					       const struct midr_ls_object *object)
-{
-	return midr_attribute_encode(stream, object, NULL, 0);
-}
-
 enum midr_codec_result midr_instance_attribute_encode(struct stream *stream,
-				 const struct midr_instance *instance, uint32_t age_ms)
+					 const struct midr_instance *instance, uint32_t age_ms)
 {
-	if (!instance)
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	return midr_attribute_encode(stream, &instance->object, instance, age_ms);
+	return midr_attribute_encode(stream, instance, age_ms);
 }
 
 static enum midr_codec_result midr_codec_get_address(struct stream *stream, size_t offset,
@@ -374,6 +363,11 @@ static enum midr_codec_result midr_codec_get_address(struct stream *stream, size
 	return MIDR_CODEC_OK;
 }
 
+static enum midr_codec_result midr_ls_object_from_wire(
+	const struct midr_ls_object_key *key,
+	const struct midr_ls_attributes *attributes,
+	struct midr_ls_object *object);
+
 static bool midr_codec_attribute_is_duplicate(uint32_t present, uint32_t flag)
 {
 	return (present & flag) != 0;
@@ -382,8 +376,9 @@ static bool midr_codec_attribute_is_duplicate(uint32_t present, uint32_t flag)
 #define MIDR_INSTANCE_HAS_STATE (1U << 30)
 #define MIDR_INSTANCE_HAS_AGE (1U << 31)
 
-static enum midr_codec_result midr_attribute_decode(struct stream *stream, size_t length,
-		struct midr_ls_attributes *attributes, struct midr_instance_attributes *instance)
+static enum midr_codec_result midr_attribute_decode(
+		struct stream *stream, size_t length,
+		struct midr_instance_attributes *instance)
 {
 	struct midr_ls_attributes decoded = {};
 	enum midr_instance_state state = 0;
@@ -397,9 +392,9 @@ static enum midr_codec_result midr_attribute_decode(struct stream *stream, size_
 	uint16_t value_length;
 	uint32_t presence;
 
-	if (!attributes)
+	if (!instance)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	memset(attributes, 0, sizeof(*attributes));
+	memset(instance, 0, sizeof(*instance));
 	if (!stream || STREAM_READABLE(stream) < length)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 	start = stream_get_getp(stream);
@@ -417,20 +412,18 @@ static enum midr_codec_result midr_attribute_decode(struct stream *stream, size_
 
 		switch (type) {
 		case MIDR_INSTANCE_TLV_STATE:
-			if (!instance)
-				return MIDR_CODEC_UNKNOWN_TLV;
 			presence = MIDR_INSTANCE_HAS_STATE;
-			if (value_length != 1)
+			if (value_length != 1 ||
+			    midr_codec_attribute_is_duplicate(decoded.present, presence))
 				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 			state = stream_getc_from(stream, value_offset);
 			if (state != MIDR_INSTANCE_ACTIVE && state != MIDR_INSTANCE_WITHDRAWN)
 				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 			break;
 		case MIDR_INSTANCE_TLV_AGE:
-			if (!instance)
-				return MIDR_CODEC_UNKNOWN_TLV;
 			presence = MIDR_INSTANCE_HAS_AGE;
-			if (value_length != 4)
+			if (value_length != 4 ||
+			    midr_codec_attribute_is_duplicate(decoded.present, presence))
 				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 			age_ms = stream_getl_from(stream, value_offset);
 			break;
@@ -506,61 +499,53 @@ static enum midr_codec_result midr_attribute_decode(struct stream *stream, size_
 		offset += MIDR_TLV_HEADER_LENGTH + value_length;
 	}
 
-	if (instance) {
-		uint32_t required = MIDR_INSTANCE_HAS_STATE | MIDR_INSTANCE_HAS_AGE | MIDR_LS_ATTR_HAS_SEQUENCE;
+	{
+		uint32_t required = MIDR_INSTANCE_HAS_STATE | MIDR_INSTANCE_HAS_AGE |
+				    MIDR_LS_ATTR_HAS_SEQUENCE;
 
 		if ((decoded.present & required) != required || !decoded.ls_sequence)
 			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 		decoded.present &= ~(MIDR_INSTANCE_HAS_STATE | MIDR_INSTANCE_HAS_AGE);
-		if (state == MIDR_INSTANCE_WITHDRAWN && decoded.present != MIDR_LS_ATTR_HAS_SEQUENCE)
+		if (state == MIDR_INSTANCE_WITHDRAWN &&
+		    decoded.present != MIDR_LS_ATTR_HAS_SEQUENCE)
 			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 		instance->state = state;
 		instance->age_ms = age_ms;
+		instance->ls = decoded;
 	}
-	*attributes = decoded;
 	stream_forward_getp(stream, length);
 	return MIDR_CODEC_OK;
-}
-
-enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t length,
-					       struct midr_ls_attributes *attributes)
-{
-	return midr_attribute_decode(stream, length, attributes, NULL);
 }
 
 enum midr_codec_result midr_instance_attribute_decode(struct stream *stream, size_t length,
 					struct midr_instance_attributes *attributes)
 {
-	struct midr_instance_attributes decoded = {};
-	enum midr_codec_result ret;
-
 	if (!attributes)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	memset(attributes, 0, sizeof(*attributes));
-	ret = midr_attribute_decode(stream, length, &decoded.ls, &decoded);
-	if (ret == MIDR_CODEC_OK)
-		*attributes = decoded;
-	return ret;
+	return midr_attribute_decode(stream, length, attributes);
 }
 
 enum midr_codec_result midr_instance_from_wire(const struct midr_ls_object_key *key,
 		const struct midr_instance_attributes *attributes, struct midr_instance *instance)
 {
 	struct midr_instance decoded = {};
+	struct midr_ls_object_key decoded_key;
 
 	if (!instance)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	memset(instance, 0, sizeof(*instance));
 	if (!key || !attributes || midr_ls_object_key_validate(key))
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	decoded_key = *key;
+	memset(instance, 0, sizeof(*instance));
 	decoded.state = attributes->state;
 	if (decoded.state == MIDR_INSTANCE_ACTIVE) {
-		if (midr_ls_object_from_wire(key, &attributes->ls, &decoded.object) != MIDR_CODEC_OK)
+		if (midr_ls_object_from_wire(&decoded_key, &attributes->ls,
+					     &decoded.object) != MIDR_CODEC_OK)
 			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 	} else if (decoded.state == MIDR_INSTANCE_WITHDRAWN) {
 		if (attributes->ls.present != MIDR_LS_ATTR_HAS_SEQUENCE)
 			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-		decoded.object.key = *key;
+		decoded.object.key = decoded_key;
 		decoded.object.ls_sequence = attributes->ls.ls_sequence;
 	} else
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
@@ -570,7 +555,7 @@ enum midr_codec_result midr_instance_from_wire(const struct midr_ls_object_key *
 	return MIDR_CODEC_OK;
 }
 
-enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key *key,
+static enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key *key,
 						const struct midr_ls_attributes *attributes,
 						struct midr_ls_object *object)
 {
@@ -640,150 +625,5 @@ enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key 
 	if (midr_ls_object_validate(&decoded) != 0)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 	*object = decoded;
-	return MIDR_CODEC_OK;
-}
-
-static bool midr_propagation_path_structure_valid(const struct midr_propagation_path *path)
-{
-	uint16_t left;
-	uint16_t right;
-
-	if (!path || !path->nodes || path->node_count < 1 ||
-	    path->node_count > MIDR_PROPAGATION_PATH_MAX_NODES || path->capacity < path->node_count)
-		return false;
-
-	for (left = 0; left < path->node_count; left++) {
-		if (!path->nodes[left])
-			return false;
-		for (right = left + 1; right < path->node_count; right++)
-			if (path->nodes[left] == path->nodes[right])
-				return false;
-	}
-	return true;
-}
-
-int midr_propagation_path_init(struct midr_propagation_path *path, uint32_t originator_node_id)
-{
-	if (!path || !originator_node_id || path->nodes || path->node_count || path->capacity)
-		return -EINVAL;
-
-	path->nodes = XCALLOC(MTYPE_MIDR_PROPAGATION_PATH, sizeof(*path->nodes));
-	path->nodes[0] = originator_node_id;
-	path->node_count = 1;
-	path->capacity = 1;
-	return 0;
-}
-
-void midr_propagation_path_fini(struct midr_propagation_path *path)
-{
-	if (!path)
-		return;
-	XFREE(MTYPE_MIDR_PROPAGATION_PATH, path->nodes);
-	memset(path, 0, sizeof(*path));
-}
-
-bool midr_propagation_path_contains(const struct midr_propagation_path *path, uint32_t node_id)
-{
-	uint16_t index;
-
-	if (!path || !path->nodes || !node_id || path->node_count < 1 ||
-	    path->node_count > MIDR_PROPAGATION_PATH_MAX_NODES || path->capacity < path->node_count)
-		return false;
-	for (index = 0; index < path->node_count; index++)
-		if (path->nodes[index] == node_id)
-			return true;
-	return false;
-}
-
-int midr_propagation_path_append(struct midr_propagation_path *path, uint32_t node_id)
-{
-	uint16_t capacity;
-
-	if (!midr_propagation_path_structure_valid(path) || !node_id)
-		return -EINVAL;
-	if (midr_propagation_path_contains(path, node_id))
-		return -ELOOP;
-	if (path->node_count == MIDR_PROPAGATION_PATH_MAX_NODES)
-		return -E2BIG;
-
-	capacity = path->capacity;
-	if (capacity == path->node_count) {
-		capacity = capacity < 4 ? 4 : capacity * 2;
-		if (capacity > MIDR_PROPAGATION_PATH_MAX_NODES)
-			capacity = MIDR_PROPAGATION_PATH_MAX_NODES;
-		path->nodes = XREALLOC(MTYPE_MIDR_PROPAGATION_PATH, path->nodes,
-				       capacity * sizeof(*path->nodes));
-		path->capacity = capacity;
-	}
-	path->nodes[path->node_count++] = node_id;
-	return 0;
-}
-
-int midr_propagation_path_validate(const struct midr_propagation_path *path,
-				   uint32_t originator_node_id, uint32_t sending_peer_node_id,
-				   uint32_t local_node_id)
-{
-	if (!originator_node_id || !sending_peer_node_id || !local_node_id ||
-	    !midr_propagation_path_structure_valid(path))
-		return -EINVAL;
-	if (path->nodes[0] != originator_node_id ||
-	    path->nodes[path->node_count - 1] != sending_peer_node_id ||
-	    midr_propagation_path_contains(path, local_node_id))
-		return -ELOOP;
-	return 0;
-}
-
-enum midr_codec_result midr_propagation_path_encode(struct stream *stream,
-						    const struct midr_propagation_path *path)
-{
-	size_t length;
-	uint16_t index;
-
-	if (!midr_propagation_path_structure_valid(path))
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	length = 2 + (size_t)path->node_count * 4;
-	if (!midr_codec_stream_can_write(stream, length))
-		return MIDR_CODEC_NO_SPACE;
-
-	stream_putw(stream, path->node_count);
-	for (index = 0; index < path->node_count; index++)
-		stream_putl(stream, ntohl(path->nodes[index]));
-	return MIDR_CODEC_OK;
-}
-
-enum midr_codec_result midr_propagation_path_decode(struct stream *stream, size_t length,
-						    struct midr_propagation_path *path)
-{
-	struct midr_propagation_path decoded = {};
-	size_t start;
-	size_t expected_length;
-	uint16_t index;
-	uint16_t node_count;
-
-	if (!stream || !path || path->nodes || path->node_count || path->capacity ||
-	    STREAM_READABLE(stream) < length || length < 2)
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	start = stream_get_getp(stream);
-	node_count = stream_getw_from(stream, start);
-	if (node_count < 1 || node_count > MIDR_PROPAGATION_PATH_MAX_NODES)
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	expected_length = 2 + (size_t)node_count * 4;
-	if (length != expected_length)
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-
-	decoded.nodes = XCALLOC(MTYPE_MIDR_PROPAGATION_PATH, node_count * sizeof(*decoded.nodes));
-	decoded.node_count = node_count;
-	decoded.capacity = node_count;
-	for (index = 0; index < node_count; index++)
-		decoded.nodes[index] =
-			htonl(stream_getl_from(stream, start + 2 + (size_t)index * 4));
-
-	if (!midr_propagation_path_structure_valid(&decoded)) {
-		midr_propagation_path_fini(&decoded);
-		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
-	}
-
-	*path = decoded;
-	stream_forward_getp(stream, length);
 	return MIDR_CODEC_OK;
 }
