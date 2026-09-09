@@ -298,8 +298,13 @@ assert_contains "$ARTIFACT_DIR/show-self.txt" \
     "Address family    : $FAMILY_LABEL" "show reports the selected family"
 assert_contains "$ARTIFACT_DIR/show-self.txt" \
     "Active locator    : $LOCAL_TRANSPORT" "the transport is active"
-assert_contains "$ARTIFACT_DIR/sockets.txt" "$LOCAL_TRANSPORT" \
-    "Control TCP and UDP use the exact transport"
+CONTROL_SOCKET_COUNT="$(grep -F "$LOCAL_TRANSPORT" \
+    "$ARTIFACT_DIR/sockets.txt" | grep -c '5859' || true)"
+if (( CONTROL_SOCKET_COUNT < 2 )); then
+    echo "FAIL: expected exact-address TCP and UDP Control sockets" >&2
+    exit 1
+fi
+echo "PASS: Control TCP and UDP use the exact transport"
 assert_not_contains "$ARTIFACT_DIR/sockets.txt" "0.0.0.0:5859" \
     "Control does not bind the IPv4 wildcard"
 assert_not_contains "$ARTIFACT_DIR/sockets.txt" "[::]:5859" \
