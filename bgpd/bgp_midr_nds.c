@@ -3305,7 +3305,8 @@ static void midr_bootstrap_start_attempt(struct bgp *bgp)
 		return;
 	while (mi->bootstrap_cur) {
 		b = listgetdata(mi->bootstrap_cur);
-		if (midr_ipaddr_valid_locator(&b->transport) &&
+		if (!b->failed &&
+		    midr_ipaddr_valid_locator(&b->transport) &&
 		    ipaddr_family(&b->transport) == ipaddr_family(&local))
 			break;
 		b->failed = true;
@@ -4535,7 +4536,8 @@ static void midr_nds_bootstrap_probe_attempt(struct bgp *bgp)
 		return;
 	while (mi->bootstrap_probe_cur) {
 		b = listgetdata(mi->bootstrap_probe_cur);
-		if (midr_ipaddr_valid_locator(&b->transport) &&
+		if (!b->attach_failed &&
+		    midr_ipaddr_valid_locator(&b->transport) &&
 		    ipaddr_family(&b->transport) == ipaddr_family(&local))
 			break;
 		mi->bootstrap_probe_cur =
@@ -5496,6 +5498,8 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 					     false);
 			midr_nds_remote_rekey_rep_dir(bgp->midr_nds_info,
 				claimant->node_id.u.prefix4, &transport, NULL);
+			midr_nds_remote_rekey_bootstraps(
+				bgp, claimant->node_id.u.prefix4, &transport, NULL);
 		}
 		midr_nds_ledger_drop(bgp, transport);
 		midr_ctrl_forget_target(bgp, transport);
