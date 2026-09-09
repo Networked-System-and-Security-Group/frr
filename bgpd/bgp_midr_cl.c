@@ -56,22 +56,6 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_IDENTITY, "MIDR representative identity");
  * 内部辅助函数
  * =========================================================================*/
 
-/* Find a link by its stable 32-bit BGP Identifier. */
-static struct midr_link_entry *
-cl_find_link_by_rid(const struct midr_global_view *gv,
-		    const struct in_addr *rid)
-{
-	struct listnode *n;
-	struct midr_link_entry *link;
-
-	for (ALL_LIST_ELEMENTS_RO(gv->links, n, link)) {
-		if (link->remote_node_id.family == AF_INET &&
-		    IPV4_ADDR_SAME(&link->remote_node_id.u.prefix4, rid))
-			return link;
-	}
-	return NULL;
-}
-
 static void cl_identity_from_rep(struct midr_rep_identity *identity,
 				 const struct midr_rep_entry *rep)
 {
@@ -136,6 +120,22 @@ static bool cl_metrics_is_better(const struct midr_nds_link_metrics *cand,
 	if (cand->loss_rate != best->loss_rate)
 		return cand->loss_rate < best->loss_rate;
 	return cand->bw_score > best->bw_score;
+}
+
+static bool cl_node_is_better(const struct midr_node_entry *candidate,
+			      const struct midr_nds_link_metrics *candidate_metrics,
+			      const struct midr_node_entry *best,
+			      const struct midr_nds_link_metrics *best_metrics)
+{
+	if (!best)
+		return true;
+	if (cl_metrics_is_better(candidate_metrics, best_metrics))
+		return true;
+	if (candidate_metrics->rtt_us != best_metrics->rtt_us ||
+	    candidate_metrics->loss_rate != best_metrics->loss_rate ||
+	    candidate_metrics->bw_score != best_metrics->bw_score)
+		return false;
+	return prefix_cmp(&candidate->node_id, &best->node_id) < 0;
 }
 
 /*
@@ -209,6 +209,7 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
 		struct midr_link_entry *link;
+		struct midr_rep_identity identity;
 
 		/* 探测键 = rid：目录条目恒带真名（REP_LIST 的 rid 栏自协议 v2 起
 		 * 必填）。rid 为 0 = 条目不完整，跳过。
@@ -218,7 +219,8 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		 *   键，不如直接跳过来得容易发现。〕 */
 		if (r->rep_rid.s_addr == INADDR_ANY)
 			continue;
-		link = cl_find_link_by_rid(gv, &r->rep_rid);
+		cl_identity_from_rep(&identity, r);
+		link = cl_find_link_by_prefix(gv, &identity.node_id);
 		if (!cl_link_has_data(link))
 			continue;
 
@@ -469,13 +471,13 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 		if (!cl_link_has_data(link))
 			continue;
 
-		if (!top1 || cl_metrics_is_better(&link->long_term, &top1_m)) {
+		if (cl_node_is_better(entry, &link->long_term, top1, &top1_m)) {
 			top2 = top1;
 			top2_m = top1_m;
 			top1 = entry;
 			top1_m = link->long_term;
-		} else if (!top2 ||
-			   cl_metrics_is_better(&link->long_term, &top2_m)) {
+		} else if (cl_node_is_better(entry, &link->long_term, top2,
+					  &top2_m)) {
 			top2 = entry;
 			top2_m = link->long_term;
 		}
