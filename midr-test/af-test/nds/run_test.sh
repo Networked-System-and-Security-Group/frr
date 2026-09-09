@@ -4,8 +4,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
-VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
+BGPD="$REPO_ROOT/bgpd/bgpd"
+VTYSH="$REPO_ROOT/vtysh/vtysh"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 SCENARIO="${1:-}"

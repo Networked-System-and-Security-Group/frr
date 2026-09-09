@@ -4,8 +4,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BGPD="$REPO_ROOT/bgpd/.libs/bgpd"
-VTYSH="$REPO_ROOT/vtysh/.libs/vtysh"
+BGPD="$REPO_ROOT/bgpd/bgpd"
+VTYSH="$REPO_ROOT/vtysh/vtysh"
 
 if [[ -z "${PYTHON_BIN:-}" ]]; then
     if [[ -n "${CONDA_PREFIX:-}" && -x "$CONDA_PREFIX/bin/python3" ]]; then
