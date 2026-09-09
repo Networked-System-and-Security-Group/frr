@@ -47,6 +47,7 @@ ARTIFACT_ROOT=""
 ARTIFACT_DIR=""
 VTY_A=""
 VTY_B=""
+VTY_CONFIG_DIR=""
 
 PID_A=""
 PID_B=""
@@ -197,8 +198,11 @@ ARTIFACT_ROOT="$SCRIPT_DIR/artifacts"
 ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID-$ADDRESS_FAMILY-$CASE"
 VTY_A="$ARTIFACT_DIR/vty-a"
 VTY_B="$ARTIFACT_DIR/vty-b"
+VTY_CONFIG_DIR="$ARTIFACT_DIR/vty-config"
 export MPLCONFIGDIR="$ARTIFACT_DIR/matplotlib"
-mkdir -p "$ARTIFACT_DIR" "$VTY_A" "$VTY_B" "$MPLCONFIGDIR"
+mkdir -p "$ARTIFACT_DIR" "$VTY_A" "$VTY_B" "$VTY_CONFIG_DIR" \
+    "$MPLCONFIGDIR"
+touch "$VTY_CONFIG_DIR/vtysh.conf" "$VTY_CONFIG_DIR/frr.conf"
 ln -sfn "$(basename "$ARTIFACT_DIR")" \
     "$ARTIFACT_ROOT/latest-$ADDRESS_FAMILY"
 exec > >(tee "$ARTIFACT_DIR/test.log") 2>&1
@@ -397,10 +401,12 @@ TCPDUMP_PID=$!
 
 ip netns exec "$NS_A" "$BGPD" -f "$ARTIFACT_DIR/bgpd-a.conf" -Z -S \
     -i "$ARTIFACT_DIR/bgpd-a.pid" --vty_socket "$VTY_A" \
+    --db_file "$ARTIFACT_DIR/bgpd-a.db" \
     --log-level debug >"$ARTIFACT_DIR/bgpd-a.console.log" 2>&1 &
 PID_A=$!
 ip netns exec "$NS_B" "$BGPD" -f "$ARTIFACT_DIR/bgpd-b.conf" -Z -S \
     -i "$ARTIFACT_DIR/bgpd-b.pid" --vty_socket "$VTY_B" \
+    --db_file "$ARTIFACT_DIR/bgpd-b.db" \
     --log-level debug >"$ARTIFACT_DIR/bgpd-b.console.log" 2>&1 &
 PID_B=$!
 
@@ -435,7 +441,8 @@ run_vty() {
     local namespace="$1"
     local socket_dir="$2"
     shift 2
-    ip netns exec "$namespace" "$VTYSH" --vty_socket "$socket_dir" "$@"
+    ip netns exec "$namespace" "$VTYSH" \
+        --config_dir "$VTY_CONFIG_DIR" --vty_socket "$socket_dir" "$@"
 }
 
 wait_for_file "$VTY_A/bgpd.vty" 20
