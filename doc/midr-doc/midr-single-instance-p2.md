@@ -127,10 +127,12 @@ midr-test/run-ted-fixtures.sh all               12/12 PASS
 The component and compatibility regression binaries passed for attributes,
 codec, instance, LS Object, packet, prefix, RIB, Owned, scope, LSDB, TED,
 input, resynchronization, sequence, cost, SAFI, synchronization and the SPF
-compatibility paths. The only build diagnostic observed outside MIDR was the
-existing Python/LeakSanitizer report from FRR clippy when the leak check is
-not disabled; the build completes with that generator check disabled. No
-Propagation Path reference remains in production or test code.
+compatibility paths. The build also reports existing warnings in unchanged
+MIDR auxiliary modules and an existing Python/LeakSanitizer report from FRR
+clippy when the leak check is not disabled. The latter does not reproduce
+when the generator is run with leak detection disabled; no warning was
+reported from the P2-modified files. No Propagation Path reference remains in
+production or test code.
 
 P2 does not implement the later refresh/aging policy, floor garbage
 collection, complete resynchronization protocol, non-graceful-loss READY
