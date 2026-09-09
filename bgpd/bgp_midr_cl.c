@@ -180,7 +180,10 @@ static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
 	       cand_link->long_term.loss_rate ==
 		       best_link->long_term.loss_rate &&
 	       cand_link->long_term.bw_score == best_link->long_term.bw_score &&
-	       cand_r->group_id < best_r->group_id;
+	       (cand_r->group_id < best_r->group_id ||
+		(cand_r->group_id == best_r->group_id &&
+		 ntohl(cand_r->rep_rid.s_addr) <
+			 ntohl(best_r->rep_rid.s_addr)));
 }
 
 /*
@@ -205,35 +208,30 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 	struct midr_rep_entry *top_rep[3] = { NULL, NULL, NULL };
 	struct midr_link_entry *top_link[3] = { NULL, NULL, NULL };
 	struct midr_cluster_decision d = {};
-	int i, j;
+	int i;
 
-	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
-		struct midr_link_entry *link;
-		struct midr_rep_identity identity;
+	for (i = 0; i < 3; i++) {
+		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
+			struct midr_link_entry *link;
+			struct midr_rep_identity identity;
+			int prior;
 
-		/* 探测键 = rid：目录条目恒带真名（REP_LIST 的 rid 栏自协议 v2 起
-		 * 必填）。rid 为 0 = 条目不完整，跳过。
-		 * 〔轮 5 清理：删掉了"查不到就回落按 transport 查"那半——手配目录
-		 *   路径 2026-08-11 已删除，目录只剩从节点表推导这一个来源，rid 恒
-		 *   非 0，回落永不命中。留着反而会在真出现 rid=0 时静默改用另一个
-		 *   键，不如直接跳过来得容易发现。〕 */
-		if (r->rep_rid.s_addr == INADDR_ANY)
-			continue;
-		cl_identity_from_rep(&identity, r);
-		link = cl_find_link_by_prefix(gv, &identity.node_id);
-		if (!cl_link_has_data(link))
-			continue;
-
-		for (i = 0; i < 3; i++) {
-			if (!cl_rep_is_better(r, link, top_rep[i], top_link[i]))
+			if (r->rep_rid.s_addr == INADDR_ANY)
 				continue;
-			for (j = 2; j > i; j--) {
-				top_rep[j] = top_rep[j - 1];
-				top_link[j] = top_link[j - 1];
+			for (prior = 0; prior < i; prior++)
+				if (top_rep[prior]->group_id == r->group_id)
+					break;
+			if (prior != i)
+				continue;
+
+			cl_identity_from_rep(&identity, r);
+			link = cl_find_link_by_prefix(gv, &identity.node_id);
+			if (!cl_link_has_data(link))
+				continue;
+			if (cl_rep_is_better(r, link, top_rep[i], top_link[i])) {
+				top_rep[i] = r;
+				top_link[i] = link;
 			}
-			top_rep[i] = r;
-			top_link[i] = link;
-			break;
 		}
 	}
 
