@@ -275,15 +275,19 @@ static size_t midr_codec_ls_attribute_length(const struct midr_ls_object *object
 	return length;
 }
 
-enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
-						const struct midr_ls_object *object)
+static enum midr_codec_result midr_attribute_encode(struct stream *stream,
+				const struct midr_ls_object *object,
+				const struct midr_instance *instance, uint32_t age_ms)
 {
 	size_t length;
+	bool withdrawn = instance && instance->state == MIDR_INSTANCE_WITHDRAWN;
 
-	if (midr_ls_object_validate(object) != 0)
+	if (instance ? midr_instance_validate(instance) != 0 : midr_ls_object_validate(object) != 0)
 		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
 
-	length = midr_codec_ls_attribute_length(object);
+	length = withdrawn ? MIDR_TLV_HEADER_LENGTH + 8 : midr_codec_ls_attribute_length(object);
+	if (instance)
+		length += 2 * MIDR_TLV_HEADER_LENGTH + 1 + 4;
 	if (!midr_codec_stream_can_write(stream, length))
 		return MIDR_CODEC_NO_SPACE;
 
@@ -293,6 +297,14 @@ enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
 		midr_codec_put_tlv_header(stream, MIDR_LS_TLV_POLICY_TAGS, 8);
 		stream_putq(stream, object->policy_tags);
 	}
+	if (instance) {
+		midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_STATE, 1);
+		stream_putc(stream, instance->state);
+		midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_AGE, 4);
+		stream_putl(stream, age_ms);
+	}
+	if (withdrawn)
+		return MIDR_CODEC_OK;
 
 	switch (object->key.type) {
 	case MIDR_NLRI_TYPE_MEMBERSHIP:
@@ -324,6 +336,20 @@ enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
 	return MIDR_CODEC_OK;
 }
 
+enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
+					       const struct midr_ls_object *object)
+{
+	return midr_attribute_encode(stream, object, NULL, 0);
+}
+
+enum midr_codec_result midr_instance_attribute_encode(struct stream *stream,
+				 const struct midr_instance *instance, uint32_t age_ms)
+{
+	if (!instance)
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	return midr_attribute_encode(stream, &instance->object, instance, age_ms);
+}
+
 static enum midr_codec_result midr_codec_get_address(struct stream *stream, size_t offset,
 						     size_t length, struct ipaddr *address)
 {
@@ -353,10 +379,15 @@ static bool midr_codec_attribute_is_duplicate(uint32_t present, uint32_t flag)
 	return (present & flag) != 0;
 }
 
-enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t length,
-						struct midr_ls_attributes *attributes)
+#define MIDR_INSTANCE_HAS_STATE (1U << 30)
+#define MIDR_INSTANCE_HAS_AGE (1U << 31)
+
+static enum midr_codec_result midr_attribute_decode(struct stream *stream, size_t length,
+		struct midr_ls_attributes *attributes, struct midr_instance_attributes *instance)
 {
 	struct midr_ls_attributes decoded = {};
+	enum midr_instance_state state = 0;
+	uint32_t age_ms = 0;
 	enum midr_codec_result result;
 	size_t start;
 	size_t offset = 0;
@@ -385,6 +416,24 @@ enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t le
 		value_offset = start + offset + MIDR_TLV_HEADER_LENGTH;
 
 		switch (type) {
+		case MIDR_INSTANCE_TLV_STATE:
+			if (!instance)
+				return MIDR_CODEC_UNKNOWN_TLV;
+			presence = MIDR_INSTANCE_HAS_STATE;
+			if (value_length != 1)
+				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+			state = stream_getc_from(stream, value_offset);
+			if (state != MIDR_INSTANCE_ACTIVE && state != MIDR_INSTANCE_WITHDRAWN)
+				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+			break;
+		case MIDR_INSTANCE_TLV_AGE:
+			if (!instance)
+				return MIDR_CODEC_UNKNOWN_TLV;
+			presence = MIDR_INSTANCE_HAS_AGE;
+			if (value_length != 4)
+				return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+			age_ms = stream_getl_from(stream, value_offset);
+			break;
 		case MIDR_LS_TLV_SEQUENCE:
 			presence = MIDR_LS_ATTR_HAS_SEQUENCE;
 			if (value_length != 8 ||
@@ -457,8 +506,67 @@ enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t le
 		offset += MIDR_TLV_HEADER_LENGTH + value_length;
 	}
 
+	if (instance) {
+		uint32_t required = MIDR_INSTANCE_HAS_STATE | MIDR_INSTANCE_HAS_AGE | MIDR_LS_ATTR_HAS_SEQUENCE;
+
+		if ((decoded.present & required) != required || !decoded.ls_sequence)
+			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+		decoded.present &= ~(MIDR_INSTANCE_HAS_STATE | MIDR_INSTANCE_HAS_AGE);
+		if (state == MIDR_INSTANCE_WITHDRAWN && decoded.present != MIDR_LS_ATTR_HAS_SEQUENCE)
+			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+		instance->state = state;
+		instance->age_ms = age_ms;
+	}
 	*attributes = decoded;
 	stream_forward_getp(stream, length);
+	return MIDR_CODEC_OK;
+}
+
+enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t length,
+					       struct midr_ls_attributes *attributes)
+{
+	return midr_attribute_decode(stream, length, attributes, NULL);
+}
+
+enum midr_codec_result midr_instance_attribute_decode(struct stream *stream, size_t length,
+					struct midr_instance_attributes *attributes)
+{
+	struct midr_instance_attributes decoded = {};
+	enum midr_codec_result ret;
+
+	if (!attributes)
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	memset(attributes, 0, sizeof(*attributes));
+	ret = midr_attribute_decode(stream, length, &decoded.ls, &decoded);
+	if (ret == MIDR_CODEC_OK)
+		*attributes = decoded;
+	return ret;
+}
+
+enum midr_codec_result midr_instance_from_wire(const struct midr_ls_object_key *key,
+		const struct midr_instance_attributes *attributes, struct midr_instance *instance)
+{
+	struct midr_instance decoded = {};
+
+	if (!instance)
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	memset(instance, 0, sizeof(*instance));
+	if (!key || !attributes || midr_ls_object_key_validate(key))
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	decoded.state = attributes->state;
+	if (decoded.state == MIDR_INSTANCE_ACTIVE) {
+		if (midr_ls_object_from_wire(key, &attributes->ls, &decoded.object) != MIDR_CODEC_OK)
+			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	} else if (decoded.state == MIDR_INSTANCE_WITHDRAWN) {
+		if (attributes->ls.present != MIDR_LS_ATTR_HAS_SEQUENCE)
+			return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+		decoded.object.key = *key;
+		decoded.object.ls_sequence = attributes->ls.ls_sequence;
+	} else
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	if (midr_instance_validate(&decoded))
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	*instance = decoded;
 	return MIDR_CODEC_OK;
 }
 

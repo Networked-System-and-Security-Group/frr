@@ -15,6 +15,7 @@
 #include "stream.h"
 
 #include "bgpd/bgp_midr_ls.h"
+#include "bgpd/bgp_midr_instance.h"
 
 enum midr_codec_result {
 	MIDR_CODEC_OK = 0,
@@ -48,6 +49,24 @@ struct midr_ls_attributes {
 	struct ipaddr link_remote_address;
 	uint32_t link_canonical_cost;
 };
+
+/* Explicit new-format entrypoints; legacy callers are not auto-upgraded. */
+struct midr_instance_attributes {
+	struct midr_ls_attributes ls;
+	enum midr_instance_state state;
+	uint32_t age_ms;
+};
+
+#define MIDR_INSTANCE_TLV_STATE 4U
+#define MIDR_INSTANCE_TLV_AGE 5U
+
+extern enum midr_codec_result midr_instance_attribute_encode(
+	struct stream *stream, const struct midr_instance *instance, uint32_t age_ms);
+extern enum midr_codec_result midr_instance_attribute_decode(
+	struct stream *stream, size_t length, struct midr_instance_attributes *attributes);
+extern enum midr_codec_result midr_instance_from_wire(
+	const struct midr_ls_object_key *key, const struct midr_instance_attributes *attributes,
+	struct midr_instance *instance);
 
 struct midr_propagation_path {
 	uint32_t *nodes;
