@@ -217,6 +217,18 @@ start_node() {
     fi
 }
 
+assert_nodes_alive() {
+    local node pid
+
+    for node in "$@"; do
+        pid=$(cat "/tmp/bgpd-cl-${node}.pid" 2>/dev/null || true)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "[run_test] bgpd for $node exited unexpectedly." >&2
+            return 1
+        fi
+    done
+}
+
 wait_bootstrap_ready() {
     local node="$1" timeout=90 elapsed=0
     echo "[run_test] Waiting for $node's remote-view callback registration..."
@@ -372,12 +384,14 @@ capture_state after-bootstrap
 echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
 for node in g1b g2a g3a; do start_node "$node" || exit 1; sleep 1; done
 wait_rep_directory g1a 3 || true
+assert_nodes_alive g1a g1b g2a g3a
 capture_state after-representatives
 
 echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
 for node in g1c g1d g1e g2b g3b; do start_node "$node" || exit 1; sleep 1; done
 # 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
 wait_group_members g1b 1 4 || true
+assert_nodes_alive g1a g1b g1c g1d g1e g2a g2b g3a g3b
 capture_state after-members
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
