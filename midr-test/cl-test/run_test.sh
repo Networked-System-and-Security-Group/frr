@@ -4,9 +4,9 @@
 # Topology: 10 nodes in separate Linux network namespaces, all connected via
 # an ns-hub L3 router.  tc-netem adds one-way delay on hub→node interfaces
 # (see setup.sh for why intra-group RTT is double a node's own delay):
-#   Group 1 (g1a-g1e): 3 ms → RTT from newnode ≈  3 ms, intra-group ≈  6 ms — best, chosen
-#   Group 3 (g3a-g3b): 6 ms → RTT from newnode ≈  6 ms, intra-group ≈ 12 ms — 2nd, 1st anchor group
-#   Group 2 (g2a-g2b): 50 ms → RTT from newnode ≈ 50 ms, intra-group ≈ 100 ms — 3rd, 2nd anchor group
+#   Group 1 members: 2/4/6/8 ms -- best, chosen in stable node order
+#   Group 3 members: 9/10 ms -- second, first anchor group
+#   Group 2 members: 50/55 ms -- third, second anchor group
 #
 # Expected result: newnode JOINs group 1 after ≈125 seconds, and — as a side
 # effect of the same RECOMMEND event (doc/change-reply.md B2/疑2) — anchor-
@@ -17,8 +17,8 @@
 #   t≈5    BGP-LS sessions establish; g1a builds full group-1 member list and
 #          learns g2a/g3a (cross-group BGP-LS neighbors) for its rep directory.
 #   t≈3    g1a replies to REP_LIST_REQ (or retry at t≈3 if g1a not ready yet).
-#   t≈63   REP_PROBE_DONE fires (60 s EWMA warm-up): ranks g1a(≈2.9ms) <
-#          g3a(≈5.8ms) < g2a(≈48ms) → CL RECOMMEND group 1, anchor_reps=[g3a,g2a].
+#   t≈63   REP_PROBE_DONE fires after EWMA warm-up and ranks the best
+#          representative from each group: group 1 < group 3 < group 2.
 #   t≈63   NDS sends MEMBER_LIST_REQ to g1a (main) and to g3a/g2a (anchors).
 #   t≈123  MEMBER_PROBE_DONE fires: 5 group-1 members × RTT < 20 ms → CL JOIN group 1.
 #   t≈123  ANCHOR_PROBE_DONE fires (~same time, own independent timer): CL

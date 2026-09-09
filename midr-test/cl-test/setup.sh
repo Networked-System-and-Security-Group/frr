@@ -71,8 +71,8 @@ else
     IP_MODE=(-6)
 fi
 
-DELAY=( [g1a]=3ms [g1b]=3ms [g1c]=3ms [g1d]=3ms [g1e]=3ms
-        [g2a]=50ms [g2b]=50ms [g3a]=6ms [g3b]=6ms [newnode]=0ms )
+DELAY=( [g1a]=1ms [g1b]=2ms [g1c]=4ms [g1d]=6ms [g1e]=8ms
+        [g2a]=50ms [g2b]=55ms [g3a]=9ms [g3b]=10ms [newnode]=0ms )
 
 for node in "${NODES[@]}"; do
     hv="v-${node}-h"
