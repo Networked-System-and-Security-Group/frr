@@ -525,6 +525,15 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
 
 	cl_select_anchor_candidates(gv, mi->anchor_group_id[0], d.evidence);
 	cl_select_anchor_candidates(gv, mi->anchor_group_id[1], d.evidence);
+	{
+		struct listnode *log_node;
+		struct midr_node_evidence *log_ev;
+		uint32_t index = 0;
+
+		for (ALL_LIST_ELEMENTS_RO(d.evidence, log_node, log_ev))
+			MIDR_FLOW_LOG("MIDR CL: I-7 ANCHOR evidence[%u]=%pI4",
+				      index++, &log_ev->node_id.u.prefix4);
+	}
 
 	MIDR_FLOW_LOG(
 		"MIDR CL: ANCHOR_PROBE_DONE → 群 %u/%u 共选出 %d 个锚点候选，ANCHOR",

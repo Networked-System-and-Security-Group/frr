@@ -27,7 +27,7 @@
 #
 # Usage: sudo ./run_test.sh [--no-setup] [--timeout SECS]
 
-set -e
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -37,10 +37,12 @@ LIBDIR="$REPO_ROOT/lib/.libs"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+ADDRESS_FAMILY="ipv4"
 ANCHOR_ESTABLISH_TIMEOUT="${MIDR_ANCHOR_ESTABLISH_TIMEOUT:-60}"
 POST_CONVERGENCE_TIMEOUT="${MIDR_POST_CONVERGENCE_TIMEOUT:-120}"
 CAPTURE_RUN_ID="${MIDR_CAPTURE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 CAPTURE_ROOT="${MIDR_CAPTURE_ROOT:-$TESTDIR/artifacts/$CAPTURE_RUN_ID}"
+CONFIG_DIR="$CAPTURE_ROOT/configs"
 export MIDR_CAPTURE_RUN_ID="$CAPTURE_RUN_ID"
 export MIDR_CAPTURE_ROOT="$CAPTURE_ROOT"
 
@@ -59,6 +61,31 @@ archive_logs() {
         chown -R "$SUDO_UID:$SUDO_GID" "$CAPTURE_ROOT" 2>/dev/null || true
     fi
 }
+
+while (( $# > 0 )); do
+    case "$1" in
+        --address-family)
+            ADDRESS_FAMILY="${2:-}"
+            shift 2
+            ;;
+        --no-setup)
+            DO_SETUP=0
+            shift
+            ;;
+        --timeout)
+            TIMEOUT="${2:-}"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+if [[ "$ADDRESS_FAMILY" != "ipv4" && "$ADDRESS_FAMILY" != "ipv6" ]]; then
+    echo "--address-family must be ipv4 or ipv6." >&2
+    exit 2
+fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "[run_test] This test must run as root: sudo ./run_test.sh" >&2
@@ -90,14 +117,14 @@ cd "$TESTDIR"
 mkdir -p "$CAPTURE_ROOT"
 exec > >(tee "$CAPTURE_ROOT/console.log") 2>&1
 
-for arg in "$@"; do
-    case "$arg" in
-        --no-setup) DO_SETUP=0 ;;
-        --timeout)  shift; TIMEOUT="$1" ;;
-    esac
-done
-
-trap 'echo "[run_test] Interrupted."; capture_state interrupted; archive_logs; exit 1' INT TERM
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    archive_logs
+    bash "$TESTDIR/teardown.sh" || true
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
 
 # ---- 0. Reap any stale bgpd instances left running by a previous, ----------
 #         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
@@ -123,7 +150,7 @@ sleep 1
 # ---- 1. Network setup -------------------------------------------------------
 if [[ "$DO_SETUP" -eq 1 ]]; then
     echo "[run_test] Setting up network namespaces..."
-    bash "$TESTDIR/setup.sh"
+    bash "$TESTDIR/setup.sh" --address-family "$ADDRESS_FAMILY"
 fi
 
 # ---- 2. Create log and VTY dirs ---------------------------------------------
@@ -138,10 +165,12 @@ done
 shopt -u nullglob
 rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
 mkdir -p "$CAPTURE_ROOT"
+bash "$TESTDIR/render_configs.sh" "$ADDRESS_FAMILY" "$CONFIG_DIR"
 {
     echo "run_id=$CAPTURE_RUN_ID"
     echo "started_at=$(date --iso-8601=seconds)"
     echo "git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "address_family=$ADDRESS_FAMILY"
     echo "timeout_seconds=$TIMEOUT"
     echo "anchor_establish_timeout_seconds=$ANCHOR_ESTABLISH_TIMEOUT"
     echo "post_convergence_timeout_seconds=$POST_CONVERGENCE_TIMEOUT"
@@ -158,7 +187,7 @@ start_node() {
 
     mkdir -p "/tmp/midr-cl-vty/$node"
     ip netns exec "ns-$node" "$BGPD" \
-        -f "$TESTDIR/configs/bgpd-${node}.conf" \
+        -f "$CONFIG_DIR/bgpd-${node}.conf" \
         -Z -S \
         -i "/tmp/bgpd-cl-${node}.pid" \
         --vty_socket "/tmp/midr-cl-vty/$node" \
@@ -411,4 +440,9 @@ echo ""
 bash "$TESTDIR/check_result.sh"
 capture_state final
 archive_logs
+python3 "$TESTDIR/extract_decisions.py" \
+    --log "$LOG" \
+    --output "$CAPTURE_ROOT/decisions.json" \
+    --address-family "$ADDRESS_FAMILY"
+ln -sfn "$CAPTURE_ROOT" "$TESTDIR/artifacts/latest-$ADDRESS_FAMILY"
 echo "[run_test] State artifacts: $CAPTURE_ROOT"
