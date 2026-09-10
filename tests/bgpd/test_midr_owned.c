@@ -390,6 +390,10 @@ static void test_owned_lifecycle_and_validation(void)
 	assert(selected.payload.membership.group_id == 30);
 	assert(midr_owned_link_metadata_get(ctx, &link_key, &ifindex) == 0);
 	assert(ifindex == 7);
+	sequence = selected_sequence(&membership_key, &selected);
+	midr_owned_test_fire_refresh(ctx);
+	assert(selected_sequence(&membership_key, &selected) > sequence);
+	assert(selected.payload.membership.group_id == 30);
 
 	node.version = 21;
 	node.policy_tags++;

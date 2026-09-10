@@ -62,6 +62,7 @@ extern int midr_owned_test_set_sequence_store(
 	struct midr_context *ctx, const struct midr_sequence_store_ops *ops,
 	void *arg);
 extern void midr_owned_test_fire_timers(struct midr_context *ctx);
+extern void midr_owned_test_fire_refresh(struct midr_context *ctx);
 extern void midr_owned_test_fire_takeover(struct midr_context *ctx);
 
 #endif /* _FRR_BGP_MIDR_OWNED_H */

@@ -15,6 +15,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_cost.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_prefix.h"
@@ -24,6 +25,7 @@
 
 #define MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MSEC 300000U
 #define MIDR_SEQUENCE_RETRY_MSEC 1000U
+#define MIDR_OWNED_REFRESH_BATCH 256U
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_OWNED_STORE, "MIDR owned object store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_OWNED_ENTRY, "MIDR owned object entry");
@@ -38,6 +40,7 @@ enum midr_owned_domain {
 
 struct midr_owned_entry {
 	struct midr_owned_store *store;
+	struct midr_owned_entry *refresh_next;
 	struct midr_ls_object_key key;
 	struct midr_ls_object advertised;
 	struct midr_link_update latest_link;
@@ -73,7 +76,10 @@ struct midr_owned_store {
 	const struct midr_sequence_store_ops *sequence_ops;
 	void *sequence_arg;
 	struct event *sequence_retry;
+	struct event *refresh_timer;
 	struct event *takeover_timer;
+	struct midr_owned_entry *refresh_head;
+	struct midr_owned_entry *refresh_cursor;
 	uint32_t owner_node_id;
 	uint32_t representative_group_id;
 	uint32_t representative_candidate;
@@ -138,6 +144,10 @@ midr_owned_entry_get(struct midr_owned_store *store,
 	struct midr_owned_entry *entry;
 
 	entry = hash_get(store->entries, &lookup, midr_owned_hash_alloc);
+	if (!entry->store) {
+		entry->refresh_next = store->refresh_head;
+		store->refresh_head = entry;
+	}
 	entry->store = store;
 	entry->domain = midr_owned_key_domain(key);
 	return entry;
@@ -156,6 +166,16 @@ midr_owned_entry_lookup(struct midr_owned_store *store,
 
 static int midr_owned_next_sequence(struct midr_owned_store *store,
 				    uint64_t *sequence);
+static void midr_owned_refresh_event(struct event *event);
+
+static void midr_owned_schedule_refresh(struct midr_owned_store *store)
+{
+	if (!store || store->refresh_timer || !bm || !bm->master)
+		return;
+	event_add_timer_msec(bm->master, midr_owned_refresh_event, store,
+				     MIDR_CANONICAL_REFRESH_MS,
+				     &store->refresh_timer);
+}
 
 static void midr_owned_path_withdraw(struct midr_owned_store *store,
 				     struct midr_owned_entry *entry)
@@ -268,9 +288,10 @@ static bool midr_owned_object_payload_same(const struct midr_ls_object *a,
 	return midr_ls_object_same(&left, &right);
 }
 
-static int midr_owned_publish(struct midr_owned_store *store,
-			      struct midr_owned_entry *entry,
-			      struct midr_ls_object *object)
+static int midr_owned_publish_internal(struct midr_owned_store *store,
+				       struct midr_owned_entry *entry,
+				       struct midr_ls_object *object,
+				       bool force)
 {
 	struct midr_instance instance = {
 		.state = MIDR_INSTANCE_ACTIVE,
@@ -278,7 +299,7 @@ static int midr_owned_publish(struct midr_owned_store *store,
 	uint64_t sequence;
 	int ret;
 
-	if (entry->advertised_present &&
+	if (!force && entry->advertised_present &&
 	    midr_owned_object_payload_same(&entry->advertised, object))
 		return 0;
 
@@ -298,6 +319,46 @@ static int midr_owned_publish(struct midr_owned_store *store,
 	monotime(&entry->last_advertised);
 	entry->suppressed = false;
 	return 0;
+}
+
+static int midr_owned_publish(struct midr_owned_store *store,
+			      struct midr_owned_entry *entry,
+			      struct midr_ls_object *object)
+{
+	return midr_owned_publish_internal(store, entry, object, false);
+}
+
+static int midr_owned_refresh_entry(struct midr_owned_entry *entry)
+{
+	struct midr_owned_store *store;
+	struct midr_ls_object object;
+	bool suppressed;
+	int ret;
+
+	if (!entry || !entry->advertised_present || !entry->store)
+		return 0;
+	store = entry->store;
+	object = entry->advertised;
+	suppressed = entry->suppressed;
+	ret = midr_owned_publish_internal(store, entry, &object, true);
+	if (ret)
+		return ret;
+	entry->suppressed = suppressed;
+	return 0;
+}
+
+static void midr_owned_refresh_batch(struct midr_owned_store *store)
+{
+	size_t count = 0;
+
+	while (store->refresh_cursor && count < MIDR_OWNED_REFRESH_BATCH) {
+		struct midr_owned_entry *entry = store->refresh_cursor;
+
+		store->refresh_cursor = entry->refresh_next;
+		if (store->ready)
+			(void)midr_owned_refresh_entry(entry);
+		count++;
+	}
 }
 
 static struct midr_ls_object
@@ -739,6 +800,23 @@ static void midr_owned_reconcile_event(struct event *event)
 	midr_owned_reconcile_domains(store->ctx, MIDR_OWNED_DOMAIN_ALL);
 }
 
+static void midr_owned_refresh_event(struct event *event)
+{
+	struct midr_owned_store *store = EVENT_ARG(event);
+
+	if (!store)
+		return;
+	store->refresh_timer = NULL;
+	if (!store->refresh_cursor)
+		store->refresh_cursor = store->refresh_head;
+	midr_owned_refresh_batch(store);
+	if (store->refresh_cursor && bm && bm->master)
+		event_add_event(bm->master, midr_owned_refresh_event, store, 0,
+				&store->refresh_timer);
+	else
+		midr_owned_schedule_refresh(store);
+}
+
 void midr_owned_input_state_changed(struct midr_context *ctx)
 {
 	midr_lsdb_input_state_changed(ctx);
@@ -752,6 +830,8 @@ void midr_owned_identity_withdraw(struct midr_context *ctx)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->refresh_timer);
+	store->refresh_cursor = NULL;
 	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
 	store->ready = false;
@@ -762,6 +842,7 @@ void midr_owned_identity_withdraw(struct midr_context *ctx)
 	store->takeover_delay_elapsed = false;
 	store->local_member_active = false;
 	memset(&store->allocator, 0, sizeof(store->allocator));
+	midr_owned_schedule_refresh(store);
 	midr_owned_input_state_changed(ctx);
 }
 
@@ -773,6 +854,8 @@ void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->refresh_timer);
+	store->refresh_cursor = NULL;
 	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
 	store->representative_group_id = 0;
@@ -783,6 +866,7 @@ void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id)
 	(void)midr_owned_allocator_start(store, node_id);
 	if (node_id && !store->ready)
 		midr_owned_schedule_sequence_retry(store);
+	midr_owned_schedule_refresh(store);
 	midr_owned_input_state_changed(ctx);
 }
 
@@ -803,6 +887,7 @@ int midr_owned_init(struct midr_context *ctx)
 	store->sequence_ops = &midr_sequence_frr_store_ops;
 	store->takeover_delay_msec = MIDR_GROUP_PREFIX_TAKEOVER_DELAY_DEFAULT_MSEC;
 	ctx->owned_store = store;
+	midr_owned_schedule_refresh(store);
 	if (ctx->bgp->router_id.s_addr)
 		(void)midr_owned_allocator_start(store,
 						ctx->bgp->router_id.s_addr);
@@ -817,6 +902,7 @@ void midr_owned_finish(struct midr_context *ctx)
 		return;
 	store = ctx->owned_store;
 	event_cancel(&store->sequence_retry);
+	event_cancel(&store->refresh_timer);
 	event_cancel(&store->takeover_timer);
 	midr_owned_withdraw_all(store);
 	hash_clean_and_free(&store->entries, midr_owned_entry_free);
@@ -1033,7 +1119,21 @@ void midr_owned_test_fire_timers(struct midr_context *ctx)
 	if (!ctx || !ctx->owned_store)
 		return;
 	hash_iterate(ctx->owned_store->entries, midr_owned_fire_timer_iter,
-		     ctx->owned_store);
+			     ctx->owned_store);
+}
+
+void midr_owned_test_fire_refresh(struct midr_context *ctx)
+{
+	struct midr_owned_store *store;
+
+	if (!ctx || !ctx->owned_store)
+		return;
+	store = ctx->owned_store;
+	event_cancel(&store->refresh_timer);
+	store->refresh_cursor = store->refresh_head;
+	while (store->refresh_cursor)
+		midr_owned_refresh_batch(store);
+	midr_owned_schedule_refresh(store);
 }
 
 void midr_owned_test_fire_takeover(struct midr_context *ctx)
