@@ -578,6 +578,18 @@ static void test_pending_activation_and_four_objects(void)
 
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	lsdb_generation = lsdb.generation;
+	{
+		size_t node_updates = callbacks.node_updates;
+
+		/* A refresh changes the control-plane version but not the
+		 * topology-derived TED content. */
+		membership = remote_membership(2, 20);
+		install_remote(&membership);
+		assert(midr_lsdb_test_process(ctx) == 0);
+		assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+		assert(lsdb.generation == lsdb_generation);
+		assert(callbacks.node_updates == node_updates);
+	}
 	midr_lsdb_local_metadata_changed(ctx);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
@@ -602,7 +614,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(!midr_ted_path_consumer_stub_result_is_current(ctx, &path_consumer,
 							      held->generation));
 
-	membership = remote_membership(2, 30);
+	membership = remote_membership(3, 30);
 	install_remote(&membership);
 	midr_lsdb_test_fail_next_prepare(ctx);
 	assert(midr_lsdb_test_process(ctx) == -ENOMEM);
@@ -619,18 +631,18 @@ static void test_pending_activation_and_four_objects(void)
 	assert(callbacks.node_updates == 2);
 
 	ctx->midr->remote_callbacks_registered = false;
-	membership = remote_membership(3, 31);
+	membership = remote_membership(4, 31);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 2);
 	ctx->midr->remote_callbacks_registered = true;
-	membership = remote_membership(4, 32);
+	membership = remote_membership(5, 32);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 3);
 
 	assert(midr_remote_view_callbacks_register(ctx, &empty_callbacks) == 0);
-	membership = remote_membership(5, 33);
+	membership = remote_membership(6, 33);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	withdraw_remote(&membership);
@@ -647,8 +659,8 @@ static void test_pending_activation_and_four_objects(void)
 							   .remote_link_withdraw =
 								   remote_link_withdraw,
 						   }) == 0);
-	/* Sequence 6 is already occupied by the canonical WITHDRAWN instance. */
-	membership = remote_membership(7, 34);
+	/* Sequence 7 is already occupied by the canonical WITHDRAWN instance. */
+	membership = remote_membership(8, 34);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 4);

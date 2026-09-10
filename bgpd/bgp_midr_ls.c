@@ -266,3 +266,20 @@ bool midr_ls_object_same(const struct midr_ls_object *a, const struct midr_ls_ob
 		return false;
 	}
 }
+
+bool midr_ls_object_semantic_same(const struct midr_ls_object *a,
+					 const struct midr_ls_object *b)
+{
+	struct midr_ls_object left;
+	struct midr_ls_object right;
+
+	if (a == b)
+		return true;
+	if (!a || !b)
+		return false;
+	left = *a;
+	right = *b;
+	left.ls_sequence = 0;
+	right.ls_sequence = 0;
+	return midr_ls_object_same(&left, &right);
+}

@@ -708,7 +708,7 @@ static int midr_lsdb_prepare_ted(
 static bool midr_lsdb_entry_same(const struct midr_lsdb_entry *left,
 				 const struct midr_lsdb_entry *right)
 {
-	return midr_ls_object_same(&left->object, &right->object) &&
+	return midr_ls_object_semantic_same(&left->object, &right->object) &&
 	       left->usable == right->usable &&
 	       left->pending_reason == right->pending_reason &&
 	       left->scope == right->scope &&
@@ -913,7 +913,7 @@ static void midr_lsdb_remote_update_iter(struct hash_bucket *bucket,
 		return;
 	old = midr_lsdb_state_entry(notify->other, &entry->object.key);
 	if (!notify->replay && old && old->usable &&
-	    midr_ls_object_same(&old->object, &entry->object))
+	    midr_ls_object_semantic_same(&old->object, &entry->object))
 		return;
 	callbacks = &store->ctx->midr->remote_callbacks;
 	if (entry->object.key.type == MIDR_NLRI_TYPE_MEMBERSHIP) {
