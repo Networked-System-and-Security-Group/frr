@@ -23,6 +23,7 @@ struct midr_canonical_entry {
 	uint32_t received_ms;
 	enum midr_canonical_state state;
 	const struct midr_instance_ref *current;
+	uint64_t floor_ns;
 };
 
 struct midr_canonical_event {
@@ -41,6 +42,9 @@ struct midr_canonical {
 	struct midr_canonical_event *tail;
 	size_t identities;
 	size_t events;
+	bool gc_enabled;
+	size_t sweep_bucket;
+	size_t sweep_offset;
 };
 
 static void *midr_canonical_alloc(size_t size, void *arg)
@@ -136,6 +140,18 @@ static void midr_canonical_enqueue(struct midr_canonical *store, struct midr_can
 		store->head = event;
 	store->tail = event;
 	store->events++;
+}
+
+static bool midr_canonical_has_event_for(
+		const struct midr_canonical *store,
+		const struct midr_ls_object_key *key)
+{
+	const struct midr_canonical_event *event;
+
+	for (event = store->head; event; event = event->next)
+		if (midr_ls_object_key_same(&event->key, key))
+			return true;
+	return false;
 }
 
 int midr_canonical_accept(struct midr_canonical *store, const struct midr_instance *instance,
@@ -290,8 +306,128 @@ int midr_canonical_expire(struct midr_canonical *store, const struct midr_ls_obj
 	event->before = entry->current;
 	entry->current = NULL;
 	entry->state = MIDR_CANONICAL_FLOOR;
+	/* The retention clock starts when this version was first accepted, not
+	 * when its active lifetime is later observed to have elapsed. */
+	entry->floor_ns = entry->observed_ns;
 	midr_canonical_enqueue(store, event);
 	return 0;
+}
+
+int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
+			 size_t *expired)
+{
+	size_t inspected = 0;
+	size_t done = 0;
+	size_t bucket;
+	size_t offset;
+	size_t buckets_visited = 0;
+	int result = 0;
+
+	if (!store || !limit)
+		return -EINVAL;
+	bucket = store->sweep_bucket % MIDR_CANONICAL_BUCKETS;
+	offset = store->sweep_offset;
+	while (inspected < limit && buckets_visited < MIDR_CANONICAL_BUCKETS) {
+		struct midr_canonical_entry *entry;
+
+		entry = store->buckets[bucket];
+		while (entry && offset) {
+			entry = entry->next;
+			offset--;
+		}
+		if (!entry) {
+			bucket = (bucket + 1) % MIDR_CANONICAL_BUCKETS;
+			offset = 0;
+			buckets_visited++;
+			continue;
+		}
+
+		while (entry && inspected < limit) {
+			struct midr_canonical_entry *next = entry->next;
+			int ret;
+
+			inspected++;
+			offset++;
+			if (entry->state == MIDR_CANONICAL_FLOOR) {
+				entry = next;
+				continue;
+			}
+			ret = midr_canonical_expire(store, &entry->key);
+			if (!ret)
+				done++;
+			else if (ret != -EAGAIN && ret != -ENOENT && !result)
+				result = ret;
+			entry = next;
+		}
+		if (!entry) {
+			bucket = (bucket + 1) % MIDR_CANONICAL_BUCKETS;
+			offset = 0;
+			buckets_visited++;
+		}
+	}
+	store->sweep_bucket = bucket;
+	store->sweep_offset = offset;
+	if (expired)
+		*expired = done;
+	return result;
+}
+
+int midr_canonical_gc(struct midr_canonical *store, size_t limit,
+			  size_t *collected)
+{
+	size_t done = 0;
+	uint64_t now;
+
+	if (!store || !limit)
+		return -EINVAL;
+	if (!store->gc_enabled) {
+		if (collected)
+			*collected = 0;
+		return 0;
+	}
+	now = store->config.now_ns(store->config.clock_arg);
+	for (size_t i = 0; i < MIDR_CANONICAL_BUCKETS && done < limit; i++) {
+		struct midr_canonical_entry **link = &store->buckets[i];
+
+		while (*link && done < limit) {
+			struct midr_canonical_entry *entry = *link;
+			uint64_t retention_ns;
+
+			if (entry->state != MIDR_CANONICAL_FLOOR || entry->current ||
+			    midr_canonical_has_event_for(store, &entry->key)) {
+				link = &entry->next;
+				continue;
+			}
+			retention_ns = (uint64_t)store->config.max_age_ms * 1000000ULL;
+			if (now < entry->floor_ns ||
+			    now - entry->floor_ns < retention_ns) {
+				link = &entry->next;
+				continue;
+			}
+			*link = entry->next;
+			store->identities--;
+			store->config.free(entry, store->config.alloc_arg);
+			done++;
+			store->sweep_bucket = 0;
+			store->sweep_offset = 0;
+		}
+	}
+	if (collected)
+		*collected = done;
+	return 0;
+}
+
+int midr_canonical_gc_enable(struct midr_canonical *store, bool enabled)
+{
+	if (!store)
+		return -EINVAL;
+	store->gc_enabled = enabled;
+	return 0;
+}
+
+uint32_t midr_canonical_max_age_ms(const struct midr_canonical *store)
+{
+	return store ? store->config.max_age_ms : 0;
 }
 
 size_t midr_canonical_identity_count(const struct midr_canonical *store)

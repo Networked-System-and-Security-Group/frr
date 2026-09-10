@@ -31,6 +31,9 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_STORE, "MIDR RIB store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_IDENTITY, "MIDR RIB identity");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_ADVERTISEMENT, "MIDR peer advertisement");
 
+#define MIDR_RIB_LIFETIME_SWEEP_MSEC 1000U
+#define MIDR_RIB_LIFETIME_SWEEP_LIMIT 256U
+
 struct midr_rib_advertisement {
 	struct midr_rib_advertisement *next;
 	struct peer *peer;
@@ -59,7 +62,10 @@ struct midr_rib_store {
 	size_t conflict_count;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
+	struct event *lifetime_timer;
 };
+
+static void midr_rib_lifetime_event(struct event *event);
 
 static uint64_t midr_rib_now_ns(void *arg)
 {
@@ -200,9 +206,7 @@ int midr_rib_init(struct midr_context *ctx)
 		struct midr_canonical_config config = {
 			.identity_limit = MIDR_RIB_MAX_IDENTITIES,
 			.event_limit = MIDR_RIB_MAX_IDENTITIES * 2U,
-			/* Full refresh/aging policy is P3; this keeps the
-			 * canonical store from imposing a second short timer. */
-			.max_age_ms = UINT32_MAX,
+			.max_age_ms = MIDR_CANONICAL_MAX_AGE_MS,
 			.now_ns = midr_rib_now_ns,
 		};
 
@@ -215,6 +219,10 @@ int midr_rib_init(struct midr_context *ctx)
 		}
 	}
 	ctx->rib_store = store;
+	if (bm && bm->master)
+		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
+				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
+				     &store->lifetime_timer);
 	return 0;
 }
 
@@ -226,6 +234,7 @@ void midr_rib_finish(struct midr_context *ctx)
 		return;
 	store = ctx->rib_store;
 	ctx->rib_store = NULL;
+	event_cancel(&store->lifetime_timer);
 	midr_canonical_destroy(&store->canonical);
 	hash_clean_and_free(&store->identities, midr_rib_identity_free);
 	idalloc_destroy(store->allocator);
@@ -379,9 +388,55 @@ int midr_rib_path_instance(struct midr_context *ctx,
 				    &identity->key, &view);
 	if (ret || view.state != MIDR_CANONICAL_CURRENT || !view.current)
 		return ret;
-	ret = midr_instance_ref_age(view.current, midr_rib_now_ns(NULL), 0,
-				    UINT32_MAX, age_ms);
+	ret = midr_instance_ref_age(view.current, midr_rib_now_ns(NULL),
+				    MIDR_CANONICAL_FORWARD_BUDGET_MS,
+				    midr_canonical_max_age_ms(
+					    ctx->rib_store->canonical),
+				    age_ms);
 	return ret;
+}
+
+static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
+{
+	const struct midr_canonical_event *event;
+
+	while ((event = midr_canonical_event_peek(store->canonical)) != NULL) {
+		const struct midr_ls_object_key *key;
+		struct midr_rib_identity *identity;
+
+		if (midr_canonical_event_change(event) != MIDR_CANONICAL_EXPIRE)
+			break;
+		key = midr_canonical_event_key(event);
+		identity = midr_rib_identity_lookup(store, key);
+		if (identity && identity->dest && identity->canonical_path &&
+		    !CHECK_FLAG(identity->canonical_path->flags, BGP_PATH_REMOVED)) {
+			struct bgp_dest *dest = bgp_dest_lock_node(identity->dest);
+
+			bgp_path_info_mark_for_delete(dest, identity->canonical_path);
+			bgp_process_main_one(store->ctx->bgp, dest, AFI_BGP_LS,
+					     SAFI_MIDR_LS);
+			bgp_dest_unlock_node(dest);
+		}
+		midr_canonical_event_ack(store->canonical);
+	}
+}
+
+static void midr_rib_lifetime_event(struct event *event)
+{
+	struct midr_rib_store *store = EVENT_ARG(event);
+
+	if (!store || !store->ctx)
+		return;
+	store->lifetime_timer = NULL;
+	(void)midr_canonical_sweep(store->canonical,
+				   MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	midr_rib_apply_lifetime_events(store);
+	(void)midr_canonical_gc(store->canonical,
+				MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	if (bm && bm->master)
+		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
+				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
+				     &store->lifetime_timer);
 }
 
 int midr_rib_path_object(const struct bgp_dest *dest,
@@ -748,7 +803,9 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		return -EINVAL;
 	store = ctx->rib_store;
 	*summary = (struct midr_rib_summary){
-		.identity_count = store->active_identity_count,
+		/* The identity limit includes floors and quarantined identities, not
+		 * only objects currently usable by the active view. */
+		.identity_count = store->identities->count,
 		.path_count = store->path_count,
 		.selected_count = store->selected_count,
 		.conflict_count = store->conflict_count,
@@ -769,6 +826,20 @@ static const char *midr_rib_identity_state_name(enum midr_rib_identity_state sta
 		return "SELECTED";
 	case MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED:
 		return "CONFLICT_QUARANTINED";
+	}
+	return "UNKNOWN";
+}
+
+static const char *midr_rib_canonical_state_name(
+		enum midr_canonical_state state)
+{
+	switch (state) {
+	case MIDR_CANONICAL_CURRENT:
+		return "CURRENT";
+	case MIDR_CANONICAL_QUARANTINED:
+		return "QUARANTINED";
+	case MIDR_CANONICAL_FLOOR:
+		return "FLOOR";
 	}
 	return "UNKNOWN";
 }
@@ -852,15 +923,35 @@ static void midr_rib_show_identity(struct hash_bucket *bucket, void *arg)
 	struct midr_rib_show_state *show = arg;
 	struct midr_rib_identity *identity = bucket->data;
 	struct bgp_path_info *path;
+	struct midr_canonical_view canonical = {};
+	int canonical_ret;
 
-	if (!identity->path_count)
+	canonical_ret = midr_canonical_lookup(show->ctx->rib_store->canonical,
+					     &identity->key, &canonical);
+	if (!identity->path_count && canonical_ret)
 		return;
 	show->identity_count++;
 	vty_out(show->vty,
-		"identity synthetic-id=%u state=%s paths=%zu\n",
+		"identity synthetic-id=%u state=%s paths=%zu",
 		identity->synthetic_id,
 		midr_rib_identity_state_name(identity->state),
 		identity->path_count);
+	if (!canonical_ret) {
+		uint32_t remaining = canonical.age_ms <
+					     midr_canonical_max_age_ms(
+						     show->ctx->rib_store->canonical)
+						 ? midr_canonical_max_age_ms(
+							   show->ctx->rib_store->canonical) -
+							   canonical.age_ms
+						 : 0;
+
+		vty_out(show->vty, " canonical=%s sequence=%" PRIu64
+				 " age-ms=%u remaining-ms=%u\n",
+				midr_rib_canonical_state_name(canonical.state),
+				canonical.sequence, canonical.age_ms, remaining);
+	} else {
+		vty_out(show->vty, " canonical=UNAVAILABLE\n");
+	}
 	for (path = bgp_dest_get_bgp_path_info(identity->dest); path;
 	     path = path->next) {
 		struct midr_ls_object object;

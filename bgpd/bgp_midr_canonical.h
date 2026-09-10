@@ -8,6 +8,11 @@ struct midr_canonical;
 struct midr_instance_ref;
 struct midr_canonical_event;
 
+/* P3 lifetime policy. These are intentionally internal constants for now. */
+#define MIDR_CANONICAL_MAX_AGE_MS 3600000U
+#define MIDR_CANONICAL_REFRESH_MS 300000U
+#define MIDR_CANONICAL_FORWARD_BUDGET_MS 1000U
+
 enum midr_canonical_result {
 	MIDR_CANONICAL_ACCEPTED,
 	MIDR_CANONICAL_DUPLICATE,
@@ -62,6 +67,17 @@ extern int midr_canonical_lookup(const struct midr_canonical *store,
 /* Expire locally; floor GC is deliberately left to the proven P3 policy. */
 extern int midr_canonical_expire(struct midr_canonical *store,
 				 const struct midr_ls_object_key *key);
+/* Expire at most limit identities and report how many became floors. */
+extern int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
+				 size_t *expired);
+/* Remove only floors whose retention lifetime has elapsed and which have no
+ * pending event. The caller owns any external RIB/LSDB cleanup obligation. */
+extern int midr_canonical_gc(struct midr_canonical *store, size_t limit,
+				 size_t *collected);
+extern int midr_canonical_gc_enable(struct midr_canonical *store,
+				    bool enabled);
+extern uint32_t midr_canonical_max_age_ms(
+				const struct midr_canonical *store);
 extern size_t midr_canonical_identity_count(const struct midr_canonical *store);
 extern size_t midr_canonical_event_count(const struct midr_canonical *store);
 

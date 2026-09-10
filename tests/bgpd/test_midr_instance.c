@@ -365,6 +365,63 @@ static void test_expiry_failure_and_history(void)
 	assert(!f.live);
 }
 
+static void test_sweep_and_floor_gc(void)
+{
+	struct fixture f = {};
+	struct midr_canonical *s = create(&f, 4, 8);
+	struct midr_instance i = sample(MIDR_NLRI_TYPE_LINK, false);
+	struct midr_canonical_view view;
+	size_t count;
+
+	expect_accept(s, &i, 0, MIDR_CANONICAL_ACCEPTED);
+	drain(s);
+	f.now = 1000000000ULL;
+	assert(midr_canonical_sweep(s, 4, &count) == 0 && count == 1);
+	assert(midr_canonical_lookup(s, &i.object.key, &view) == 0);
+	assert(view.state == MIDR_CANONICAL_FLOOR && !view.current);
+	drain(s);
+
+	/* A newer owner instance is still admissible while the floor is held. */
+	i.object.ls_sequence++;
+	expect_accept(s, &i, 0, MIDR_CANONICAL_ACCEPTED);
+	drain(s);
+	f.now = 2000000000ULL;
+	assert(midr_canonical_sweep(s, 4, &count) == 0 && count == 1);
+	drain(s);
+	f.now = 1999999999ULL;
+	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 0);
+	f.now = 2000000000ULL;
+	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 0);
+	assert(midr_canonical_gc_enable(s, true) == 0);
+	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 1);
+	assert(midr_canonical_identity_count(s) == 0);
+	midr_canonical_destroy(&s);
+	assert(!f.live);
+}
+
+static void test_sweep_fairness(void)
+{
+	struct fixture f = {};
+	struct midr_canonical *s = create(&f, 320, 640);
+	struct midr_instance i = sample(MIDR_NLRI_TYPE_LINK, false);
+	size_t first;
+	size_t second;
+
+	for (unsigned int n = 0; n < 300; n++) {
+		i.object.key.u.link.link_id = n + 1;
+		expect_accept(s, &i, 0, MIDR_CANONICAL_ACCEPTED);
+		drain(s);
+	}
+	f.now = 1000000000ULL;
+	assert(midr_canonical_sweep(s, 256, &first) == 0 && first == 256);
+	drain(s);
+	assert(midr_canonical_sweep(s, 256, &second) == 0 && second == 44);
+	drain(s);
+	assert(midr_canonical_identity_count(s) == 300);
+	midr_canonical_destroy(&s);
+	assert(!f.live);
+}
+
 static void test_codec(void)
 {
 	for (int type = MIDR_NLRI_TYPE_MEMBERSHIP; type <= MIDR_NLRI_TYPE_GROUP_PREFIX; type++)
@@ -441,6 +498,8 @@ int main(void)
 	test_families();
 	test_codec();
 	test_expiry_failure_and_history();
+	test_sweep_and_floor_gc();
+	test_sweep_fairness();
 	puts("MIDR instance/canonical tests passed");
 	return 0;
 }
