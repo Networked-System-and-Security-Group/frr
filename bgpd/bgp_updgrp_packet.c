@@ -712,6 +712,11 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 	while (adv) {
 		const struct prefix *dest_p;
 
+		/* MIDR age is part of the per-instance envelope. Do not batch
+		 * multiple identities under one attribute snapshot. */
+		if (safi == SAFI_MIDR_LS && num_pfx)
+			break;
+
 		assert(adv->dest);
 		dest = adv->dest;
 		dest_p = bgp_dest_get_prefix(dest);
@@ -1026,6 +1031,9 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 
 	while ((adv = bgp_adv_fifo_first(&subgrp->sync->withdraw)) != NULL) {
 		const struct prefix *dest_p;
+
+		if (safi == SAFI_MIDR_LS && num_pfx)
+			break;
 
 		assert(adv->dest);
 		adj = adv->adj;
