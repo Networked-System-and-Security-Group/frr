@@ -26,6 +26,7 @@
 #include "bgpd/bgp_packet.h"	// for bgp_notify_io_invalid...
 #include "bgpd/bgp_trace.h"	// for frrtraces
 #include "bgpd/bgpd.h"		// for peer, BGP_MARKER_SIZE, bgp_master, bm
+#include "bgpd/bgp_midr_sync.h"
 /* clang-format on */
 
 /* forward declarations */
@@ -75,8 +76,10 @@ void bgp_writes_off(struct peer_connection *connection)
 	/* Clear out the write fifo */
 	frr_with_mutex (&connection->io_mtx) {
 		if (connection->obuf != NULL) {
-			while ((s = stream_fifo_pop(connection->obuf)) != NULL)
+			while ((s = stream_fifo_pop(connection->obuf)) != NULL) {
+				midr_sync_packet_dropped(connection, s);
 				stream_free(s);
+			}
 		}
 	}
 
@@ -477,6 +480,7 @@ static uint16_t bgp_write(struct peer_connection *connection)
 			break;
 		}
 
+		midr_sync_packet_written(connection, s);
 		stream_free(s);
 		ostreams[i] = NULL;
 		update_last_write = 1;

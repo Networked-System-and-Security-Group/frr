@@ -25,6 +25,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_debug.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_attr.h"
@@ -390,6 +391,9 @@ static void updgrp_show_adj(struct bgp *bgp, afi_t afi, safi_t safi,
 	update_group_af_walk(bgp, afi, safi, updgrp_show_adj_walkcb, &ctx);
 }
 
+static void midr_sync_snapshot_subgroup(struct update_subgroup *subgrp,
+						 bool begin);
+
 static void subgroup_coalesce_timer(struct event *event)
 {
 	struct update_subgroup *subgrp;
@@ -409,6 +413,13 @@ static void subgroup_coalesce_timer(struct event *event)
 	subgrp->v_coalesce = 0;
 	bgp = SUBGRP_INST(subgrp);
 	subgroup_announce_route(subgrp);
+	if (SUBGRP_AFI(subgrp) == AFI_BGP_LS &&
+	    SUBGRP_SAFI(subgrp) == SAFI_MIDR_LS) {
+		struct peer_af *paf;
+
+		SUBGRP_FOREACH_PEER (subgrp, paf)
+			midr_sync_snapshot_end(PAF_PEER(paf)->connection);
+	}
 	safi = SUBGRP_SAFI(subgrp);
 
 	/* While the announce_route() may kick off the route advertisement timer
@@ -433,6 +444,26 @@ static void subgroup_coalesce_timer(struct event *event)
 			BGP_TIMER_ON(connection->t_routeadv, bgp_routeadv_timer,
 				     0);
 		}
+	}
+}
+
+static void midr_sync_snapshot_subgroup(struct update_subgroup *subgrp,
+						 bool begin)
+{
+	struct peer_af *paf;
+
+	if (!subgrp || SUBGRP_AFI(subgrp) != AFI_BGP_LS ||
+	    SUBGRP_SAFI(subgrp) != SAFI_MIDR_LS)
+		return;
+	SUBGRP_FOREACH_PEER (subgrp, paf) {
+		struct peer_connection *connection = PAF_PEER(paf)->connection;
+
+		if (!midr_sync_snapshot_requested(connection))
+			continue;
+		if (begin)
+			midr_sync_snapshot_begin(connection);
+		else
+			midr_sync_snapshot_end(connection);
 	}
 }
 
@@ -1161,7 +1192,9 @@ void subgroup_announce_all(struct update_subgroup *subgrp)
 
 		frrtrace(2, frr_bgp, upd_announce_all_routes, subgrp->update_group->id, subgrp->id);
 
+		midr_sync_snapshot_subgroup(subgrp, true);
 		subgroup_announce_route(subgrp);
+		midr_sync_snapshot_subgroup(subgrp, false);
 		return;
 	}
 
@@ -1169,6 +1202,7 @@ void subgroup_announce_all(struct update_subgroup *subgrp)
 	 * We should wait for the coalesce timer. Arm the timer if not done.
 	 */
 	if (!subgrp->t_coalesce) {
+		midr_sync_snapshot_subgroup(subgrp, true);
 		event_add_timer_msec(bm->master, subgroup_coalesce_timer,
 				     subgrp, subgrp->v_coalesce,
 				     &subgrp->t_coalesce);

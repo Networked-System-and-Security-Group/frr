@@ -659,6 +659,24 @@ DEFUN(show_midr_ted_detail, show_midr_ted_detail_cmd,
 	return CMD_SUCCESS;
 }
 
+static const char *midr_sync_shutdown_state_name(
+	enum midr_sync_shutdown_state state)
+{
+	switch (state) {
+	case MIDR_SYNC_SHUTDOWN_IDLE:
+		return "IDLE";
+	case MIDR_SYNC_SHUTDOWN_WAITING:
+		return "WAITING";
+	case MIDR_SYNC_SHUTDOWN_COMPLETE:
+		return "COMPLETE";
+	case MIDR_SYNC_SHUTDOWN_DEGRADED:
+		return "DEGRADED";
+	case MIDR_SYNC_SHUTDOWN_GENERATION_FAILED:
+		return "GENERATION_FAILED";
+	}
+	return "UNKNOWN";
+}
+
 DEFUN(show_midr_sync, show_midr_sync_cmd,
       "show midr sync",
       SHOW_STR
@@ -683,6 +701,25 @@ DEFUN(show_midr_sync, show_midr_sync_cmd,
 	vty_out(vty, "  timed-out peers:    %zu\n", status.timed_out_peer_count);
 	vty_out(vty, "  barriers/timeouts:  %" PRIu64 "/%" PRIu64 "\n",
 		status.barrier_count, status.timeout_count);
+	vty_out(vty, "  active sessions:    %zu\n", status.active_session_count);
+	vty_out(vty, "  syncing sessions:   %zu\n", status.syncing_session_count);
+	vty_out(vty, "  remote EoR:         %zu\n", status.eor_received_count);
+	vty_out(vty, "  local EoR written:  %zu\n", status.eor_written_count);
+	vty_out(vty, "  receive drained:    %zu\n", status.receive_drained_count);
+	vty_out(vty, "  resync required:    %zu\n", status.resync_required_count);
+	vty_out(vty, "  snapshots active/done: %zu/%zu\n",
+		status.snapshot_active_count, status.snapshot_completed_count);
+	vty_out(vty, "  shutdown pending:   %zu (%s)\n",
+		status.shutdown_pending_count,
+		status.shutdown_active ? "active" : "idle");
+	vty_out(vty, "  shutdown result:    %s\n",
+		midr_sync_shutdown_state_name(status.shutdown_state));
+	vty_out(vty, "  pending updates:    %zu\n", status.pending_update_count);
+	vty_out(vty, "  pending input:      %zu\n", status.pending_input_count);
+	vty_out(vty, "  session generation: %" PRIu64 "\n",
+		status.next_session_generation);
+	vty_out(vty, "  reconnects/stale:   %" PRIu64 "/%" PRIu64 "\n",
+		status.reconnect_count, status.stale_event_count);
 	return CMD_SUCCESS;
 }
 
