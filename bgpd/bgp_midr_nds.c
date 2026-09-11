@@ -33,6 +33,9 @@
 #include "bgpd/bgp_midr_cl.h"
 #include "bgpd/bgp_midr_pm.h"
 #include "bgpd/bgp_midr_store.h"
+#include "bgpd/bgp_midr_owned.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_debug.h"
 
 /* §8.31 bootstrap 种子持久化参数 */
@@ -47,6 +50,7 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_ENTRY, "MIDR rep directory entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_BOOTSTRAP_ENTRY, "MIDR bootstrap candidate");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_EXCLUDE, "MIDR excluded session");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_LEDGER, "MIDR session ledger entry");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SHUTDOWN_TARGET, "MIDR shutdown target");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ATTACH_DOWN, "MIDR attach down-pending");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SESSION_DOWN, "MIDR session down-pending");
 
@@ -3283,45 +3287,161 @@ static unsigned int midr_shutdown_teardown_sessions(struct bgp *bgp,
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct listnode *node;
-	struct midr_session_ledger_entry *e;
-	struct in_addr *doomed_t, *doomed_rid;
-	bool *doomed_manual;
-	unsigned int cnt, n = 0, i, manual = 0;
+	struct midr_shutdown_target *target;
+	unsigned int n = 0, manual = 0;
 
 	if (manual_out)
 		*manual_out = 0;
-	if (!mi->session_ledger || list_isempty(mi->session_ledger))
+	if (!mi->shutdown_targets || list_isempty(mi->shutdown_targets))
 		return 0;
 
-	cnt = listcount(mi->session_ledger);
-	doomed_t = XCALLOC(MTYPE_TMP, cnt * sizeof(*doomed_t));
-	doomed_rid = XCALLOC(MTYPE_TMP, cnt * sizeof(*doomed_rid));
-	doomed_manual = XCALLOC(MTYPE_TMP, cnt * sizeof(*doomed_manual));
+	for (ALL_LIST_ELEMENTS_RO(mi->shutdown_targets, node, target)) {
+		if (target->has_sync_generation && bgp->midr_info) {
+			struct peer *peer;
+			struct prefix prefix;
+			union sockunion remote;
+			uint64_t generation;
 
-	for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, e)) {
-		doomed_t[n] = e->transport;
-		doomed_rid[n] = e->remote_rid;
-		doomed_manual[n] = (e->reason == MIDR_SESSION_MANUAL);
+			midr_prefix_from_in_addr(&prefix, target->transport);
+			prefix2sockunion(&prefix, &remote);
+			peer = peer_lookup(bgp, &remote);
+			if (!peer || !peer->connection ||
+			    midr_sync_connection_generation(
+				    &bgp->midr_info->ctx, peer->connection,
+				    &generation) != 0 ||
+			    generation != target->sync_generation) {
+				zlog_info("MIDR 退网：跳过已断开或已被新会话替代的目标 %pI4",
+					  &target->transport);
+				continue;
+			}
+		}
+		if (target->reason == MIDR_SESSION_MANUAL) {
+			manual++;
+			zlog_warn("MIDR 退网：拆除运维手配会话 %pI4（台账 MANUAL）——重入后如仍需要，请重敲 midr session",
+				  &target->transport);
+		}
+		midr_ctrl_detach_transport(bgp, target->transport, target->remote_rid,
+					   true, MIDR_STOP_GRACEFUL_SHUTDOWN);
 		n++;
 	}
 
-	for (i = 0; i < n; i++) {
-		if (doomed_manual[i]) {
-			manual++;
-			zlog_warn("MIDR 退网：拆除运维手配会话 %pI4（台账 MANUAL）——重入后如仍需要，请重敲 midr session",
-				  &doomed_t[i]);
-		}
-		midr_ctrl_detach_transport(bgp, doomed_t[i], doomed_rid[i],
-					   true, MIDR_STOP_GRACEFUL_SHUTDOWN);
-	}
-
-	XFREE(MTYPE_TMP, doomed_t);
-	XFREE(MTYPE_TMP, doomed_rid);
-	XFREE(MTYPE_TMP, doomed_manual);
+	list_delete_all_node(mi->shutdown_targets);
 
 	if (manual_out)
 		*manual_out = manual;
 	return n;
+}
+
+static unsigned int midr_shutdown_session_count(struct bgp *bgp,
+						 unsigned int *manual_out)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_shutdown_target *target;
+	struct listnode *node;
+	unsigned int count = 0, manual = 0;
+
+	if (manual_out)
+		*manual_out = 0;
+	if (!bgp || !(mi = bgp->midr_nds_info) || !mi->shutdown_targets)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(mi->shutdown_targets, node, target)) {
+		count++;
+		if (target->reason == MIDR_SESSION_MANUAL)
+			manual++;
+	}
+	if (manual_out)
+		*manual_out = manual;
+	return count;
+}
+
+static void midr_shutdown_targets_clear(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+
+	if (!bgp || !(mi = bgp->midr_nds_info) || !mi->shutdown_targets)
+		return;
+	list_delete_all_node(mi->shutdown_targets);
+}
+
+static bool midr_shutdown_peer_established(struct bgp *bgp,
+						 struct in_addr transport)
+{
+	struct peer *peer;
+	struct listnode *node;
+	struct peer_connection *connection;
+
+	if (!bgp)
+		return false;
+	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
+		connection = peer->connection;
+		if (!connection || connection->status != Established ||
+		    !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] ||
+		    connection->su.sa.sa_family != AF_INET)
+			continue;
+		if (connection->su.sin.sin_addr.s_addr == transport.s_addr)
+			return true;
+	}
+	return false;
+}
+
+static void midr_shutdown_targets_snapshot(struct bgp *bgp)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_session_ledger_entry *entry;
+	struct midr_shutdown_target *target;
+	struct listnode *node;
+
+	if (!bgp || !(mi = bgp->midr_nds_info) || !mi->session_ledger ||
+	    !mi->shutdown_targets)
+		return;
+	midr_shutdown_targets_clear(bgp);
+	for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, entry)) {
+		if (!midr_shutdown_peer_established(bgp, entry->transport))
+			continue;
+		target = XCALLOC(MTYPE_MIDR_SHUTDOWN_TARGET, sizeof(*target));
+		target->transport = entry->transport;
+		target->remote_rid = entry->remote_rid;
+		target->reason = entry->reason;
+		if (bgp->midr_info) {
+			struct prefix prefix;
+			union sockunion remote;
+			struct peer *peer;
+
+			midr_prefix_from_in_addr(&prefix, entry->transport);
+			prefix2sockunion(&prefix, &remote);
+			peer = peer_lookup(bgp, &remote);
+			if (peer && peer->connection &&
+			    midr_sync_connection_generation(
+				    &bgp->midr_info->ctx, peer->connection,
+				    &target->sync_generation) == 0)
+				target->has_sync_generation = true;
+		}
+		listnode_add(mi->shutdown_targets, target);
+	}
+}
+
+static bool midr_shutdown_withdraw_owned(struct bgp *bgp)
+{
+	struct midr_owned_withdraw_result result;
+	struct bgp_midr_nds *mi;
+	int ret;
+
+	if (!bgp || !bgp->midr_info || !(mi = bgp->midr_nds_info))
+		return true;
+	if (mi->shutdown_owned_complete)
+		return true;
+	ret = midr_owned_shutdown_withdraw(&bgp->midr_info->ctx, &result);
+	if (ret) {
+		midr_sync_shutdown_generation_failed(&bgp->midr_info->ctx);
+		zlog_warn("MIDR 退网：owner 撤销生成未完成 ret=%d attempted=%zu completed=%zu failed=%zu，等待重试",
+			  ret, result.attempted, result.completed, result.failed);
+		return false;
+	}
+	mi->shutdown_owned_complete = true;
+	midr_sync_shutdown_announce_complete(&bgp->midr_info->ctx);
+	zlog_info("MIDR 退网：owner 撤销已全部进入 canonical RIB（本轮 %zu 条）",
+		  result.completed);
+	return true;
 }
 
 /*
@@ -3334,13 +3454,34 @@ static void midr_shutdown_teardown_cb(struct event *t)
 {
 	struct bgp *bgp = EVENT_ARG(t);
 	unsigned int n, manual;
+	struct bgp_midr_nds *mi;
+	time_t now;
 
 	if (!bgp || !bgp->midr_nds_info)
 		return;
+	mi = bgp->midr_nds_info;
+	mi->t_shutdown_teardown = NULL;
+	now = time(NULL);
+	(void)midr_shutdown_withdraw_owned(bgp);
+	if (bgp->midr_info &&
+	    !midr_sync_shutdown_ready(&bgp->midr_info->ctx) &&
+	    now < mi->shutdown_teardown_started + MIDR_SHUTDOWN_TEARDOWN_DELAY) {
+		event_add_timer_msec(bm->master, midr_shutdown_teardown_cb, bgp,
+				     MIDR_SHUTDOWN_TEARDOWN_POLL_MSEC,
+				     &mi->t_shutdown_teardown);
+		return;
+	}
+	if (bgp->midr_info && !midr_sync_shutdown_ready(&bgp->midr_info->ctx))
+		midr_sync_shutdown_expired(&bgp->midr_info->ctx);
+	if (bgp->midr_info &&
+	    midr_sync_shutdown_degraded(&bgp->midr_info->ctx))
+		zlog_warn("MIDR 退网：撤销报文未在期限内全部写出，进入 DEGRADED，未交付部分依赖对象老化和下次重同步");
 
 	n = midr_shutdown_teardown_sessions(bgp, &manual);
-	zlog_info("MIDR 退网：延时 %d 秒到，拆除会话 %u 条（撤销已先行发出）",
-		  MIDR_SHUTDOWN_TEARDOWN_DELAY, n);
+	if (bgp->midr_info)
+		midr_sync_shutdown_finish(&bgp->midr_info->ctx);
+	zlog_info("MIDR 退网：撤销写出等待结束，拆除会话 %u 条（手配 %u 条）",
+		  n, manual);
 }
 
 unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
@@ -3360,12 +3501,17 @@ unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
 	 * NODE_CHANGE、拆会话会引来重建。
 	 */
 	mi->shutdown = true;
+	mi->shutdown_owned_complete = false;
+	if (bgp->midr_info)
+		midr_sync_shutdown_begin(&bgp->midr_info->ctx);
+	midr_shutdown_targets_snapshot(bgp);
 
 	/*
 	 * ② 撤自身通告。LEAVE 分支在 midr_nds_report_node() 里排在 shutdown 抑制
 	 * **之前**，所以先置位不会把自己这发 withdraw 吞掉（读码核实，退网专题答 2）。
 	 */
 	midr_nds_report_node(bgp, MIDR_ORIGIN_LEAVE);
+	(void)midr_shutdown_withdraw_owned(bgp);
 
 	/*
 	 * ③ 拆会话：**延后 MIDR_SHUTDOWN_TEARDOWN_DELAY 秒**（本函数只排定时器，
@@ -3402,7 +3548,11 @@ unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
 	 *                           MIDR_SHUTDOWN_TEARDOWN_DELAY, &mi->t_shutdown_teardown);`
 	 * 定时器回调、exit 的补拆、finish 的取消都留着没删，改一行即可。
 	 */
-	n = midr_shutdown_teardown_sessions(bgp, &manual);
+	n = midr_shutdown_session_count(bgp, &manual);
+	mi->shutdown_teardown_started = time(NULL);
+	event_add_timer_msec(bm->master, midr_shutdown_teardown_cb, bgp,
+			     MIDR_SHUTDOWN_TEARDOWN_POLL_MSEC,
+			     &mi->t_shutdown_teardown);
 
 	/*
 	 * ④ 全量停探（I-2）。不逐边配对：join 期对群代表/成员起的探测、锚点评估对
@@ -3500,9 +3650,16 @@ bool midr_nds_shutdown_exit(struct bgp *bgp)
 		torn = midr_shutdown_teardown_sessions(bgp, &manual);
 		zlog_info("MIDR 退网：延时未到即重上线，当场补拆会话 %u 条", torn);
 	}
+	if (bgp->midr_info) {
+		midr_sync_shutdown_cancel(&bgp->midr_info->ctx);
+	}
+	mi->shutdown_owned_complete = false;
 
-	/* ① 清位：两道守卫随之解除，keepalive 下一拍自动恢复重发。 */
+	/* ① 清位：解除 originate 守卫后再恢复 owner identity。 */
 	mi->shutdown = false;
+	if (bgp->midr_info)
+		midr_owned_identity_start(&bgp->midr_info->ctx,
+					  bgp->router_id.s_addr);
 
 	/* ② 重新通告自己（群号 = 退网时回落的配置值）。 */
 	midr_nds_report_node(bgp, MIDR_ORIGIN_REJOIN);
@@ -4829,6 +4986,7 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	mi->bootstrap_list = list_new(); /* §8.32 候选引导节点清单 */
 	mi->session_blacklist = list_new(); /* 会话排除名单 */
 	mi->session_ledger = list_new();    /* 会话台账（结论 20） */
+	mi->shutdown_targets = list_new();  /* 退网开始时固定的邻居集合 */
 	mi->attach_down_pending = list_new(); /* 钩子 (b) 待处理掉线（D4） */
 	mi->session_down_pending = list_new(); /* 件④ 掉沿清账待办 */
 	mi->remote_withdrawn = list_new();    /* 件③ 虚报观察探针 */
@@ -4930,6 +5088,8 @@ void bgp_midr_nds_finish(struct bgp *bgp)
 			XFREE(MTYPE_MIDR_SESSION_LEDGER, e);
 		list_delete(&mi->session_ledger);
 	}
+	if (mi->shutdown_targets)
+		list_delete(&mi->shutdown_targets);
 	if (mi->attach_down_pending) { /* 钩子 (b) 待处理掉线（D4） */
 		struct listnode *node, *nnode;
 		struct in_addr *a;

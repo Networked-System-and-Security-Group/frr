@@ -105,8 +105,8 @@ int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		}
 
 		if (key.originator_node_id == peer->bgp->router_id.s_addr) {
-			ret = midr_owned_observe_self_sequence_number(
-				ctx, instance.object.ls_sequence);
+			ret = midr_owned_observe_self_instance(
+				ctx, &key, instance.object.ls_sequence);
 			goto done;
 		}
 

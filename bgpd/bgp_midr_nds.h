@@ -112,6 +112,7 @@
  * 改大于 6 会让"会话拆净"判据假失败。
  */
 #define MIDR_SHUTDOWN_TEARDOWN_DELAY 5
+#define MIDR_SHUTDOWN_TEARDOWN_POLL_MSEC 100U
 
 /* ---------------------------------------------------------------------------
  * §8.21 指标变化门控（去抖）阈值 —— ⚠ 全部为粗定值，待真实网络跑出数据后校准。
@@ -496,6 +497,15 @@ struct midr_session_ledger_entry {
 	time_t down_since;
 };
 
+/* Fixed set of established sessions captured at graceful-shutdown start. */
+struct midr_shutdown_target {
+	struct in_addr transport;
+	struct in_addr remote_rid;
+	enum midr_session_reason reason;
+	uint64_t sync_generation;
+	bool has_sync_generation;
+};
+
 /* §2.7 MIDR instance state, hung off bgp->midr_nds_info */
 struct bgp_midr_nds {
 	struct bgp *bgp; /* back-pointer */
@@ -567,6 +577,9 @@ struct bgp_midr_nds {
 	struct event *t_attach_reap;	  /* 钩子 (b) 掉线的"下一拍"处理（D4） */
 	struct event *t_session_reap;	  /* 掉沿清账的"下一拍"处理（件④） */
 	struct event *t_shutdown_teardown; /* 退网延时拆会话（见 MIDR_SHUTDOWN_TEARDOWN_DELAY） */
+	time_t shutdown_teardown_started;
+	struct list *shutdown_targets; /* list of struct midr_shutdown_target */
+	bool shutdown_owned_complete;
 	/*
 	 * 钩子 (b) 记下的待处理掉线 transport（struct in_addr *；同时掉线最多 K 条）。
 	 * 为什么不在钩子里当场拆：FSM 喊完 peer_status_changed 之后还要回来摸这条
