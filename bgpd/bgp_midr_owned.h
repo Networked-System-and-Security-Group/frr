@@ -36,6 +36,13 @@ struct midr_owned_summary {
 	uint64_t fightbacks;
 };
 
+struct midr_owned_withdraw_result {
+	size_t attempted;
+	size_t completed;
+	size_t failed;
+	int first_error;
+};
+
 extern int midr_owned_init(struct midr_context *ctx);
 extern void midr_owned_finish(struct midr_context *ctx);
 extern void midr_owned_reconcile(struct midr_context *ctx);
@@ -43,10 +50,16 @@ extern void midr_owned_prefix_reconcile(struct midr_context *ctx);
 extern void midr_owned_group_reconcile(struct midr_context *ctx);
 extern void midr_owned_input_state_changed(struct midr_context *ctx);
 extern void midr_owned_identity_withdraw(struct midr_context *ctx);
+extern int midr_owned_shutdown_withdraw(
+	struct midr_context *ctx, struct midr_owned_withdraw_result *result);
 extern void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id);
 
 extern int midr_owned_observe_self_sequence(struct midr_context *ctx,
 					    const struct midr_ls_object *object);
+extern int midr_owned_observe_self_instance(
+					    struct midr_context *ctx,
+					    const struct midr_ls_object_key *key,
+					    uint64_t sequence);
 extern int midr_owned_observe_self_sequence_number(struct midr_context *ctx,
 						   uint64_t sequence);
 extern int midr_owned_link_metadata_get(struct midr_context *ctx,
