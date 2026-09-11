@@ -308,6 +308,30 @@ static void test_persistence_failure_and_fightback(void)
 	assert(summary.fightbacks == 1);
 }
 
+static void test_restart_observes_self_instance_before_allocator_ready(void)
+{
+	struct midr_ls_object_key membership_key = {
+		.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+		.originator_node_id = bgp->router_id.s_addr,
+	};
+	struct midr_owned_summary summary;
+	struct midr_ls_object selected;
+	uint64_t observed = (UINT64_C(99) << 32) | 7;
+
+	sequence_store.fail_save = true;
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(!summary.ready);
+
+	/* A valid self-originated old instance is accepted as version evidence,
+	 * but its payload is never installed as a local fact. */
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	sequence_store.fail_save = false;
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	midr_owned_reconcile(ctx);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+}
+
 static void test_owned_lifecycle_and_validation(void)
 {
 	struct midr_ls_object_key membership_key = {
@@ -502,6 +526,7 @@ int main(void)
 
 	test_origination_suppression_and_withdraw();
 	test_persistence_failure_and_fightback();
+	test_restart_observes_self_instance_before_allocator_ready();
 	test_owned_lifecycle_and_validation();
 	assert(midr_owned_init(ctx) == -EALREADY);
 	midr_owned_finish(ctx);

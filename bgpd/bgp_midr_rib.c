@@ -37,6 +37,8 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_ADVERTISEMENT, "MIDR peer advertisement");
 struct midr_rib_advertisement {
 	struct midr_rib_advertisement *next;
 	struct peer *peer;
+	uint64_t sequence;
+	enum midr_instance_state state;
 };
 
 struct midr_rib_identity {
@@ -139,17 +141,36 @@ static bool midr_rib_advertisement_has(
 	return false;
 }
 
-static int midr_rib_advertisement_add(struct midr_rib_identity *identity,
-					      struct peer *peer)
+static struct midr_rib_advertisement *midr_rib_advertisement_lookup(
+	struct midr_rib_identity *identity, const struct peer *peer)
 {
 	struct midr_rib_advertisement *advertisement;
 
-	if (midr_rib_advertisement_has(identity, peer))
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		if (advertisement->peer == peer)
+			return advertisement;
+	return NULL;
+}
+
+static int midr_rib_advertisement_update(
+	struct midr_rib_identity *identity, struct peer *peer,
+	const struct midr_instance *instance)
+{
+	struct midr_rib_advertisement *advertisement;
+
+	advertisement = midr_rib_advertisement_lookup(identity, peer);
+	if (advertisement) {
+		advertisement->sequence = instance->object.ls_sequence;
+		advertisement->state = instance->state;
 		return 0;
+	}
 	advertisement = XCALLOC(MTYPE_MIDR_RIB_ADVERTISEMENT, sizeof(*advertisement));
 	if (!advertisement)
 		return -ENOMEM;
 	advertisement->peer = peer;
+	advertisement->sequence = instance->object.ls_sequence;
+	advertisement->state = instance->state;
 	advertisement->next = identity->advertisements;
 	identity->advertisements = advertisement;
 	return 0;
@@ -181,6 +202,28 @@ bool midr_rib_peer_advertisement_has(
 		return false;
 	identity = midr_rib_identity_lookup(ctx->rib_store, key);
 	return identity && midr_rib_advertisement_has(identity, peer);
+}
+
+bool midr_rib_peer_advertisement_current(
+	struct midr_context *ctx, const struct midr_instance *instance,
+	const struct peer *peer)
+{
+	struct midr_rib_advertisement *advertisement;
+	struct midr_rib_identity *identity;
+
+	if (!ctx || !ctx->rib_store || !instance || !peer)
+		return false;
+	identity = midr_rib_identity_lookup(ctx->rib_store,
+					    &instance->object.key);
+	if (!identity)
+		return false;
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		if (advertisement->peer == peer)
+			return advertisement->sequence ==
+				       instance->object.ls_sequence &&
+			       advertisement->state == instance->state;
+	return false;
 }
 
 int midr_rib_init(struct midr_context *ctx)
@@ -533,6 +576,9 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	enum midr_canonical_result result;
 	bool event_pending;
 	bool advertisement_was_present;
+	uint64_t old_advertisement_sequence = 0;
+	enum midr_instance_state old_advertisement_state = 0;
+	struct midr_rib_advertisement *advertisement;
 	int ret;
 
 	if (!ctx || !ctx->bgp || !ctx->rib_store)
@@ -554,9 +600,13 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	identity = midr_rib_identity_get(ctx, &instance->object.key, &dest);
 	if (!identity)
 		return -ENOSPC;
-	advertisement_was_present =
-		midr_rib_advertisement_has(identity, peer);
-	ret = midr_rib_advertisement_add(identity, peer);
+	advertisement = midr_rib_advertisement_lookup(identity, peer);
+	advertisement_was_present = advertisement != NULL;
+	if (advertisement) {
+		old_advertisement_sequence = advertisement->sequence;
+		old_advertisement_state = advertisement->state;
+	}
+	ret = midr_rib_advertisement_update(identity, peer, instance);
 	if (ret) {
 		bgp_dest_unlock_node(dest);
 		return ret;
@@ -567,6 +617,11 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	if (!new_attr) {
 		if (!advertisement_was_present)
 			midr_rib_advertisement_remove(identity, peer);
+		else {
+			advertisement = midr_rib_advertisement_lookup(identity, peer);
+			advertisement->sequence = old_advertisement_sequence;
+			advertisement->state = old_advertisement_state;
+		}
 		bgp_dest_unlock_node(dest);
 		return -ENOMEM;
 	}
@@ -576,6 +631,11 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 		bgp_attr_unintern(&new_attr);
 		if (!advertisement_was_present)
 			midr_rib_advertisement_remove(identity, peer);
+		else {
+			advertisement = midr_rib_advertisement_lookup(identity, peer);
+			advertisement->sequence = old_advertisement_sequence;
+			advertisement->state = old_advertisement_state;
+		}
 		bgp_dest_unlock_node(dest);
 		return ret;
 	}

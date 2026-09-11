@@ -181,6 +181,38 @@ static void test_advertisement_relationship(void)
 	assert(midr_rib_peer_withdraw(ctx, same_group, &link.object.key) == 0);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+
+	/* A newer correction is sent even when this peer advertised an older
+	 * version. Once it advertises the current version, reflection stops. */
+	link.object.ls_sequence++;
+	install(relay, &link);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	ref = selected(&link.object.key);
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+	install(same_group, &link);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+}
+
+static void test_withdrawn_global_flood(void)
+{
+	struct peer *source = test_peer("10.0.0.7");
+	struct peer *target = test_peer("10.0.0.8");
+	struct midr_instance object = membership(source->remote_id.s_addr, 30, 9);
+	struct selected_ref ref;
+
+	install(source, &object);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	object.state = MIDR_INSTANCE_WITHDRAWN;
+	object.object.ls_sequence++;
+	memset(&object.object.payload, 0, sizeof(object.object.payload));
+	install(source, &object);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	ref = selected(&object.object.key);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, source));
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target));
+
+	install(target, &object);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target));
 }
 
 static void test_scope_gate(void)
@@ -225,6 +257,7 @@ int main(void)
 
 	test_advertisement_relationship();
 	test_scope_gate();
+	test_withdrawn_global_flood();
 	puts("MIDR scope tests passed");
 	return 0;
 }

@@ -741,19 +741,27 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 	state = ctx->lsdb_store->current;
 	key = midr_rib_dest_key(dest);
 	if (!state || !key || midr_rib_path_instance(ctx, dest, path,
-							&instance, NULL) != 0 ||
-	    instance.state != MIDR_INSTANCE_ACTIVE)
+							&instance, NULL) != 0)
+		return false;
+
+	/* A peer that already supplied this exact instance does not need it
+	 * reflected back. A newer correction must still be sent even if that peer
+	 * previously advertised an older version of the same identity. */
+	if (midr_rib_peer_advertisement_current(ctx, &instance, target))
+		return false;
+
+	/* The current P4 policy floods authoritative WITHDRAWN instances to every
+	 * MIDR peer. They are not usable LSDB entries, so scope cannot be recovered
+	 * from the active view. The final withdrawal scope remains FOLLOW-11-A. */
+	if (instance.state == MIDR_INSTANCE_WITHDRAWN)
+		return true;
+	if (instance.state != MIDR_INSTANCE_ACTIVE)
 		return false;
 	entry = midr_lsdb_state_entry(state, key);
 	if (!entry || !entry->usable || entry->selected != path ||
 	    entry->scope == MIDR_LSDB_SCOPE_LOCAL_ONLY)
 		return false;
 
-	/* A peer that has advertised this identity must not receive it back as a
-	 * normal flood.  The relationship is independent of which peer currently
-	 * supplies the canonical instance. */
-	if (midr_rib_peer_advertisement_has(ctx, key, target))
-		return false;
 	target_membership = midr_lsdb_membership_lookup(state, target->remote_id.s_addr);
 	if (!target_membership)
 		return false;
@@ -1067,6 +1075,7 @@ static int midr_lsdb_process(struct midr_lsdb_store *store)
 	if (changed)
 		midr_owned_group_reconcile(store->ctx);
 	store->last_error = 0;
+	midr_sync_derivation_complete(store->ctx);
 	return 0;
 
 fail:

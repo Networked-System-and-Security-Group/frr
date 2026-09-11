@@ -59,6 +59,9 @@ extern int midr_rib_peer_withdraw(
 extern bool midr_rib_peer_advertisement_has(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	const struct peer *peer);
+extern bool midr_rib_peer_advertisement_current(
+	struct midr_context *ctx, const struct midr_instance *instance,
+	const struct peer *peer);
 extern int midr_rib_path_instance(
 	struct midr_context *ctx, const struct bgp_dest *dest,
 	const struct bgp_path_info *path, struct midr_instance *instance,
