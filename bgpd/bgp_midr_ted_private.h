@@ -25,6 +25,7 @@ struct midr_ted_link_input {
 
 struct midr_ted_status {
 	bool ready;
+	bool derivation_pending;
 	uint64_t generation;
 	uint64_t sync_reason_flags;
 	size_t consumer_count;

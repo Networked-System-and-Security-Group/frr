@@ -70,7 +70,12 @@ struct midr_sync_status {
 extern int midr_sync_init(struct midr_context *ctx);
 extern void midr_sync_finish(struct midr_context *ctx);
 extern bool midr_sync_view_ready(struct midr_context *ctx, bool local_ready,
-				 uint64_t *reason_flags);
+					 uint64_t *reason_flags);
+/* True when all current peers have supplied usable input or timed out.
+ * This is the precondition for deriving a candidate; EoR completion uses
+ * the stricter receive-drained check in the implementation. */
+extern bool midr_sync_view_can_derive(struct midr_context *ctx,
+					      uint64_t *reason_flags);
 extern bool midr_sync_local_ready(const struct midr_context *ctx);
 extern void midr_sync_peer_status_changed(struct midr_context *ctx, struct peer *peer);
 extern void midr_sync_peer_eor(struct midr_context *ctx, struct peer *peer);

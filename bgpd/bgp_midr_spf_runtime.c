@@ -44,6 +44,12 @@ static void midr_spf_recompute_cb(struct event *event)
 	runtime->t_recompute = NULL;
 	ret = midr_ted_snapshot_get(runtime->ctx, &snapshot);
 	if (ret == -EAGAIN) {
+		old = runtime->cached;
+		runtime->cached = NULL;
+		midr_spf_install_results(runtime->ctx, old, NULL);
+		midr_spf_results_release(&old);
+		runtime->pending_generation = 0;
+		runtime->pending_change_flags = MIDR_TED_CHANGE_NONE;
 		runtime->last_error = 0;
 		return;
 	}

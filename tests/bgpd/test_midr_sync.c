@@ -83,9 +83,12 @@ static void test_eor_peer_down_timeout_and_late_eor(void)
 	struct midr_sync_status status;
 	uint64_t reasons = 0;
 
+	/* Peer establishment can precede local input readiness. */
+	midr_sync_peer_status_changed(ctx, peer);
 	assert(!midr_sync_view_ready(ctx, true, &reasons));
 	assert(midr_sync_status_get(ctx, &status) == 0);
 	assert(status.state == MIDR_SYNC_REMOTE_WAIT);
+	assert(status.initial_peer_count == 1);
 	assert(status.waiting_peer_count == 1);
 	midr_sync_peer_eor(ctx, peer);
 	assert(midr_sync_status_get(ctx, &status) == 0);
@@ -292,8 +295,11 @@ static void test_eor_waits_for_admission_and_derivation(void)
 	assert(status.waiting_peer_count == 1);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_sync_status_get(ctx, &status) == 0);
-	assert(status.waiting_peer_count == 0);
-	assert(status.receive_drained_count == 1);
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(status.waiting_peer_count == 1);
+	assert(status.receive_drained_count == 0);
+	assert(!lsdb.ready);
+	assert(!lsdb.derivation_pending);
 
 	midr_sync_test_session_down(ctx, peer->connection);
 	midr_sync_test_session_start(ctx, peer, peer->connection);
@@ -399,9 +405,13 @@ int main(void)
 	ctx = &bgp->midr_info->ctx;
 
 	test_no_peer_and_configuration();
+	/* The following cases exercise the sync state machine without the
+	 * LSDB/TED readiness gate. Full integration coverage follows below. */
+	midr_lsdb_finish(ctx);
 	test_eor_peer_down_timeout_and_late_eor();
 	test_session_generation_and_packet_lifecycle();
 	test_delayed_completion_reuse_and_destroy();
+	assert(midr_lsdb_init(ctx) == 0);
 	test_eor_waits_for_admission_and_derivation();
 	test_writer_teardown_race();
 	test_shutdown_result_is_bounded_and_retained();

@@ -44,6 +44,9 @@ struct midr_lsdb_summary {
 	uint64_t commit_count;
 	uint64_t failure_count;
 	int last_error;
+	bool ready;
+	bool derivation_pending;
+	uint32_t retry_delay_msec;
 };
 
 struct midr_lsdb_group_prefix_candidate {
@@ -84,6 +87,8 @@ extern int midr_lsdb_local_group_prefix_foreach(struct midr_context *ctx,
 						midr_lsdb_group_prefix_cb cb, void *arg);
 
 extern int midr_lsdb_test_process(struct midr_context *ctx);
+extern int midr_lsdb_test_fire_commit(struct midr_context *ctx);
+extern bool midr_lsdb_test_retry_pending(struct midr_context *ctx);
 extern void midr_lsdb_test_fail_next_prepare(struct midr_context *ctx);
 
 #endif /* _FRR_BGP_MIDR_LSDB_H */

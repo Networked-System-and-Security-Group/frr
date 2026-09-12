@@ -140,11 +140,19 @@ static bool midr_sync_receive_drained(struct midr_sync_session *session)
 {
 	struct midr_lsdb_summary summary;
 
+	if (!session->store->ctx->lsdb_store)
+		return session->remote_eor && !session->pending_input &&
+		       !session->needs_resync;
+	if (midr_lsdb_summary_get(session->store->ctx, &summary) != 0)
+		return false;
+
 	return session->remote_eor && !session->pending_input &&
 	       !session->needs_resync &&
-	       midr_lsdb_summary_get(session->store->ctx, &summary) == 0 &&
-	       !summary.dirty_count && !summary.last_error;
+	       summary.ready && !summary.dirty_count &&
+	       !summary.derivation_pending && !summary.last_error;
 }
+
+static void midr_sync_start(struct midr_sync_store *store);
 
 static void midr_sync_session_packet_free(void *arg)
 {
@@ -367,10 +375,60 @@ static size_t midr_sync_waiting_count(const struct midr_sync_store *store)
 	return count;
 }
 
+bool midr_sync_view_can_derive(struct midr_context *ctx,
+				       uint64_t *reason_flags)
+{
+	struct midr_sync_store *store;
+	struct listnode *node;
+	struct midr_sync_peer *entry;
+	struct midr_sync_session *session;
+
+	if (!ctx || !(store = ctx->sync_store))
+		return false;
+	if (!store->local_ready) {
+		store->local_ready = true;
+		midr_sync_start(store);
+	}
+	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {
+		if (entry->timed_out) {
+			if (reason_flags)
+				*reason_flags |= MIDR_TED_SYNC_REASON_EOR_TIMEOUT;
+			continue;
+		}
+		if (!entry->waiting)
+			continue;
+		session = NULL;
+		for (struct listnode *session_node = listhead(store->sessions);
+		     session_node; session_node = listnextnode(session_node)) {
+			struct midr_sync_session *candidate = listgetdata(session_node);
+
+			if (candidate->peer == entry->peer &&
+			    candidate->generation == entry->generation &&
+			    candidate->state != MIDR_SYNC_SESSION_DOWN) {
+				session = candidate;
+				break;
+			}
+		}
+		if (!session || !session->remote_eor || session->pending_input ||
+		    session->needs_resync)
+			return false;
+	}
+	return true;
+}
+
 static void midr_sync_complete_if_ready(struct midr_sync_store *store)
 {
 	if (store->state != MIDR_SYNC_REMOTE_WAIT || midr_sync_waiting_count(store))
 		return;
+	if (store->ctx->lsdb_store) {
+		struct midr_lsdb_summary summary;
+
+		if (midr_lsdb_summary_get(store->ctx, &summary) != 0 ||
+		    !summary.ready ||
+		    summary.dirty_count || summary.derivation_pending ||
+		    summary.last_error)
+			return;
+	}
 	store->state = MIDR_SYNC_READY;
 	event_cancel(&store->t_timeout);
 	midr_lsdb_sync_changed(store->ctx);
@@ -392,6 +450,10 @@ static void midr_sync_timeout_event(struct event *event)
 		entry->timed_out = true;
 	}
 	store->timeout_count++;
+	/* A timeout is a usable initial-sync outcome.  Wake derivation even
+	 * when no prior READY TED exists; otherwise the first candidate can
+	 * remain NOT_READY indefinitely. */
+	midr_lsdb_sync_changed(store->ctx);
 	midr_sync_complete_if_ready(store);
 }
 
@@ -418,11 +480,12 @@ static void midr_sync_start(struct midr_sync_store *store)
 		    !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS])
 			continue;
 		session = midr_sync_session_create(store, peer, peer->connection);
-		entry = XCALLOC(MTYPE_MIDR_SYNC_PEER, sizeof(*entry));
-		entry->peer = peer;
+		entry = midr_sync_peer_ensure(store, peer, session->generation);
+		if (!entry)
+			continue;
 		entry->generation = session->generation;
 		entry->waiting = !midr_sync_receive_drained(session);
-		listnode_add(store->peers, entry);
+		entry->timed_out = false;
 	}
 	if (!midr_sync_waiting_count(store)) {
 		store->state = MIDR_SYNC_READY;
@@ -557,6 +620,7 @@ void midr_sync_peer_eor_connection(struct midr_context *ctx,
 	struct midr_sync_store *store;
 	struct midr_sync_peer *entry;
 	struct midr_sync_session *session;
+	bool first_eor;
 
 	if (!ctx || !ctx->sync_store || !connection)
 		return;
@@ -576,8 +640,12 @@ void midr_sync_peer_eor_connection(struct midr_context *ctx,
 		}
 	}
 	if (session) {
-		if (!session->remote_eor)
+		first_eor = !session->remote_eor;
+		if (first_eor)
 			session->remote_eor = true;
+		if (first_eor)
+			/* An empty snapshot has no route hook to wake LSDB. */
+			midr_lsdb_sync_changed(ctx);
 		if (session->local_eor_written && midr_sync_receive_drained(session))
 			session->state = MIDR_SYNC_SESSION_READY;
 	}

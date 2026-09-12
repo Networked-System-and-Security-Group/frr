@@ -19,8 +19,6 @@
 struct zebra_privs_t bgpd_privs = {};
 struct event_loop *master;
 static struct bgp_master test_bm;
-struct bgp_master *bm = &test_bm;
-struct zclient *bgp_zclient;
 
 static uint32_t node_id(const char *text)
 {
@@ -597,6 +595,7 @@ static void test_runtime_recompute_and_cache_lifetime(void)
 
 	master = event_master_create("MIDR SPF test");
 	test_bm.master = master;
+	bm = &test_bm;
 	assert(midr_ted_context_init(&ctx) == 0);
 	assert(midr_spf_context_init(&ctx) == 0);
 

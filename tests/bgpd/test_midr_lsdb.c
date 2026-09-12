@@ -21,6 +21,7 @@
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
@@ -614,17 +615,89 @@ static void test_pending_activation_and_four_objects(void)
 	assert(!midr_ted_path_consumer_stub_result_is_current(ctx, &path_consumer,
 							      held->generation));
 
+	/* A reconnect alone must not invalidate an already usable TED. */
+	{
+		struct midr_sync_status sync_status;
+		uint64_t reasons = 0;
+
+		remote_peer->connection->status = Established;
+		remote_peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] = 1;
+		assert(!midr_sync_view_ready(ctx, false, &reasons));
+		assert(!midr_sync_view_ready(ctx, true, &reasons));
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		assert(sync_status.waiting_peer_count == 1);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+
+		remote_peer->connection->status = Idle;
+		midr_sync_peer_status_changed(ctx, remote_peer);
+		remote_peer->connection->status = Established;
+		midr_sync_peer_status_changed(ctx, remote_peer);
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		assert(sync_status.waiting_peer_count == 1);
+		assert(sync_status.next_session_generation != 0);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+
+		midr_sync_peer_eor(ctx, remote_peer);
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		assert(sync_status.waiting_peer_count == 0);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+	}
+
 	membership = remote_membership(3, 30);
 	install_remote(&membership);
 	midr_lsdb_test_fail_next_prepare(ctx);
-	assert(midr_lsdb_test_process(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.ready);
+	assert(lsdb.derivation_pending);
+	assert(lsdb.retry_delay_msec == 1000);
+	assert(lsdb.dirty_count > 0);
 	assert(midr_ted_status_get(ctx, &status) == 0);
 	assert(status.generation == ready_generation);
+	assert(status.ready);
+	assert(status.derivation_pending);
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
 	assert(remote.nodes[0].group_id == 20);
 	midr_remote_view_snapshot_release(ctx, &remote);
 
-	assert(midr_lsdb_test_process(ctx) == 0);
+	/* A second consecutive failure backs off without changing the
+	 * committed LSDB/TED state. */
+	link.ls_sequence = 3;
+	install_remote(&link);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	midr_lsdb_test_fail_next_prepare(ctx);
+	assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.retry_delay_msec == 2000);
+	assert(lsdb.failure_count >= 2);
+	{
+		static const uint32_t retry_delays[] = {
+			4000, 8000, 16000, 32000, 60000,
+		};
+
+		for (size_t i = 0; i < array_size(retry_delays); i++) {
+			midr_lsdb_test_fail_next_prepare(ctx);
+			assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+			assert(midr_lsdb_test_retry_pending(ctx));
+			assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+			assert(lsdb.retry_delay_msec == retry_delays[i]);
+		}
+	}
+
+	assert(midr_lsdb_test_fire_commit(ctx) == 0);
+	assert(!midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(!lsdb.derivation_pending);
+	assert(lsdb.retry_delay_msec == 0);
+	assert(lsdb.last_error == 0);
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
 	assert(remote.nodes[0].group_id == 30);
 	midr_remote_view_snapshot_release(ctx, &remote);
@@ -712,8 +785,9 @@ static void test_out_of_sync_reason(void)
 	assert(midr_topology_link_upsert(ctx, &link) == -ENOSPC);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_ted_status_get(ctx, &status) == 0);
-	assert(status.ready);
+	assert(!status.ready);
 	assert(status.sync_reason_flags == MIDR_TED_SYNC_REASON_RESYNC_FAILED);
+	assert(midr_ted_snapshot_get(ctx, &snapshot) == -EAGAIN);
 }
 
 int main(void)

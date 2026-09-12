@@ -491,6 +491,8 @@ DEFUN(show_midr_ted_summary, show_midr_ted_summary_cmd,
 
 	vty_out(vty, "MIDR TED summary:\n");
 	vty_out(vty, "  state:                 %s\n", status.ready ? "READY" : "NOT_READY");
+	vty_out(vty, "  source status:         %s\n",
+		status.derivation_pending ? "DERIVATION_PENDING" : "CURRENT");
 	vty_out(vty, "  generation:            %" PRIu64 "\n", status.generation);
 	vty_out(vty, "  sync reasons:          ");
 	midr_vty_show_sync_reasons(vty, status.sync_reason_flags);
