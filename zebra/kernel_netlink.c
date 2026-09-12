@@ -1478,6 +1478,8 @@ static enum netlink_msg_status nl_put_msg(struct nl_batch *bth,
 		return FRR_NETLINK_ERROR;
 
 	case DPLANE_OP_GRE_SET:
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
 		return netlink_put_gre_set_msg(bth, ctx);
 
 	case DPLANE_OP_INTF_ADDR_ADD:

@@ -4125,6 +4125,103 @@ static inline void zebra_gre_source_set(ZAPI_HANDLER_ARGS)
 	return;
 }
 
+/*
+ * Create a GRE virtual interface on behalf of a control-plane client
+ * (e.g. MIDR in bgpd).  See zclient_send_gre_add() in lib/zclient.c for the
+ * wire format of the request.
+ */
+static inline void zebra_gre_add(ZAPI_HANDLER_ARGS)
+{
+	struct stream *s = msg;
+	struct zebra_l2info_gre gre_info = {};
+	char ifname[IFNAMSIZ] = {};
+	uint32_t link_ifindex, ikey, okey, mtu;
+	uint16_t encap_flags;
+	uint8_t family;
+
+	STREAM_GET(ifname, s, IFNAMSIZ);
+
+	STREAM_GETC(s, family);
+	if (family == AF_INET) {
+		SET_IPADDR_V4(&gre_info.vtep_ip);
+		STREAM_GET(&gre_info.vtep_ip.ipaddr_v4, s,
+			   sizeof(struct in_addr));
+	} else if (family == AF_INET6) {
+		SET_IPADDR_V6(&gre_info.vtep_ip);
+		STREAM_GET(&gre_info.vtep_ip.ipaddr_v6, s,
+			   sizeof(struct in6_addr));
+	} else
+		goto stream_failure;
+
+	STREAM_GETC(s, family);
+	if (family == AF_INET) {
+		SET_IPADDR_V4(&gre_info.vtep_ip_remote);
+		STREAM_GET(&gre_info.vtep_ip_remote.ipaddr_v4, s,
+			   sizeof(struct in_addr));
+	} else if (family == AF_INET6) {
+		SET_IPADDR_V6(&gre_info.vtep_ip_remote);
+		STREAM_GET(&gre_info.vtep_ip_remote.ipaddr_v6, s,
+			   sizeof(struct in6_addr));
+	} else
+		goto stream_failure;
+
+	STREAM_GETL(s, link_ifindex);
+	STREAM_GETL(s, ikey);
+	STREAM_GETL(s, okey);
+	STREAM_GETW(s, encap_flags);
+	STREAM_GETL(s, mtu);
+
+	if (ifname[0] == '\0')
+		goto stream_failure;
+
+	gre_info.ikey = ikey;
+	gre_info.okey = okey;
+	gre_info.encap_flags = encap_flags;
+	gre_info.ifindex_link = link_ifindex;
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("GRE interface %s add: local %pIA remote %pIA",
+			   ifname, &gre_info.vtep_ip,
+			   &gre_info.vtep_ip_remote);
+
+	dplane_gre_interface_add(ifname, zvrf->vrf->vrf_id, &gre_info,
+				 link_ifindex, mtu);
+
+ stream_failure:
+	return;
+}
+
+/*
+ * Remove a GRE virtual interface on behalf of a control-plane client.
+ * See zclient_send_gre_delete() in lib/zclient.c for the wire format.
+ */
+static inline void zebra_gre_delete(ZAPI_HANDLER_ARGS)
+{
+	struct stream *s = msg;
+	char ifname[IFNAMSIZ] = {};
+	ifindex_t ifindex = 0;
+	struct interface *ifp;
+
+	STREAM_GET(ifname, s, IFNAMSIZ);
+
+	if (ifname[0] == '\0')
+		goto stream_failure;
+
+	/* Prefer the kernel ifindex when zebra already knows the device. */
+	ifp = if_lookup_by_name(ifname, zvrf->vrf->vrf_id);
+	if (ifp)
+		ifindex = ifp->ifindex;
+
+	if (IS_ZEBRA_DEBUG_KERNEL)
+		zlog_debug("GRE interface %s delete (ifindex %u)", ifname,
+			   ifindex);
+
+	dplane_gre_interface_delete(ifname, zvrf->vrf->vrf_id, ifindex);
+
+ stream_failure:
+	return;
+}
+
 static void zsend_error_msg(struct zserv *client, enum zebra_error_types error,
 			    struct zmsghdr *bad_hdr)
 {
@@ -4245,6 +4342,8 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_CONFIGURE_ARP] = zebra_configure_arp,
 	[ZEBRA_GRE_GET] = zebra_gre_get,
 	[ZEBRA_GRE_SOURCE_SET] = zebra_gre_source_set,
+	[ZEBRA_GRE_ADD] = zebra_gre_add,
+	[ZEBRA_GRE_DELETE] = zebra_gre_delete,
 	[ZEBRA_TC_QDISC_INSTALL] = zread_tc_qdisc,
 	[ZEBRA_TC_QDISC_UNINSTALL] = zread_tc_qdisc,
 	[ZEBRA_TC_CLASS_ADD] = zread_tc_class,
