@@ -165,6 +165,8 @@ static void test_advertisement_relationship(void)
 	struct midr_instance link = link_instance(same_group->remote_id.s_addr,
 							other_group->remote_id.s_addr);
 	struct selected_ref ref;
+	struct midr_lsdb_summary after;
+	struct midr_lsdb_summary before;
 
 	install(bgp->peer_self, &local);
 	install(same_group, &same);
@@ -176,6 +178,19 @@ static void test_advertisement_relationship(void)
 	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
 	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, other_group));
 	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, relay));
+
+	/* A pure refresh from the same peer replaces the selected RIB path but
+	 * must neither advance the LSDB generation nor be suppressed toward
+	 * other peers. */
+	assert(midr_lsdb_summary_get(ctx, &before) == 0);
+	link.object.ls_sequence++;
+	install(same_group, &link);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_lsdb_summary_get(ctx, &after) == 0);
+	assert(after.generation == before.generation);
+	ref = selected(&link.object.key);
+	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, same_group));
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, other_group));
 
 	/* MP_UNREACH removes only the relationship; canonical remains selected. */
 	assert(midr_rib_peer_withdraw(ctx, same_group, &link.object.key) == 0);

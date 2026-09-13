@@ -836,7 +836,17 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 	if (instance.state != MIDR_INSTANCE_ACTIVE)
 		return false;
 	entry = midr_lsdb_state_entry(state, key);
-	if (!entry || !entry->usable || entry->selected != path ||
+	/* A pure lifetime refresh replaces the selected RIB path while leaving
+	 * the committed LSDB/TED semantics and generation unchanged.  In that
+	 * case current intentionally still references the previous path, but the
+	 * newer semantically identical instance must continue to flood.  A
+	 * semantic change remains blocked until a successful LSDB commit, which
+	 * prevents propagation from using stale scope after derivation failure. */
+	if (!entry || !entry->usable ||
+	    (entry->selected != path &&
+	     (instance.object.ls_sequence <= entry->object.ls_sequence ||
+	      !midr_ls_object_semantic_same(&entry->object,
+					    &instance.object))) ||
 	    entry->scope == MIDR_LSDB_SCOPE_LOCAL_ONLY)
 		return false;
 
