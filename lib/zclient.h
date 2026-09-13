@@ -230,6 +230,8 @@ typedef enum {
 	ZEBRA_GRE_GET,
 	ZEBRA_GRE_UPDATE,
 	ZEBRA_GRE_SOURCE_SET,
+	ZEBRA_GRE_ADD,
+	ZEBRA_GRE_DELETE,
 	ZEBRA_TC_QDISC_INSTALL,
 	ZEBRA_TC_QDISC_UNINSTALL,
 	ZEBRA_TC_CLASS_ADD,
@@ -1430,6 +1432,45 @@ extern int zapi_client_close_notify_decode(struct stream *s,
 
 extern int zclient_send_zebra_gre_request(struct zclient *client,
 					  struct interface *ifp);
+
+/*
+ * GRE virtual interface provisioning (MIDR data-plane).
+ *
+ * These commands let a control-plane client (bgpd/MIDR) ask zebra to create
+ * or remove a GRE tunnel netdevice.  The actual netlink encoding is performed
+ * by zebra's data plane (DPLANE_OP_GRE_ADD / DPLANE_OP_GRE_DELETE).
+ */
+struct zclient_gre_if {
+	/* Netdevice name (IFNAMSIZ bytes, NUL-terminated).  Mandatory for
+	 * ZEBRA_GRE_ADD; the kernel rejects anonymous create requests.
+	 */
+	char ifname[IFNAMSIZ];
+
+	/* Tunnel endpoints. */
+	struct ipaddr local;  /* IFLA_GRE_LOCAL  (tunnel source) */
+	struct ipaddr remote; /* IFLA_GRE_REMOTE (tunnel destination) */
+
+	/* Underlay egress link ifindex; 0 lets the kernel resolve the route. */
+	ifindex_t link_ifindex;
+
+	/* Optional GRE keys. */
+	uint32_t ikey;
+	uint32_t okey;
+
+	/* Optional GRE encap flags (ZEBRA_GRE_ENCAP_FLAGS_CSUM/CSUM6). */
+	uint16_t encap_flags;
+
+	/* Tunnel MTU; 0 means "use the kernel default". */
+	uint32_t mtu;
+};
+
+extern enum zclient_send_status
+zclient_send_gre_add(struct zclient *client, vrf_id_t vrf_id,
+		     const struct zclient_gre_if *gre);
+extern enum zclient_send_status
+zclient_send_gre_delete(struct zclient *client, vrf_id_t vrf_id,
+			const char *ifname);
+
 #ifdef __cplusplus
 }
 #endif

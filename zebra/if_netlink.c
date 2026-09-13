@@ -345,6 +345,24 @@ uint32_t kernel_get_speed(struct interface *ifp, int *error)
 	return get_iflink_speed(ifp, error);
 }
 
+/*
+ * Choose the GRE link kind for a tunnel.
+ *
+ * Linux exposes IPv4 GRE and IPv6 GRE as separate link kinds backed by
+ * different modules: "gre" (ip_gre) for IPv4 endpoints and "ip6gre"
+ * (ip6_gre) for IPv6 endpoints.  The IFLA_GRE_* encapsulation attributes
+ * are shared by both; only the kind (and the endpoint address width)
+ * differs, so we select it from the endpoint family.
+ */
+static const char *netlink_gre_link_kind(const struct zebra_l2info_gre *gre_info)
+{
+	if (IS_IPADDR_V6(&gre_info->vtep_ip) ||
+	    IS_IPADDR_V6(&gre_info->vtep_ip_remote))
+		return "ip6gre";
+
+	return "gre";
+}
+
 static ssize_t
 netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 			    size_t buflen)
@@ -354,8 +372,12 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 		struct ifinfomsg ifi;
 		char buf[];
 	} *req = buf;
+	enum dplane_op_e op = dplane_ctx_get_op(ctx);
 	uint32_t link_idx;
 	unsigned int mtu;
+	ifindex_t ifindex;
+	const char *ifname;
+	const char *kind;
 	struct rtattr *rta_info, *rta_data;
 	const struct zebra_l2info_gre *gre_info;
 
@@ -363,17 +385,52 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 		return 0;
 	memset(req, 0, sizeof(*req));
 
-	req->n.nlmsg_type =  RTM_NEWLINK;
 	req->n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
 	req->n.nlmsg_flags = NLM_F_REQUEST;
 
-	req->ifi.ifi_index = dplane_ctx_get_ifindex(ctx);
+	ifindex = dplane_ctx_get_ifindex(ctx);
+	ifname = dplane_ctx_get_ifname(ctx);
+	req->ifi.ifi_index = ifindex;
+
+	/*
+	 * Delete path: RTM_DELLINK.  Prefer the kernel ifindex when zebra
+	 * already knows the device, otherwise fall back to the name.
+	 */
+	if (op == DPLANE_OP_GRE_DELETE) {
+		req->n.nlmsg_type = RTM_DELLINK;
+		if (!ifindex) {
+			if (!ifname || !ifname[0])
+				return 0;
+			if (!nl_attr_put(&req->n, buflen, IFLA_IFNAME, ifname,
+					 strlen(ifname) + 1))
+				return 0;
+		}
+
+		return NLMSG_ALIGN(req->n.nlmsg_len);
+	}
+
+	/*
+	 * Add / modify path: RTM_NEWLINK.  A create request needs both the
+	 * NLM_F_CREATE|NLM_F_EXCL flags and an explicit device name.
+	 */
+	req->n.nlmsg_type = RTM_NEWLINK;
+	if (op == DPLANE_OP_GRE_ADD)
+		req->n.nlmsg_flags |= (NLM_F_CREATE | NLM_F_EXCL);
+
+	if (op == DPLANE_OP_GRE_ADD) {
+		if (!ifname || !ifname[0])
+			return 0;
+		if (!nl_attr_put(&req->n, buflen, IFLA_IFNAME, ifname,
+				 strlen(ifname) + 1))
+			return 0;
+	}
+
+	req->ifi.ifi_change = 0xFFFFFFFF;
 
 	gre_info = dplane_ctx_gre_get_info(ctx);
 	if (!gre_info)
 		return 0;
 
-	req->ifi.ifi_change = 0xFFFFFFFF;
 	link_idx = dplane_ctx_gre_get_link_ifindex(ctx);
 	mtu = dplane_ctx_gre_get_mtu(ctx);
 
@@ -384,15 +441,25 @@ netlink_gre_set_msg_encoder(struct zebra_dplane_ctx *ctx, void *buf,
 	if (!rta_info)
 		return 0;
 
-	if (!nl_attr_put(&req->n, buflen, IFLA_INFO_KIND, "gre", 3))
+	/* "gre" for IPv4 endpoints, "ip6gre" for IPv6 endpoints. */
+	kind = netlink_gre_link_kind(gre_info);
+	if (!nl_attr_put(&req->n, buflen, IFLA_INFO_KIND, kind,
+			 strlen(kind) + 1))
 		return 0;
 
 	rta_data = nl_attr_nest(&req->n, buflen, IFLA_INFO_DATA);
 	if (!rta_data)
 		return 0;
 
-	if (!nl_attr_put32(&req->n, buflen, IFLA_GRE_LINK, link_idx))
-		return 0;
+	/*
+	 * Preserve the historical "set" behaviour (always emit the link),
+	 * but omit a zero link for create so the kernel does not attempt to
+	 * bind the new device to a non-existent ifindex.
+	 */
+	if (op != DPLANE_OP_GRE_ADD || link_idx) {
+		if (!nl_attr_put32(&req->n, buflen, IFLA_GRE_LINK, link_idx))
+			return 0;
+	}
 
 	if (IS_IPADDR_V4(&gre_info->vtep_ip) &&
 	    !nl_attr_put32(&req->n, buflen, IFLA_GRE_LOCAL, gre_info->vtep_ip.ipaddr_v4.s_addr))
@@ -886,7 +953,8 @@ netlink_put_gre_set_msg(struct nl_batch *bth, struct zebra_dplane_ctx *ctx)
 	enum netlink_msg_status ret;
 
 	op = dplane_ctx_get_op(ctx);
-	assert(op == DPLANE_OP_GRE_SET);
+	assert(op == DPLANE_OP_GRE_SET || op == DPLANE_OP_GRE_ADD ||
+	       op == DPLANE_OP_GRE_DELETE);
 
 	ret = netlink_batch_add_msg(bth, ctx, netlink_gre_set_msg_encoder, false);
 

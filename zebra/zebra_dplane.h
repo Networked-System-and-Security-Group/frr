@@ -187,6 +187,10 @@ enum dplane_op_e {
 	DPLANE_OP_NEIGH_TABLE_UPDATE,
 	DPLANE_OP_GRE_SET,
 
+	/* GRE virtual interface create / delete (MIDR data-plane) */
+	DPLANE_OP_GRE_ADD,
+	DPLANE_OP_GRE_DELETE,
+
 	/* Incoming interface address events */
 	DPLANE_OP_INTF_ADDR_ADD,
 	DPLANE_OP_INTF_ADDR_DEL,
@@ -1099,6 +1103,28 @@ enum zebra_dplane_result dplane_neigh_table_update(const struct interface *ifp,
 enum zebra_dplane_result
 dplane_gre_set(struct interface *ifp, struct interface *ifp_link,
 	       unsigned int mtu, const struct zebra_l2info_gre *gre_info);
+
+/*
+ * Enqueue a GRE virtual interface create.
+ *
+ * The kernel is asked to create a new "gre" netdevice named @ifname with the
+ * supplied endpoints/keys.  @link_ifindex is the underlay egress link (0 lets
+ * the kernel resolve it), @mtu is the tunnel MTU (0 = kernel default).
+ */
+enum zebra_dplane_result
+dplane_gre_interface_add(const char *ifname, vrf_id_t vrf_id,
+			 const struct zebra_l2info_gre *gre_info,
+			 ifindex_t link_ifindex, unsigned int mtu);
+
+/*
+ * Enqueue a GRE virtual interface delete.
+ *
+ * If @ifindex is non-zero it is preferred; otherwise the device is looked up
+ * by @ifname.
+ */
+enum zebra_dplane_result
+dplane_gre_interface_delete(const char *ifname, vrf_id_t vrf_id,
+			    ifindex_t ifindex);
 
 /*
  * Enqueue an SRv6 encap source address set
