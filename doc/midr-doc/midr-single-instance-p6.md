@@ -73,26 +73,24 @@ MIDR_LAB_RUN_ROOT=/home/guest/yhy/midr-lab-runs/midr-backbone-p6 \
 ```text
 主机：NetArchLab90
 分支：feat/yhy-midr-single-instance-ls-flooding
-基础提交：6490422a9175
-镜像：frr-midr-p6:6490422a9175
-镜像 ID：fcb0f38d815a
-运行目录：/home/guest/yhy/midr-lab-runs/midr-backbone-p6-run2
-证据：evidence/20260913-062058/post-convergence
+验收提交：f9beedd0d653
+镜像：frr-midr-p6:f9beedd0d653
+镜像 ID：1c59b1dfc275
+镜像创建时间：2026-09-13T09:44:37.998297556Z
+运行目录：/home/guest/yhy/midr-lab-runs/midr-backbone-p6-final
+刷新前证据：evidence/20260913-094800-pre-soak/post-convergence
+刷新后证据：evidence/20260913-094800-post-soak/post-convergence
 ```
 
-镜像出处说明：该镜像实际构建于 2026-09-13T06:19Z，除基础提交外还包含当时
-未提交、后提交为 `a92452e09d`、`6f306b9183`、`127dd391d8`、`d15732de79`
-的四个 P6 收口修正，验收二进制内容等于该修正后的代码树。
-`build-metadata.txt` 是 05:44Z 更早一次构建的快照，未反映这次重建；
-最终提交落地后应以新提交重建镜像并重跑 `check` 更新标签。
+镜像由验收提交 `f9beedd0d653` 直接构建，标签、镜像内容和文档记录一致。
 
 验收结果：
 
-- 第一组与第二组运行检查：60 passed，0 failed。
-- 对象、LSDB 和 TED 证据检查：128 passed，0 failed。
-- P6 SPF、Zebra 和 Linux FIB 检查：7 passed，0 failed；7 个 MIDR 节点各安装其余 6 个服务前缀。
+- 冷启动收敛后的第一轮完整验收：第一组与第二组运行检查 60 passed、0 failed；对象、LSDB 和 TED 证据检查 128 passed、0 failed；P6 SPF/Zebra/Linux FIB 与 Membership sequence 检查 14 passed、0 failed。
+- 330 秒 soak 跨过至少一个 5 分钟 owner 刷新周期后，第二轮完整验收仍为 60 passed、0 failed；128 passed、0 failed；14 passed、0 failed。7 个 MIDR 节点均安装其余 6 个服务前缀，每个 owner 的最新 Membership sequence 在全网一致。
 - 镜像内组件回归（`image-component-tests.log`/`.tsv`）：21 个 MIDR 组件测试与 12 个 TED fixture 场景全部通过。其中 `test_midr_ted_fixture` 需经 `run-ted-fixtures.py` 驱动；`test_midr_zebra_e2e` 需活动 zebra，按证据文件中记录的特权容器配方运行后全部通过（双实例 SPF+TE SRv6 与内核 FIB 增删验证）。
-- `test_midr_lsdb` 首次镜像内运行失败于 `waiting_peer_count` 断言：`127dd391d8` 的 barrier 后迟到会话语义更新了 `test_midr_sync.c` 但漏改 `test_midr_lsdb.c`。该过期断言已修正为期望 `waiting_peer_count == 0`，修正后在镜像内重编并通过；测试修正随收尾提交一并入库。
 - 镜像内全量 `make check` 为 341 passed、2 skipped、105 failed；105 项失败集中于既有 `test_aspath` 和 `test_peer_attr` 基线，因此不记录为全量 FRR 测试通过。
+
+长稳复测曾发现 Membership 视图在运行约 3 小时后分裂：owner 每 5 分钟生成更高 sequence 的纯寿命刷新，但 LSDB/TED 语义未变时仍保留旧 selected-path 指针，导出门禁因此抑制新路径继续洪泛，远端最终按 1 小时寿命删除对象。提交 `7cd2dd979e` 允许同一 peer 上 sequence 更高且语义与已提交对象一致的纯刷新继续洪泛，同时保持 LSDB/TED generation 不变。最终 soak 中所有 owner 的 Membership sequence 均由初始 `4294967297` 推进并在 7 个 MIDR 节点上一致，确认刷新周期主路径闭环；旧失败台的证据保留在 `/home/guest/yhy/midr-lab-runs/midr-backbone-p6-run2/evidence`。
 
 最终 bootstrap 同步状态为一次 barrier、零 timeout、零 waiting peer，且所有活动会话均完成双向 EoR 和 receive-drained。`r1/r2` 的后建立会话不再增加初始 peer 计数或留下 READY/`waiting peers` 状态冲突。FOLLOW-11-A/B、生产 `H = L` 证明、异常慢写恢复、生产 floor 回收启用和 allocator 文件丢失恢复不属于本次通过项。
