@@ -635,7 +635,10 @@ static void test_pending_activation_and_four_objects(void)
 		remote_peer->connection->status = Established;
 		midr_sync_peer_status_changed(ctx, remote_peer);
 		assert(midr_sync_status_get(ctx, &sync_status) == 0);
-		assert(sync_status.waiting_peer_count == 1);
+		/* Dropping the last waiting peer completes the initial barrier, so
+		 * the re-established session is a late peer: it keeps its own
+		 * snapshot/EoR state but must not rejoin the barrier peer set. */
+		assert(sync_status.waiting_peer_count == 0);
 		assert(sync_status.next_session_generation != 0);
 		assert(midr_ted_status_get(ctx, &status) == 0);
 		assert(status.ready);
