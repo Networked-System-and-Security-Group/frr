@@ -13,6 +13,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_lsdb.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted.h"
@@ -140,6 +141,12 @@ static bool midr_sync_receive_drained(struct midr_sync_session *session)
 {
 	struct midr_lsdb_summary summary;
 
+	/* A dedicated bootstrap has no local Membership and therefore never has
+	 * a READY derived LSDB/TED.  Its receive side is nevertheless drained
+	 * once the peer snapshot reached EoR and no input or resync work remains. */
+	if (midr_nds_is_bootstrap(session->store->ctx->bgp))
+		return session->remote_eor && !session->pending_input &&
+		       !session->needs_resync;
 	if (!session->store->ctx->lsdb_store)
 		return session->remote_eor && !session->pending_input &&
 		       !session->needs_resync;
@@ -420,7 +427,7 @@ static void midr_sync_complete_if_ready(struct midr_sync_store *store)
 {
 	if (store->state != MIDR_SYNC_REMOTE_WAIT || midr_sync_waiting_count(store))
 		return;
-	if (store->ctx->lsdb_store) {
+	if (store->ctx->lsdb_store && !midr_nds_is_bootstrap(store->ctx->bgp)) {
 		struct midr_lsdb_summary summary;
 
 		if (midr_lsdb_summary_get(store->ctx, &summary) != 0 ||
@@ -543,6 +550,11 @@ bool midr_sync_view_ready(struct midr_context *ctx, bool local_ready, uint64_t *
 		return false;
 	store = ctx->sync_store;
 	if (!local_ready) {
+		/* Bootstrap nodes intentionally have no local Membership.  Once their
+		 * empty snapshot is active, LSDB's NOT_READY state must not tear down
+		 * EoR synchronization and start the same snapshot again. */
+		if (midr_nds_is_bootstrap(ctx->bgp))
+			return false;
 		if (store->local_ready)
 			midr_sync_reset(store);
 		return false;
@@ -583,6 +595,22 @@ void midr_sync_peer_status_changed(struct midr_context *ctx, struct peer *peer)
 
 		if (!session)
 			return;
+		/* The store-wide barrier is an initial-view barrier.  Sessions that
+		 * establish after it completed retain their own snapshot/EoR state,
+		 * but must not repopulate the completed barrier's peer set. */
+		if (store->state == MIDR_SYNC_READY) {
+			entry = midr_sync_peer_lookup(store, peer);
+			if (entry && entry->generation != session->generation) {
+				bool timed_out = entry->timed_out;
+
+				entry->generation = session->generation;
+				entry->waiting = false;
+				entry->timed_out = false;
+				if (timed_out)
+					midr_lsdb_sync_changed(ctx);
+			}
+			return;
+		}
 		entry = midr_sync_peer_ensure(store, peer, session->generation);
 		if (entry && session && entry->generation != session->generation) {
 			entry->generation = session->generation;
@@ -649,7 +677,9 @@ void midr_sync_peer_eor_connection(struct midr_context *ctx,
 		if (session->local_eor_written && midr_sync_receive_drained(session))
 			session->state = MIDR_SYNC_SESSION_READY;
 	}
-	entry = midr_sync_peer_ensure(store, connection->peer,
+	entry = midr_sync_peer_lookup(store, connection->peer);
+	if (!entry && store->state != MIDR_SYNC_READY)
+		entry = midr_sync_peer_ensure(store, connection->peer,
 					      session->generation);
 	if (entry && entry->generation == session->generation &&
 	    midr_sync_receive_drained(session)) {
@@ -667,16 +697,29 @@ bool midr_sync_can_send_eor(struct midr_context *ctx,
 {
 	struct midr_sync_store *store;
 	struct midr_sync_session *session;
+	bool bootstrap;
 
 	if (!ctx || !ctx->sync_store || !connection ||
 	    !peer_established(connection) ||
-	    !connection->peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] ||
-	    !midr_sync_local_ready(ctx))
+	    !connection->peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS])
 		return false;
 	store = ctx->sync_store;
+	bootstrap = midr_nds_is_bootstrap(ctx->bgp);
+	/* A dedicated bootstrap originates no LS objects, so its empty local
+	 * snapshot is ready without a local Membership.  Start its per-session
+	 * snapshots here; otherwise both sides can wait forever for its EoR. */
+	if (!store->local_ready && bootstrap) {
+		store->local_ready = true;
+		midr_sync_start(store);
+	}
+	if (!store->local_ready)
+		return false;
 	session = midr_sync_session_lookup(store, connection);
 	if (!session)
 		session = midr_sync_session_create(store, connection->peer, connection);
+	if (session && bootstrap && !session->snapshot_active &&
+	    !session->snapshot_completed)
+		midr_sync_schedule_resync(session);
 	return session && session->snapshot_completed && !session->snapshot_active &&
 	       !session->needs_resync && !session->pending_updates &&
 	       !session->local_eor_queued;

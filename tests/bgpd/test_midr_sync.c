@@ -17,6 +17,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_rib.h"
@@ -74,6 +75,72 @@ static void test_no_peer_and_configuration(void)
 	assert(midr_sync_timeout_set(ctx, 5) == 0);
 	assert(midr_sync_status_get(ctx, &status) == 0);
 	assert(status.timeout_seconds == 5);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+}
+
+static void test_bootstrap_empty_snapshot_can_send_eor(void)
+{
+	struct peer *peer = established_peer("10.0.0.9");
+	struct peer_connection *connection = peer->connection;
+	struct midr_sync_status before;
+	struct midr_sync_status after;
+	uint64_t reasons = 0;
+
+	assert(bgp->midr_nds_info);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	bgp->midr_nds_info->local_capabilities |= MIDR_CAP_BOOTSTRAP;
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(!midr_sync_can_send_eor(ctx, connection));
+	assert(midr_sync_local_ready(ctx));
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	assert(midr_sync_can_send_eor(ctx, connection));
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.waiting_peer_count == 0);
+	assert(after.receive_drained_count == 1);
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(midr_sync_local_ready(ctx));
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.barrier_count == before.barrier_count);
+
+	bgp->midr_nds_info->local_capabilities &= ~MIDR_CAP_BOOTSTRAP;
+	connection->status = Idle;
+	midr_sync_test_session_down(ctx, connection);
+	event_cancel(&connection->t_generate_updgrp_packets);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(!midr_sync_local_ready(ctx));
+}
+
+static void test_late_peer_does_not_reopen_initial_barrier(void)
+{
+	struct midr_sync_status before;
+	struct midr_sync_status after;
+	struct peer *peer;
+	uint64_t reasons = 0;
+
+	assert(midr_sync_view_ready(ctx, true, &reasons));
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(before.state == MIDR_SYNC_READY);
+	assert(before.initial_peer_count == 0);
+	peer = established_peer("10.0.0.8");
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.initial_peer_count == 0);
+	assert(after.waiting_peer_count == 0);
+	assert(after.active_session_count == 1);
+	assert(after.barrier_count == before.barrier_count);
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.receive_drained_count == 1);
+
+	peer->connection->status = Idle;
+	midr_sync_peer_status_changed(ctx, peer);
+	event_cancel(&peer->connection->t_generate_updgrp_packets);
 	assert(!midr_sync_view_ready(ctx, false, &reasons));
 }
 
@@ -405,9 +472,11 @@ int main(void)
 	ctx = &bgp->midr_info->ctx;
 
 	test_no_peer_and_configuration();
+	test_bootstrap_empty_snapshot_can_send_eor();
 	/* The following cases exercise the sync state machine without the
 	 * LSDB/TED readiness gate. Full integration coverage follows below. */
 	midr_lsdb_finish(ctx);
+	test_late_peer_does_not_reopen_initial_barrier();
 	test_eor_peer_down_timeout_and_late_eor();
 	test_session_generation_and_packet_lifecycle();
 	test_delayed_completion_reuse_and_destroy();
