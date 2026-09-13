@@ -275,7 +275,11 @@ static void test_persistence_failure_and_fightback(void)
 	node = node_update(10, 10);
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
-	(void)selected_sequence(&membership_key, &selected);
+	observed = selected_sequence(&membership_key, &selected);
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	assert(selected_sequence(&membership_key, &selected) == observed);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(summary.fightbacks == 0);
 
 	sequence_store.fail_save = true;
 	selected.ls_sequence = (((selected.ls_sequence >> 32) + 1) << 32);
@@ -330,6 +334,39 @@ static void test_restart_observes_self_instance_before_allocator_ready(void)
 	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
 	midr_owned_reconcile(ctx);
 	assert(selected_sequence(&membership_key, &selected) > observed);
+}
+
+static void test_instance_fightback_is_targeted(void)
+{
+	struct midr_ls_object_key membership_key = {
+		.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+		.originator_node_id = bgp->router_id.s_addr,
+	};
+	struct midr_ls_object_key link_key = {
+		.type = MIDR_NLRI_TYPE_LINK,
+		.originator_node_id = bgp->router_id.s_addr,
+		.u.link = {
+			.remote_node_id = router_id("10.0.0.2"),
+			.link_id = 100,
+		},
+	};
+	struct midr_owned_summary before;
+	struct midr_owned_summary after;
+	struct midr_ls_object selected;
+	uint64_t membership_sequence;
+	uint64_t link_sequence;
+	uint64_t observed;
+
+	membership_sequence = selected_sequence(&membership_key, &selected);
+	link_sequence = selected_sequence(&link_key, &selected);
+	assert(midr_owned_summary_get(ctx, &before) == 0);
+
+	observed = membership_sequence + (UINT64_C(1) << 32);
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+	assert(selected_sequence(&link_key, &selected) == link_sequence);
+	assert(midr_owned_summary_get(ctx, &after) == 0);
+	assert(after.fightbacks == before.fightbacks + 1);
 }
 
 static void test_owned_lifecycle_and_validation(void)
@@ -527,6 +564,7 @@ int main(void)
 	test_origination_suppression_and_withdraw();
 	test_persistence_failure_and_fightback();
 	test_restart_observes_self_instance_before_allocator_ready();
+	test_instance_fightback_is_targeted();
 	test_owned_lifecycle_and_validation();
 	assert(midr_owned_init(ctx) == -EALREADY);
 	midr_owned_finish(ctx);

@@ -49,6 +49,7 @@ struct midr_owned_entry {
 	struct timeval last_advertised;
 	struct event *timer;
 	uint32_t domain;
+	uint64_t last_sequence;
 	bool advertised_present;
 	bool seen;
 	bool suppressed;
@@ -256,6 +257,7 @@ static int midr_owned_path_withdraw(struct midr_owned_store *store,
 				       store->ctx->bgp->peer_self, &instance, 0);
 	if (ret)
 		return ret;
+	entry->last_sequence = sequence;
 	entry->advertised_present = false;
 	memset(&entry->advertised, 0, sizeof(entry->advertised));
 	return 0;
@@ -368,6 +370,12 @@ static int midr_owned_observed_fightback(struct midr_owned_store *store,
 	if (!store || !observed || !store->ready ||
 	    observed->sequence <= observed->handled_sequence)
 		return 0;
+	entry = midr_owned_entry_lookup(store, &observed->key);
+	if (entry && observed->sequence <= entry->last_sequence) {
+		observed->handled_sequence = observed->sequence;
+		return 0;
+	}
+
 	ret = midr_sequence_allocator_advance_past(&store->allocator,
 						  observed->sequence);
 	if (ret)
@@ -385,9 +393,11 @@ static int midr_owned_observed_fightback(struct midr_owned_store *store,
 	/* Ensure an identity that was only observed from a neighbor also gets a
 	 * local tombstone. Reconciliation may replace it with local ACTIVE facts. */
 	entry = midr_owned_entry_get(store, &observed->key);
+	entry->last_sequence = sequence;
 	entry->advertised_present = false;
-	observed->handled_sequence = observed->sequence;
+	observed->handled_sequence = sequence;
 	store->fightbacks++;
+	SET_FLAG(store->pending_domains, entry->domain);
 	return 0;
 }
 
@@ -405,7 +415,6 @@ static void midr_owned_observed_iter(struct hash_bucket *bucket, void *arg)
 		midr_owned_schedule_sequence_retry(store);
 		return;
 	}
-	midr_owned_withdraw_all(store);
 }
 
 static void midr_owned_process_observed(struct midr_owned_store *store)
@@ -479,6 +488,7 @@ static int midr_owned_publish_internal(struct midr_owned_store *store,
 		return ret;
 
 	entry->advertised = *object;
+	entry->last_sequence = sequence;
 	entry->advertised_present = true;
 	monotime(&entry->last_advertised);
 	entry->suppressed = false;
