@@ -18,6 +18,7 @@
 #include "bgpd/bgp_midr_packet.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
 
@@ -208,6 +209,81 @@ static void test_packet_validation(void)
 	stream_free(nlri);
 }
 
+static void test_resource_rejection_keeps_session(void)
+{
+	struct midr_instance third_party = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = {
+			.key = {
+				.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+				.originator_node_id = router_id("10.0.0.9"),
+			},
+			.ls_sequence = 30,
+			.payload.membership = {
+				.group_id = 21,
+				.cap_flags = 1,
+			},
+		},
+	};
+	struct midr_instance refresh = membership(200, 23);
+	struct midr_sync_status status;
+	struct midr_instance selected;
+	struct peer *selected_peer;
+	struct stream *nlri = stream_new(128);
+	struct bgp_nlri packet;
+	struct attr attr;
+	uint32_t age;
+
+	midr_sync_test_session_start(ctx, remote, remote->connection);
+	assert(midr_rib_test_set_identity_limit(ctx, 1) == 0);
+
+	/* A new identity beyond the limit is a resource rejection, not a
+	 * protocol error: the parse must keep the session up, record the
+	 * unadmitted input, and leave the identity unselected. */
+	attr = instance_attr(&third_party, 5);
+	encode_packet(nlri, &third_party);
+	packet = packet_from_stream(nlri);
+	assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_OK);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 1);
+	assert(status.resync_required_count == 1);
+	assert(midr_rib_selected_instance_get(ctx, &third_party.object.key,
+					      &selected, &age,
+					      &selected_peer) == -ENOENT);
+
+	/* An update of an existing identity is still admitted at the limit. */
+	{
+		struct attr refresh_attr = instance_attr(&refresh, 6);
+
+		stream_reset(nlri);
+		encode_packet(nlri, &refresh);
+		packet = packet_from_stream(nlri);
+		assert(bgp_nlri_parse_midr(remote, &refresh_attr, &packet) ==
+		       BGP_NLRI_PARSE_OK);
+		assert(midr_rib_selected_instance_get(ctx, &refresh.object.key,
+						      &selected, &age,
+						      &selected_peer) == 0);
+		assert(selected.object.ls_sequence == 200);
+		assert(midr_sync_status_get(ctx, &status) == 0);
+		assert(status.input_rejected_count == 1);
+		bgp_attr_unintern_sub(&refresh_attr);
+	}
+
+	/* Once capacity is restored, the same unadmitted input is accepted. */
+	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
+	stream_reset(nlri);
+	encode_packet(nlri, &third_party);
+	packet = packet_from_stream(nlri);
+	assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_OK);
+	assert(midr_rib_selected_instance_get(ctx, &third_party.object.key,
+					      &selected, &age,
+					      &selected_peer) == 0);
+	assert(selected.object.ls_sequence == 30);
+
+	bgp_attr_unintern_sub(&attr);
+	stream_free(nlri);
+}
+
 int main(void)
 {
 	as_t asn = 65000;
@@ -233,6 +309,7 @@ int main(void)
 	test_active_withdraw_and_mp_unreach();
 	test_outbound_snapshot_and_single_nlri();
 	test_packet_validation();
+	test_resource_rejection_keeps_session();
 	puts("MIDR packet tests passed");
 	return 0;
 }

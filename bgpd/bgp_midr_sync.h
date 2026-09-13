@@ -65,6 +65,7 @@ struct midr_sync_status {
 	uint64_t next_session_generation;
 	uint64_t reconnect_count;
 	uint64_t stale_event_count;
+	uint64_t input_rejected_count;
 };
 
 extern int midr_sync_init(struct midr_context *ctx);
@@ -93,6 +94,9 @@ extern void midr_sync_snapshot_begin(struct peer_connection *connection);
 extern void midr_sync_snapshot_end(struct peer_connection *connection);
 extern bool midr_sync_snapshot_requested(struct peer_connection *connection);
 extern void midr_sync_request_resync(struct peer_connection *connection);
+/* Resource-rejected MIDR input: keep the session up, mark it for resync. */
+extern void midr_sync_input_rejected(struct midr_context *ctx,
+				      struct peer_connection *connection);
 extern void midr_sync_shutdown_begin(struct midr_context *ctx);
 extern void midr_sync_shutdown_announce_complete(struct midr_context *ctx);
 extern void midr_sync_shutdown_generation_failed(struct midr_context *ctx);
@@ -120,5 +124,9 @@ extern int midr_sync_timeout_set(struct midr_context *ctx, uint32_t seconds);
 extern int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *status);
 extern void midr_sync_test_timeout(struct midr_context *ctx);
 extern void midr_sync_test_drain_completions(struct midr_context *ctx);
+extern int midr_sync_test_set_input_reject_backoff(struct midr_context *ctx,
+						    uint32_t msec);
+extern size_t midr_sync_test_resync_pending(struct midr_context *ctx);
+extern size_t midr_sync_test_fire_resync(struct midr_context *ctx);
 
 #endif /* _FRR_BGP_MIDR_SYNC_H */

@@ -64,6 +64,7 @@ struct midr_rib_store {
 	size_t conflict_count;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
+	uint64_t rejected_resource;
 	struct event *lifetime_timer;
 };
 
@@ -615,6 +616,7 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	 * canonical store.  A failed allocation must leave both views unchanged. */
 	new_attr = midr_rib_instance_attr_intern(ctx->bgp, instance, age_ms);
 	if (!new_attr) {
+		store->rejected_resource++;
 		if (!advertisement_was_present)
 			midr_rib_advertisement_remove(identity, peer);
 		else {
@@ -628,6 +630,7 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	ret = midr_canonical_accept(store->canonical, instance, age_ms,
 				    &result);
 	if (ret) {
+		store->rejected_resource++;
 		bgp_attr_unintern(&new_attr);
 		if (!advertisement_was_present)
 			midr_rib_advertisement_remove(identity, peer);
@@ -873,6 +876,7 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		.rejected_limit = store->rejected_limit,
 		.rejected_payload_conflict =
 			store->rejected_payload_conflict,
+		.rejected_resource = store->rejected_resource,
 	};
 	return 0;
 }
@@ -1072,9 +1076,10 @@ int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 {
 	if (!ctx || !ctx->rib_store)
 		return -ENOENT;
-	if (!limit || limit > MIDR_RIB_MAX_IDENTITIES ||
-	    limit < ctx->rib_store->identities->count)
+	if (!limit || limit > MIDR_RIB_MAX_IDENTITIES)
 		return -EINVAL;
+	/* Tests may lower the limit below the live identity count to drive
+	 * the new-identity rejection path; existing identities stay usable. */
 	ctx->rib_store->identity_limit = limit;
 	return 0;
 }

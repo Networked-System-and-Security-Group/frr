@@ -10,6 +10,7 @@
 
 #include "linklist.h"
 #include "memory.h"
+#include "monotime.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_lsdb.h"
@@ -28,6 +29,11 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_PACKET, "MIDR sync packet");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_TOKEN, "MIDR sync session token");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_SHUTDOWN_TARGET,
 			   "MIDR shutdown sync target");
+
+/* Minimum spacing between resync attempts scheduled by resource-rejected
+ * MIDR input, so sustained overload degrades to a bounded retry rate
+ * instead of a resync storm. */
+#define MIDR_SYNC_INPUT_REJECT_BACKOFF_MSEC 1000U
 
 struct midr_sync_peer {
 	struct peer *peer;
@@ -78,6 +84,7 @@ struct midr_sync_session {
 	uint64_t snapshot_generation;
 	size_t pending_updates;
 	size_t pending_input;
+	int64_t last_input_reject_ms;
 	struct list *packets;
 	struct midr_sync_token *token;
 };
@@ -95,6 +102,8 @@ struct midr_sync_store {
 	uint64_t next_session_generation;
 	uint64_t reconnect_count;
 	uint64_t stale_event_count;
+	uint64_t input_rejected_count;
+	uint32_t input_reject_backoff_msec;
 	bool shutdown_active;
 	bool shutdown_announce_complete;
 	enum midr_sync_shutdown_state shutdown_state;
@@ -250,7 +259,8 @@ static void midr_sync_resync_event(struct event *event)
 	midr_sync_token_release(token);
 }
 
-static void midr_sync_schedule_resync(struct midr_sync_session *session)
+static void midr_sync_schedule_resync_delay(
+	struct midr_sync_session *session, uint32_t delay_ms)
 {
 	if (!session || session->resync_event || !bm || !bm->master ||
 	    !peer_established(session->connection))
@@ -262,8 +272,13 @@ static void midr_sync_schedule_resync(struct midr_sync_session *session)
 	UNSET_FLAG(session->peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS],
 		   PEER_STATUS_EOR_SEND);
 	session->token->references++;
-	event_add_event(bm->master, midr_sync_resync_event, session->token, 0,
-			&session->resync_event);
+	event_add_timer_msec(bm->master, midr_sync_resync_event, session->token,
+			     delay_ms, &session->resync_event);
+}
+
+static void midr_sync_schedule_resync(struct midr_sync_session *session)
+{
+	midr_sync_schedule_resync_delay(session, 0);
 }
 
 static struct midr_sync_session *midr_sync_session_lookup(
@@ -279,6 +294,40 @@ static struct midr_sync_session *midr_sync_session_lookup(
 		    session->state != MIDR_SYNC_SESSION_DOWN)
 			return session;
 	return NULL;
+}
+
+/*
+ * A well-formed MIDR UPDATE that cannot be admitted for resource reasons
+ * must not reset the session.  Record the rejection, keep the session out
+ * of the drained/READY state, and schedule a resync at a bounded rate.
+ */
+void midr_sync_input_rejected(struct midr_context *ctx,
+			      struct peer_connection *connection)
+{
+	struct midr_sync_store *store;
+	struct midr_sync_session *session;
+	struct timespec now;
+	int64_t now_ms;
+
+	if (!ctx || !ctx->sync_store || !connection)
+		return;
+	store = ctx->sync_store;
+	store->input_rejected_count++;
+	session = midr_sync_session_lookup(store, connection);
+	if (!session || session->state == MIDR_SYNC_SESSION_DOWN)
+		return;
+	session->needs_resync = true;
+	session->state = MIDR_SYNC_SESSION_RESYNC;
+	if (session->resync_event)
+		return;
+	monotime(&now);
+	now_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	if (now_ms < session->last_input_reject_ms +
+			     (int64_t)store->input_reject_backoff_msec)
+		return;
+	session->last_input_reject_ms = now_ms;
+	midr_sync_schedule_resync_delay(session,
+					store->input_reject_backoff_msec);
 }
 
 static struct midr_sync_peer *midr_sync_peer_lookup(struct midr_sync_store *store,
@@ -521,6 +570,7 @@ int midr_sync_init(struct midr_context *ctx)
 	store->sessions->del = midr_sync_session_free;
 	store->shutdown_targets = list_new();
 	store->shutdown_targets->del = midr_sync_shutdown_target_free;
+	store->input_reject_backoff_msec = MIDR_SYNC_INPUT_REJECT_BACKOFF_MSEC;
 	ctx->sync_store = store;
 	return 0;
 }
@@ -1155,6 +1205,7 @@ int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *stat
 	status->next_session_generation = store->next_session_generation;
 	status->reconnect_count = store->reconnect_count;
 	status->stale_event_count = store->stale_event_count;
+	status->input_rejected_count = store->input_rejected_count;
 	status->shutdown_state = store->shutdown_state;
 	status->shutdown_active = store->shutdown_active;
 	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {
@@ -1207,6 +1258,51 @@ void midr_sync_test_timeout(struct midr_context *ctx)
 	event_cancel(&ctx->sync_store->t_timeout);
 	event.arg = ctx->sync_store;
 	midr_sync_timeout_event(&event);
+}
+
+int midr_sync_test_set_input_reject_backoff(struct midr_context *ctx,
+					     uint32_t msec)
+{
+	if (!ctx || !ctx->sync_store)
+		return -ENOENT;
+	ctx->sync_store->input_reject_backoff_msec = msec;
+	return 0;
+}
+
+size_t midr_sync_test_resync_pending(struct midr_context *ctx)
+{
+	struct midr_sync_session *session;
+	struct listnode *node;
+	size_t pending = 0;
+
+	if (!ctx || !ctx->sync_store)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session))
+		if (session->resync_event)
+			pending++;
+	return pending;
+}
+
+size_t midr_sync_test_fire_resync(struct midr_context *ctx)
+{
+	struct midr_sync_session *session;
+	struct listnode *node;
+	size_t fired = 0;
+
+	if (!ctx || !ctx->sync_store)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session)) {
+		struct midr_sync_token *token = session->token;
+		struct event event = {};
+
+		if (!session->resync_event)
+			continue;
+		event_cancel(&session->resync_event);
+		event.arg = token;
+		midr_sync_resync_event(&event);
+		fired++;
+	}
+	return fired;
 }
 
 void midr_sync_test_drain_completions(struct midr_context *ctx)

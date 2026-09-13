@@ -38,6 +38,7 @@ struct midr_rib_summary {
 	size_t identity_limit;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
+	uint64_t rejected_resource;
 };
 
 typedef int (*midr_rib_selected_cb)(

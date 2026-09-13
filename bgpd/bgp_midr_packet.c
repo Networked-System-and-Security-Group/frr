@@ -18,6 +18,7 @@
 #include "bgpd/bgp_midr_packet.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 
 static int midr_packet_withdraw(struct midr_context *ctx, struct peer *peer,
 				const struct midr_ls_object_key *key)
@@ -111,9 +112,18 @@ int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 		}
 
 		ret = midr_rib_instance_upsert(ctx, peer, &instance,
-					       wire.age_ms) == 0
-			      ? BGP_NLRI_PARSE_OK
-			      : BGP_NLRI_PARSE_ERROR;
+					       wire.age_ms);
+		if (ret == 0)
+			ret = BGP_NLRI_PARSE_OK;
+		else if (ret == -ENOSPC || ret == -ENOMEM || ret == -ERANGE) {
+			/* A well-formed UPDATE that cannot be admitted for
+			 * resource reasons must not reset the session.  The
+			 * packet is counted as received; the unadmitted input
+			 * is recovered by resync/refresh with backoff. */
+			midr_sync_input_rejected(ctx, peer->connection);
+			ret = BGP_NLRI_PARSE_OK;
+		} else
+			ret = BGP_NLRI_PARSE_ERROR;
 	}
 
 done:

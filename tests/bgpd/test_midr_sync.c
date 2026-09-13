@@ -455,6 +455,54 @@ static void test_shutdown_result_is_bounded_and_retained(void)
 	stream_free(stream);
 }
 
+static void test_input_rejection_backoff_and_recovery(void)
+{
+	struct midr_sync_status status;
+	struct peer *peer;
+
+	peer = established_peer("10.0.0.10");
+	midr_sync_test_session_start(ctx, peer, peer->connection);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 60000) == 0);
+
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 1);
+	assert(status.resync_required_count == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+
+	/* A repeated rejection while a resync is already pending adds no work. */
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 2);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+
+	/* After the resync fires, the backoff window suppresses an immediate
+	 * reschedule; with the backoff disabled a new one is admitted. */
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 3);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 0) == 0);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 4);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+
+	/* A rejection without a live session only bumps the counter. */
+	peer->connection->status = Idle;
+	midr_sync_test_session_down(ctx, peer->connection);
+	event_cancel(&peer->connection->t_generate_updgrp_packets);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 5);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 1000) == 0);
+}
+
 int main(void)
 {
 	as_t asn = 65000;
@@ -480,6 +528,7 @@ int main(void)
 	test_eor_peer_down_timeout_and_late_eor();
 	test_session_generation_and_packet_lifecycle();
 	test_delayed_completion_reuse_and_destroy();
+	test_input_rejection_backoff_and_recovery();
 	assert(midr_lsdb_init(ctx) == 0);
 	test_eor_waits_for_admission_and_derivation();
 	test_writer_teardown_race();

@@ -254,10 +254,43 @@ static void test_iteration_limits_and_validation(void)
 	assert(midr_rib_selected_instance_get(ctx, &unknown, &(struct midr_instance){},
 						       &(uint32_t){0}, &(struct peer *){0}) == -ENOENT);
 	assert(midr_rib_summary_get(ctx, &summary) == 0 && summary.identity_count == 4);
-	assert(midr_rib_test_set_identity_limit(ctx, 1) == -EINVAL);
+	assert(midr_rib_test_set_identity_limit(ctx, 0) == -EINVAL);
+	assert(midr_rib_test_set_identity_limit(
+		       ctx, MIDR_RIB_MAX_IDENTITIES + 1) == -EINVAL);
 	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
 	assert(midr_rib_peer_withdraw(ctx, peer_two, &first.object.key) == 0);
 	assert(midr_rib_peer_withdraw(ctx, peer_two, &second.object.key) == 0);
+}
+
+static void test_identity_limit_rejection_and_recovery(void)
+{
+	struct midr_instance extra = membership(router_id("6.6.6.6"), 1, 60);
+	struct midr_instance update = membership(router_id("3.3.3.3"), 99, 31);
+	struct midr_instance selected;
+	struct midr_rib_summary summary;
+	struct peer *peer;
+	uint32_t age;
+	uint64_t rejected;
+
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	rejected = summary.rejected_limit;
+
+	/* Lowering the limit below the live count only blocks new identities;
+	 * updates of existing identities stay admissible. */
+	assert(midr_rib_test_set_identity_limit(ctx, 1) == 0);
+	assert(midr_rib_instance_upsert(ctx, peer_two, &update, 0) == 0);
+	assert(midr_rib_instance_upsert(ctx, peer_two, &extra, 0) == -ENOSPC);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.rejected_limit == rejected + 1);
+	assert(midr_rib_selected_instance_get(ctx, &extra.object.key, &selected,
+					      &age, &peer) == -ENOENT);
+
+	/* Restoring capacity admits the previously rejected identity. */
+	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
+	assert(midr_rib_instance_upsert(ctx, peer_two, &extra, 0) == 0);
+	assert(midr_rib_selected_instance_get(ctx, &extra.object.key, &selected,
+					      &age, &peer) == 0);
+	assert(selected.object.ls_sequence == 1);
 }
 
 int main(void)
@@ -282,6 +315,7 @@ int main(void)
 	test_sequence_admission_and_peer_withdraw();
 	test_duplicate_conflict_and_resolution();
 	test_iteration_limits_and_validation();
+	test_identity_limit_rejection_and_recovery();
 	puts("MIDR RIB tests passed");
 	return 0;
 }
