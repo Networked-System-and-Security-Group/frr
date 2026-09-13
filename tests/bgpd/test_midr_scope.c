@@ -215,6 +215,30 @@ static void test_withdrawn_global_flood(void)
 	assert(!midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target));
 }
 
+static void test_global_bootstrap_without_target_membership(void)
+{
+	struct peer *target = test_peer("10.0.0.9");
+	struct midr_instance local = membership(bgp->router_id.s_addr, 10, 20);
+	struct midr_instance group = local;
+	struct selected_ref ref;
+
+	group.object.key.type = MIDR_NLRI_TYPE_GROUP_PREFIX;
+	group.object.key.u.group_prefix.group_id = 10;
+	group.object.key.u.group_prefix.prefix.afi = AFI_IP;
+	group.object.key.u.group_prefix.prefix.safi = SAFI_UNICAST;
+	group.object.key.u.group_prefix.prefix.prefix = prefix4("198.51.100.0/24");
+	group.object.ls_sequence++;
+
+	install(bgp->peer_self, &local);
+	install(bgp->peer_self, &group);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	ref = selected(&group.object.key);
+
+	/* Target Membership is intentionally absent: this is the first global
+	 * object needed to seed the remote node during cold start. */
+	assert(midr_lsdb_export_eligible(ctx, ref.dest, ref.path, target));
+}
+
 static void test_scope_gate(void)
 {
 	struct peer *same_group = test_peer("10.0.0.5");
@@ -258,6 +282,7 @@ int main(void)
 	test_advertisement_relationship();
 	test_scope_gate();
 	test_withdrawn_global_flood();
+	test_global_bootstrap_without_target_membership();
 	puts("MIDR scope tests passed");
 	return 0;
 }

@@ -840,6 +840,14 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 	    entry->scope == MIDR_LSDB_SCOPE_LOCAL_ONLY)
 		return false;
 
+	/* Global objects are the bootstrap path: Membership and Group Prefix
+	 * instances must be exportable before the target has advertised its own
+	 * Membership. Requiring that Membership here deadlocks cold start. */
+	if (entry->scope == MIDR_LSDB_SCOPE_GLOBAL &&
+	    (key->type == MIDR_NLRI_TYPE_MEMBERSHIP ||
+	     key->type == MIDR_NLRI_TYPE_GROUP_PREFIX))
+		return true;
+
 	target_membership = midr_lsdb_membership_lookup(state, target->remote_id.s_addr);
 	if (!target_membership)
 		return false;
