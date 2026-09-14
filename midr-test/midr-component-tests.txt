@@ -23,3 +23,4 @@ test_midr_zebra
 test_midr_spf
 test_midr_spf_install
 test_midr_spf_pipeline
+test_capability

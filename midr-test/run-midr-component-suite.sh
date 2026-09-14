@@ -32,6 +32,9 @@ sed -n 's|^check_PROGRAMS += tests/bgpd/\(test_midr_[A-Za-z0-9_]*\)$|\1|p' \
 	"$ROOT/tests/bgpd/subdir.am" \
 	| grep -v -E '^(test_midr_ted_fixture|test_midr_zebra_e2e)$' \
 	| sort -u >"$REGISTERED"
+sed -n 's|^check_PROGRAMS += tests/bgpd/\(test_capability\)$|\1|p' \
+	"$ROOT/tests/bgpd/subdir.am" >>"$REGISTERED"
+sort -u "$REGISTERED" -o "$REGISTERED"
 sort -u "$MANIFEST_CLEAN" >"$MANIFEST_SORTED"
 
 if ! diff -u "$REGISTERED" "$MANIFEST_SORTED"; then

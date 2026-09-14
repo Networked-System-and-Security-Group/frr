@@ -281,6 +281,60 @@ static void test_persistence_failure_and_fightback(void)
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(summary.fightbacks == 0);
 
+	/* Re-publish the local fact after the fight-back tombstone so the
+	 * following blocked update exercises a real withdrawal operation. */
+	midr_owned_identity_withdraw(ctx);
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	node = node_update(11, 10);
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+	assert(selected.payload.membership.group_id == 10);
+
+	/* A real canonical event allocation failure must count as an operation
+	 * failure without erasing the previously advertised instance. */
+	{
+		uint64_t previous_sequence = selected.ls_sequence;
+		uint64_t withdraw_failures = summary.withdraw_failures;
+		uint64_t refresh_failures = summary.refresh_failures;
+
+		assert(midr_rib_test_set_event_limit(ctx, 0) == 0);
+		/* Exercise the public identity withdrawal path directly.  The input
+		 * queue may coalesce a blocked topology update before reconciliation,
+		 * whereas this path must always attempt the advertised instance. */
+		midr_owned_identity_withdraw(ctx);
+		assert(selected_sequence(&membership_key, &selected) ==
+		       previous_sequence);
+		assert(selected.payload.membership.group_id == 10);
+		assert(midr_owned_summary_get(ctx, &summary) == 0);
+		/* Both the local Membership and Link are advertised at this point;
+		 * count failures per object, as required by the diagnostics contract. */
+		assert(summary.withdraw_failures == withdraw_failures + 2);
+
+		assert(midr_rib_test_set_event_limit(
+			       ctx, MIDR_RIB_MAX_IDENTITIES * 2U) == 0);
+		midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+		node = node_update(13, 20);
+		assert(midr_topology_node_upsert(ctx, &node) == 0);
+		midr_topology_process_pending(ctx);
+		assert(selected_sequence(&membership_key, &selected) >
+		       previous_sequence);
+		assert(selected.payload.membership.group_id == 20);
+
+		previous_sequence = selected.ls_sequence;
+		assert(midr_rib_test_set_event_limit(ctx, 0) == 0);
+		midr_owned_test_fire_refresh(ctx);
+		assert(selected_sequence(&membership_key, &selected) ==
+		       previous_sequence);
+		assert(midr_owned_summary_get(ctx, &summary) == 0);
+		assert(summary.refresh_failures == refresh_failures + 2);
+		assert(midr_rib_test_set_event_limit(
+			       ctx, MIDR_RIB_MAX_IDENTITIES * 2U) == 0);
+		midr_owned_test_fire_refresh(ctx);
+		assert(selected_sequence(&membership_key, &selected) >
+		       previous_sequence);
+	}
+
 	sequence_store.fail_save = true;
 	selected.ls_sequence = (((selected.ls_sequence >> 32) + 1) << 32);
 	assert(midr_owned_observe_self_sequence(ctx, &selected) == -EIO);
@@ -288,21 +342,21 @@ static void test_persistence_failure_and_fightback(void)
 	assert(!summary.ready);
 	assert(summary.sequence_failures == 1);
 	assert(selected_sequence(&membership_key, &selected) > 0);
-	assert(selected.payload.membership.group_id == 10);
+	assert(selected.payload.membership.group_id == 20);
 	assert(midr_owned_test_set_sequence_store(ctx, &sequence_ops, &sequence_store) == -EBUSY);
 
-	node.version = 11;
-	node.group_id = 20;
+	node.version = 14;
+	node.group_id = 30;
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
 	assert(selected_sequence(&membership_key, &selected) > 0);
-	assert(selected.payload.membership.group_id == 10);
+	assert(selected.payload.membership.group_id == 20);
 
 	sequence_store.fail_save = false;
 	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
 	midr_owned_reconcile(ctx);
 	observed = selected_sequence(&membership_key, &selected);
-	assert(selected.payload.membership.group_id == 20);
+	assert(selected.payload.membership.group_id == 30);
 
 	selected.ls_sequence += (UINT64_C(1) << 32);
 	observed = selected.ls_sequence;
