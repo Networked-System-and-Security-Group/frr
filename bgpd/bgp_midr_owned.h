@@ -34,6 +34,10 @@ struct midr_owned_summary {
 	bool takeover_timer_pending;
 	uint64_t sequence_failures;
 	uint64_t fightbacks;
+	uint64_t withdraw_failures;
+	uint64_t refresh_failures;
+	int last_withdraw_error;
+	int last_refresh_error;
 };
 
 struct midr_owned_withdraw_result {

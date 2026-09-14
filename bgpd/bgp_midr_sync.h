@@ -67,6 +67,9 @@ struct midr_sync_status {
 	uint64_t stale_event_count;
 	uint64_t input_rejected_count;
 	uint64_t output_timeout_count;
+	uint64_t shutdown_generation_failures;
+	uint64_t gr_tuple_ignored;
+	uint64_t llgr_tuple_ignored;
 };
 
 extern int midr_sync_init(struct midr_context *ctx);
@@ -103,6 +106,8 @@ extern void midr_sync_input_rejected(struct midr_context *ctx,
 extern void midr_sync_shutdown_begin(struct midr_context *ctx);
 extern void midr_sync_shutdown_announce_complete(struct midr_context *ctx);
 extern void midr_sync_shutdown_generation_failed(struct midr_context *ctx);
+extern void midr_sync_capability_tuple_ignored(struct midr_context *ctx,
+						 bool llgr);
 extern void midr_sync_shutdown_expired(struct midr_context *ctx);
 extern bool midr_sync_shutdown_ready(struct midr_context *ctx);
 extern bool midr_sync_shutdown_degraded(struct midr_context *ctx);

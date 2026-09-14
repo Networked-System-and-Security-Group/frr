@@ -102,6 +102,10 @@ struct midr_owned_store {
 	uint32_t pending_domains;
 	uint64_t sequence_failures;
 	uint64_t fightbacks;
+	uint64_t withdraw_failures;
+	uint64_t refresh_failures;
+	int last_withdraw_error;
+	int last_refresh_error;
 };
 
 static unsigned int midr_owned_observed_hash_key(const void *arg)
@@ -228,6 +232,22 @@ static int midr_owned_next_sequence(struct midr_owned_store *store,
 				    uint64_t *sequence);
 static void midr_owned_refresh_event(struct event *event);
 
+static void midr_owned_withdraw_failed(struct midr_owned_store *store, int ret)
+{
+	if (!store || !ret)
+		return;
+	store->withdraw_failures++;
+	store->last_withdraw_error = ret;
+}
+
+static void midr_owned_refresh_failed(struct midr_owned_store *store, int ret)
+{
+	if (!store || !ret)
+		return;
+	store->refresh_failures++;
+	store->last_refresh_error = ret;
+}
+
 static void midr_owned_schedule_refresh(struct midr_owned_store *store)
 {
 	if (!store || store->refresh_timer || !bm || !bm->master)
@@ -248,15 +268,19 @@ static int midr_owned_path_withdraw(struct midr_owned_store *store,
 		return 0;
 
 	ret = midr_owned_next_sequence(store, &sequence);
-	if (ret)
+	if (ret) {
+		midr_owned_withdraw_failed(store, ret);
 		return ret;
+	}
 	instance.state = MIDR_INSTANCE_WITHDRAWN;
 	instance.object.key = entry->key;
 	instance.object.ls_sequence = sequence;
 	ret = midr_rib_instance_upsert(store->ctx,
 				       store->ctx->bgp->peer_self, &instance, 0);
-	if (ret)
+	if (ret) {
+		midr_owned_withdraw_failed(store, ret);
 		return ret;
+	}
 	entry->last_sequence = sequence;
 	entry->advertised_present = false;
 	memset(&entry->advertised, 0, sizeof(entry->advertised));
@@ -515,8 +539,10 @@ static int midr_owned_refresh_entry(struct midr_owned_entry *entry)
 	object = entry->advertised;
 	suppressed = entry->suppressed;
 	ret = midr_owned_publish_internal(store, entry, &object, true);
-	if (ret)
+	if (ret) {
+		midr_owned_refresh_failed(store, ret);
 		return ret;
+	}
 	entry->suppressed = suppressed;
 	return 0;
 }
@@ -524,15 +550,23 @@ static int midr_owned_refresh_entry(struct midr_owned_entry *entry)
 static void midr_owned_refresh_batch(struct midr_owned_store *store)
 {
 	size_t count = 0;
+	size_t failures = 0;
+	int first_error = 0;
 
 	while (store->refresh_cursor && count < MIDR_OWNED_REFRESH_BATCH) {
 		struct midr_owned_entry *entry = store->refresh_cursor;
 
 		store->refresh_cursor = entry->refresh_next;
-		if (store->ready)
-			(void)midr_owned_refresh_entry(entry);
+		if (store->ready && midr_owned_refresh_entry(entry) != 0) {
+			failures++;
+			if (!first_error)
+				first_error = store->last_refresh_error;
+		}
 		count++;
 	}
+	if (failures)
+		zlog_warn("MIDR owned refresh: %zu refresh attempts failed (first error %d)",
+			  failures, first_error);
 }
 
 static struct midr_ls_object
@@ -724,6 +758,8 @@ static int midr_owned_link_fact(const struct midr_link_update *link, void *arg)
 struct midr_owned_sweep {
 	struct midr_owned_store *store;
 	uint32_t domains;
+	size_t withdraw_failures;
+	int first_withdraw_error;
 };
 
 static void midr_owned_mark_unseen(struct hash_bucket *bucket, void *arg)
@@ -743,7 +779,12 @@ static void midr_owned_sweep_unseen(struct hash_bucket *bucket, void *arg)
 	if (!CHECK_FLAG(sweep->domains, entry->domain) || entry->seen)
 		return;
 	event_cancel(&entry->timer);
-	midr_owned_path_withdraw(sweep->store, entry);
+	if (midr_owned_path_withdraw(sweep->store, entry) != 0) {
+		sweep->withdraw_failures++;
+		if (!sweep->first_withdraw_error)
+			sweep->first_withdraw_error =
+				sweep->store->last_withdraw_error;
+	}
 }
 
 static int midr_owned_node_prefix(const struct prefix *prefix, void *arg)
@@ -821,6 +862,7 @@ static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t doma
 	do {
 		domains = store->pending_domains;
 		store->pending_domains = 0;
+		memset(&sweep, 0, sizeof(sweep));
 		sweep.store = store;
 		sweep.domains = domains;
 		hash_iterate(store->entries, midr_owned_mark_unseen, &sweep);
@@ -843,6 +885,9 @@ static void midr_owned_reconcile_domains(struct midr_context *ctx, uint32_t doma
 			(void)midr_lsdb_local_group_prefix_foreach(ctx, midr_owned_group_prefix,
 								   store);
 		hash_iterate(store->entries, midr_owned_sweep_unseen, &sweep);
+		if (sweep.withdraw_failures)
+			zlog_warn("MIDR owned reconcile: %zu withdrawal attempts failed (first error %d)",
+				  sweep.withdraw_failures, sweep.first_withdraw_error);
 	} while (store->pending_domains);
 	store->reconciling = false;
 	midr_lsdb_local_metadata_changed(ctx);
@@ -1241,6 +1286,10 @@ int midr_owned_summary_get(struct midr_context *ctx,
 	summary->owner_node_id = store->owner_node_id;
 	summary->sequence_failures = store->sequence_failures;
 	summary->fightbacks = store->fightbacks;
+	summary->withdraw_failures = store->withdraw_failures;
+	summary->refresh_failures = store->refresh_failures;
+	summary->last_withdraw_error = store->last_withdraw_error;
+	summary->last_refresh_error = store->last_refresh_error;
 	summary->representative_group_id = store->representative_group_id;
 	summary->representative_candidate = store->representative_candidate;
 	summary->representative_committed = store->representative_committed;
@@ -1283,6 +1332,10 @@ void midr_show_owned(struct vty *vty, struct midr_context *ctx)
 		summary.takeover_timer_pending ? " (timer pending)" : "");
 	vty_out(vty, "  sequence failures:  %" PRIu64 "\n", summary.sequence_failures);
 	vty_out(vty, "  fightbacks:         %" PRIu64 "\n", summary.fightbacks);
+	vty_out(vty, "  withdraw failures:  %" PRIu64 " (last %d)\n",
+		summary.withdraw_failures, summary.last_withdraw_error);
+	vty_out(vty, "  refresh failures:   %" PRIu64 " (last %d)\n",
+		summary.refresh_failures, summary.last_refresh_error);
 }
 
 int midr_owned_takeover_delay_set(struct midr_context *ctx, uint32_t delay_msec)

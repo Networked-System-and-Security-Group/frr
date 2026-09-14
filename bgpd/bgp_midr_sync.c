@@ -108,9 +108,13 @@ struct midr_sync_store {
 	uint64_t stale_event_count;
 	uint64_t input_rejected_count;
 	uint64_t output_timeout_count;
+	uint64_t shutdown_generation_failures;
+	uint64_t gr_tuple_ignored;
+	uint64_t llgr_tuple_ignored;
 	uint32_t input_reject_backoff_msec;
 	bool shutdown_active;
 	bool shutdown_announce_complete;
+	bool shutdown_generation_failure_recorded;
 	enum midr_sync_shutdown_state shutdown_state;
 	struct list *shutdown_targets;
 };
@@ -1040,6 +1044,7 @@ void midr_sync_shutdown_begin(struct midr_context *ctx)
 	list_delete_all_node(ctx->sync_store->shutdown_targets);
 	ctx->sync_store->shutdown_active = true;
 	ctx->sync_store->shutdown_announce_complete = false;
+	ctx->sync_store->shutdown_generation_failure_recorded = false;
 	ctx->sync_store->shutdown_state = MIDR_SYNC_SHUTDOWN_WAITING;
 	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session)) {
 		if (session->state == MIDR_SYNC_SESSION_DOWN ||
@@ -1069,6 +1074,10 @@ void midr_sync_shutdown_generation_failed(struct midr_context *ctx)
 	if (!ctx || !ctx->sync_store || !ctx->sync_store->shutdown_active)
 		return;
 	ctx->sync_store->shutdown_announce_complete = false;
+	if (!ctx->sync_store->shutdown_generation_failure_recorded) {
+		ctx->sync_store->shutdown_generation_failures++;
+		ctx->sync_store->shutdown_generation_failure_recorded = true;
+	}
 	ctx->sync_store->shutdown_state =
 		MIDR_SYNC_SHUTDOWN_GENERATION_FAILED;
 }
@@ -1116,9 +1125,27 @@ bool midr_sync_shutdown_degraded(struct midr_context *ctx)
 void midr_sync_shutdown_finish(struct midr_context *ctx)
 {
 	struct midr_sync_store *store;
+	const char *result;
 
 	if (!ctx || !(store = ctx->sync_store))
 		return;
+	switch (store->shutdown_state) {
+	case MIDR_SYNC_SHUTDOWN_COMPLETE:
+		result = "COMPLETE";
+		break;
+	case MIDR_SYNC_SHUTDOWN_GENERATION_FAILED:
+		result = "GENERATION_FAILED";
+		break;
+	case MIDR_SYNC_SHUTDOWN_DEGRADED:
+		result = "DEGRADED";
+		break;
+	case MIDR_SYNC_SHUTDOWN_IDLE:
+	case MIDR_SYNC_SHUTDOWN_WAITING:
+	default:
+		result = "DEGRADED";
+		break;
+	}
+	zlog_info("MIDR shutdown result: %s", result);
 	store->shutdown_active = false;
 	store->shutdown_announce_complete = false;
 	list_delete_all_node(store->shutdown_targets);
@@ -1278,6 +1305,10 @@ int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *stat
 	status->stale_event_count = store->stale_event_count;
 	status->input_rejected_count = store->input_rejected_count;
 	status->output_timeout_count = store->output_timeout_count;
+	status->shutdown_generation_failures =
+		store->shutdown_generation_failures;
+	status->gr_tuple_ignored = store->gr_tuple_ignored;
+	status->llgr_tuple_ignored = store->llgr_tuple_ignored;
 	status->shutdown_state = store->shutdown_state;
 	status->shutdown_active = store->shutdown_active;
 	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {
