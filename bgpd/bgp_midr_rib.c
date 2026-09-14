@@ -71,6 +71,8 @@ struct midr_rib_store {
 	uint64_t rejected_resource;
 	uint64_t rejected_internal;
 	uint64_t identities_reclaimed;
+	uint64_t lifetime_failures;
+	int last_lifetime_error;
 	struct event *lifetime_timer;
 	bool test_clock_enabled;
 	uint64_t test_now_ns;
@@ -215,7 +217,7 @@ static struct midr_rib_advertisement *midr_rib_advertisement_lookup(
 	return NULL;
 }
 
-static int midr_rib_advertisement_update(
+static void midr_rib_advertisement_update(
 	struct midr_rib_identity *identity, struct peer *peer,
 	const struct midr_instance *instance)
 {
@@ -225,17 +227,15 @@ static int midr_rib_advertisement_update(
 	if (advertisement) {
 		advertisement->sequence = instance->object.ls_sequence;
 		advertisement->state = instance->state;
-		return 0;
+		return;
 	}
 	advertisement = XCALLOC(MTYPE_MIDR_RIB_ADVERTISEMENT, sizeof(*advertisement));
-	if (!advertisement)
-		return -ENOMEM;
+	/* FRR XCALLOC is fatal on OOM, so a NULL allocation branch is unreachable. */
 	advertisement->peer = peer;
 	advertisement->sequence = instance->object.ls_sequence;
 	advertisement->state = instance->state;
 	advertisement->next = identity->advertisements;
 	identity->advertisements = advertisement;
-	return 0;
 }
 
 static bool midr_rib_advertisement_remove(struct midr_rib_identity *identity,
@@ -604,14 +604,32 @@ static bool midr_rib_canonical_reclaim(const struct midr_ls_object_key *key,
 	return true;
 }
 
-static void midr_rib_lifetime_pass(struct midr_rib_store *store)
+static int midr_rib_lifetime_pass(struct midr_rib_store *store)
 {
-	(void)midr_canonical_sweep(store->canonical,
+	int first_error = 0;
+	int ret;
+
+	ret = midr_canonical_sweep(store->canonical,
 				   MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	if (ret && !first_error)
+		first_error = ret;
 	midr_rib_apply_lifetime_events(store);
-	(void)midr_canonical_gc(store->canonical,
+	ret = midr_canonical_gc(store->canonical,
 				MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL,
 				midr_rib_canonical_reclaim, store);
+	if (ret && !first_error)
+		first_error = ret;
+	if (first_error) {
+		store->lifetime_failures++;
+		if (store->last_lifetime_error != first_error)
+			zlog_warn("MIDR RIB lifetime pass failed: error %d", first_error);
+		store->last_lifetime_error = first_error;
+	} else if (store->last_lifetime_error) {
+		zlog_info("MIDR RIB lifetime pass recovered from error %d",
+			  store->last_lifetime_error);
+		store->last_lifetime_error = 0;
+	}
+	return first_error;
 }
 
 static void midr_rib_lifetime_event(struct event *event)
@@ -621,7 +639,7 @@ static void midr_rib_lifetime_event(struct event *event)
 	if (!store || !store->ctx)
 		return;
 	store->lifetime_timer = NULL;
-	midr_rib_lifetime_pass(store);
+	(void)midr_rib_lifetime_pass(store);
 	if (bm && bm->master)
 		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
 				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
@@ -756,13 +774,7 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 		old_advertisement_sequence = advertisement->sequence;
 		old_advertisement_state = advertisement->state;
 	}
-	ret = midr_rib_advertisement_update(identity, peer, instance);
-	if (ret) {
-		if (identity_created)
-			midr_rib_identity_detach(store, identity);
-		bgp_dest_unlock_node(dest);
-		return ret;
-	}
+	midr_rib_advertisement_update(identity, peer, instance);
 	/* Build and intern the immutable path attribute before changing the
 	 * canonical store.  A failed allocation must leave both views unchanged. */
 	new_attr = midr_rib_instance_attr_intern(ctx->bgp, instance, age_ms);
@@ -907,6 +919,29 @@ int midr_rib_peer_withdraw(struct midr_context *ctx, struct peer *peer,
 	/* MP_UNREACH removes only this peer's advertisement relationship.  The
 	 * canonical instance remains authoritative until a newer instance arrives. */
 	return midr_rib_advertisement_remove(identity, peer) ? 0 : -ENOENT;
+}
+
+struct midr_rib_peer_cleanup_state {
+	const struct peer *peer;
+};
+
+static void midr_rib_peer_cleanup_iter(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_rib_peer_cleanup_state *state = arg;
+	struct midr_rib_identity *identity = bucket->data;
+
+	while (midr_rib_advertisement_remove(identity, state->peer))
+		;
+}
+
+void midr_rib_peer_cleanup(struct midr_context *ctx, const struct peer *peer)
+{
+	struct midr_rib_peer_cleanup_state state = {.peer = peer};
+
+	if (!ctx || !ctx->rib_store || !peer)
+		return;
+	hash_iterate(ctx->rib_store->identities, midr_rib_peer_cleanup_iter,
+			     &state);
 }
 
 void midr_rib_dest_cleanup(struct bgp *bgp, struct bgp_dest *dest)
@@ -1091,6 +1126,8 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		.rejected_resource = store->rejected_resource,
 		.rejected_internal = store->rejected_internal,
 		.identities_reclaimed = store->identities_reclaimed,
+		.lifetime_failures = store->lifetime_failures,
+		.last_lifetime_error = store->last_lifetime_error,
 		.canonical_identity_count =
 			midr_canonical_identity_count(store->canonical),
 		.floor_count = midr_canonical_floor_count(store->canonical),
@@ -1327,8 +1364,15 @@ int midr_rib_test_run_lifetime(struct midr_context *ctx)
 {
 	if (!ctx || !ctx->rib_store)
 		return -ENOENT;
-	midr_rib_lifetime_pass(ctx->rib_store);
-	return 0;
+	return midr_rib_lifetime_pass(ctx->rib_store);
+}
+
+int midr_rib_test_set_event_limit(struct midr_context *ctx, size_t limit)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_canonical_test_set_event_limit(ctx->rib_store->canonical,
+						  limit);
 }
 
 int midr_rib_test_set_path_stale(

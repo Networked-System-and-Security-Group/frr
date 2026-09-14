@@ -48,6 +48,8 @@ struct midr_rib_summary {
 	uint64_t rejected_resource;
 	uint64_t rejected_internal;
 	uint64_t identities_reclaimed;
+	uint64_t lifetime_failures;
+	int last_lifetime_error;
 };
 
 typedef int (*midr_rib_selected_cb)(
@@ -70,6 +72,8 @@ extern int midr_rib_instance_upsert_received(
 extern int midr_rib_peer_withdraw(
 	struct midr_context *ctx, struct peer *peer,
 	const struct midr_ls_object_key *key);
+extern void midr_rib_peer_cleanup(struct midr_context *ctx,
+					  const struct peer *peer);
 extern bool midr_rib_peer_advertisement_has(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	const struct peer *peer);
@@ -125,6 +129,8 @@ extern int midr_rib_test_set_now_ns(struct midr_context *ctx,
 extern int midr_rib_test_set_gc_enabled(struct midr_context *ctx,
 					 bool enabled);
 extern int midr_rib_test_run_lifetime(struct midr_context *ctx);
+extern int midr_rib_test_set_event_limit(struct midr_context *ctx,
+					 size_t limit);
 extern int midr_rib_test_set_path_stale(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	struct peer *peer, bool stale);

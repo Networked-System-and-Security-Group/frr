@@ -82,6 +82,8 @@ extern int midr_canonical_gc(struct midr_canonical *store, size_t limit,
 				 void *reclaim_arg);
 extern int midr_canonical_gc_enable(struct midr_canonical *store,
 				    bool enabled);
+extern int midr_canonical_test_set_event_limit(struct midr_canonical *store,
+						 size_t limit);
 extern uint32_t midr_canonical_max_age_ms(
 				const struct midr_canonical *store);
 extern size_t midr_canonical_identity_count(const struct midr_canonical *store);

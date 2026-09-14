@@ -456,6 +456,15 @@ int midr_canonical_gc_enable(struct midr_canonical *store, bool enabled)
 	return 0;
 }
 
+int midr_canonical_test_set_event_limit(struct midr_canonical *store,
+						size_t limit)
+{
+	if (!store)
+		return -EINVAL;
+	store->config.event_limit = limit;
+	return 0;
+}
+
 uint32_t midr_canonical_max_age_ms(const struct midr_canonical *store)
 {
 	return store ? store->config.max_age_ms : 0;

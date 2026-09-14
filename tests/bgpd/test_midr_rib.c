@@ -155,6 +155,19 @@ static void test_sequence_admission_and_peer_withdraw(void)
 	assert(selected_peer(&current.object.key, &sequence, NULL) == peer_three);
 	assert(sequence == 11);
 
+	/* A peer disconnect removes only its advertisement relationship.  The
+	 * canonical path and another peer's relationship remain intact. */
+	midr_rib_peer_cleanup(ctx, peer_three);
+	assert(!midr_rib_peer_advertisement_has(ctx, &current.object.key,
+					       peer_three));
+	assert(midr_rib_peer_advertisement_has(ctx, &current.object.key,
+					       peer_two));
+	assert(selected_peer(&current.object.key, &sequence, NULL) == peer_three);
+	assert(sequence == 11);
+	midr_rib_peer_cleanup(ctx, peer_three);
+	assert(selected_peer(&current.object.key, NULL, NULL) == peer_three);
+	assert(midr_rib_instance_upsert(ctx, peer_three, &newer, 0) == 0);
+
 	/* MP_UNREACH only removes the sender's advertisement relationship. */
 	assert(midr_rib_peer_withdraw(ctx, peer_three, &current.object.key) == 0);
 	assert(!midr_rib_peer_advertisement_has(ctx, &current.object.key, peer_three));
@@ -302,6 +315,31 @@ static void run_lifetime_at(uint64_t now_ns)
 	assert(midr_rib_test_run_lifetime(ctx) == 0);
 }
 
+static void test_lifetime_event_capacity_failure(void)
+{
+	const uint64_t life_ns =
+		(uint64_t)MIDR_CANONICAL_MAX_AGE_MS * 1000000ULL;
+	const struct midr_instance object =
+		membership(router_id("12.12.12.12"), 1, 12);
+	struct midr_rib_summary before, after;
+	struct timespec ts;
+	uint64_t now_ns;
+
+	assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+	now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec + life_ns;
+	assert(midr_rib_summary_get(ctx, &before) == 0);
+	assert(midr_rib_instance_upsert(ctx, peer_two, &object, 0) == 0);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_rib_test_set_event_limit(ctx, 0) == 0);
+	assert(midr_rib_test_set_now_ns(ctx, now_ns) == 0);
+	assert(midr_rib_test_run_lifetime(ctx) == -ENOSPC);
+	assert(midr_rib_summary_get(ctx, &after) == 0);
+	assert(after.lifetime_failures == before.lifetime_failures + 1);
+	assert(after.last_lifetime_error == -ENOSPC);
+	assert(midr_rib_test_set_event_limit(ctx, MIDR_RIB_MAX_IDENTITIES * 2U) == 0);
+	assert(midr_rib_test_run_lifetime(ctx) == 0);
+}
+
 static void test_identity_reclaim_and_slot_reuse(void)
 {
 	const uint64_t life_ns =
@@ -439,6 +477,7 @@ int main(void)
 	test_duplicate_conflict_and_resolution();
 	test_iteration_limits_and_validation();
 	test_identity_limit_rejection_and_recovery();
+	test_lifetime_event_capacity_failure();
 	test_identity_reclaim_and_slot_reuse();
 	puts("MIDR RIB tests passed");
 	return 0;
