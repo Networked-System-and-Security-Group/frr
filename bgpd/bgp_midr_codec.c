@@ -272,7 +272,7 @@ static size_t midr_codec_ls_attribute_length(const struct midr_ls_object *object
 
 static enum midr_codec_result midr_attribute_encode(
 				struct stream *stream, const struct midr_instance *instance,
-				uint32_t age_ms)
+				uint32_t age_ms, size_t *age_offset)
 {
 	const struct midr_ls_object *object;
 	size_t length;
@@ -299,6 +299,8 @@ static enum midr_codec_result midr_attribute_encode(
 	midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_STATE, 1);
 	stream_putc(stream, instance->state);
 	midr_codec_put_tlv_header(stream, MIDR_INSTANCE_TLV_AGE, 4);
+	if (age_offset)
+		*age_offset = stream_get_endp(stream);
 	stream_putl(stream, age_ms);
 	if (withdrawn)
 		return MIDR_CODEC_OK;
@@ -336,7 +338,17 @@ static enum midr_codec_result midr_attribute_encode(
 enum midr_codec_result midr_instance_attribute_encode(struct stream *stream,
 					 const struct midr_instance *instance, uint32_t age_ms)
 {
-	return midr_attribute_encode(stream, instance, age_ms);
+	return midr_attribute_encode(stream, instance, age_ms, NULL);
+}
+
+enum midr_codec_result midr_instance_attribute_encode_tracked(
+	struct stream *stream, const struct midr_instance *instance,
+	uint32_t age_ms, size_t *age_offset)
+{
+	if (!age_offset)
+		return MIDR_CODEC_MALFORMED_ATTRIBUTE;
+	*age_offset = 0;
+	return midr_attribute_encode(stream, instance, age_ms, age_offset);
 }
 
 static enum midr_codec_result midr_codec_get_address(struct stream *stream, size_t offset,

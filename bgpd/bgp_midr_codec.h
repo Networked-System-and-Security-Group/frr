@@ -62,6 +62,9 @@ struct midr_instance_attributes {
 
 extern enum midr_codec_result midr_instance_attribute_encode(
 	struct stream *stream, const struct midr_instance *instance, uint32_t age_ms);
+extern enum midr_codec_result midr_instance_attribute_encode_tracked(
+	struct stream *stream, const struct midr_instance *instance,
+	uint32_t age_ms, size_t *age_offset);
 extern enum midr_codec_result midr_instance_attribute_decode(
 	struct stream *stream, size_t length, struct midr_instance_attributes *attributes);
 extern enum midr_codec_result midr_instance_from_wire(

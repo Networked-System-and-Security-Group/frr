@@ -13,12 +13,14 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_codec.h"
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_packet.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
+#include "bgpd/bgp_updgrp.h"
 
 static int midr_packet_withdraw(struct midr_context *ctx, struct peer *peer,
 				const struct midr_ls_object_key *key)
@@ -111,11 +113,14 @@ int bgp_nlri_parse_midr(struct peer *peer, struct attr *attr, struct bgp_nlri *p
 			goto done;
 		}
 
-		ret = midr_rib_instance_upsert(ctx, peer, &instance,
-					       wire.age_ms);
+		ret = midr_rib_instance_upsert_received(
+			ctx, peer, &instance, wire.age_ms,
+			peer->connection && peer->connection->curr
+				? stream_get_monotime_ns(peer->connection->curr)
+				: 0);
 		if (ret == 0)
 			ret = BGP_NLRI_PARSE_OK;
-		else if (ret == -ENOSPC || ret == -ENOMEM || ret == -ERANGE) {
+		else if (ret == -ENOSPC || ret == -ENOMEM) {
 			/* A well-formed UPDATE that cannot be admitted for
 			 * resource reasons must not reset the session.  The
 			 * packet is counted as received; the unadmitted input
@@ -131,18 +136,31 @@ done:
 	return ret;
 }
 
-int bgp_midr_packet_attributes(struct stream *stream, struct bgp *bgp, struct bgp_path_info *path)
+int bgp_midr_packet_attributes(struct stream *stream, struct bgp *bgp,
+			       struct bgp_path_info *path,
+			       struct bpacket_attr_vec_arr *vecarr)
 {
-	struct midr_instance instance;
+	const struct midr_instance_ref *instance_ref;
+	const struct midr_instance *instance;
 	uint32_t age_ms;
+	uint64_t now_ns;
 	size_t start;
 	size_t length_pos;
 	size_t value_start;
+	size_t age_offset;
 	int ret = -EINVAL;
 
 	if (!stream || !bgp || !bgp->midr_info || !path || !path->net ||
-	    midr_rib_path_instance(&bgp->midr_info->ctx, path->net, path,
-				   &instance, &age_ms) != 0)
+	    !vecarr || vecarr->midr_instance ||
+	    midr_rib_path_instance_ref(&bgp->midr_info->ctx, path->net, path,
+				       &instance_ref) != 0)
+		return -EINVAL;
+	instance = midr_instance_ref_value(instance_ref);
+	now_ns = midr_rib_now_ns(&bgp->midr_info->ctx);
+	if (!instance || !now_ns ||
+	    midr_rib_instance_ref_age_at(&bgp->midr_info->ctx, instance_ref,
+					 now_ns, 0, &age_ms) != 0 ||
+	    age_ms >= midr_rib_max_age_ms(&bgp->midr_info->ctx))
 		return -EINVAL;
 
 	start = stream_get_endp(stream);
@@ -151,12 +169,16 @@ int bgp_midr_packet_attributes(struct stream *stream, struct bgp *bgp, struct bg
 	length_pos = stream_get_endp(stream);
 	stream_putw(stream, 0);
 	value_start = stream_get_endp(stream);
-	if (midr_instance_attribute_encode(stream, &instance, age_ms) !=
-	    MIDR_CODEC_OK)
+	if (midr_instance_attribute_encode_tracked(stream, instance, age_ms,
+					   &age_offset) != MIDR_CODEC_OK)
 		goto rollback;
 	if (stream_get_endp(stream) - value_start > UINT16_MAX)
 		goto rollback;
 	stream_putw_at(stream, length_pos, stream_get_endp(stream) - value_start);
+	SET_FLAG(vecarr->entries[BGP_ATTR_VEC_MIDR_AGE].flags,
+		 BPKT_ATTRVEC_FLAGS_UPDATED);
+	vecarr->entries[BGP_ATTR_VEC_MIDR_AGE].offset = age_offset;
+	vecarr->midr_instance = instance_ref;
 
 	ret = stream_get_endp(stream) - start;
 

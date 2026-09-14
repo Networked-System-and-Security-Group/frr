@@ -58,7 +58,13 @@
 	(PEER_CAP_ORF_PREFIX_SM_RCV | PEER_CAP_ADDPATH_AF_TX_ADV |             \
 	 PEER_CAP_ADDPATH_AF_RX_RCV | PEER_CAP_ENHE_AF_NEGO)
 
-enum bpacket_attr_vec_type { BGP_ATTR_VEC_NH = 0, BGP_ATTR_VEC_MAX };
+struct midr_instance_ref;
+
+enum bpacket_attr_vec_type {
+	BGP_ATTR_VEC_NH = 0,
+	BGP_ATTR_VEC_MIDR_AGE,
+	BGP_ATTR_VEC_MAX
+};
 
 typedef struct {
 	uint32_t flags;
@@ -76,6 +82,9 @@ typedef struct {
 
 typedef struct bpacket_attr_vec_arr {
 	bpacket_attr_vec entries[BGP_ATTR_VEC_MAX];
+	/* Borrowed while attributes are built; each queued bpacket acquires its
+	 * own reference so template delay cannot outlive the canonical instance. */
+	const struct midr_instance_ref *midr_instance;
 } bpacket_attr_vec_arr;
 
 struct bpacket {

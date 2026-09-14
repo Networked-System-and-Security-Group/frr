@@ -66,6 +66,7 @@ struct midr_sync_status {
 	uint64_t reconnect_count;
 	uint64_t stale_event_count;
 	uint64_t input_rejected_count;
+	uint64_t output_timeout_count;
 };
 
 extern int midr_sync_init(struct midr_context *ctx);
@@ -90,6 +91,8 @@ extern void midr_sync_packet_written(struct peer_connection *connection,
 						 struct stream *stream);
 extern void midr_sync_packet_dropped(struct peer_connection *connection,
 						 struct stream *stream);
+extern bool midr_sync_packet_timed_out(struct peer_connection *connection,
+				       struct stream *stream);
 extern void midr_sync_snapshot_begin(struct peer_connection *connection);
 extern void midr_sync_snapshot_end(struct peer_connection *connection);
 extern bool midr_sync_snapshot_requested(struct peer_connection *connection);
@@ -128,5 +131,8 @@ extern int midr_sync_test_set_input_reject_backoff(struct midr_context *ctx,
 						    uint32_t msec);
 extern size_t midr_sync_test_resync_pending(struct midr_context *ctx);
 extern size_t midr_sync_test_fire_resync(struct midr_context *ctx);
+extern bool midr_sync_test_packet_timed_out_at(
+	struct peer_connection *connection, struct stream *stream,
+	uint64_t now_ns);
 
 #endif /* _FRR_BGP_MIDR_SYNC_H */

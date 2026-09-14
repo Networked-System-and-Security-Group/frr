@@ -21,6 +21,7 @@ struct bgp;
 struct bgp_dest;
 struct bgp_path_info;
 struct midr_context;
+struct midr_instance_ref;
 struct peer;
 struct vty;
 
@@ -39,6 +40,7 @@ struct midr_rib_summary {
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
 	uint64_t rejected_resource;
+	uint64_t rejected_internal;
 };
 
 typedef int (*midr_rib_selected_cb)(
@@ -54,6 +56,10 @@ extern void midr_rib_finish(struct midr_context *ctx);
 extern int midr_rib_instance_upsert(
 	struct midr_context *ctx, struct peer *peer,
 	const struct midr_instance *instance, uint32_t age_ms);
+extern int midr_rib_instance_upsert_received(
+	struct midr_context *ctx, struct peer *peer,
+	const struct midr_instance *instance, uint32_t age_ms,
+	uint64_t received_ns);
 extern int midr_rib_peer_withdraw(
 	struct midr_context *ctx, struct peer *peer,
 	const struct midr_ls_object_key *key);
@@ -67,6 +73,15 @@ extern int midr_rib_path_instance(
 	struct midr_context *ctx, const struct bgp_dest *dest,
 	const struct bgp_path_info *path, struct midr_instance *instance,
 	uint32_t *age_ms);
+extern int midr_rib_path_instance_ref(
+	struct midr_context *ctx, const struct bgp_dest *dest,
+	const struct bgp_path_info *path,
+	const struct midr_instance_ref **instance_ref);
+extern uint64_t midr_rib_now_ns(struct midr_context *ctx);
+extern uint32_t midr_rib_max_age_ms(struct midr_context *ctx);
+extern int midr_rib_instance_ref_age_at(
+	struct midr_context *ctx, const struct midr_instance_ref *instance_ref,
+	uint64_t now_ns, uint32_t budget_ms, uint32_t *age_ms);
 extern int midr_rib_selected_instance_get(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	struct midr_instance *instance, uint32_t *age_ms,
@@ -98,6 +113,8 @@ extern void midr_show_rib_paths(struct vty *vty, struct midr_context *ctx);
 
 extern int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 					     size_t limit);
+extern int midr_rib_test_set_now_ns(struct midr_context *ctx,
+				     uint64_t now_ns);
 extern int midr_rib_test_set_path_stale(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	struct peer *peer, bool stale);

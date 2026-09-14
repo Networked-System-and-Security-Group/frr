@@ -14,12 +14,14 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_codec.h"
 #include "bgpd/bgp_midr_packet.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_network.h"
+#include "bgpd/bgp_updgrp.h"
 #include "bgpd/bgp_vty.h"
 
 struct zebra_privs_t bgpd_privs = {};
@@ -28,6 +30,8 @@ struct event_loop *master;
 static struct bgp *bgp;
 static struct midr_context *ctx;
 static struct peer *remote;
+
+#define TEST_BASE_NS 1000000000000000000ULL
 
 static uint32_t router_id(const char *text)
 {
@@ -85,6 +89,7 @@ struct encode_state {
 	struct stream *stream;
 	struct bgp_dest *dest;
 	struct bgp_path_info *path;
+	struct bpacket_attr_vec_arr *vecarr;
 	int result;
 };
 
@@ -99,7 +104,8 @@ static int encode_selected(const struct midr_instance *instance, struct peer *pe
 		return 0;
 	state->dest = dest;
 	state->path = path;
-	state->result = bgp_midr_packet_attributes(state->stream, bgp, path);
+	state->result = bgp_midr_packet_attributes(state->stream, bgp, path,
+						   state->vecarr);
 	return 0;
 }
 
@@ -152,18 +158,35 @@ static void test_active_withdraw_and_mp_unreach(void)
 static void test_outbound_snapshot_and_single_nlri(void)
 {
 	struct midr_instance active = membership(20, 30);
+	struct midr_instance newer = membership(21, 31);
 	struct stream *nlri = stream_new(128);
 	struct stream *encoded = stream_new(256);
+	struct stream *reformatted;
+	struct stream *wire;
 	struct bgp_nlri packet;
 	struct attr attr;
+	struct attr newer_attr;
+	struct bpacket_attr_vec_arr vecarr;
+	struct bpacket_queue queue;
+	struct bpacket *template;
+	struct peer_af paf = {
+		.peer = remote,
+		.afi = AFI_BGP_LS,
+		.safi = SAFI_MIDR_LS,
+	};
+	const uint64_t base_ns = TEST_BASE_NS;
 	struct encode_state state = {
 		.key = &active.object.key,
 		.stream = encoded,
+		.vecarr = &vecarr,
 		.result = -1,
 	};
 	struct attr parsed = {};
+	struct midr_instance_attributes wire_attributes;
 	size_t length;
 
+	assert(midr_rib_test_set_now_ns(ctx, base_ns) == 0);
+	bpacket_attr_vec_arr_reset(&vecarr);
 	attr = instance_attr(&active, 33);
 	encode_packet(nlri, &active);
 	packet = packet_from_stream(nlri);
@@ -183,12 +206,106 @@ static void test_outbound_snapshot_and_single_nlri(void)
 	assert(bgp_midr_ls_attr_age(parsed.midr_ls) == 33);
 	bgp_attr_unintern_sub(&parsed);
 
+	/* The shared template retains the exact canonical instance.  Replacing
+	 * the RIB path before peer reformat must not invalidate or retarget it. */
+	bpacket_queue_init(&queue);
+	bpacket_queue_add(&queue, NULL, NULL);
+	template = bpacket_queue_add(&queue, encoded, &vecarr);
+	encoded = NULL;
+	assert(template && template->arr.midr_instance);
+	assert(midr_rib_test_set_now_ns(ctx, base_ns + 100000000ULL) == 0);
+	newer_attr = instance_attr(&newer, 44);
+	stream_reset(nlri);
+	encode_packet(nlri, &newer);
+	packet = packet_from_stream(nlri);
+	assert(bgp_nlri_parse_midr(remote, &newer_attr, &packet) ==
+	       BGP_NLRI_PARSE_OK);
+	bgp_attr_unintern_sub(&newer_attr);
+
+	/* MRAI/coalesce/template delay is included at peer-private reformat,
+	 * then one B is added for the not-yet-counted delivery interval. */
+	assert(midr_rib_test_set_now_ns(ctx, base_ns + 500000000ULL) == 0);
+	reformatted = bpacket_reformat_for_peer(template, &paf);
+	assert(reformatted);
+	length = stream_getw_from(reformatted, 2);
+	wire = stream_new(length);
+	stream_put(wire, STREAM_DATA(reformatted) + 4, length);
+	assert(midr_instance_attribute_decode(wire, length, &wire_attributes) ==
+	       MIDR_CODEC_OK);
+	assert(wire_attributes.ls.ls_sequence == 20);
+	assert(wire_attributes.age_ms ==
+	       33 + 500 + MIDR_CANONICAL_FORWARD_BUDGET_MS);
+	assert(stream_get_monotime_ns(reformatted) == base_ns + 500000000ULL);
+	stream_free(wire);
+	stream_free(reformatted);
+
+	/* A template that has itself reached L is discarded, never encoded as
+	 * a deceptively young or wrapped instance. */
+	assert(midr_rib_test_set_now_ns(
+		       ctx, base_ns + (uint64_t)MIDR_CANONICAL_MAX_AGE_MS *
+				      1000000ULL) == 0);
+	assert(bpacket_reformat_for_peer(template, &paf) == NULL);
+	bpacket_queue_cleanup(&queue);
+
 	/* A second NLRI in the same UPDATE is rejected before RIB mutation. */
 	encode_packet(nlri, &active);
 	packet = packet_from_stream(nlri);
 	assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_ERROR);
 	bgp_attr_unintern_sub(&attr);
 	stream_free(encoded);
+	stream_free(nlri);
+}
+
+static void test_receive_fifo_age_and_clock_regression(void)
+{
+	struct midr_instance received = membership(500, 50);
+	struct midr_instance regressed = membership(501, 51);
+	struct midr_instance selected;
+	struct peer *selected_peer;
+	struct midr_rib_summary rib_before, rib_after;
+	struct midr_sync_status sync_before, sync_after;
+	struct stream *nlri = stream_new(128);
+	struct stream *incoming = stream_new(64);
+	struct bgp_nlri packet;
+	struct attr attr;
+	uint32_t age_ms;
+	const uint64_t received_ns =
+		TEST_BASE_NS + 10000000000ULL +
+		(uint64_t)MIDR_CANONICAL_MAX_AGE_MS * 1000000ULL;
+
+	stream_set_monotime_ns(incoming, received_ns);
+	remote->connection->curr = incoming;
+	assert(midr_rib_test_set_now_ns(ctx, received_ns + 250000000ULL) == 0);
+	attr = instance_attr(&received, 100);
+	encode_packet(nlri, &received);
+	packet = packet_from_stream(nlri);
+	assert(bgp_nlri_parse_midr(remote, &attr, &packet) == BGP_NLRI_PARSE_OK);
+	assert(midr_rib_selected_instance_get(ctx, &received.object.key,
+					      &selected, &age_ms,
+					      &selected_peer) == 0);
+	assert(age_ms == 350);
+	bgp_attr_unintern_sub(&attr);
+	remote->connection->curr = NULL;
+	stream_free(incoming);
+
+	/* A monotonic regression is an internal time failure, not capacity
+	 * pressure: it must not enter the resource-resync/backoff path. */
+	assert(midr_rib_summary_get(ctx, &rib_before) == 0);
+	assert(midr_sync_status_get(ctx, &sync_before) == 0);
+	assert(midr_rib_test_set_now_ns(ctx, received_ns + 249000000ULL) == 0);
+	stream_reset(nlri);
+	attr = instance_attr(&regressed, 100);
+	encode_packet(nlri, &regressed);
+	packet = packet_from_stream(nlri);
+	assert(bgp_nlri_parse_midr(remote, &attr, &packet) ==
+	       BGP_NLRI_PARSE_ERROR);
+	assert(midr_rib_summary_get(ctx, &rib_after) == 0);
+	assert(midr_sync_status_get(ctx, &sync_after) == 0);
+	assert(rib_after.rejected_internal == rib_before.rejected_internal + 1);
+	assert(rib_after.rejected_resource == rib_before.rejected_resource);
+	assert(sync_after.input_rejected_count == sync_before.input_rejected_count);
+	bgp_attr_unintern_sub(&attr);
+	assert(midr_rib_test_set_now_ns(ctx, received_ns + 251000000ULL) == 0);
 	stream_free(nlri);
 }
 
@@ -225,7 +342,7 @@ static void test_resource_rejection_keeps_session(void)
 			},
 		},
 	};
-	struct midr_instance refresh = membership(200, 23);
+	struct midr_instance refresh = membership(600, 23);
 	struct midr_sync_status status;
 	struct midr_instance selected;
 	struct peer *selected_peer;
@@ -263,7 +380,7 @@ static void test_resource_rejection_keeps_session(void)
 		assert(midr_rib_selected_instance_get(ctx, &refresh.object.key,
 						      &selected, &age,
 						      &selected_peer) == 0);
-		assert(selected.object.ls_sequence == 200);
+		assert(selected.object.ls_sequence == 600);
 		assert(midr_sync_status_get(ctx, &status) == 0);
 		assert(status.input_rejected_count == 1);
 		bgp_attr_unintern_sub(&refresh_attr);
@@ -300,6 +417,7 @@ int main(void)
 		       ASNOTATION_PLAIN) >= 0);
 	bgp->router_id.s_addr = router_id("10.0.0.1");
 	ctx = &bgp->midr_info->ctx;
+	assert(midr_rib_test_set_now_ns(ctx, TEST_BASE_NS) == 0);
 	remote = peer_create_accept(bgp, NULL);
 	assert(remote && remote->connection);
 	remote->remote_id.s_addr = router_id("10.0.0.2");
@@ -308,6 +426,7 @@ int main(void)
 
 	test_active_withdraw_and_mp_unreach();
 	test_outbound_snapshot_and_single_nlri();
+	test_receive_fifo_age_and_clock_regression();
 	test_packet_validation();
 	test_resource_rejection_keeps_session();
 	puts("MIDR packet tests passed");

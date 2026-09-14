@@ -104,6 +104,7 @@ struct stream *stream_new(size_t size)
 	s->next = NULL;
 	s->size = size;
 	s->allow_expansion = false;
+	s->monotime_ns = 0;
 	return s;
 }
 
@@ -133,10 +134,22 @@ struct stream *stream_copy(struct stream *dest, const struct stream *src)
 	dest->allow_expansion = src->allow_expansion;
 	dest->endp = src->endp;
 	dest->getp = src->getp;
+	dest->monotime_ns = src->monotime_ns;
 
 	memcpy(dest->data, src->data, src->endp);
 
 	return dest;
+}
+
+uint64_t stream_get_monotime_ns(const struct stream *s)
+{
+	return s ? s->monotime_ns : 0;
+}
+
+void stream_set_monotime_ns(struct stream *s, uint64_t monotime_ns)
+{
+	if (s)
+		s->monotime_ns = monotime_ns;
 }
 
 struct stream *stream_dup(const struct stream *s)
@@ -168,6 +181,7 @@ struct stream *stream_dupcat(const struct stream *s1, const struct stream *s2,
 		return NULL;
 
 	new->allow_expansion = s1->allow_expansion || s2->allow_expansion;
+	new->monotime_ns = s1->monotime_ns;
 	memcpy(new->data, s1->data, offset);
 	memcpy(new->data + offset, s2->data, s2->endp);
 	memcpy(new->data + offset + s2->endp, s1->data + offset,
@@ -1233,6 +1247,7 @@ void stream_reset(struct stream *s)
 	STREAM_VERIFY_SANE(s);
 
 	s->getp = s->endp = 0;
+	s->monotime_ns = 0;
 }
 
 /* Write stream contents to the file descriptor. */

@@ -7,12 +7,14 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "linklist.h"
 #include "memory.h"
 #include "monotime.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
@@ -53,8 +55,10 @@ struct midr_sync_session_packet {
 	struct midr_sync_token *token;
 	struct event *completion;
 	struct midr_sync_session_packet *next;
+	uint64_t encoded_ns;
 	bool eor;
 	bool written;
+	bool timed_out;
 };
 
 struct midr_sync_shutdown_target {
@@ -103,6 +107,7 @@ struct midr_sync_store {
 	uint64_t reconnect_count;
 	uint64_t stale_event_count;
 	uint64_t input_rejected_count;
+	uint64_t output_timeout_count;
 	uint32_t input_reject_backoff_msec;
 	bool shutdown_active;
 	bool shutdown_announce_complete;
@@ -113,6 +118,15 @@ struct midr_sync_store {
 static struct midr_sync_session *midr_sync_session_lookup_generation(
 	struct midr_sync_store *store, struct peer_connection *connection,
 	uint64_t generation);
+
+static uint64_t midr_sync_now_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 static struct midr_sync_shutdown_target *midr_sync_shutdown_target_lookup(
 	struct midr_sync_store *store, struct peer_connection *connection,
@@ -196,6 +210,8 @@ static void midr_sync_packet_event(struct event *event)
 
 	packet->completion = NULL;
 	if (session && in_session) {
+		if (packet->timed_out)
+			session->store->output_timeout_count++;
 		if (packet->eor)
 			session->local_eor_written = packet->written;
 		else if (session->pending_updates)
@@ -306,7 +322,7 @@ void midr_sync_input_rejected(struct midr_context *ctx,
 {
 	struct midr_sync_store *store;
 	struct midr_sync_session *session;
-	struct timespec now;
+	uint64_t now_ns;
 	int64_t now_ms;
 
 	if (!ctx || !ctx->sync_store || !connection)
@@ -320,8 +336,8 @@ void midr_sync_input_rejected(struct midr_context *ctx,
 	session->state = MIDR_SYNC_SESSION_RESYNC;
 	if (session->resync_event)
 		return;
-	monotime(&now);
-	now_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	now_ns = midr_sync_now_ns();
+	now_ms = (int64_t)(now_ns / 1000000ULL);
 	if (now_ms < session->last_input_reject_ms +
 			     (int64_t)store->input_reject_backoff_msec)
 		return;
@@ -800,6 +816,9 @@ void midr_sync_packet_queued(struct peer_connection *connection,
 	packet->token = session->token;
 	packet->token->references++;
 	packet->eor = eor;
+	packet->encoded_ns = stream_get_monotime_ns(stream);
+	if (!packet->encoded_ns)
+		packet->encoded_ns = midr_sync_now_ns();
 	listnode_add(session->packets, packet);
 	if (eor)
 		session->local_eor_queued = true;
@@ -844,6 +863,58 @@ void midr_sync_packet_dropped(struct peer_connection *connection,
 			      struct stream *stream)
 {
 	midr_sync_packet_complete(connection, stream, false);
+}
+
+static bool midr_sync_packet_timed_out_at(
+	struct peer_connection *connection, struct stream *stream,
+	uint64_t now_ns)
+{
+	struct midr_sync_session_packet **link;
+	struct midr_sync_session_packet *packet = NULL;
+	const uint64_t budget_ns =
+		(uint64_t)MIDR_CANONICAL_FORWARD_BUDGET_MS * 1000000ULL;
+	uint64_t encoded_ns;
+
+	if (!connection || !stream || !bm || !bm->master)
+		return false;
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (link = &midr_sync_packets; *link; link = &(*link)->next) {
+		packet = *link;
+		if (packet->connection == connection && packet->stream == stream)
+			break;
+	}
+	if (!*link)
+		packet = NULL;
+	encoded_ns = packet ? packet->encoded_ns : stream_get_monotime_ns(stream);
+	if (!encoded_ns || (packet && packet->eor) ||
+	    (now_ns >= encoded_ns && now_ns - encoded_ns <= budget_ns)) {
+		pthread_mutex_unlock(&midr_sync_packets_mutex);
+		return false;
+	}
+	if (packet) {
+		*link = packet->next;
+		packet->stream = NULL;
+		packet->written = false;
+		packet->timed_out = true;
+		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
+				&packet->completion);
+	}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	return true;
+}
+
+bool midr_sync_packet_timed_out(struct peer_connection *connection,
+				struct stream *stream)
+{
+	return midr_sync_packet_timed_out_at(connection, stream,
+					     midr_sync_now_ns());
+}
+
+bool midr_sync_test_packet_timed_out_at(
+	struct peer_connection *connection, struct stream *stream,
+	uint64_t now_ns)
+{
+	return midr_sync_packet_timed_out_at(connection, stream, now_ns);
 }
 
 void midr_sync_snapshot_begin(struct peer_connection *connection)
@@ -1206,6 +1277,7 @@ int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *stat
 	status->reconnect_count = store->reconnect_count;
 	status->stale_event_count = store->stale_event_count;
 	status->input_rejected_count = store->input_rejected_count;
+	status->output_timeout_count = store->output_timeout_count;
 	status->shutdown_state = store->shutdown_state;
 	status->shutdown_active = store->shutdown_active;
 	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {

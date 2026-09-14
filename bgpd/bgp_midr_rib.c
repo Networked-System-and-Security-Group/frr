@@ -65,16 +65,21 @@ struct midr_rib_store {
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
 	uint64_t rejected_resource;
+	uint64_t rejected_internal;
 	struct event *lifetime_timer;
+	bool test_clock_enabled;
+	uint64_t test_now_ns;
 };
 
 static void midr_rib_lifetime_event(struct event *event);
 
-static uint64_t midr_rib_now_ns(void *arg)
+static uint64_t midr_rib_clock_now_ns(void *arg)
 {
+	struct midr_rib_store *store = arg;
 	struct timespec ts;
 
-	(void)arg;
+	if (store && store->test_clock_enabled)
+		return store->test_now_ns;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0;
 	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -251,7 +256,8 @@ int midr_rib_init(struct midr_context *ctx)
 			.identity_limit = MIDR_RIB_MAX_IDENTITIES,
 			.event_limit = MIDR_RIB_MAX_IDENTITIES * 2U,
 			.max_age_ms = MIDR_CANONICAL_MAX_AGE_MS,
-			.now_ns = midr_rib_now_ns,
+			.now_ns = midr_rib_clock_now_ns,
+			.clock_arg = store,
 		};
 
 		if (midr_canonical_create(&config, &store->canonical) != 0) {
@@ -432,12 +438,61 @@ int midr_rib_path_instance(struct midr_context *ctx,
 				    &identity->key, &view);
 	if (ret || view.state != MIDR_CANONICAL_CURRENT || !view.current)
 		return ret;
-	ret = midr_instance_ref_age(view.current, midr_rib_now_ns(NULL),
-				    MIDR_CANONICAL_FORWARD_BUDGET_MS,
+	ret = midr_instance_ref_age(view.current, midr_rib_now_ns(ctx),
+				    0,
 				    midr_canonical_max_age_ms(
 					    ctx->rib_store->canonical),
 				    age_ms);
 	return ret;
+}
+
+int midr_rib_path_instance_ref(
+	struct midr_context *ctx, const struct bgp_dest *dest,
+	const struct bgp_path_info *path,
+	const struct midr_instance_ref **instance_ref)
+{
+	const struct midr_rib_identity *identity;
+	struct midr_canonical_view view;
+	int ret;
+
+	if (!ctx || !ctx->rib_store || !dest || !path || !instance_ref)
+		return -EINVAL;
+	*instance_ref = NULL;
+	identity = dest->midr_identity;
+	if (!identity || identity->canonical_path != path)
+		return -ESTALE;
+	ret = midr_canonical_lookup(ctx->rib_store->canonical,
+				    &identity->key, &view);
+	if (ret)
+		return ret;
+	if (view.state != MIDR_CANONICAL_CURRENT || !view.current)
+		return -ESTALE;
+	*instance_ref = view.current;
+	return 0;
+}
+
+uint64_t midr_rib_now_ns(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->rib_store)
+		return 0;
+	return midr_rib_clock_now_ns(ctx->rib_store);
+}
+
+uint32_t midr_rib_max_age_ms(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->rib_store)
+		return 0;
+	return midr_canonical_max_age_ms(ctx->rib_store->canonical);
+}
+
+int midr_rib_instance_ref_age_at(
+	struct midr_context *ctx, const struct midr_instance_ref *instance_ref,
+	uint64_t now_ns, uint32_t budget_ms, uint32_t *age_ms)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_instance_ref_age(instance_ref, now_ns, budget_ms,
+				     midr_rib_max_age_ms(ctx), age_ms);
 }
 
 static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
@@ -630,7 +685,10 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	ret = midr_canonical_accept(store->canonical, instance, age_ms,
 				    &result);
 	if (ret) {
-		store->rejected_resource++;
+		if (ret == -ENOMEM || ret == -ENOSPC)
+			store->rejected_resource++;
+		else
+			store->rejected_internal++;
 		bgp_attr_unintern(&new_attr);
 		if (!advertisement_was_present)
 			midr_rib_advertisement_remove(identity, peer);
@@ -697,6 +755,31 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	bgp_dest_unlock_node(dest);
 	midr_canonical_event_ack(store->canonical);
 	return 0;
+}
+
+int midr_rib_instance_upsert_received(
+	struct midr_context *ctx, struct peer *peer,
+	const struct midr_instance *instance, uint32_t age_ms,
+	uint64_t received_ns)
+{
+	struct midr_rib_store *store;
+	uint32_t current_age;
+	uint64_t now_ns;
+	int ret;
+
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	store = ctx->rib_store;
+	now_ns = midr_rib_now_ns(ctx);
+	if (!received_ns)
+		received_ns = now_ns;
+	ret = midr_instance_age(age_ms, received_ns, now_ns, 0,
+				midr_rib_max_age_ms(ctx), &current_age);
+	if (ret) {
+		store->rejected_internal++;
+		return ret;
+	}
+	return midr_rib_instance_upsert(ctx, peer, instance, current_age);
 }
 
 int midr_rib_peer_withdraw(struct midr_context *ctx, struct peer *peer,
@@ -877,6 +960,7 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		.rejected_payload_conflict =
 			store->rejected_payload_conflict,
 		.rejected_resource = store->rejected_resource,
+		.rejected_internal = store->rejected_internal,
 	};
 	return 0;
 }
@@ -1081,6 +1165,15 @@ int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 	/* Tests may lower the limit below the live identity count to drive
 	 * the new-identity rejection path; existing identities stay usable. */
 	ctx->rib_store->identity_limit = limit;
+	return 0;
+}
+
+int midr_rib_test_set_now_ns(struct midr_context *ctx, uint64_t now_ns)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	ctx->rib_store->test_clock_enabled = true;
+	ctx->rib_store->test_now_ns = now_ns;
 	return 0;
 }
 

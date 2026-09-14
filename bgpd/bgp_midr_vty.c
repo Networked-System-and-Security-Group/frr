@@ -271,6 +271,8 @@ DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
 		summary.rejected_limit);
 	vty_out(vty, "  rejected resource: %" PRIu64 "\n",
 		summary.rejected_resource);
+	vty_out(vty, "  rejected internal: %" PRIu64 "\n",
+		summary.rejected_internal);
 	vty_out(vty, "  payload conflicts: %" PRIu64 "\n",
 		summary.rejected_payload_conflict);
 	return CMD_SUCCESS;
@@ -722,6 +724,8 @@ DEFUN(show_midr_sync, show_midr_sync_cmd,
 	vty_out(vty, "  pending input:      %zu\n", status.pending_input_count);
 	vty_out(vty, "  input rejected:     %" PRIu64 "\n",
 		status.input_rejected_count);
+	vty_out(vty, "  output timeouts:    %" PRIu64 "\n",
+		status.output_timeout_count);
 	vty_out(vty, "  session generation: %" PRIu64 "\n",
 		status.next_session_generation);
 	vty_out(vty, "  reconnects/stale:   %" PRIu64 "/%" PRIu64 "\n",

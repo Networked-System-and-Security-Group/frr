@@ -623,6 +623,14 @@ void bgp_generate_updgrp_packets(struct event *event)
 			 * packet with appropriate attributes from peer
 			 * and advance peer */
 			s = bpacket_reformat_for_peer(next_pkt, paf);
+			if (!s && afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				/* The held instance expired, the age clock regressed, or
+				 * the age vector was invalid.  Never abort bgpd or send the
+				 * stale template; skip it and rebuild the session snapshot. */
+				bpacket_queue_advance_peer(paf);
+				midr_sync_request_resync(connection);
+				continue;
+			}
 			assert(s);
 			if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
 				midr_sync_packet_queued(connection, s, false);

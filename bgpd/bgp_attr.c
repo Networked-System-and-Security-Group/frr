@@ -5863,7 +5863,7 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 		bgp_packet_ls_attribute(s, bgp, attr, bpi);
 
 	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS &&
-	    bgp_midr_packet_attributes(s, bgp, bpi) < 0) {
+	    bgp_midr_packet_attributes(s, bgp, bpi, vecarr) < 0) {
 		stream_set_endp(s, cp);
 		return 0;
 	}

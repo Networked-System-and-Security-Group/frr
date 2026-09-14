@@ -17,6 +17,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_lsdb.h"
@@ -321,6 +322,64 @@ static void test_delayed_completion_reuse_and_destroy(void)
 
 }
 
+static void test_encoded_packet_budget_timeout(void)
+{
+	struct peer *peer = established_peer("10.0.0.11");
+	struct peer_connection *connection = peer->connection;
+	struct midr_sync_status before, after;
+	struct stream *stream = stream_new(64);
+	struct stream *untracked = stream_new(64);
+	const uint64_t encoded_ns = 3000000000000ULL;
+	const uint64_t budget_ns =
+		(uint64_t)MIDR_CANONICAL_FORWARD_BUDGET_MS * 1000000ULL;
+
+	midr_sync_test_session_start(ctx, peer, connection);
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	stream_putw(stream, 0x1234);
+	stream_set_monotime_ns(stream, encoded_ns);
+	midr_sync_packet_queued(connection, stream, false);
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(before.pending_update_count == 1);
+
+	/* Exactly B is still covered by the encoded compensation. */
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, stream, encoded_ns + budget_ns));
+	/* A partial write does not grant a fresh deadline.  Once B is exceeded,
+	 * the remaining bytes are failed and the session is forced to resync;
+	 * bgp_io also raises TCP_fatal_error so the old byte stream is discarded. */
+	stream_forward_getp(stream, 1);
+	assert(midr_sync_test_packet_timed_out_at(
+		connection, stream, encoded_ns + budget_ns + 1));
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.pending_update_count == 0);
+	assert(after.resync_required_count == 1);
+	assert(after.output_timeout_count == before.output_timeout_count + 1);
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+
+	/* The wire deadline is enforced from the stream metadata even if packet
+	 * tracking could not attach to a session.  Resetting a reusable stream
+	 * clears that metadata before it carries unrelated new contents. */
+	stream_putw(untracked, 0x5678);
+	stream_set_monotime_ns(untracked, encoded_ns);
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns));
+	assert(midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns + 1));
+	stream_reset(untracked);
+	assert(stream_get_monotime_ns(untracked) == 0);
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns + 1));
+
+	midr_sync_test_session_down(ctx, connection);
+	connection->status = Idle;
+	event_cancel(&connection->t_generate_updgrp_packets);
+	stream_free(untracked);
+	stream_free(stream);
+}
+
 static void test_eor_waits_for_admission_and_derivation(void)
 {
 	struct peer *peer;
@@ -528,6 +587,7 @@ int main(void)
 	test_eor_peer_down_timeout_and_late_eor();
 	test_session_generation_and_packet_lifecycle();
 	test_delayed_completion_reuse_and_destroy();
+	test_encoded_packet_budget_timeout();
 	test_input_rejection_backoff_and_recovery();
 	assert(midr_lsdb_init(ctx) == 0);
 	test_eor_waits_for_admission_and_derivation();
