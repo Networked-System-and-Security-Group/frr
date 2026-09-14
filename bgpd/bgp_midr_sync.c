@@ -55,6 +55,9 @@ struct midr_sync_session_packet {
 	struct midr_sync_token *token;
 	struct event *completion;
 	struct midr_sync_session_packet *next;
+	struct midr_sync_session_packet *completion_next;
+	size_t references;
+	uint64_t generation;
 	uint64_t encoded_ns;
 	bool eor;
 	bool written;
@@ -70,6 +73,7 @@ struct midr_sync_shutdown_target {
 /* The writer only accesses this registry under the mutex, never the LS store. */
 static pthread_mutex_t midr_sync_packets_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct midr_sync_session_packet *midr_sync_packets;
+static struct midr_sync_session_packet *midr_sync_completions;
 
 struct midr_sync_session {
 	struct midr_sync_store *store;
@@ -164,6 +168,44 @@ static void midr_sync_token_release(struct midr_sync_token *token)
 		XFREE(MTYPE_MIDR_SYNC_TOKEN, token);
 }
 
+static void midr_sync_packet_ref(struct midr_sync_session_packet *packet)
+{
+	if (packet)
+		packet->references++;
+}
+
+static void midr_sync_packet_unref(struct midr_sync_session_packet *packet)
+{
+	struct midr_sync_session_packet **link;
+
+	if (!packet || !packet->references)
+		return;
+	if (--packet->references)
+		return;
+
+	/* An unclaimed packet can still be present in the writer registry when
+	 * its session is torn down.  Remove that registry reference before the
+	 * object is released.  Claimed completions have their own reference and
+	 * therefore cannot reach this path until their event has run. */
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (link = &midr_sync_packets; *link; link = &(*link)->next)
+		if (*link == packet) {
+			*link = packet->next;
+			break;
+		}
+	for (struct midr_sync_session_packet **completion =
+		     &midr_sync_completions;
+	     *completion; completion = &(*completion)->completion_next)
+		if (*completion == packet) {
+			*completion = packet->completion_next;
+			break;
+		}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	event_cancel(&packet->completion);
+	midr_sync_token_release(packet->token);
+	XFREE(MTYPE_MIDR_SYNC_PACKET, packet);
+}
+
 static bool midr_sync_receive_drained(struct midr_sync_session *session)
 {
 	struct midr_lsdb_summary summary;
@@ -191,26 +233,33 @@ static void midr_sync_start(struct midr_sync_store *store);
 static void midr_sync_session_packet_free(void *arg)
 {
 	struct midr_sync_session_packet *packet = arg;
-	struct midr_sync_session_packet **link;
-	struct midr_sync_token *token = packet->token;
 
-	pthread_mutex_lock(&midr_sync_packets_mutex);
-	for (link = &midr_sync_packets; *link; link = &(*link)->next)
-		if (*link == packet) {
-			*link = packet->next;
-			break;
-		}
-	pthread_mutex_unlock(&midr_sync_packets_mutex);
-	event_cancel(&packet->completion);
-	midr_sync_token_release(token);
-	XFREE(MTYPE_MIDR_SYNC_PACKET, packet);
+	/* The session list owns one reference.  A completion claimed by the
+	 * writer owns a second reference and is deliberately not cancelled here;
+	 * its event may run after the session has gone away. */
+	midr_sync_packet_unref(packet);
 }
 
 static void midr_sync_packet_event(struct event *event)
 {
 	struct midr_sync_session_packet *packet = EVENT_ARG(event);
-	struct midr_sync_session *session = packet->token->session;
-	bool in_session = session && listnode_lookup(session->packets, packet);
+	struct midr_sync_session *session = packet->token ? packet->token->session : NULL;
+	bool in_session = session && session->connection == packet->connection &&
+			  session->generation == packet->generation &&
+			  session->state != MIDR_SYNC_SESSION_DOWN &&
+			  listnode_lookup(session->packets, packet);
+	/* The event owns the completion reference.  Remove the packet from the
+	 * test/diagnostic completion registry before applying its result so a
+	 * direct test drain cannot invoke it twice. */
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (struct midr_sync_session_packet **completion =
+		     &midr_sync_completions;
+	     *completion; completion = &(*completion)->completion_next)
+		if (*completion == packet) {
+			*completion = packet->completion_next;
+			break;
+		}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
 
 	packet->completion = NULL;
 	if (session && in_session) {
@@ -244,10 +293,11 @@ static void midr_sync_packet_event(struct event *event)
 					session->connection, 0,
 					&session->connection->t_generate_updgrp_packets);
 		listnode_delete(session->packets, packet);
-		midr_sync_session_packet_free(packet);
+		midr_sync_packet_unref(packet); /* session reference */
+		midr_sync_packet_unref(packet); /* completion reference */
 		return;
 	}
-	midr_sync_session_packet_free(packet);
+	midr_sync_packet_unref(packet); /* completion reference */
 }
 
 static void midr_sync_session_free(void *arg)
@@ -815,10 +865,12 @@ void midr_sync_packet_queued(struct peer_connection *connection,
 	if (!session)
 		return;
 	packet = XCALLOC(MTYPE_MIDR_SYNC_PACKET, sizeof(*packet));
+	packet->references = 1; /* session packet list */
 	packet->stream = stream;
 	packet->connection = connection;
 	packet->token = session->token;
 	packet->token->references++;
+	packet->generation = session->generation;
 	packet->eor = eor;
 	packet->encoded_ns = stream_get_monotime_ns(stream);
 	if (!packet->encoded_ns)
@@ -839,6 +891,7 @@ static void midr_sync_packet_complete(struct peer_connection *connection,
 {
 	struct midr_sync_session_packet **link;
 	struct midr_sync_session_packet *packet;
+	bool claimed = false;
 
 	if (!connection || !stream || !bm || !bm->master)
 		return;
@@ -850,11 +903,19 @@ static void midr_sync_packet_complete(struct peer_connection *connection,
 		*link = packet->next;
 		packet->stream = NULL;
 		packet->written = written;
-		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
-				&packet->completion);
+		/* Keep the packet alive while the completion is handed to the event
+		 * loop.  The session may be torn down as soon as this mutex is
+		 * released. */
+		midr_sync_packet_ref(packet);
+		packet->completion_next = midr_sync_completions;
+		midr_sync_completions = packet;
+		claimed = true;
 		break;
 	}
 	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	if (claimed)
+		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
+				&packet->completion);
 }
 
 void midr_sync_packet_written(struct peer_connection *connection,
@@ -900,10 +961,16 @@ static bool midr_sync_packet_timed_out_at(
 		packet->stream = NULL;
 		packet->written = false;
 		packet->timed_out = true;
-		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
-				&packet->completion);
+		/* Transfer a completion reference before dropping the registry lock;
+		 * teardown can release the session-list reference concurrently. */
+		midr_sync_packet_ref(packet);
+		packet->completion_next = midr_sync_completions;
+		midr_sync_completions = packet;
 	}
 	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	if (packet)
+		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
+				&packet->completion);
 	return true;
 }
 

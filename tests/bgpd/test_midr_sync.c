@@ -514,6 +514,32 @@ static void test_shutdown_result_is_bounded_and_retained(void)
 	stream_free(stream);
 }
 
+static void test_shutdown_generation_failure_is_counted_once(void)
+{
+	struct midr_sync_status status;
+	uint64_t before;
+
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	before = status.shutdown_generation_failures;
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_GENERATION_FAILED);
+	assert(status.shutdown_generation_failures == before + 1);
+	midr_sync_shutdown_finish(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(!status.shutdown_active);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_GENERATION_FAILED);
+
+	/* The next teardown cycle gets its own single increment. */
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_generation_failures == before + 2);
+	midr_sync_shutdown_finish(ctx);
+}
+
 static void test_input_rejection_backoff_and_recovery(void)
 {
 	struct midr_sync_status status;
@@ -593,8 +619,13 @@ int main(void)
 	test_eor_waits_for_admission_and_derivation();
 	test_writer_teardown_race();
 	test_shutdown_result_is_bounded_and_retained();
+	test_shutdown_generation_failure_is_counted_once();
 	assert(midr_sync_status_get(NULL, &(struct midr_sync_status){}) == -ENOENT);
 	assert(midr_sync_status_get(ctx, NULL) == -EINVAL);
+	/* Release sessions and any completion that has already reached the
+	 * test-owned event queue before LeakSanitizer inspects the fixture. */
+	midr_sync_test_drain_completions(ctx);
+	midr_sync_finish(ctx);
 	puts("MIDR sync tests passed");
 	return 0;
 }
