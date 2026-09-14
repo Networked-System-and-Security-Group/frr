@@ -104,7 +104,7 @@ GATE_RESULT=0
 Evidence:
 
 ```text
-/home/guest/yhy/midr-gate-runs/r3-component-20260914T075619Z-worktree
+/home/guest/yhy/midr-gate-runs/r3-final-component-20260914T081729Z-worktree
 ```
 
 The focused GCC tests passed for `test_midr_instance`, `test_midr_rib`,
