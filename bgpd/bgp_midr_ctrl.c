@@ -1032,7 +1032,6 @@ static struct stream *midr_ctrl_build_member_list(struct bgp *bgp,
 						  struct ipaddr dst,
 						  uint32_t group_id)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct stream *s;
 	struct list *members;
 	struct listnode *node;
@@ -2516,7 +2515,6 @@ static void midr_try_disconnect(struct bgp *bgp,
 				bool force)
 {
 	union sockunion su;
-	struct prefix locator;
 	afi_t afi;
 	safi_t safi;
 	struct ipaddr transport;
