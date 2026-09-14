@@ -20,7 +20,7 @@ run_cluster() {
 	local node_a=$9 node_b=${10} node_c=${11}
 	local prefix_a=${12} prefix_b=${13} prefix_c=${14}
 	local run topo lab a_addr b_a_addr b_c_addr c_addr
-	local a_listen b_listen c_listen a_peer b_peer c_peer
+	local a_listen b_listen c_listen a_peer b_peer b_to_c_peer c_peer
 	local n container all i
 
 	run=$(mktemp -d "${TMPDIR:-/tmp}/midrd-r7-${name}.XXXXXX")
@@ -36,6 +36,7 @@ run_cluster() {
 		c_listen=10.77.2.2:$((base_port + 2))
 		a_peer=10.77.1.2:$((base_port + 1))
 		b_peer=10.77.1.1:$base_port
+		b_to_c_peer=10.77.2.2:$((base_port + 2))
 		c_peer=10.77.2.1:$((base_port + 1))
 	else
 		a_addr='2001:db8:77:1::1/64 nodad'
@@ -47,6 +48,7 @@ run_cluster() {
 		c_listen="[2001:db8:77:2::2]:$((base_port + 2))"
 		a_peer="[2001:db8:77:1::2]:$((base_port + 1))"
 		b_peer="[2001:db8:77:1::1]:$base_port"
+		b_to_c_peer="[2001:db8:77:2::2]:$((base_port + 2))"
 		c_peer="[2001:db8:77:2::1]:$((base_port + 1))"
 	fi
 
@@ -77,7 +79,7 @@ topology:
         - ip addr add $b_c_addr dev eth2
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
-          --peer $b_peer --peer $c_peer --prefix $prefix_b --lifetime 900
+          --peer $b_peer --peer $b_to_c_peer --prefix $prefix_b --lifetime 900
           --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
