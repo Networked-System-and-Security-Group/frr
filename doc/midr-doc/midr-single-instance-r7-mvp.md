@@ -31,7 +31,7 @@ midr-prefix-provider-test: PASS
 
 构建产物位于 `midrd/build/`，不写入 FRR 源码树的其他目录。
 
-## Containerlab 等价 smoke
+## Containerlab smoke
 
 ```sh
 cd midrd
@@ -41,7 +41,7 @@ cd midrd
 runner 不启动 `bgpd`，依次验证：
 
 1. 三节点 IPv4 收敛：每个节点最终持有三个对象，并完成 snapshot/EoR 和 KEEPALIVE；
-2. 三节点 IPv6 收敛：使用 `[::1]` 原生 UDP endpoint 验证相同闭环；
+2. 三节点 IPv6 收敛：使用容器间原生 IPv6 链路和双栈 endpoint 验证相同闭环；
 3. IPv4 生命周期：Owner 提前退出，两个存活节点在 lifetime 到期后生成并洪泛 WITHDRAWN，最终各持有两个对象。
 
 当前 runner 输出三组 `PASS` 后再输出 `r7 smoke: PASS`。日志目录由 runner 打印并保留在远端 `/tmp`，便于检查 HELLO、KEEPALIVE、EoR、sequence、WITHDRAWN 和最终对象数。
