@@ -145,6 +145,8 @@ static int midr_peer_status_changed(struct peer *peer)
 	ctx = midr_context_from_bgp(peer->bgp);
 	if (ctx && ctx->midr) {
 		ctx->midr->peer_hook_events++;
+		if (!peer->connection || !peer_established(peer->connection))
+			midr_rib_peer_cleanup(ctx, peer);
 		midr_sync_peer_status_changed(ctx, peer);
 	}
 
