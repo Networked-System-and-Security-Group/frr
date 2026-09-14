@@ -38,6 +38,10 @@ struct midr_rib_summary {
 	size_t conflict_count;
 	size_t identity_limit;
 	size_t canonical_identity_count;
+	size_t floor_count;
+	size_t pending_event_count;
+	size_t retired_ref_count;
+	size_t retired_ref_bytes;
 	size_t advertisement_count;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;

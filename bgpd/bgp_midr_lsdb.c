@@ -132,6 +132,16 @@ static bool midr_lsdb_identity_hash_cmp(const void *a, const void *b)
 				       &right->object.key);
 }
 
+static struct midr_lsdb_entry *midr_lsdb_identity_lookup(
+	struct midr_lsdb_state *state, const struct midr_ls_object_key *key)
+{
+	struct midr_lsdb_entry lookup = {
+		.object.key = *key,
+	};
+
+	return state ? hash_lookup(state->identities, &lookup) : NULL;
+}
+
 static unsigned int midr_lsdb_membership_hash_key(const void *arg)
 {
 	const struct midr_lsdb_entry *entry = arg;
@@ -865,6 +875,34 @@ bool midr_lsdb_export_eligible(struct midr_context *ctx,
 		return true;
 	return target_membership->object.payload.membership.group_id ==
 	       entry->scope_group_id;
+}
+
+bool midr_lsdb_identity_reclaim_safe(
+	struct midr_context *ctx, const struct midr_ls_object_key *key)
+{
+	struct midr_lsdb_store *store;
+	struct listnode *node;
+	struct midr_lsdb_dirty *dirty;
+
+	if (!ctx || !key || !ctx->lsdb_store)
+		return true;
+	store = ctx->lsdb_store;
+	/* The committed LSDB owns path and dest locks for every entry.  Keep
+	 * the RIB identity until the commit which removes this key completes. */
+	if (store->current && midr_lsdb_identity_lookup(store->current, key))
+		return false;
+	/* A dirty item is the staging/announce obligation for an in-flight
+	 * selected-path transition.  Its dest/path locks must drain first. */
+	for (ALL_LIST_ELEMENTS_RO(store->dirty, node, dirty)) {
+		const struct midr_ls_object_key *dirty_key;
+
+		if (!dirty->dest)
+			continue;
+		dirty_key = midr_rib_dest_key(dirty->dest);
+		if (dirty_key && midr_ls_object_key_same(dirty_key, key))
+			return false;
+	}
+	return true;
 }
 
 static void midr_lsdb_announce_dirty(struct midr_lsdb_store *store)

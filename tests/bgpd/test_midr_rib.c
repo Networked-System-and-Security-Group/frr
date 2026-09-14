@@ -332,6 +332,9 @@ static void test_identity_reclaim_and_slot_reuse(void)
 	assert(summary.path_count == 0 && summary.selected_count == 0);
 	assert(midr_rib_selected_foreach(ctx, selected_callback, &state) == 0);
 	assert(state.count == 0);
+	/* The first pass only expires the path and creates the LSDB dirty
+	 * obligation.  Reclamation must wait until that commit drains. */
+	assert(midr_lsdb_test_process(ctx) == 0);
 
 	/* GC stays off by default: floors past their retention window are
 	 * still retained, exactly as production would keep them. */
@@ -382,6 +385,8 @@ static void test_identity_reclaim_and_slot_reuse(void)
 		assert(summary.path_count == 3);
 		/* At L the round expires and is reclaimed in the same pass. */
 		run_lifetime_at(round_ns + life_ns);
+	assert(midr_lsdb_test_process(ctx) == 0);
+		run_lifetime_at(round_ns + life_ns + 1);
 		assert(midr_rib_summary_get(ctx, &summary) == 0);
 		assert(summary.identity_count == 0);
 		assert(summary.identities_reclaimed == reclaimed_before + 3);

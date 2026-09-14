@@ -427,7 +427,7 @@ struct reclaim_log {
 	size_t count;
 };
 
-static void note_reclaim(const struct midr_ls_object_key *key, void *arg)
+static bool note_reclaim(const struct midr_ls_object_key *key, void *arg)
 {
 	struct reclaim_log *log = arg;
 
@@ -436,6 +436,36 @@ static void note_reclaim(const struct midr_ls_object_key *key, void *arg)
 	if (log->count < 4)
 		log->keys[log->count] = *key;
 	log->count++;
+	return true;
+}
+
+static void test_gc_waits_for_held_instance(void)
+{
+	struct fixture f = {};
+	struct midr_canonical *s = create(&f, 4, 8);
+	struct midr_instance instance = sample(MIDR_NLRI_TYPE_LINK, false);
+	const struct midr_canonical_event *event;
+	const struct midr_instance_ref *held;
+	size_t count;
+
+	expect_accept(s, &instance, 0, MIDR_CANONICAL_ACCEPTED);
+	drain(s);
+	f.now = 1000000000ULL;
+	assert(midr_canonical_sweep(s, 4, &count) == 0 && count == 1);
+	event = midr_canonical_event_peek(s);
+	held = midr_canonical_event_before(event);
+	assert(held);
+	assert(midr_instance_ref_acquire(held) == 0);
+	drain(s);
+	assert(midr_canonical_gc_enable(s, true) == 0);
+	f.now = 2000000000ULL;
+	assert(midr_canonical_gc(s, 4, &count, NULL, NULL) == 0 && count == 0);
+	assert(midr_canonical_identity_count(s) == 1);
+	midr_instance_ref_release(&held);
+	assert(midr_canonical_gc(s, 4, &count, NULL, NULL) == 0 && count == 1);
+	assert(midr_canonical_identity_count(s) == 0);
+	midr_canonical_destroy(&s);
+	assert(!f.live);
 }
 
 static void test_gc_reclaim_callback(void)
@@ -556,6 +586,7 @@ int main(void)
 	test_sweep_and_floor_gc();
 	test_sweep_fairness();
 	test_gc_reclaim_callback();
+	test_gc_waits_for_held_instance();
 	puts("MIDR instance/canonical tests passed");
 	return 0;
 }

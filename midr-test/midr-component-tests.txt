@@ -18,6 +18,7 @@ test_midr_sync
 test_midr_lsdb
 test_midr_ted
 test_midr_instance
+test_midr_scale
 test_midr_zebra
 test_midr_spf
 test_midr_spf_install

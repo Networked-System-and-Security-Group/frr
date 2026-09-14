@@ -76,7 +76,7 @@ extern int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
  * any external RIB/LSDB state that tracks this identity. */
 extern int midr_canonical_gc(struct midr_canonical *store, size_t limit,
 				 size_t *collected,
-				 void (*reclaim)(
+				 bool (*reclaim)(
 					 const struct midr_ls_object_key *key,
 					 void *arg),
 				 void *reclaim_arg);
@@ -85,6 +85,9 @@ extern int midr_canonical_gc_enable(struct midr_canonical *store,
 extern uint32_t midr_canonical_max_age_ms(
 				const struct midr_canonical *store);
 extern size_t midr_canonical_identity_count(const struct midr_canonical *store);
+extern size_t midr_canonical_floor_count(const struct midr_canonical *store);
+extern size_t midr_canonical_retired_ref_count(const struct midr_canonical *store);
+extern size_t midr_canonical_retired_ref_bytes(const struct midr_canonical *store);
 extern size_t midr_canonical_event_count(const struct midr_canonical *store);
 
 /* Peek then ack only after downstream work is secured; failed work can retry. */

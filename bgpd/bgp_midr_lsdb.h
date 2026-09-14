@@ -70,6 +70,9 @@ extern void midr_lsdb_input_state_changed(struct midr_context *ctx);
 extern void midr_lsdb_sync_changed(struct midr_context *ctx);
 extern bool midr_lsdb_export_eligible(struct midr_context *ctx, const struct bgp_dest *dest,
 				      const struct bgp_path_info *path, const struct peer *target);
+/* True only after the committed/staging LSDB no longer holds this identity. */
+extern bool midr_lsdb_identity_reclaim_safe(
+		struct midr_context *ctx, const struct midr_ls_object_key *key);
 
 extern int midr_lsdb_remote_snapshot_get(
 	struct midr_context *ctx, struct midr_remote_view_snapshot *snapshot);

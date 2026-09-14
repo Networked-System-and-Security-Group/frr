@@ -22,6 +22,7 @@
 #include "bgpd/bgp_midr_attr.h"
 #include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_instance.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_route.h"
@@ -48,6 +49,9 @@ struct midr_rib_identity {
 	enum midr_rib_identity_state state;
 	struct bgp_path_info *selected;
 	struct bgp_path_info *canonical_path;
+	/* Hold the reaped canonical path until old update-group/LSDB users
+	 * release their path locks. */
+	struct bgp_path_info *retired_path;
 	struct midr_rib_advertisement *advertisements;
 	size_t path_count;
 };
@@ -136,6 +140,15 @@ static void midr_rib_identity_free(void *arg)
 	XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
 }
 
+static void midr_rib_identity_release_retired_path(
+	struct midr_rib_identity *identity)
+{
+	if (!identity || !identity->retired_path)
+		return;
+	bgp_path_info_unlock(identity->retired_path);
+	identity->retired_path = NULL;
+}
+
 /* Fully remove an identity from the store, mirroring the table-teardown
  * template in midr_rib_dest_cleanup(): disconnect the dest back-pointer,
  * drop the store counters, release the hash slot and the synthetic ID, and
@@ -158,6 +171,7 @@ static void midr_rib_identity_detach(struct midr_rib_store *store,
 		bgp_dest_unlock_node(locked);
 	}
 	assert(!identity->path_count);
+	assert(!identity->retired_path || identity->retired_path->lock == 1);
 	if (dest) {
 		dest->midr_identity = NULL;
 		identity->dest = NULL;
@@ -166,6 +180,7 @@ static void midr_rib_identity_detach(struct midr_rib_store *store,
 		store->selected_count--;
 	if (identity->state == MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED)
 		store->conflict_count--;
+	midr_rib_identity_release_retired_path(identity);
 	assert(hash_release(store->identities, identity) == identity);
 	idalloc_free(store->allocator, identity->synthetic_id);
 	midr_rib_identity_free(identity);
@@ -402,6 +417,11 @@ midr_rib_identity_get(struct midr_context *ctx,
 		return NULL;
 	}
 	assert(!dest->midr_identity);
+	/* Keep one route-node reference for the identity itself.  Path and
+	 * caller references are transient; without this hold, reaping the last
+	 * path destroys the destination before the canonical floor retention
+	 * window and makes the identity impossible to reclaim safely. */
+	bgp_dest_lock_node(dest);
 	dest->midr_identity = identity;
 	identity->dest = dest;
 	*dest_out = dest;
@@ -552,6 +572,9 @@ static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
 		    !CHECK_FLAG(identity->canonical_path->flags, BGP_PATH_REMOVED)) {
 			struct bgp_dest *dest = bgp_dest_lock_node(identity->dest);
 
+			assert(!identity->retired_path);
+			identity->retired_path =
+				bgp_path_info_lock(identity->canonical_path);
 			bgp_path_info_mark_for_delete(dest, identity->canonical_path);
 			bgp_process_main_one(store->ctx->bgp, dest, AFI_BGP_LS,
 					     SAFI_MIDR_LS);
@@ -564,15 +587,21 @@ static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
 /* A canonical floor whose retention expired was reclaimed: forget the
  * matching RIB identity, its synthetic ID and its dest so the slot and the
  * ID become reusable. */
-static void midr_rib_canonical_reclaim(const struct midr_ls_object_key *key,
-				       void *arg)
+static bool midr_rib_canonical_reclaim(const struct midr_ls_object_key *key,
+					       void *arg)
 {
 	struct midr_rib_store *store = arg;
 	struct midr_rib_identity *identity;
 
 	identity = midr_rib_identity_lookup(store, key);
-	if (identity)
-		midr_rib_identity_detach(store, identity);
+	if (!identity)
+		return true;
+	if (identity->path_count || identity->canonical_path ||
+	    (identity->retired_path && identity->retired_path->lock != 1) ||
+	    !midr_lsdb_identity_reclaim_safe(store->ctx, key))
+		return false;
+	midr_rib_identity_detach(store, identity);
+	return true;
 }
 
 static void midr_rib_lifetime_pass(struct midr_rib_store *store)
@@ -828,6 +857,10 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 		bgp_path_info_mark_for_delete(dest, old_path);
 	bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
 			     SAFI_MIDR_LS);
+	/* A newer canonical version supersedes the floor.  Old packets retain
+	 * their own instance/path references; the identity hold is no longer a
+	 * reclamation gate once this identity is live again. */
+	midr_rib_identity_release_retired_path(identity);
 	bgp_dest_unlock_node(dest);
 	midr_canonical_event_ack(store->canonical);
 	return 0;
@@ -896,6 +929,7 @@ void midr_rib_dest_cleanup(struct bgp *bgp, struct bgp_dest *dest)
 		store->conflict_count--;
 	if (identity->path_count <= store->path_count)
 		store->path_count -= identity->path_count;
+	midr_rib_identity_release_retired_path(identity);
 	assert(hash_release(store->identities, identity) ==
 	       identity);
 	idalloc_free(store->allocator, identity->synthetic_id);
@@ -1059,6 +1093,12 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		.identities_reclaimed = store->identities_reclaimed,
 		.canonical_identity_count =
 			midr_canonical_identity_count(store->canonical),
+		.floor_count = midr_canonical_floor_count(store->canonical),
+		.pending_event_count = midr_canonical_event_count(store->canonical),
+		.retired_ref_count =
+			midr_canonical_retired_ref_count(store->canonical),
+		.retired_ref_bytes =
+			midr_canonical_retired_ref_bytes(store->canonical),
 		.advertisement_count = advertisements.count,
 	};
 	return 0;

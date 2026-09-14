@@ -145,6 +145,14 @@ tests_bgpd_test_midr_instance_CPPFLAGS = $(TESTS_CPPFLAGS)
 tests_bgpd_test_midr_instance_LDADD = $(BGP_TEST_LDADD)
 tests_bgpd_test_midr_instance_SOURCES = tests/bgpd/test_midr_instance.c
 
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_scale
+endif
+tests_bgpd_test_midr_scale_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_scale_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_scale_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_scale_SOURCES = tests/bgpd/test_midr_scale.c
+
 
 if BGPD
 check_PROGRAMS += tests/bgpd/test_midr_sequence

@@ -269,6 +269,10 @@ DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
 		summary.conflict_count);
 	vty_out(vty, "  canonical entries: %zu\n",
 		summary.canonical_identity_count);
+	vty_out(vty, "  canonical floors:  %zu\n", summary.floor_count);
+	vty_out(vty, "  pending events:    %zu\n", summary.pending_event_count);
+	vty_out(vty, "  retired refs:      %zu (%zu bytes)\n",
+		summary.retired_ref_count, summary.retired_ref_bytes);
 	vty_out(vty, "  advertisements:    %zu\n",
 		summary.advertisement_count);
 	vty_out(vty, "  identities reclaimed: %" PRIu64 "\n",

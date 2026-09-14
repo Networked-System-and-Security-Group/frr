@@ -23,6 +23,9 @@ struct midr_canonical_entry {
 	uint32_t received_ms;
 	enum midr_canonical_state state;
 	const struct midr_instance_ref *current;
+	/* One private hold keeps an expired instance alive while old senders
+	 * finish.  External packet/template references are additional holds. */
+	const struct midr_instance_ref *retired;
 	uint64_t floor_ns;
 };
 
@@ -237,6 +240,10 @@ int midr_canonical_accept(struct midr_canonical *store, const struct midr_instan
 		store->buckets[bucket] = entry;
 		store->identities++;
 	}
+	/* A newer version supersedes the floor.  Any old packet/template still
+	 * owns its own reference; drop only the canonical floor hold. */
+	if (entry->retired)
+		midr_instance_ref_release(&entry->retired);
 	event->key = entry->key;
 	event->sequence = instance->object.ls_sequence;
 	event->before = entry->current; /* transfer entry's previous reference */
@@ -304,6 +311,14 @@ int midr_canonical_expire(struct midr_canonical *store, const struct midr_ls_obj
 	event->sequence = entry->sequence;
 	event->change = MIDR_CANONICAL_EXPIRE;
 	event->before = entry->current;
+	if (entry->current) {
+		ret = midr_instance_ref_acquire(entry->current);
+		if (ret) {
+			store->config.free(event, store->config.alloc_arg);
+			return ret;
+		}
+		entry->retired = entry->current;
+	}
 	entry->current = NULL;
 	entry->state = MIDR_CANONICAL_FLOOR;
 	/* The retention clock starts when this version was first accepted, not
@@ -374,7 +389,7 @@ int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
 
 int midr_canonical_gc(struct midr_canonical *store, size_t limit,
 			  size_t *collected,
-			  void (*reclaim)(const struct midr_ls_object_key *key,
+			  bool (*reclaim)(const struct midr_ls_object_key *key,
 					  void *arg),
 			  void *reclaim_arg)
 {
@@ -407,11 +422,19 @@ int midr_canonical_gc(struct midr_canonical *store, size_t limit,
 				link = &entry->next;
 				continue;
 			}
-			/* The caller owns any external RIB/LSDB cleanup for this
-			 * identity; report the key while the entry is still on the
-			 * bucket chain so declining is impossible. */
-			if (reclaim)
-				reclaim(&entry->key, reclaim_arg);
+			/* The floor hold is one reference.  Do not reclaim while a
+			 * packet/template still owns the retired instance. */
+			if (entry->retired && entry->retired->refs > 1) {
+				link = &entry->next;
+				continue;
+			}
+			/* The caller may veto until RIB/LSDB staging and update-group
+			 * references are gone. */
+			if (reclaim && !reclaim(&entry->key, reclaim_arg)) {
+				link = &entry->next;
+				continue;
+			}
+			midr_instance_ref_release(&entry->retired);
 			*link = entry->next;
 			store->identities--;
 			store->config.free(entry, store->config.alloc_arg);
@@ -441,6 +464,43 @@ uint32_t midr_canonical_max_age_ms(const struct midr_canonical *store)
 size_t midr_canonical_identity_count(const struct midr_canonical *store)
 {
 	return store ? store->identities : 0;
+}
+
+size_t midr_canonical_floor_count(const struct midr_canonical *store)
+{
+	size_t count = 0;
+
+	if (!store)
+		return 0;
+	for (size_t i = 0; i < MIDR_CANONICAL_BUCKETS; i++)
+		for (const struct midr_canonical_entry *entry = store->buckets[i];
+		     entry; entry = entry->next)
+			if (entry->state == MIDR_CANONICAL_FLOOR)
+				count++;
+	return count;
+}
+
+size_t midr_canonical_retired_ref_count(const struct midr_canonical *store)
+{
+	size_t count = 0;
+
+	if (!store)
+		return 0;
+	for (size_t i = 0; i < MIDR_CANONICAL_BUCKETS; i++)
+		for (const struct midr_canonical_entry *entry = store->buckets[i];
+		     entry; entry = entry->next)
+			if (entry->retired)
+				count++;
+	return count;
+}
+
+size_t midr_canonical_retired_ref_bytes(const struct midr_canonical *store)
+{
+	size_t count = midr_canonical_retired_ref_count(store);
+
+	if (count > SIZE_MAX / sizeof(struct midr_instance_ref))
+		return SIZE_MAX;
+	return count * sizeof(struct midr_instance_ref);
 }
 
 size_t midr_canonical_event_count(const struct midr_canonical *store)
@@ -511,6 +571,7 @@ void midr_canonical_destroy(struct midr_canonical **storep)
 			struct midr_canonical_entry *next = entry->next;
 
 			midr_instance_ref_release(&entry->current);
+			midr_instance_ref_release(&entry->retired);
 			store->config.free(entry, store->config.alloc_arg);
 			entry = next;
 		}
