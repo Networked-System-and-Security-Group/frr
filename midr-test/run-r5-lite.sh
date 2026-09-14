@@ -18,7 +18,7 @@ fi
 
 echo "[R5-lite] pure lifetime refresh propagation"
 "$SCOPE_TEST" 2>&1 | tee "$RUN_ROOT/pure-refresh.log"
-grep -q 'MIDR propagation scope tests passed' "$RUN_ROOT/pure-refresh.log"
+grep -q 'MIDR scope tests passed' "$RUN_ROOT/pure-refresh.log"
 
 echo "[R5-lite] multi-node service/link withdrawal propagation"
 MIDR_M5_RUN_DIR="$M5_RUN_ROOT" \

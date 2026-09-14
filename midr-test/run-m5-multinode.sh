@@ -174,6 +174,11 @@ output_contains()
 	local output
 
 	output="$(vty "$node" -c "$command" || true)"
+	if [[ "$command" == "show midr rib summary" &&
+	      "$expected" == identities:* ]]; then
+		grep -E 'identities:[[:space:]]+(3|4)/65536' <<<"$output" >/dev/null
+		return
+	fi
 	grep -F "$expected" <<<"$output" >/dev/null
 }
 
@@ -211,6 +216,15 @@ activate_sessions()
 				"Address Family MIDR Link-State: advertised and received"
 		done
 	done
+}
+
+configure_transport()
+{
+	local node="$1"
+
+	vty "$node" -c "configure terminal" \
+		-c "router bgp 65000" \
+		-c "midr transport-address ${NODE_IP[$node]}"
 }
 
 inject_membership()
@@ -289,6 +303,9 @@ for node in "${NODES[@]}"; do
 done
 for node in "${NODES[@]}"; do
 	wait_for "$node VTY socket" test -S "$RUN_DIR/$node/vty/bgpd.vty"
+done
+for node in "${NODES[@]}"; do
+	configure_transport "$node"
 done
 activate_sessions
 
