@@ -736,6 +736,10 @@ DEFUN(show_midr_sync, show_midr_sync_cmd,
 		status.input_rejected_count);
 	vty_out(vty, "  output timeouts:    %" PRIu64 "\n",
 		status.output_timeout_count);
+	vty_out(vty, "  shutdown generation failures: %" PRIu64 "\n",
+		status.shutdown_generation_failures);
+	vty_out(vty, "  ignored GR/LLGR MIDR tuples:  %" PRIu64 "/%" PRIu64 "\n",
+		status.gr_tuple_ignored, status.llgr_tuple_ignored);
 	vty_out(vty, "  session generation: %" PRIu64 "\n",
 		status.next_session_generation);
 	vty_out(vty, "  reconnects/stale:   %" PRIu64 "/%" PRIu64 "\n",

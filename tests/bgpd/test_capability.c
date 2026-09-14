@@ -18,6 +18,8 @@
 #include "bgpd/bgp_open.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_packet.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 
 #define VT100_RESET "\x1b[0m"
 #define VT100_RED "\x1b[31m"
@@ -909,6 +911,148 @@ static void parse_test(struct peer *peer, struct test_segment *t, int type)
 	printf("\n\n");
 }
 
+static void midr_capability_reset_flags(struct peer *peer)
+{
+	UNSET_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		   PEER_CAP_RESTART_AF_RCV);
+	UNSET_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		   PEER_CAP_RESTART_AF_PRESERVE_RCV);
+	UNSET_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		   PEER_CAP_LLGR_AF_RCV);
+	UNSET_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+		   PEER_CAP_RESTART_AF_RCV);
+	UNSET_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+		   PEER_CAP_RESTART_AF_PRESERVE_RCV);
+	UNSET_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+		   PEER_CAP_LLGR_AF_RCV);
+}
+
+static void midr_capability_assert_flags(struct peer *peer, bool llgr,
+						 bool mixed)
+{
+	if (CHECK_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		       PEER_CAP_RESTART_AF_RCV) ||
+	    CHECK_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		       PEER_CAP_RESTART_AF_PRESERVE_RCV) ||
+	    CHECK_FLAG(peer->af_cap[AFI_BGP_LS][SAFI_MIDR_LS],
+		       PEER_CAP_LLGR_AF_RCV))
+		failed++;
+
+	if (!mixed)
+		return;
+
+	if (llgr) {
+		if (!CHECK_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+				PEER_CAP_LLGR_AF_RCV))
+			failed++;
+	} else if (!CHECK_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+				      PEER_CAP_RESTART_AF_RCV) ||
+		   !CHECK_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+				      PEER_CAP_RESTART_AF_PRESERVE_RCV)) {
+		failed++;
+	}
+}
+
+static void midr_capability_test(struct peer *peer, bool dynamic, bool llgr,
+					 bool mixed)
+{
+	struct midr_sync_status before, after;
+	uint8_t code = llgr ? CAPABILITY_CODE_LLGR : CAPABILITY_CODE_RESTART;
+	uint8_t tuple_len = llgr ? BGP_CAP_LLGR_MIN_PACKET_LEN : 4;
+	uint8_t cap_len = (llgr ? 0 : 2) + tuple_len * (mixed ? 2 : 1);
+	uint8_t packet_len;
+	int ret;
+	int capability = 0;
+	uint64_t *ignored;
+	int oldfailed = failed;
+
+	if (midr_sync_status_get(&peer->bgp->midr_info->ctx, &before) != 0) {
+		failed++;
+		return;
+	}
+
+	midr_capability_reset_flags(peer);
+	if (llgr && mixed)
+		SET_FLAG(peer->af_cap[AFI_IP][SAFI_UNICAST],
+			 PEER_CAP_RESTART_AF_RCV);
+	stream_reset(peer->connection->curr);
+	stream_set_getp(peer->connection->curr, 0);
+
+	if (dynamic) {
+		/* Dynamic capability message: action, code, length, value. */
+		stream_putc(peer->connection->curr, CAPABILITY_ACTION_SET);
+		stream_putc(peer->connection->curr, code);
+		stream_putc(peer->connection->curr, cap_len);
+	} else {
+		/* OPEN optional parameter containing one capability. */
+		stream_putc(peer->connection->curr, BGP_OPEN_OPT_CAP);
+		stream_putc(peer->connection->curr, cap_len + 2);
+		stream_putc(peer->connection->curr, code);
+		stream_putc(peer->connection->curr, cap_len);
+	}
+
+	/* GR carries restart flags/time before its tuples; LLGR does not. */
+	if (!llgr)
+		stream_putw(peer->connection->curr, 0x0010);
+	/* MIDR_LS (AFI 16388 / SAFI 241), F-bit set in the test tuple. */
+	stream_putw(peer->connection->curr, 0x4004);
+	stream_putc(peer->connection->curr,
+			    dynamic ? SAFI_MIDR_LS : 0xf1);
+	if (llgr) {
+		stream_putc(peer->connection->curr, 0);
+		stream_putc(peer->connection->curr, 0);
+		stream_putc(peer->connection->curr, 0);
+		stream_putc(peer->connection->curr, 0x3c);
+	} else {
+		stream_putc(peer->connection->curr, GRACEFUL_RESTART_F_BIT);
+	}
+
+	if (mixed) {
+		/* IPv4 unicast remains on the ordinary GR/LLGR path. */
+		stream_putw(peer->connection->curr, 1);
+		stream_putc(peer->connection->curr, 1);
+		if (llgr) {
+			stream_putc(peer->connection->curr, 0);
+			stream_putc(peer->connection->curr, 0);
+			stream_putc(peer->connection->curr, 0);
+			stream_putc(peer->connection->curr, 0x3c);
+		} else {
+			stream_putc(peer->connection->curr,
+				    GRACEFUL_RESTART_F_BIT);
+		}
+	}
+
+	packet_len = dynamic ? 3 + cap_len : cap_len + 4;
+	if (dynamic) {
+		SET_FLAG(peer->cap, PEER_CAP_DYNAMIC_ADV);
+		SET_FLAG(peer->cap, PEER_CAP_DYNAMIC_RCV);
+		peer->connection->status = Established;
+		ret = bgp_capability_receive(peer->connection, 3 + cap_len);
+	} else {
+		ret = bgp_open_option_parse(peer->connection, packet_len, &capability);
+	}
+
+	if (ret != 0)
+		failed++;
+	midr_capability_assert_flags(peer, llgr, mixed);
+
+	if (midr_sync_status_get(&peer->bgp->midr_info->ctx, &after) != 0) {
+		failed++;
+		return;
+	}
+	ignored = llgr ? &after.llgr_tuple_ignored : &after.gr_tuple_ignored;
+	if (*ignored != (llgr ? before.llgr_tuple_ignored :
+					before.gr_tuple_ignored) + 1)
+		failed++;
+
+	printf("MIDR %s %s %s: %s",
+	       dynamic ? "dynamic" : "OPEN", llgr ? "LLGR" : "GR",
+	       mixed ? "mixed" : "pure", failed > oldfailed ? "failed!" : "OK");
+	if (failed > oldfailed)
+		printf(" (%d)", failed);
+	printf("\n\n");
+}
+
 static struct bgp *bgp;
 static as_t asn = 100;
 
@@ -943,6 +1087,9 @@ int main(void)
 
 	peer = peer_create_accept(bgp, NULL);
 	peer->host = (char *)"foo";
+	if (!bgp->midr_info)
+		bgp_midr_init(bgp);
+	assert(bgp->midr_info != NULL);
 
 	for (i = AFI_IP; i < AFI_MAX; i++)
 		for (j = SAFI_UNICAST; j < SAFI_MAX; j++) {
@@ -979,6 +1126,17 @@ int main(void)
 	i = 0;
 	while (dynamic_cap_msgs[i].name)
 		parse_test(peer, &dynamic_cap_msgs[i++], DYNCAP);
+
+	/* MIDR's GR/LLGR tuples are consumed without enabling AF state; other
+	 * AF tuples in the same capability retain the normal behavior. */
+	midr_capability_test(peer, false, false, false);
+	midr_capability_test(peer, false, false, true);
+	midr_capability_test(peer, false, true, false);
+	midr_capability_test(peer, false, true, true);
+	midr_capability_test(peer, true, false, false);
+	midr_capability_test(peer, true, false, true);
+	midr_capability_test(peer, true, true, false);
+	midr_capability_test(peer, true, true, true);
 
 	printf("failures: %d\n", failed);
 	return failed;

@@ -1082,6 +1082,16 @@ void midr_sync_shutdown_generation_failed(struct midr_context *ctx)
 		MIDR_SYNC_SHUTDOWN_GENERATION_FAILED;
 }
 
+void midr_sync_capability_tuple_ignored(struct midr_context *ctx, bool llgr)
+{
+	if (!ctx || !ctx->sync_store)
+		return;
+	if (llgr)
+		ctx->sync_store->llgr_tuple_ignored++;
+	else
+		ctx->sync_store->gr_tuple_ignored++;
+}
+
 void midr_sync_shutdown_expired(struct midr_context *ctx)
 {
 	struct midr_sync_store *store;
@@ -1425,4 +1435,22 @@ void midr_sync_test_drain_completions(struct midr_context *ctx)
 			event.arg = packet;
 			midr_sync_packet_event(&event);
 		}
+	/* Completions claimed before a session teardown are no longer reachable
+	 * through that session's packet list.  Drain their references directly
+	 * in the test harness while preserving the production teardown rule that
+	 * claimed completions are never cancelled by session destruction. */
+	for (;;) {
+		struct midr_sync_session_packet *completion;
+
+		pthread_mutex_lock(&midr_sync_packets_mutex);
+		completion = midr_sync_completions;
+		if (completion)
+			midr_sync_completions = completion->completion_next;
+		pthread_mutex_unlock(&midr_sync_packets_mutex);
+		if (!completion)
+			break;
+		event_cancel(&completion->completion);
+		event.arg = completion;
+		midr_sync_packet_event(&event);
+	}
 }

@@ -42,6 +42,8 @@
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_mplsvpn.h"
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_updgrp.h"
@@ -3634,6 +3636,10 @@ static void bgp_dynamic_capability_llgr(uint8_t *pnt, int action,
 						   peer->host,
 						   iana_afi2str(pkt_afi),
 						   iana_safi2str(pkt_safi));
+			} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				if (peer->bgp && peer->bgp->midr_info)
+					midr_sync_capability_tuple_ignored(
+						&peer->bgp->midr_info->ctx, true);
 			} else if (!peer->afc[afi][safi] ||
 				   !CHECK_FLAG(peer->af_cap[afi][safi],
 					       PEER_CAP_RESTART_AF_RCV)) {
@@ -3730,6 +3736,10 @@ static void bgp_dynamic_capability_graceful_restart(uint8_t *pnt, int action,
 					zlog_debug("%pBP: Addr-family %s/%s(afi/safi) not supported. Ignore the Graceful Restart capability for this AFI/SAFI",
 						   peer, iana_afi2str(pkt_afi),
 						   iana_safi2str(pkt_safi));
+			} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				if (peer->bgp && peer->bgp->midr_info)
+					midr_sync_capability_tuple_ignored(
+						&peer->bgp->midr_info->ctx, false);
 			} else if (!peer->afc[afi][safi]) {
 				if (bgp_debug_neighbor_events(peer))
 					zlog_debug("%pBP: Addr-family %s/%s(afi/safi) not enabled. Ignore the Graceful Restart capability",
