@@ -373,7 +373,10 @@ int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
 }
 
 int midr_canonical_gc(struct midr_canonical *store, size_t limit,
-			  size_t *collected)
+			  size_t *collected,
+			  void (*reclaim)(const struct midr_ls_object_key *key,
+					  void *arg),
+			  void *reclaim_arg)
 {
 	size_t done = 0;
 	uint64_t now;
@@ -404,6 +407,11 @@ int midr_canonical_gc(struct midr_canonical *store, size_t limit,
 				link = &entry->next;
 				continue;
 			}
+			/* The caller owns any external RIB/LSDB cleanup for this
+			 * identity; report the key while the entry is still on the
+			 * bucket chain so declining is impossible. */
+			if (reclaim)
+				reclaim(&entry->key, reclaim_arg);
 			*link = entry->next;
 			store->identities--;
 			store->config.free(entry, store->config.alloc_arg);

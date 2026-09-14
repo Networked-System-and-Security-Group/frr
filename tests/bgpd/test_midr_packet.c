@@ -344,6 +344,7 @@ static void test_resource_rejection_keeps_session(void)
 	};
 	struct midr_instance refresh = membership(600, 23);
 	struct midr_sync_status status;
+	struct midr_rib_summary rib_before;
 	struct midr_instance selected;
 	struct peer *selected_peer;
 	struct stream *nlri = stream_new(128);
@@ -352,6 +353,7 @@ static void test_resource_rejection_keeps_session(void)
 	uint32_t age;
 
 	midr_sync_test_session_start(ctx, remote, remote->connection);
+	assert(midr_rib_summary_get(ctx, &rib_before) == 0);
 	assert(midr_rib_test_set_identity_limit(ctx, 1) == 0);
 
 	/* A new identity beyond the limit is a resource rejection, not a
@@ -367,6 +369,14 @@ static void test_resource_rejection_keeps_session(void)
 	assert(midr_rib_selected_instance_get(ctx, &third_party.object.key,
 					      &selected, &age,
 					      &selected_peer) == -ENOENT);
+	{
+		/* The rejected input must not leave an empty identity stub:
+		 * stubs have no canonical entry and no GC path could free them. */
+		struct midr_rib_summary rib_after;
+
+		assert(midr_rib_summary_get(ctx, &rib_after) == 0);
+		assert(rib_after.identity_count == rib_before.identity_count);
+	}
 
 	/* An update of an existing identity is still admitted at the limit. */
 	{

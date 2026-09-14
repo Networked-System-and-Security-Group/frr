@@ -71,9 +71,15 @@ extern int midr_canonical_expire(struct midr_canonical *store,
 extern int midr_canonical_sweep(struct midr_canonical *store, size_t limit,
 				 size_t *expired);
 /* Remove only floors whose retention lifetime has elapsed and which have no
- * pending event. The caller owns any external RIB/LSDB cleanup obligation. */
+ * pending event.  Each reclaimed key is reported synchronously through
+ * `reclaim` (optional) before the entry is freed, so the caller can remove
+ * any external RIB/LSDB state that tracks this identity. */
 extern int midr_canonical_gc(struct midr_canonical *store, size_t limit,
-				 size_t *collected);
+				 size_t *collected,
+				 void (*reclaim)(
+					 const struct midr_ls_object_key *key,
+					 void *arg),
+				 void *reclaim_arg);
 extern int midr_canonical_gc_enable(struct midr_canonical *store,
 				    bool enabled);
 extern uint32_t midr_canonical_max_age_ms(

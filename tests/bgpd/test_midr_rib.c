@@ -13,6 +13,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
@@ -293,6 +294,123 @@ static void test_identity_limit_rejection_and_recovery(void)
 	assert(selected.object.ls_sequence == 1);
 }
 
+/* One lifetime cycle at the given virtual time: sweep -> expire/reap ->
+ * (optional) floor reclaim through the canonical GC callback. */
+static void run_lifetime_at(uint64_t now_ns)
+{
+	assert(midr_rib_test_set_now_ns(ctx, now_ns) == 0);
+	assert(midr_rib_test_run_lifetime(ctx) == 0);
+}
+
+static void test_identity_reclaim_and_slot_reuse(void)
+{
+	const uint64_t life_ns =
+		(uint64_t)MIDR_CANONICAL_MAX_AGE_MS * 1000000ULL;
+	struct midr_instance stub = membership(router_id("9.9.9.9"), 1, 90);
+	struct midr_rib_summary summary;
+	struct foreach_state state = {};
+	struct timespec ts;
+	uint64_t reclaimed_base;
+	uint64_t base_ns;
+	size_t baseline;
+
+	/* Anchor the virtual clock just past the real monotonic time so the
+	 * identities left by earlier tests still age forward, never regress. */
+	assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+	base_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec +
+		  1000000000ULL;
+	assert(midr_rib_test_set_now_ns(ctx, base_ns) == 0);
+
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	baseline = summary.identity_count;
+	reclaimed_base = summary.identities_reclaimed;
+
+	/* Expire everything, including identities left by earlier tests. */
+	run_lifetime_at(base_ns + life_ns);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.identity_count == baseline);
+	assert(summary.path_count == 0 && summary.selected_count == 0);
+	assert(midr_rib_selected_foreach(ctx, selected_callback, &state) == 0);
+	assert(state.count == 0);
+
+	/* GC stays off by default: floors past their retention window are
+	 * still retained, exactly as production would keep them. */
+	run_lifetime_at(base_ns + 2 * life_ns + 1);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.identity_count == baseline);
+	assert(summary.identities_reclaimed == reclaimed_base);
+	assert(summary.canonical_identity_count == baseline);
+
+	/* With GC enabled the RIB identities, canonical floors and synthetic
+	 * IDs are reclaimed together and the slots become reusable. */
+	assert(midr_rib_test_set_gc_enabled(ctx, true) == 0);
+	run_lifetime_at(base_ns + 2 * life_ns + 2);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.identity_count == 0);
+	assert(summary.canonical_identity_count == 0);
+	assert(summary.identities_reclaimed == reclaimed_base + baseline);
+	state.count = 0;
+	assert(midr_rib_selected_entry_foreach(ctx, selected_entry_callback,
+					       &state) == 0);
+	assert(state.count == 0);
+
+	/* Churn: with a tiny limit, repeated fill/expire/reclaim rounds must
+	 * not permanently exhaust the identity budget.  Floor retention is
+	 * measured from acceptance, so expiry and reclaimability coincide:
+	 * one lifetime pass with GC enabled drops each round completely. */
+	assert(midr_rib_test_set_identity_limit(ctx, 3) == 0);
+	for (unsigned int round = 0; round < 3; round++) {
+		uint64_t round_ns = base_ns + (round + 4) * 4 * life_ns;
+		struct midr_instance batch[3];
+		uint64_t reclaimed_before;
+
+		for (unsigned int n = 0; n < 3; n++)
+			batch[n] = membership(
+				htonl(0x14000001 + round * 16 + n),
+				round * 10 + n + 1, 30 + n);
+		assert(midr_rib_summary_get(ctx, &summary) == 0);
+		reclaimed_before = summary.identities_reclaimed;
+		assert(midr_rib_test_set_now_ns(ctx, round_ns) == 0);
+		for (unsigned int n = 0; n < 3; n++)
+			assert(midr_rib_instance_upsert(ctx, peer_two,
+							&batch[n], 0) == 0);
+		/* Mid-life nothing has expired yet (age accounting rounds
+		 * elapsed nanoseconds up to whole milliseconds). */
+		run_lifetime_at(round_ns + life_ns / 2);
+		assert(midr_rib_summary_get(ctx, &summary) == 0);
+		assert(summary.identity_count == 3);
+		assert(summary.path_count == 3);
+		/* At L the round expires and is reclaimed in the same pass. */
+		run_lifetime_at(round_ns + life_ns);
+		assert(midr_rib_summary_get(ctx, &summary) == 0);
+		assert(summary.identity_count == 0);
+		assert(summary.identities_reclaimed == reclaimed_before + 3);
+	}
+	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
+
+	/* A resource-rejected or already-expired input must not leave an
+	 * empty identity stub behind: those have no canonical entry, so no
+	 * floor-GC callback could ever reach them. */
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	baseline = summary.identity_count;
+	assert(midr_rib_instance_upsert(ctx, peer_two, &stub,
+					MIDR_CANONICAL_MAX_AGE_MS) == 0);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.identity_count == baseline);
+	assert(midr_rib_test_set_identity_limit(ctx, 1) == 0);
+	{
+		struct midr_instance live = membership(router_id("7.7.7.7"), 5, 70);
+
+		assert(midr_rib_instance_upsert(ctx, peer_two, &live, 0) == 0);
+		baseline++;
+	}
+	stub.object.key.originator_node_id = router_id("9.9.9.8");
+	assert(midr_rib_instance_upsert(ctx, peer_two, &stub, 0) == -ENOSPC);
+	assert(midr_rib_test_set_identity_limit(ctx, MIDR_RIB_MAX_IDENTITIES) == 0);
+	assert(midr_rib_summary_get(ctx, &summary) == 0);
+	assert(summary.identity_count == baseline);
+}
+
 int main(void)
 {
 	as_t asn = 65000;
@@ -316,6 +434,7 @@ int main(void)
 	test_duplicate_conflict_and_resolution();
 	test_iteration_limits_and_validation();
 	test_identity_limit_rejection_and_recovery();
+	test_identity_reclaim_and_slot_reuse();
 	puts("MIDR RIB tests passed");
 	return 0;
 }

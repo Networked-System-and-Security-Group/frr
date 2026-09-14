@@ -37,10 +37,13 @@ struct midr_rib_summary {
 	size_t selected_count;
 	size_t conflict_count;
 	size_t identity_limit;
+	size_t canonical_identity_count;
+	size_t advertisement_count;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
 	uint64_t rejected_resource;
 	uint64_t rejected_internal;
+	uint64_t identities_reclaimed;
 };
 
 typedef int (*midr_rib_selected_cb)(
@@ -114,7 +117,10 @@ extern void midr_show_rib_paths(struct vty *vty, struct midr_context *ctx);
 extern int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 					     size_t limit);
 extern int midr_rib_test_set_now_ns(struct midr_context *ctx,
-				     uint64_t now_ns);
+					     uint64_t now_ns);
+extern int midr_rib_test_set_gc_enabled(struct midr_context *ctx,
+					 bool enabled);
+extern int midr_rib_test_run_lifetime(struct midr_context *ctx);
 extern int midr_rib_test_set_path_stale(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
 	struct peer *peer, bool stale);

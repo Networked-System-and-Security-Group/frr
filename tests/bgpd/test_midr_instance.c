@@ -389,11 +389,11 @@ static void test_sweep_and_floor_gc(void)
 	assert(midr_canonical_sweep(s, 4, &count) == 0 && count == 1);
 	drain(s);
 	f.now = 1999999999ULL;
-	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 0);
+	assert(midr_canonical_gc(s, 4, &count, NULL, NULL) == 0 && count == 0);
 	f.now = 2000000000ULL;
-	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 0);
+	assert(midr_canonical_gc(s, 4, &count, NULL, NULL) == 0 && count == 0);
 	assert(midr_canonical_gc_enable(s, true) == 0);
-	assert(midr_canonical_gc(s, 4, &count) == 0 && count == 1);
+	assert(midr_canonical_gc(s, 4, &count, NULL, NULL) == 0 && count == 1);
 	assert(midr_canonical_identity_count(s) == 0);
 	midr_canonical_destroy(&s);
 	assert(!f.live);
@@ -418,6 +418,61 @@ static void test_sweep_fairness(void)
 	assert(midr_canonical_sweep(s, 256, &second) == 0 && second == 44);
 	drain(s);
 	assert(midr_canonical_identity_count(s) == 300);
+	midr_canonical_destroy(&s);
+	assert(!f.live);
+}
+
+struct reclaim_log {
+	struct midr_ls_object_key keys[4];
+	size_t count;
+};
+
+static void note_reclaim(const struct midr_ls_object_key *key, void *arg)
+{
+	struct reclaim_log *log = arg;
+
+	/* The key is only valid until the callback returns: the entry is
+	 * freed immediately afterwards. */
+	if (log->count < 4)
+		log->keys[log->count] = *key;
+	log->count++;
+}
+
+static void test_gc_reclaim_callback(void)
+{
+	struct fixture f = {};
+	struct midr_canonical *s = create(&f, 8, 16);
+	struct midr_instance first = sample(MIDR_NLRI_TYPE_LINK, false);
+	struct midr_instance second = first;
+	struct midr_ls_object_key expired_keys[2];
+	struct reclaim_log log = {};
+	size_t count;
+
+	second.object.key.u.link.link_id = 2;
+	expired_keys[0] = first.object.key;
+	expired_keys[1] = second.object.key;
+	expect_accept(s, &first, 0, MIDR_CANONICAL_ACCEPTED);
+	expect_accept(s, &second, 0, MIDR_CANONICAL_ACCEPTED);
+	drain(s);
+	f.now = 1000000000ULL;
+	assert(midr_canonical_sweep(s, 8, &count) == 0 && count == 2);
+	drain(s);
+	assert(midr_canonical_gc_enable(s, true) == 0);
+
+	/* Keys are reported before the entries are freed, exactly once each,
+	 * and only after the retention window has fully elapsed.  The floor
+	 * clock started at acceptance (f.now == 0), so the boundary is L. */
+	f.now = 999999999ULL;
+	assert(midr_canonical_gc(s, 8, &count, note_reclaim, &log) == 0);
+	assert(count == 0 && log.count == 0);
+	f.now = 1000000000ULL;
+	assert(midr_canonical_gc(s, 8, &count, note_reclaim, &log) == 0);
+	assert(count == 2 && log.count == 2);
+	assert(midr_ls_object_key_same(&log.keys[0], &expired_keys[0]) ||
+	       midr_ls_object_key_same(&log.keys[0], &expired_keys[1]));
+	assert(midr_ls_object_key_same(&log.keys[1], &expired_keys[0]) ||
+	       midr_ls_object_key_same(&log.keys[1], &expired_keys[1]));
+	assert(!midr_ls_object_key_same(&log.keys[0], &log.keys[1]));
 	midr_canonical_destroy(&s);
 	assert(!f.live);
 }
@@ -500,6 +555,7 @@ int main(void)
 	test_expiry_failure_and_history();
 	test_sweep_and_floor_gc();
 	test_sweep_fairness();
+	test_gc_reclaim_callback();
 	puts("MIDR instance/canonical tests passed");
 	return 0;
 }

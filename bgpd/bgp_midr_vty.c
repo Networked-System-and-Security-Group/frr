@@ -267,6 +267,12 @@ DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
 		summary.selected_count);
 	vty_out(vty, "  conflicts:         %zu\n",
 		summary.conflict_count);
+	vty_out(vty, "  canonical entries: %zu\n",
+		summary.canonical_identity_count);
+	vty_out(vty, "  advertisements:    %zu\n",
+		summary.advertisement_count);
+	vty_out(vty, "  identities reclaimed: %" PRIu64 "\n",
+		summary.identities_reclaimed);
 	vty_out(vty, "  rejected limit:    %" PRIu64 "\n",
 		summary.rejected_limit);
 	vty_out(vty, "  rejected resource: %" PRIu64 "\n",

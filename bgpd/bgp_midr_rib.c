@@ -66,6 +66,7 @@ struct midr_rib_store {
 	uint64_t rejected_payload_conflict;
 	uint64_t rejected_resource;
 	uint64_t rejected_internal;
+	uint64_t identities_reclaimed;
 	struct event *lifetime_timer;
 	bool test_clock_enabled;
 	uint64_t test_now_ns;
@@ -133,6 +134,46 @@ static void midr_rib_identity_free(void *arg)
 		XFREE(MTYPE_MIDR_RIB_ADVERTISEMENT, advertisement);
 	}
 	XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
+}
+
+/* Fully remove an identity from the store, mirroring the table-teardown
+ * template in midr_rib_dest_cleanup(): disconnect the dest back-pointer,
+ * drop the store counters, release the hash slot and the synthetic ID, and
+ * release the identity's creation reference on the dest so the empty dest
+ * is actually freed.  The identity must have no live export path. */
+static void midr_rib_identity_detach(struct midr_rib_store *store,
+				     struct midr_rib_identity *identity)
+{
+	struct bgp_dest *dest = identity->dest;
+
+	if (dest && identity->canonical_path &&
+	    !CHECK_FLAG(identity->canonical_path->flags, BGP_PATH_REMOVED)) {
+		/* Defensive reap: expiry normally reaps paths in the same
+		 * lifetime pass, before floor reclamation can run. */
+		struct bgp_dest *locked = bgp_dest_lock_node(dest);
+
+		bgp_path_info_mark_for_delete(locked, identity->canonical_path);
+		bgp_process_main_one(store->ctx->bgp, locked, AFI_BGP_LS,
+				     SAFI_MIDR_LS);
+		bgp_dest_unlock_node(locked);
+	}
+	assert(!identity->path_count);
+	if (dest) {
+		dest->midr_identity = NULL;
+		identity->dest = NULL;
+	}
+	if (identity->selected)
+		store->selected_count--;
+	if (identity->state == MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED)
+		store->conflict_count--;
+	assert(hash_release(store->identities, identity) == identity);
+	idalloc_free(store->allocator, identity->synthetic_id);
+	midr_rib_identity_free(identity);
+	store->identities_reclaimed++;
+	/* Drop the never-yet-released creation reference; this may free the
+	 * dest, whose cleanup sees midr_identity == NULL and stops early. */
+	if (dest)
+		bgp_dest_unlock_node(dest);
 }
 
 static bool midr_rib_advertisement_has(
@@ -520,6 +561,30 @@ static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
 	}
 }
 
+/* A canonical floor whose retention expired was reclaimed: forget the
+ * matching RIB identity, its synthetic ID and its dest so the slot and the
+ * ID become reusable. */
+static void midr_rib_canonical_reclaim(const struct midr_ls_object_key *key,
+				       void *arg)
+{
+	struct midr_rib_store *store = arg;
+	struct midr_rib_identity *identity;
+
+	identity = midr_rib_identity_lookup(store, key);
+	if (identity)
+		midr_rib_identity_detach(store, identity);
+}
+
+static void midr_rib_lifetime_pass(struct midr_rib_store *store)
+{
+	(void)midr_canonical_sweep(store->canonical,
+				   MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	midr_rib_apply_lifetime_events(store);
+	(void)midr_canonical_gc(store->canonical,
+				MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL,
+				midr_rib_canonical_reclaim, store);
+}
+
 static void midr_rib_lifetime_event(struct event *event)
 {
 	struct midr_rib_store *store = EVENT_ARG(event);
@@ -527,11 +592,7 @@ static void midr_rib_lifetime_event(struct event *event)
 	if (!store || !store->ctx)
 		return;
 	store->lifetime_timer = NULL;
-	(void)midr_canonical_sweep(store->canonical,
-				   MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
-	midr_rib_apply_lifetime_events(store);
-	(void)midr_canonical_gc(store->canonical,
-				MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	midr_rib_lifetime_pass(store);
 	if (bm && bm->master)
 		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
 				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
@@ -632,6 +693,8 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	enum midr_canonical_result result;
 	bool event_pending;
 	bool advertisement_was_present;
+	bool identity_created;
+	size_t identities_before;
 	uint64_t old_advertisement_sequence = 0;
 	enum midr_instance_state old_advertisement_state = 0;
 	struct midr_rib_advertisement *advertisement;
@@ -653,9 +716,11 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	}
 
 	store = ctx->rib_store;
+	identities_before = store->identities->count;
 	identity = midr_rib_identity_get(ctx, &instance->object.key, &dest);
 	if (!identity)
 		return -ENOSPC;
+	identity_created = store->identities->count > identities_before;
 	advertisement = midr_rib_advertisement_lookup(identity, peer);
 	advertisement_was_present = advertisement != NULL;
 	if (advertisement) {
@@ -664,6 +729,8 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	}
 	ret = midr_rib_advertisement_update(identity, peer, instance);
 	if (ret) {
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return ret;
 	}
@@ -679,6 +746,8 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 			advertisement->sequence = old_advertisement_sequence;
 			advertisement->state = old_advertisement_state;
 		}
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return -ENOMEM;
 	}
@@ -697,6 +766,8 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 			advertisement->sequence = old_advertisement_sequence;
 			advertisement->state = old_advertisement_state;
 		}
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return ret;
 	}
@@ -704,6 +775,11 @@ int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
 	    result == MIDR_CANONICAL_OLDER ||
 	    result == MIDR_CANONICAL_EXPIRED) {
 		bgp_attr_unintern(&new_attr);
+		/* No canonical entry was installed for a brand-new identity:
+		 * drop the stub instead of leaking a slot that no floor-GC
+		 * callback can ever reach. */
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return 0;
 	}
@@ -938,9 +1014,26 @@ int midr_rib_selected_entry_foreach(
 	return state.result;
 }
 
+struct midr_rib_advertisement_count {
+	size_t count;
+};
+
+static void midr_rib_advertisement_count_iter(struct hash_bucket *bucket,
+					      void *arg)
+{
+	struct midr_rib_advertisement_count *state = arg;
+	struct midr_rib_identity *identity = bucket->data;
+	struct midr_rib_advertisement *advertisement;
+
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		state->count++;
+}
+
 int midr_rib_summary_get(struct midr_context *ctx,
 			 struct midr_rib_summary *summary)
 {
+	struct midr_rib_advertisement_count advertisements = {};
 	struct midr_rib_store *store;
 
 	if (!ctx || !ctx->rib_store)
@@ -948,6 +1041,8 @@ int midr_rib_summary_get(struct midr_context *ctx,
 	if (!summary)
 		return -EINVAL;
 	store = ctx->rib_store;
+	hash_iterate(store->identities, midr_rib_advertisement_count_iter,
+		     &advertisements);
 	*summary = (struct midr_rib_summary){
 		/* The identity limit includes floors and quarantined identities, not
 		 * only objects currently usable by the active view. */
@@ -961,6 +1056,10 @@ int midr_rib_summary_get(struct midr_context *ctx,
 			store->rejected_payload_conflict,
 		.rejected_resource = store->rejected_resource,
 		.rejected_internal = store->rejected_internal,
+		.identities_reclaimed = store->identities_reclaimed,
+		.canonical_identity_count =
+			midr_canonical_identity_count(store->canonical),
+		.advertisement_count = advertisements.count,
 	};
 	return 0;
 }
@@ -1174,6 +1273,21 @@ int midr_rib_test_set_now_ns(struct midr_context *ctx, uint64_t now_ns)
 		return -ENOENT;
 	ctx->rib_store->test_clock_enabled = true;
 	ctx->rib_store->test_now_ns = now_ns;
+	return 0;
+}
+
+int midr_rib_test_set_gc_enabled(struct midr_context *ctx, bool enabled)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_canonical_gc_enable(ctx->rib_store->canonical, enabled);
+}
+
+int midr_rib_test_run_lifetime(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	midr_rib_lifetime_pass(ctx->rib_store);
 	return 0;
 }
 
