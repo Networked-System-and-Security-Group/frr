@@ -246,6 +246,7 @@ int midr_owned_withdraw(struct midr_owned *owned,
 	object.state = MIDR_CORE_WITHDRAWN;
 	object.sequence = sequence;
 	object.lifetime_ms = owned->config.lifetime_ms;
+	object.group = 0;
 	object.metric = 0;
 	memset(object.local_address, 0, sizeof(object.local_address));
 	memset(object.remote_address, 0, sizeof(object.remote_address));

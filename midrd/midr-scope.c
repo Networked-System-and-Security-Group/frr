@@ -53,7 +53,7 @@ int midr_scope_create(const struct midr_scope_config *config,
 int midr_scope_clone(const struct midr_scope *source,
 			    struct midr_scope **out)
 {
-	struct midr_scope *clone;
+	struct midr_scope *clone = NULL;
 
 	if (!source || !out || *out)
 		return -EINVAL;
@@ -93,15 +93,22 @@ int midr_scope_apply(struct midr_scope *scope,
 			scope->memberships[index].active = false;
 		return 0;
 	}
-	if (object->state != MIDR_CORE_ACTIVE || !object->identity.group)
+	if (object->state != MIDR_CORE_ACTIVE || !object->group)
 		return -EINVAL;
 	if (index < 0) {
-		if (scope->count == scope->config.max_memberships)
-			return -ENOSPC;
-		index = (ssize_t)scope->count++;
+		for (size_t i = 0; i < scope->count; i++)
+			if (!scope->memberships[i].active) {
+				index = (ssize_t)i;
+				break;
+			}
+		if (index < 0) {
+			if (scope->count == scope->config.max_memberships)
+				return -ENOSPC;
+			index = (ssize_t)scope->count++;
+		}
 	}
 	scope->memberships[index].node_id = object->identity.originator;
-	scope->memberships[index].group = object->identity.group;
+	scope->memberships[index].group = object->group;
 	scope->memberships[index].active = true;
 	return 0;
 }
@@ -150,24 +157,65 @@ bool midr_scope_export(const struct midr_scope *scope,
 
 	if (!scope || !object || object->state == MIDR_CORE_WITHDRAWN)
 		return object && object->state == MIDR_CORE_WITHDRAWN;
-	if (object->identity.type == MIDR_CORE_MEMBERSHIP || !peer_node_id)
-		return true;
-	if (midr_scope_membership(scope, peer_node_id, &peer_group))
+	if (object->identity.type == MIDR_CORE_MEMBERSHIP)
 		return true;
 	if (object->identity.type == MIDR_CORE_GROUP_PREFIX) {
-		if (!midr_scope_representative(scope, object->identity.group,
-					       &representative) &&
-			    representative != object->identity.originator)
+		return !midr_scope_representative(scope, object->identity.group,
+						  &representative) &&
+		       representative == object->identity.originator;
+	}
+	if (object->identity.type == MIDR_CORE_NODE_PREFIX) {
+		if (midr_scope_membership(scope, object->identity.originator,
+					  &owner_group))
 			return false;
-		return peer_group == object->identity.group;
+		if (midr_scope_membership(scope, peer_node_id, &peer_group))
+			return false;
+		return peer_group == owner_group;
 	}
 	if (object->identity.type != MIDR_CORE_LINK)
-		return true;
+		return false;
 	if (midr_scope_membership(scope, object->identity.originator,
 				 &owner_group) ||
 	    midr_scope_membership(scope, object->identity.remote, &remote_group))
-		return true;
+		return false;
 	if (owner_group != remote_group)
 		return true;
+	if (midr_scope_membership(scope, peer_node_id, &peer_group))
+		return false;
 	return peer_group == owner_group;
+}
+
+bool midr_scope_usable(const struct midr_scope *scope,
+			      const struct midr_core_object *object)
+{
+	uint32_t local_group, owner_group, remote_group, representative;
+
+	if (!scope || !object || object->state != MIDR_CORE_ACTIVE)
+		return false;
+	if (object->identity.type == MIDR_CORE_MEMBERSHIP)
+		return true;
+	if (object->identity.type == MIDR_CORE_GROUP_PREFIX)
+		return !midr_scope_representative(scope, object->identity.group,
+						  &representative) &&
+		       representative == object->identity.originator;
+	if (object->identity.type == MIDR_CORE_NODE_PREFIX) {
+		if (midr_scope_membership(scope, scope->config.local_node_id,
+					  &local_group))
+			return false;
+		if (midr_scope_membership(scope, object->identity.originator,
+					  &owner_group))
+			return false;
+		return local_group == owner_group;
+	}
+	if (object->identity.type != MIDR_CORE_LINK ||
+	    midr_scope_membership(scope, object->identity.originator,
+				  &owner_group) ||
+	    midr_scope_membership(scope, object->identity.remote, &remote_group))
+		return false;
+	if (owner_group != remote_group)
+		return true;
+	if (midr_scope_membership(scope, scope->config.local_node_id,
+				  &local_group))
+		return false;
+	return local_group == owner_group;
 }

@@ -70,6 +70,10 @@ int midr_wire_encode_object(const struct midr_core_object *object,
 	    (object->state != MIDR_CORE_ACTIVE &&
 	     object->state != MIDR_CORE_WITHDRAWN))
 		return -EINVAL;
+	if (object->state == MIDR_CORE_ACTIVE &&
+	    object->identity.type == MIDR_CORE_LINK &&
+	    (!object->metric || object->metric == UINT32_MAX))
+		return -EINVAL;
 	id = &object->identity;
 	payload[0] = id->type;
 	payload[1] = id->family;
@@ -77,7 +81,8 @@ int midr_wire_encode_object(const struct midr_core_object *object,
 	payload[3] = 0;
 	put_u32(payload + 4, id->originator);
 	put_u32(payload + 8, id->remote);
-	put_u32(payload + 12, id->group);
+	put_u32(payload + 12, id->type == MIDR_CORE_MEMBERSHIP ?
+			object->group : id->group);
 	put_u64(payload + 16, id->link_id);
 	memcpy(payload + 24, id->prefix, sizeof(id->prefix));
 	payload[40] = object->state;
@@ -112,6 +117,14 @@ int midr_wire_decode_object(const uint8_t *payload, size_t length,
 	object->metric = get_u32(payload + 56);
 	memcpy(object->local_address, payload + 60, 16);
 	memcpy(object->remote_address, payload + 76, 16);
+	if (object->identity.type == MIDR_CORE_MEMBERSHIP) {
+		object->group = object->identity.group;
+		object->identity.group = 0;
+	}
+	if (object->state == MIDR_CORE_ACTIVE &&
+	    object->identity.type == MIDR_CORE_LINK &&
+	    (!object->metric || object->metric == UINT32_MAX))
+		return -EINVAL;
 	return midr_core_identity_validate(&object->identity) ? -EINVAL :
 	       ((object->state == MIDR_CORE_ACTIVE ||
 		 object->state == MIDR_CORE_WITHDRAWN) && object->sequence

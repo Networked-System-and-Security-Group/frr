@@ -7,6 +7,7 @@
 #include "midr-consumer.h"
 #include "midr-core.h"
 #include "midr-prefix-provider.h"
+#include "midr-scope.h"
 
 struct midr_engine;
 
@@ -42,6 +43,15 @@ int midr_engine_event_next(struct midr_engine *engine,
 				  struct midr_core_object *object);
 uint64_t midr_engine_generation(const struct midr_engine *engine);
 size_t midr_engine_count(const struct midr_engine *engine);
+bool midr_engine_export(const struct midr_engine *engine,
+			const struct midr_core_object *object,
+			uint32_t peer_node_id);
+bool midr_engine_usable(const struct midr_engine *engine,
+			const struct midr_core_object *object);
+int midr_engine_membership(const struct midr_engine *engine,
+			   uint32_t node_id, uint32_t *group);
+int midr_engine_representative(const struct midr_engine *engine,
+			       uint32_t group, uint32_t *node_id);
 
 int midr_engine_apply_prefix_event(struct midr_engine *engine,
 				   const struct midr_prefix_event *event,

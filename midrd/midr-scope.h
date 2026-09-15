@@ -26,6 +26,8 @@ int midr_scope_apply(struct midr_scope *scope,
 bool midr_scope_export(const struct midr_scope *scope,
 			      const struct midr_core_object *object,
 			      uint32_t peer_node_id);
+bool midr_scope_usable(const struct midr_scope *scope,
+			      const struct midr_core_object *object);
 int midr_scope_membership(const struct midr_scope *scope,
 				  uint32_t node_id, uint32_t *group);
 int midr_scope_representative(const struct midr_scope *scope,

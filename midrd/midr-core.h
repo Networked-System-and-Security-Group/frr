@@ -52,7 +52,8 @@ enum midr_core_error {
  * Identity is the canonical key.  For LINK/MEMBERSHIP, family/prefix are
  * NONE/0; NODE_PREFIX and GROUP_PREFIX carry an IPv4 or IPv6 prefix.
  * originator is the stable node identity; remote/group/link_id carry the
- * object-specific relationship dimensions.
+ * object-specific relationship dimensions.  Membership's group is a payload
+ * field on midr_core_object, rather than an identity dimension.
  */
 struct midr_core_identity {
 	uint8_t type;
@@ -72,6 +73,8 @@ struct midr_core_object {
 	uint8_t reserved[3];
 	uint64_t sequence;
 	uint32_t lifetime_ms;
+	/* Membership payload.  group is not part of Membership identity. */
+	uint32_t group;
 	uint32_t metric;
 	uint8_t local_address[MIDR_CORE_ADDR_BYTES];
 	uint8_t remote_address[MIDR_CORE_ADDR_BYTES];

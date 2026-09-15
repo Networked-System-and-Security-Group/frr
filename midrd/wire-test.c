@@ -8,6 +8,7 @@
 int main(void)
 {
 	struct midr_core_object object = {0}, decoded = {0};
+	struct midr_core_object membership = {0}, link = {0};
 	struct midr_wire_frame frame, parsed;
 	uint8_t payload[MIDR_WIRE_OBJECT_LEN], packet[256];
 	uint8_t identity_prefix[16] = {0x20, 0x01, 0x0d, 0xb8};
@@ -38,6 +39,32 @@ int main(void)
 	assert(parsed.type == MIDR_WIRE_UPDATE && parsed.sequence == 17);
 	assert(parsed.payload_len == payload_len);
 	assert(midr_wire_decode_frame(packet, packet_len - 1, &parsed) == -EINVAL);
+	membership.identity.type = MIDR_CORE_MEMBERSHIP;
+	membership.identity.originator = 42;
+	membership.group = 7;
+	membership.state = MIDR_CORE_ACTIVE;
+	membership.sequence = 10;
+	membership.lifetime_ms = 1000;
+	assert(midr_wire_encode_object(&membership, payload, sizeof(payload),
+				       &payload_len) == 0);
+	assert(midr_wire_decode_object(payload, payload_len, &decoded) == 0);
+	assert(decoded.identity.group == 0 && decoded.group == 7);
+	assert(midr_core_object_semantic_equal(&membership, &decoded));
+	link.identity.type = MIDR_CORE_LINK;
+	link.identity.originator = 42;
+	link.identity.remote = 43;
+	link.identity.link_id = 9;
+	link.state = MIDR_CORE_ACTIVE;
+	link.sequence = 11;
+	link.lifetime_ms = 1000;
+	link.metric = 25;
+	assert(midr_wire_encode_object(&link, payload, sizeof(payload),
+				       &payload_len) == 0);
+	assert(midr_wire_decode_object(payload, payload_len, &decoded) == 0);
+	assert(midr_core_object_semantic_equal(&link, &decoded));
+	link.metric = 0;
+	assert(midr_wire_encode_object(&link, payload, sizeof(payload),
+				       &payload_len) == -EINVAL);
 	puts("midrd-wire-test: PASS");
 	return 0;
 }

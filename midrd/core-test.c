@@ -126,6 +126,57 @@ static void test_refresh_withdraw_expire(void)
 	assert(midr_core_lookup(core, &key, 1300, &object, NULL) == -ENOENT);
 }
 
+static void test_membership_group_is_payload(void)
+{
+	struct midr_core_identity key = {
+		.type = MIDR_CORE_MEMBERSHIP,
+		.originator = 200,
+	};
+	struct midr_core_identity invalid = key;
+	struct midr_core_object object = {
+		.identity = key,
+		.state = MIDR_CORE_ACTIVE,
+		.sequence = 1,
+		.group = 10,
+	};
+	struct midr_core_object current;
+	enum midr_core_result result;
+
+	invalid.group = 10;
+	assert(midr_core_identity_validate(&invalid) == -EINVAL);
+	assert(midr_core_upsert(core, &object, 400, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	drain_one(1, MIDR_CORE_ACTIVE);
+	object.sequence = 2;
+	object.group = 20;
+	assert(midr_core_upsert(core, &object, 401, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	drain_one(2, MIDR_CORE_ACTIVE);
+	assert(midr_core_lookup(core, &key, 401, &current, NULL) == 0);
+	assert(current.group == 20);
+	assert(midr_core_count(core) == 1);
+}
+
+static void test_link_cost_validation(void)
+{
+	struct midr_core_object object = {0};
+	enum midr_core_result result;
+
+	object.identity.type = MIDR_CORE_LINK;
+	object.identity.originator = 300;
+	object.identity.remote = 301;
+	object.identity.link_id = 1;
+	object.state = MIDR_CORE_ACTIVE;
+	object.sequence = 1;
+	assert(midr_core_upsert(core, &object, 500, &result) == -EINVAL);
+	object.metric = UINT32_MAX;
+	assert(midr_core_upsert(core, &object, 501, &result) == -EINVAL);
+	object.metric = 1;
+	assert(midr_core_upsert(core, &object, 502, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	drain_one(1, MIDR_CORE_ACTIVE);
+}
+
 int main(void)
 {
 	const struct midr_core_config config = {
@@ -137,6 +188,10 @@ int main(void)
 	test_versions_and_conflict();
 	test_ipv6_and_normalization();
 	test_refresh_withdraw_expire();
+	/* The earlier prefix entries have expired; reuse the same core to verify
+	 * a Membership group change remains one canonical identity. */
+	test_membership_group_is_payload();
+	test_link_cost_validation();
 	midr_core_destroy(&core);
 	puts("midr-core-test: PASS");
 	return 0;

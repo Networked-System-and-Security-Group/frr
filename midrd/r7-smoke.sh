@@ -16,9 +16,9 @@ command -v containerlab >/dev/null 2>&1 || {
 
 run_cluster() {
 	local name=$1 family=$2 base_port=$3 owner_runtime=$4 peer_runtime=$5
-	local expected_a=$6 expected_b=$7 expected_c=$8
-	local node_a=$9 node_b=${10} node_c=${11}
-	local prefix_a=${12} prefix_b=${13} prefix_c=${14}
+	local expected_routes=$6
+	local node_a=$7 node_b=${8} node_c=${9}
+	local prefix_a=${10} prefix_b=${11} prefix_c=${12}
 	local run topo lab a_addr b_a_addr b_c_addr c_addr
 	local a_listen b_listen c_listen a_peer b_peer b_to_c_peer c_peer
 	local n container all i
@@ -66,7 +66,7 @@ topology:
         - ip addr add $a_addr dev eth1
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_a --listen $a_listen
-          --peer $a_peer --prefix $prefix_a --lifetime 900
+          --peer $a_peer --group 1 --prefix $prefix_a --link $node_b:5 --lifetime 900
           --runtime $owner_runtime >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
@@ -79,7 +79,8 @@ topology:
         - ip addr add $b_c_addr dev eth2
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
-          --peer $b_peer --peer $b_to_c_peer --prefix $prefix_b --lifetime 900
+          --peer $b_peer --peer $b_to_c_peer --group 1 --prefix $prefix_b
+          --link $node_a:5 --link $node_c:7 --lifetime 900
           --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
@@ -91,7 +92,7 @@ topology:
         - ip addr add $c_addr dev eth1
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_c --listen $c_listen
-          --peer $c_peer --prefix $prefix_c --lifetime 900
+          --peer $c_peer --group 1 --prefix $prefix_c --link $node_b:7 --lifetime 900
           --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
@@ -125,25 +126,28 @@ EOF
 	for n in a b c; do
 		docker exec "clab-${lab}-${n}" cat /tmp/midrd.log >"$run/$n.log"
 	done
-	grep -q "final-objects=$expected_a" "$run/a.log"
-	grep -q "final-objects=$expected_b" "$run/b.log"
-	grep -q "final-objects=$expected_c" "$run/c.log"
+	for n in a b c; do
+		grep -q "spf generation=.* routes=$expected_routes" "$run/$n.log"
+	done
 	grep -q 'sync type=6' "$run/b.log"
 	grep -q 'sync type=6' "$run/c.log"
 	grep -q 'type=2' "$run/b.log"
 	grep -q 'type=2' "$run/c.log"
-	if [[ "$expected_b" != 3 || "$expected_c" != 3 ]]; then
+	if [[ "$expected_routes" == 0 ]]; then
 		grep -q 'event state=2' "$run/b.log"
 		grep -q 'event state=2' "$run/c.log"
+	else
+		grep -q "route originator=$node_c metric=22 reachable=1" "$run/a.log"
+		grep -q "route originator=$node_a metric=22 reachable=1" "$run/c.log"
 	fi
 	echo "r7 containerlab smoke $name: PASS (logs: $run)"
 }
 
-run_cluster ipv4-convergence 4 31001 4 4 3 3 3 \
+run_cluster ipv4-convergence 4 31001 4 4 3 \
 	101 102 103 10.0.1.1/32 10.0.2.2/32 10.0.3.3/32
-run_cluster ipv6-convergence 6 32001 4 4 3 3 3 \
+run_cluster ipv6-convergence 6 32001 4 4 3 \
 	111 112 113 2001:db8:11::1/128 2001:db8:12::1/128 2001:db8:13::1/128
-run_cluster ipv4-expiry 4 31101 1 3 3 2 2 \
+run_cluster ipv4-expiry 4 31101 1 3 0 \
 	121 122 123 10.1.1.1/32 10.1.2.2/32 10.1.3.3/32
 
 echo 'r7 containerlab smoke: PASS'

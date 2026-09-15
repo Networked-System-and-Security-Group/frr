@@ -37,7 +37,8 @@ int midr_consumer_event_validate(const struct midr_consumer_event *event)
 	if (!event->originator)
 		return -EINVAL;
 	if (event->kind == MIDR_CONSUMER_LINK) {
-		return event->remote ? 0 : -EINVAL;
+		return event->remote && event->originator != event->remote &&
+		       event->metric && event->metric != UINT32_MAX ? 0 : -EINVAL;
 	}
 	if ((event->family != MIDR_CORE_AF_IPV4 &&
 	     event->family != MIDR_CORE_AF_IPV6) ||

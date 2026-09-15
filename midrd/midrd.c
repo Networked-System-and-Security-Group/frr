@@ -6,7 +6,6 @@
 #include "midr-prefix-ipc.h"
 #include "midr-spf.h"
 #include "midr-owned.h"
-#include "midr-scope.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
 
@@ -24,6 +23,7 @@
 #include <unistd.h>
 
 #define MIDRD_MAX_PEERS 32U
+#define MIDRD_MAX_LINKS 64U
 #define MIDRD_MAX_SNAPSHOT 4096U
 #define MIDRD_MAX_FRAME 4096U
 #define MIDRD_DEFAULT_LIFETIME 6000U
@@ -42,6 +42,15 @@ struct midrd_peer_config {
 	uint32_t node_id;
 };
 
+/* Development-time static Link input.  The daemon is the owner of the
+ * resulting object; the remote node and metric are the only wire-facing
+ * parameters needed for a single link between two nodes. */
+struct midrd_link_config {
+	uint32_t remote;
+	uint32_t metric;
+	uint64_t link_id;
+};
+
 struct midrd_snapshot_stage {
 	struct midr_transport_endpoint peer;
 	struct midr_core_object *objects;
@@ -58,14 +67,15 @@ struct midrd {
 	uint64_t frame_sequence;
 	struct midr_engine *engine;
 	struct midr_owned *owned;
-	struct midr_scope *scope;
 	struct midr_consumer *consumer;
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_prefix_ipc *prefix_ipc;
 	struct midr_transport *transport;
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
+	struct midrd_link_config links[MIDRD_MAX_LINKS];
 	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
 	size_t peer_count;
+	size_t link_count;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
 	bool prefix_batch;
@@ -76,6 +86,17 @@ struct midrd {
 	uint64_t next_expire;
 	uint64_t stop_at;
 };
+
+static uint32_t peer_node_id(const struct midrd *daemon,
+			     const struct midr_transport_endpoint *peer)
+{
+	if (!daemon || !peer)
+		return 0;
+	for (size_t i = 0; i < daemon->peer_count; i++)
+		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint, peer))
+			return daemon->peers[i].node_id;
+	return 0;
+}
 
 static struct midrd_snapshot_stage *stage_for(struct midrd *daemon,
 					      const struct midr_transport_endpoint *peer,
@@ -197,6 +218,34 @@ static int parse_endpoint(const char *text,
 	return 0;
 }
 
+static int parse_link(const char *text, struct midrd_link_config *link)
+{
+	char copy[128], *separator, *end;
+	unsigned long remote, metric;
+
+	if (!text || !link || strlen(text) >= sizeof(copy))
+		return -EINVAL;
+	strcpy(copy, text);
+	separator = strchr(copy, ':');
+	if (!separator || strchr(separator + 1, ':'))
+		return -EINVAL;
+	*separator++ = '\0';
+	errno = 0;
+	remote = strtoul(copy, &end, 10);
+	if (errno || *end || !remote || remote > UINT32_MAX)
+		return -EINVAL;
+	errno = 0;
+	metric = strtoul(separator, &end, 10);
+	if (errno || *end || !metric || metric >= UINT32_MAX)
+		return -EINVAL;
+	link->remote = (uint32_t)remote;
+	link->metric = (uint32_t)metric;
+	/* A single static link per remote is sufficient for development input.
+	 * The identity remains stable across refreshes and restarts. */
+	link->link_id = link->remote;
+	return 0;
+}
+
 static int send_frame(struct midrd *daemon,
 		      const struct midr_transport_endpoint *peer,
 		      uint8_t type, const uint8_t *payload, size_t payload_len)
@@ -263,8 +312,8 @@ static void flood_object(struct midrd *daemon,
 		if (except && midr_transport_endpoint_equal(
 				&daemon->peers[i].endpoint, except))
 			continue;
-		if (daemon->scope && !midr_scope_export(daemon->scope, object,
-						       daemon->peers[i].node_id))
+		if (!midr_engine_export(daemon->engine, object,
+					daemon->peers[i].node_id))
 			continue;
 		(void)send_object(daemon, &daemon->peers[i].endpoint, object);
 	}
@@ -288,53 +337,21 @@ static void reflood_scope(struct midrd *daemon,
 	free(objects);
 }
 
-static void replace_scope(struct midrd *daemon, struct midr_scope **candidate)
-{
-	struct midr_scope *old = daemon->scope;
-
-	daemon->scope = *candidate;
-	*candidate = NULL;
-	midr_scope_destroy(&old);
-}
-
 static int apply_update(struct midrd *daemon,
 			const struct midr_core_object *object,
 			uint64_t now_ms, enum midr_core_result *result,
 			bool *scope_changed)
 {
-	struct midr_scope *candidate = NULL;
-	bool membership;
 	int ret;
 
 	if (!daemon || !object || !result || !scope_changed)
 		return -EINVAL;
 	*scope_changed = false;
-	membership = object->identity.type == MIDR_CORE_MEMBERSHIP;
-	if (!membership)
-		return midr_engine_apply(daemon->engine, object, now_ms, result);
-	ret = midr_scope_clone(daemon->scope, &candidate);
-	if (ret)
-		return ret;
-	ret = midr_engine_begin_batch(daemon->engine);
-	if (!ret)
-		ret = midr_engine_apply(daemon->engine, object, now_ms, result);
-	if (!ret && *result == MIDR_CORE_ACCEPTED)
-		ret = midr_scope_apply(candidate, object);
-	if (!ret)
-		ret = midr_engine_end_batch(daemon->engine, now_ms);
-	else
-		(void)midr_engine_abort_batch(daemon->engine);
-	if (ret) {
-		midr_scope_destroy(&candidate);
-		return ret;
-	}
-	if (*result == MIDR_CORE_ACCEPTED) {
-		replace_scope(daemon, &candidate);
+	ret = midr_engine_apply(daemon->engine, object, now_ms, result);
+	if (!ret && *result == MIDR_CORE_ACCEPTED &&
+	    object->identity.type == MIDR_CORE_MEMBERSHIP)
 		*scope_changed = true;
-	} else {
-		midr_scope_destroy(&candidate);
-	}
-	return 0;
+	return ret;
 }
 
 static void drain_consumer(struct midrd *daemon)
@@ -348,11 +365,18 @@ static void drain_consumer(struct midrd *daemon)
 		printf("node=%" PRIu32 " ted-event kind=%u generation=%" PRIu64 "\n",
 		       daemon->node_id, event.kind, event.generation);
 	if (midr_consumer_snapshot_acquire(daemon->consumer, &snapshot) == 0) {
-		if (midr_spf_compute(&snapshot, routes, MIDRD_MAX_SNAPSHOT,
-				     &route_count) == 0)
+		if (midr_spf_compute(&snapshot, daemon->node_id, routes,
+				     MIDRD_MAX_SNAPSHOT,
+				     &route_count) == 0) {
 			printf("node=%" PRIu32 " spf generation=%" PRIu64
 			       " routes=%zu\n", daemon->node_id, snapshot.generation,
 			       route_count);
+			for (size_t i = 0; i < route_count; i++)
+				printf("node=%" PRIu32 " route originator=%" PRIu32
+				       " metric=%" PRIu32 " reachable=%u\n",
+				       daemon->node_id, routes[i].originator,
+				       routes[i].metric, routes[i].reachable ? 1U : 0U);
+		}
 		midr_consumer_snapshot_release(&snapshot);
 	}
 }
@@ -381,7 +405,9 @@ static void send_snapshot(struct midrd *daemon,
 	if (objects && midr_engine_snapshot(daemon->engine, mono_ms(), objects,
 					    MIDRD_MAX_SNAPSHOT, &count) == 0)
 		for (size_t i = 0; i < count; i++)
-			if (objects[i].state == MIDR_CORE_ACTIVE)
+			if (objects[i].state == MIDR_CORE_ACTIVE &&
+			    midr_engine_export(daemon->engine, &objects[i],
+					       peer_node_id(daemon, peer)))
 				(void)send_snapshot_object(daemon, peer, &objects[i]);
 	free(objects);
 	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
@@ -441,6 +467,9 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 				daemon->peers[i].node_id = node_id;
 				break;
 			}
+		/* The initial snapshot may have been sent before the peer's HELLO
+		 * arrived.  Re-send now that export eligibility is known. */
+		send_snapshot(daemon, peer);
 		return 0;
 		}
 	case MIDR_WIRE_KEEPALIVE:
@@ -499,7 +528,6 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
 								false);
-			struct midr_scope *candidate = NULL;
 			bool scope_changed = false;
 			int ret;
 
@@ -507,9 +535,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			       frame->type);
 			if (!stage)
 				return 0;
-			ret = midr_scope_clone(daemon->scope, &candidate);
-			if (!ret)
-				ret = midr_engine_begin_batch(daemon->engine);
+			ret = midr_engine_begin_batch(daemon->engine);
 			if (!ret)
 				for (size_t i = 0; i < stage->count; i++) {
 					ret = midr_engine_apply(daemon->engine,
@@ -520,10 +546,6 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					if (result == MIDR_CORE_ACCEPTED &&
 						    stage->objects[i].identity.type ==
 							    MIDR_CORE_MEMBERSHIP) {
-							ret = midr_scope_apply(candidate,
-								       &stage->objects[i]);
-							if (ret)
-								break;
 							scope_changed = true;
 						}
 				}
@@ -531,12 +553,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 				ret = midr_engine_end_batch(daemon->engine, mono_ms());
 			if (ret)
 				(void)midr_engine_abort_batch(daemon->engine);
-			if (!ret)
-				replace_scope(daemon, &candidate);
 			stage_release(stage);
-			if (ret)
-				midr_scope_destroy(&candidate);
-			else {
+			if (!ret) {
 				drain_events(daemon, peer);
 				if (scope_changed)
 					reflood_scope(daemon, peer);
@@ -705,32 +723,64 @@ static int install_local_prefix(struct midrd *daemon, const char *text)
 static int install_local_membership(struct midrd *daemon, uint32_t group_id)
 {
 	struct midr_core_object object = {0};
-	struct midr_scope *candidate = NULL;
 	int ret;
 
 	if (!group_id)
 		return -EINVAL;
 	object.identity.type = MIDR_CORE_MEMBERSHIP;
 	object.identity.originator = daemon->node_id;
-	object.identity.group = group_id;
+	object.group = group_id;
 	object.state = MIDR_CORE_ACTIVE;
-	ret = midr_scope_clone(daemon->scope, &candidate);
+	ret = midr_owned_upsert(daemon->owned, &object);
 	if (ret)
 		return ret;
-	ret = midr_scope_apply(candidate, &object);
-	if (ret) {
-		midr_scope_destroy(&candidate);
-		return ret;
-	}
-	ret = midr_owned_upsert(daemon->owned, &object);
-	if (ret) {
-		midr_scope_destroy(&candidate);
-		return ret;
-	}
-	replace_scope(daemon, &candidate);
 	drain_events(daemon, NULL);
 	reflood_scope(daemon, NULL);
 	return 0;
+}
+
+static int install_local_link(struct midrd *daemon,
+			      const struct midrd_link_config *link)
+{
+	struct midr_core_object object = {0};
+	int ret;
+
+	if (!daemon || !link || !link->remote || link->remote == daemon->node_id ||
+	    !link->metric || link->metric == UINT32_MAX)
+		return -EINVAL;
+	object.identity.type = MIDR_CORE_LINK;
+	object.identity.originator = daemon->node_id;
+	object.identity.remote = link->remote;
+	object.identity.link_id = link->link_id;
+	object.state = MIDR_CORE_ACTIVE;
+	object.metric = link->metric;
+	ret = midr_owned_upsert(daemon->owned, &object);
+	if (ret)
+		return ret;
+	drain_events(daemon, NULL);
+	return 0;
+}
+
+static void refresh_owned(struct midrd *daemon)
+{
+	struct midr_core_identity identity = {0};
+
+	if (daemon->have_local_identity)
+		(void)midr_owned_refresh(daemon->owned, &daemon->local_identity);
+	if (daemon->group_id) {
+		identity.type = MIDR_CORE_MEMBERSHIP;
+		identity.originator = daemon->node_id;
+		(void)midr_owned_refresh(daemon->owned, &identity);
+	}
+	for (size_t i = 0; i < daemon->link_count; i++) {
+		memset(&identity, 0, sizeof(identity));
+		identity.type = MIDR_CORE_LINK;
+		identity.originator = daemon->node_id;
+		identity.remote = daemon->links[i].remote;
+		identity.link_id = daemon->links[i].link_id;
+		(void)midr_owned_refresh(daemon->owned, &identity);
+	}
+	drain_events(daemon, NULL);
 }
 
 static void periodic(struct midrd *daemon, uint64_t now)
@@ -746,10 +796,8 @@ static void periodic(struct midrd *daemon, uint64_t now)
 					 MIDR_WIRE_KEEPALIVE, NULL, 0);
 		daemon->next_keepalive = now + daemon->hello_ms;
 	}
-	if (daemon->have_local_identity && now >= daemon->next_refresh) {
-		if (midr_owned_refresh(daemon->owned,
-				       &daemon->local_identity) == 0)
-			drain_events(daemon, NULL);
+	if (now >= daemon->next_refresh) {
+		refresh_owned(daemon);
 		daemon->next_refresh = now + daemon->lifetime_ms / 3U;
 	}
 	if (now >= daemon->next_expire) {
@@ -765,7 +813,8 @@ static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
-		"[--group ID] [--prefix ADDRESS/LEN] [--prefix-socket PATH] "
+		"[--group ID] [--prefix ADDRESS/LEN] [--link NODE:COST]... "
+		"[--prefix-socket PATH] "
 		"[--sequence-file PATH] [--lifetime MS] [--runtime SEC] "
 		"[--pidfile PATH]\n",
 		program);
@@ -779,7 +828,6 @@ int main(int argc, char **argv)
 	};
 	struct midr_engine_config engine_config;
 	struct midr_owned_config owned_config;
-	struct midr_scope_config scope_config;
 	struct midr_consumer_config consumer_config = {
 		.on_event = on_consumer_event,
 	};
@@ -810,6 +858,14 @@ int main(int argc, char **argv)
 			daemon.peer_count++;
 		} else if (!strcmp(argv[opt], "--prefix") && opt + 1 < argc)
 			prefix_text = argv[++opt];
+		else if (!strcmp(argv[opt], "--link") && opt + 1 < argc) {
+			if (daemon.link_count == MIDRD_MAX_LINKS ||
+			    parse_link(argv[++opt], &daemon.links[daemon.link_count])) {
+				usage(argv[0]);
+				return 2;
+			}
+			daemon.link_count++;
+		}
 		else if (!strcmp(argv[opt], "--group") && opt + 1 < argc)
 			daemon.group_id = (uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--prefix-socket") && opt + 1 < argc)
@@ -845,14 +901,11 @@ int main(int argc, char **argv)
 	owned_config.max_objects = MIDRD_MAX_SNAPSHOT;
 	owned_config.lifetime_ms = daemon.lifetime_ms;
 	owned_config.sequence_file = daemon.sequence_file;
-	scope_config.local_node_id = daemon.node_id;
-	scope_config.max_memberships = MIDRD_MAX_SNAPSHOT;
 	if (midr_engine_create(&engine_config, &daemon.engine) ||
 	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
 	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
 	    midr_owned_create(&owned_config, publish_owned, &daemon,
 			       &daemon.owned) ||
-	    midr_scope_create(&scope_config, &daemon.scope) ||
 	    midr_transport_create(&transport_config, &transport_callbacks,
 				   &daemon.transport) ||
 	    midr_transport_start(daemon.transport)) {
@@ -887,6 +940,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "invalid group\n");
 		return 2;
 	}
+	for (size_t i = 0; i < daemon.link_count; i++)
+		if (install_local_link(&daemon, &daemon.links[i])) {
+			fprintf(stderr, "invalid link\n");
+			return 2;
+		}
 	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR)
 		return 1;
 	if (pidfile) {
@@ -940,7 +998,6 @@ int main(int argc, char **argv)
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
 	midr_owned_destroy(&daemon.owned);
-	midr_scope_destroy(&daemon.scope);
 	midr_consumer_destroy(&daemon.consumer);
 	midr_engine_destroy(&daemon.engine);
 	if (pidfile)

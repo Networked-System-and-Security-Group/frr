@@ -44,11 +44,32 @@ int midr_core_identity_normalize(const struct midr_core_identity *input,
 		return -EINVAL;
 	*output = *input;
 	output->reserved = 0;
-	if (input->family == MIDR_CORE_AF_NONE) {
-		if (input->prefix_len)
-			return -EINVAL;
+	switch (input->type) {
+	case MIDR_CORE_MEMBERSHIP:
+		output->family = MIDR_CORE_AF_NONE;
+		output->prefix_len = 0;
+		output->remote = 0;
+		output->group = 0;
+		output->link_id = 0;
 		memset(output->prefix, 0, sizeof(output->prefix));
 		return 0;
+	case MIDR_CORE_LINK:
+		output->family = MIDR_CORE_AF_NONE;
+		output->prefix_len = 0;
+		output->group = 0;
+		memset(output->prefix, 0, sizeof(output->prefix));
+		return 0;
+	case MIDR_CORE_NODE_PREFIX:
+		output->remote = 0;
+		output->group = 0;
+		output->link_id = 0;
+		break;
+	case MIDR_CORE_GROUP_PREFIX:
+		output->remote = 0;
+		output->link_id = 0;
+		break;
+	default:
+		return -EINVAL;
 	}
 	if (input->family == MIDR_CORE_AF_IPV4) {
 		if (input->prefix_len > 32U)
@@ -118,7 +139,7 @@ bool midr_core_object_semantic_equal(const struct midr_core_object *a,
 		return false;
 	if (a->state == MIDR_CORE_WITHDRAWN)
 		return true;
-	return a->metric == b->metric &&
+	return a->group == b->group && a->metric == b->metric &&
 	       !memcmp(a->local_address, b->local_address,
 		       sizeof(a->local_address)) &&
 	       !memcmp(a->remote_address, b->remote_address,
@@ -238,7 +259,15 @@ int midr_core_upsert(struct midr_core *core,
 	normalized = *object;
 	if (midr_core_identity_normalize(&object->identity, &normalized.identity))
 		return -EINVAL;
+	if (normalized.state == MIDR_CORE_ACTIVE &&
+	    normalized.identity.type == MIDR_CORE_MEMBERSHIP && !normalized.group)
+		return -EINVAL;
+	if (normalized.state == MIDR_CORE_ACTIVE &&
+	    normalized.identity.type == MIDR_CORE_LINK &&
+	    (!normalized.metric || normalized.metric == UINT32_MAX))
+		return -EINVAL;
 	if (normalized.state == MIDR_CORE_WITHDRAWN) {
+		normalized.group = 0;
 		normalized.metric = 0;
 		memset(normalized.local_address, 0, sizeof(normalized.local_address));
 		memset(normalized.remote_address, 0, sizeof(normalized.remote_address));
