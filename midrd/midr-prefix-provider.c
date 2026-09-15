@@ -54,7 +54,8 @@ int midr_prefix_event_validate(const struct midr_prefix_event *event)
 	if (!event || !event->originator || !event->generation)
 		return -EINVAL;
 	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN ||
-	    event->kind == MIDR_PREFIX_SNAPSHOT_END)
+	    event->kind == MIDR_PREFIX_SNAPSHOT_END ||
+	    event->kind == MIDR_PREFIX_EOR)
 		return 0;
 	if (event->kind != MIDR_PREFIX_UPSERT &&
 	    event->kind != MIDR_PREFIX_WITHDRAW)

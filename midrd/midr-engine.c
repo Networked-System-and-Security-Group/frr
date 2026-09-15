@@ -258,7 +258,8 @@ int midr_engine_apply_prefix_event(struct midr_engine *engine,
 	if (!engine || midr_prefix_event_validate(event))
 		return -EINVAL;
 	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN ||
-	    event->kind == MIDR_PREFIX_SNAPSHOT_END)
+	    event->kind == MIDR_PREFIX_SNAPSHOT_END ||
+	    event->kind == MIDR_PREFIX_EOR)
 		return 0;
 	object.identity.type = MIDR_CORE_NODE_PREFIX;
 	object.identity.family = event->prefix.family;

@@ -133,6 +133,21 @@ SUFFIXES =
 
 bin_PROGRAMS =
 sbin_PROGRAMS =
+
+# Standalone MIDR daemon.  It intentionally links only the protocol-neutral
+# sources under midrd/; BGP remains an optional external Prefix adapter.
+sbin_PROGRAMS += midrd/midrd
+midrd_midrd_SOURCES = \
+	midrd/midrd.c \
+	midrd/midr-core.c midrd/midr-core.h \
+	midrd/midr-engine.c midrd/midr-engine.h \
+	midrd/midr-consumer.c midrd/midr-consumer.h \
+	midrd/midr-prefix-provider.c midrd/midr-prefix-provider.h \
+	midrd/midr-prefix-ipc.c midrd/midr-prefix-ipc.h \
+	midrd/midr-spf.c midrd/midr-spf.h \
+	midrd/midr-transport.c midrd/midr-transport.h \
+	midrd/midr-wire.c midrd/midr-wire.h
+midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd
 sbin_SCRIPTS =
 noinst_PROGRAMS =
 noinst_HEADERS =

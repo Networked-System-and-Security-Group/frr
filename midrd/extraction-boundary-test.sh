@@ -23,6 +23,7 @@ cat >"$tmp/contract.c" <<'EOF'
 #include "midr-core.h"
 #include "midr-consumer.h"
 #include "midr-prefix-provider.h"
+#include "midr-prefix-ipc.h"
 #include "midr-transport.h"
 int main(void) { return MIDR_CORE_WIRE_VERSION == 1U ? 0 : 1; }
 EOF

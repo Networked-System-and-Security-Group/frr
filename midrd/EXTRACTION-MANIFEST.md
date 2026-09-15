@@ -1,4 +1,4 @@
-# R7-EXT-0 extraction manifest
+# R7 extraction manifest (EXT-0 through EXT-3)
 
 This manifest is the source-of-truth for the standalone MIDR extraction.  The
 `midrd` core must build without FRR or BGP headers.  The existing `bgpd`
@@ -35,5 +35,21 @@ The original 18 R5-full-A cases map to the following standalone targets:
 * neutral Consumer snapshot/commit tests;
 * three-node IPv4 and IPv6 containerlab smoke without `bgpd`.
 
-EXT-0 only establishes the build and test boundaries.  It does not claim that
-the complete parity behavior has already migrated.
+## Current migration status
+
+* EXT-0: standalone extraction boundary, neutral wire/transport/Consumer
+  contracts and source scan are complete.
+* EXT-1: canonical lifecycle, snapshot staging, EOR batch commit, refresh,
+  withdraw and expiry are complete in `midr-engine.[ch]` and `midrd`.
+* EXT-2: committed Consumer snapshots and the protocol-neutral minimal SPF
+  route-result adapter are complete; IPv4/IPv6 parity is covered by unit tests
+  and the no-`bgpd` containerlab smoke.
+* EXT-3: Prefix Feed IPC is a framed Unix stream with snapshot, upsert,
+  withdraw, EoR, disconnect and reconnect handling.  `midrd` accepts
+  `--prefix-socket`, supports a pidfile and graceful SIGINT/SIGTERM shutdown,
+  and has a top-level Automake install target in addition to the standalone
+  developer Makefile.
+
+The old `bgpd` implementation remains a differential oracle.  This manifest
+does not authorize its removal before hardening, R5-full-B, R6-B-B and the
+parity gate.

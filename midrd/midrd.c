@@ -3,6 +3,7 @@
 
 #include "midr-engine.h"
 #include "midr-prefix-provider.h"
+#include "midr-prefix-ipc.h"
 #include "midr-spf.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,6 +26,14 @@
 #define MIDRD_MAX_FRAME 4096U
 #define MIDRD_DEFAULT_LIFETIME 6000U
 #define MIDRD_DEFAULT_HELLO 1000U
+
+static volatile sig_atomic_t stop_requested;
+
+static void on_signal(int signal_number)
+{
+	(void)signal_number;
+	stop_requested = 1;
+}
 
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
@@ -45,12 +55,14 @@ struct midrd {
 	struct midr_engine *engine;
 	struct midr_consumer *consumer;
 	struct midr_prefix_provider *prefix_provider;
+	struct midr_prefix_ipc *prefix_ipc;
 	struct midr_transport *transport;
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
 	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
 	size_t peer_count;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
+	bool prefix_batch;
 	uint64_t next_hello;
 	uint64_t next_keepalive;
 	uint64_t next_refresh;
@@ -425,10 +437,30 @@ static int prefix_event(void *arg, const struct midr_prefix_event *event)
 	struct midr_core_object object = {0};
 	int ret;
 
+	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN) {
+		if (daemon->prefix_batch)
+			return -EINVAL;
+		ret = midr_engine_begin_batch(daemon->engine);
+		if (!ret)
+			daemon->prefix_batch = true;
+		return ret;
+	}
+	if (event->kind == MIDR_PREFIX_EOR) {
+		if (!daemon->prefix_batch)
+			return 0;
+		daemon->prefix_batch = false;
+		ret = midr_engine_end_batch(daemon->engine, mono_ms());
+		if (!ret)
+			drain_events(daemon, NULL);
+		return ret;
+	}
+	if (event->kind == MIDR_PREFIX_SNAPSHOT_END)
+		return 0;
 	ret = midr_engine_apply_prefix_event(daemon->engine, event, mono_ms());
 	if (ret)
 		return ret;
-	if (event->kind == MIDR_PREFIX_UPSERT) {
+	if (event->originator == daemon->node_id &&
+	    event->kind == MIDR_PREFIX_UPSERT) {
 		object.identity.type = MIDR_CORE_NODE_PREFIX;
 		object.identity.family = event->prefix.family;
 		object.identity.prefix_len = event->prefix.prefix_len;
@@ -437,10 +469,16 @@ static int prefix_event(void *arg, const struct midr_prefix_event *event)
 		       sizeof(object.identity.prefix));
 		daemon->local_identity = object.identity;
 		daemon->have_local_identity = true;
-	} else if (event->kind == MIDR_PREFIX_WITHDRAW) {
+	} else if (event->originator == daemon->node_id &&
+		   event->kind == MIDR_PREFIX_WITHDRAW) {
 		daemon->have_local_identity = false;
 	}
 	return 0;
+}
+
+static int prefix_ipc_event(void *arg, const struct midr_prefix_event *event)
+{
+	return prefix_event(arg, event);
 }
 
 static int install_local_prefix(struct midrd *daemon, const char *text)
@@ -514,7 +552,8 @@ static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
-		"[--prefix ADDRESS/LEN] [--lifetime MS] [--runtime SEC]\n",
+		"[--prefix ADDRESS/LEN] [--prefix-socket PATH] "
+		"[--lifetime MS] [--runtime SEC] [--pidfile PATH]\n",
 		program);
 }
 
@@ -534,7 +573,9 @@ int main(int argc, char **argv)
 		.on_established = on_established,
 		.on_closed = on_closed,
 	};
-	const char *listen_text = NULL, *prefix_text = NULL;
+	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
+	const char *pidfile = NULL;
+	FILE *pid_stream = NULL;
 	int runtime_sec = 0;
 	int opt;
 
@@ -553,10 +594,14 @@ int main(int argc, char **argv)
 			daemon.peer_count++;
 		} else if (!strcmp(argv[opt], "--prefix") && opt + 1 < argc)
 			prefix_text = argv[++opt];
+		else if (!strcmp(argv[opt], "--prefix-socket") && opt + 1 < argc)
+			prefix_socket = argv[++opt];
 		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
 			daemon.lifetime_ms = (uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--runtime") && opt + 1 < argc)
 			runtime_sec = atoi(argv[++opt]);
+		else if (!strcmp(argv[opt], "--pidfile") && opt + 1 < argc)
+			pidfile = argv[++opt];
 		else {
 			usage(argv[0]);
 			return 2;
@@ -585,6 +630,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "midrd initialization failed\n");
 		return 1;
 	}
+	if (prefix_socket) {
+		struct midr_prefix_ipc_config ipc_config = {
+			.path = prefix_socket,
+			.on_event = prefix_ipc_event,
+			.arg = &daemon,
+		};
+
+		if (midr_prefix_ipc_server_create(&ipc_config, &daemon.prefix_ipc) ||
+		    midr_prefix_ipc_server_start(daemon.prefix_ipc)) {
+			fprintf(stderr, "prefix IPC initialization failed\n");
+			return 1;
+		}
+	}
 	for (size_t i = 0; i < daemon.peer_count; i++)
 		if (midr_transport_connect(daemon.transport,
 					    &daemon.peers[i].endpoint)) {
@@ -594,6 +652,22 @@ int main(int argc, char **argv)
 	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
 		fprintf(stderr, "invalid prefix\n");
 		return 2;
+	}
+	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR)
+		return 1;
+	if (pidfile) {
+		pid_stream = fopen(pidfile, "w");
+		if (!pid_stream || fprintf(pid_stream, "%ld\n", (long)getpid()) < 0) {
+			if (pid_stream)
+				(void)fclose(pid_stream);
+			(void)unlink(pidfile);
+			return 1;
+		}
+		if (fclose(pid_stream) != 0) {
+			(void)unlink(pidfile);
+			return 1;
+		}
+		pid_stream = NULL;
 	}
 	{
 		uint64_t now = mono_ms();
@@ -612,8 +686,9 @@ int main(int argc, char **argv)
 	for (;;) {
 		uint64_t now = mono_ms();
 
-		if (daemon.stop_at && now >= daemon.stop_at)
+		if (stop_requested || (daemon.stop_at && now >= daemon.stop_at))
 			break;
+		(void)midr_prefix_ipc_server_poll(daemon.prefix_ipc, 0);
 		(void)midr_transport_poll(daemon.transport, 100);
 		periodic(&daemon, mono_ms());
 	}
@@ -626,9 +701,12 @@ int main(int argc, char **argv)
 	       midr_engine_count(daemon.engine));
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
 		stage_release(&daemon.stages[i]);
+	midr_prefix_ipc_server_destroy(&daemon.prefix_ipc);
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
 	midr_consumer_destroy(&daemon.consumer);
 	midr_engine_destroy(&daemon.engine);
+	if (pidfile)
+		(void)unlink(pidfile);
 	return 0;
 }

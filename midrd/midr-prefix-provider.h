@@ -17,6 +17,7 @@ enum midr_prefix_event_kind {
 	MIDR_PREFIX_UPSERT = 2,
 	MIDR_PREFIX_WITHDRAW = 3,
 	MIDR_PREFIX_SNAPSHOT_END = 4,
+	MIDR_PREFIX_EOR = 5,
 };
 
 struct midr_prefix {
