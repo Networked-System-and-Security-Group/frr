@@ -48,5 +48,9 @@ int midr_consumer_create(const struct midr_consumer_config *config,
 void midr_consumer_destroy(struct midr_consumer **consumer);
 int midr_consumer_publish(struct midr_consumer *consumer,
 			  const struct midr_consumer_event *event);
+int midr_consumer_event_validate(const struct midr_consumer_event *event);
+int midr_consumer_event_next(struct midr_consumer *consumer,
+			     struct midr_consumer_event *event);
+size_t midr_consumer_pending(const struct midr_consumer *consumer);
 
 #endif /* MIDRD_CONSUMER_H */
