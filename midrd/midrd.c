@@ -28,6 +28,14 @@ struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
 };
 
+struct midrd_snapshot_stage {
+	struct midr_transport_endpoint peer;
+	struct midr_core_object *objects;
+	size_t count;
+	size_t capacity;
+	bool active;
+};
+
 struct midrd {
 	uint32_t node_id;
 	uint32_t lifetime_ms;
@@ -38,6 +46,7 @@ struct midrd {
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_transport *transport;
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
+	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
 	size_t peer_count;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
@@ -47,6 +56,40 @@ struct midrd {
 	uint64_t next_expire;
 	uint64_t stop_at;
 };
+
+static struct midrd_snapshot_stage *stage_for(struct midrd *daemon,
+					      const struct midr_transport_endpoint *peer,
+					      bool create)
+{
+	struct midrd_snapshot_stage *free_stage = NULL;
+
+	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++) {
+		if (daemon->stages[i].active &&
+		    midr_transport_endpoint_equal(&daemon->stages[i].peer, peer))
+			return &daemon->stages[i];
+		if (!daemon->stages[i].active && !free_stage)
+			free_stage = &daemon->stages[i];
+	}
+	if (!create || !free_stage)
+		return NULL;
+	free_stage->peer = *peer;
+	free_stage->capacity = MIDRD_MAX_SNAPSHOT;
+	free_stage->objects = calloc(free_stage->capacity,
+					      sizeof(*free_stage->objects));
+	if (!free_stage->objects)
+		return NULL;
+	free_stage->count = 0;
+	free_stage->active = true;
+	return free_stage;
+}
+
+static void stage_release(struct midrd_snapshot_stage *stage)
+{
+	if (!stage)
+		return;
+	free(stage->objects);
+	memset(stage, 0, sizeof(*stage));
+}
 
 static uint64_t mono_ms(void)
 {
@@ -291,6 +334,18 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	case MIDR_WIRE_KEEPALIVE:
 		return 0;
 	case MIDR_WIRE_SNAPSHOT_OBJECT:
+		{
+			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
+								false);
+
+			if (!stage || !stage->active || stage->count == stage->capacity)
+				return -ENOSPC;
+			if (midr_wire_decode_object(frame->payload, frame->payload_len,
+						    &stage->objects[stage->count]))
+				return -EINVAL;
+			stage->count++;
+			return 0;
+		}
 	case MIDR_WIRE_UPDATE:
 	case MIDR_WIRE_WITHDRAW:
 		if (midr_wire_decode_object(frame->payload, frame->payload_len,
@@ -304,11 +359,49 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			drain_events(daemon, peer);
 		return 0;
 	case MIDR_WIRE_SNAPSHOT_BEGIN:
-	case MIDR_WIRE_SNAPSHOT_END:
-	case MIDR_WIRE_EOR:
+		{
+			struct midrd_snapshot_stage *stage = stage_for(daemon, peer, true);
+
+			if (!stage)
+				return -ENOSPC;
+			/* A repeated begin starts a fresh snapshot generation. */
+			stage->count = 0;
+		}
 		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
 		       frame->type);
 		return 0;
+	case MIDR_WIRE_SNAPSHOT_END:
+		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
+		       frame->type);
+		return 0;
+	case MIDR_WIRE_EOR:
+		{
+			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
+								false);
+			int ret;
+
+			printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
+			       frame->type);
+			if (!stage)
+				return 0;
+			ret = midr_engine_begin_batch(daemon->engine);
+			if (!ret)
+				for (size_t i = 0; i < stage->count; i++) {
+					ret = midr_engine_apply(daemon->engine,
+								&stage->objects[i], mono_ms(),
+								&result);
+					if (ret)
+						break;
+				}
+			if (!ret)
+				ret = midr_engine_end_batch(daemon->engine, mono_ms());
+			else
+				(void)midr_engine_end_batch(daemon->engine, mono_ms());
+			stage_release(stage);
+			if (!ret)
+				drain_events(daemon, peer);
+			return ret;
+		}
 	default:
 		return -EINVAL;
 	}
@@ -519,6 +612,8 @@ int main(int argc, char **argv)
 	}
 	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
 	       midr_engine_count(daemon.engine));
+	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
+		stage_release(&daemon.stages[i]);
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
 	midr_consumer_destroy(&daemon.consumer);

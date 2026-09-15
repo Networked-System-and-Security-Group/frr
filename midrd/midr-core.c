@@ -204,6 +204,7 @@ int midr_core_upsert(struct midr_core *core,
 {
 	struct midr_core_object normalized;
 	struct midr_core_entry *entry;
+	bool new_entry;
 
 	if (!core || !object || !result || !object->sequence ||
 	    (object->state != MIDR_CORE_ACTIVE &&
@@ -238,19 +239,21 @@ int midr_core_upsert(struct midr_core *core,
 					? MIDR_CORE_DUPLICATE : MIDR_CORE_CONFLICT;
 			return 0;
 		}
-		entry->object = normalized;
-		entry->updated_ms = now_ms;
-		entry->floor = false;
+		new_entry = false;
 	} else {
 		if (core->count == core->capacity)
 			return -ENOSPC;
+		new_entry = true;
+	}
+	if (enqueue_event(core, &normalized))
+		return -ENOMEM;
+	if (new_entry) {
 		entry = &core->entries[core->count++];
 		memset(entry, 0, sizeof(*entry));
-		entry->object = normalized;
-		entry->updated_ms = now_ms;
 	}
-	if (enqueue_event(core, &entry->object))
-		return -ENOMEM;
+	entry->object = normalized;
+	entry->updated_ms = now_ms;
+	entry->floor = false;
 	*result = MIDR_CORE_ACCEPTED;
 	return 0;
 }
@@ -329,8 +332,12 @@ int midr_core_snapshot(struct midr_core *core, uint64_t now_ms,
 
 	if (!core || !objects || !count)
 		return -EINVAL;
-	if (midr_core_expire(core, now_ms, NULL))
-		return -ERANGE;
+	{
+		int ret = midr_core_expire(core, now_ms, NULL);
+
+		if (ret)
+			return ret;
+	}
 	for (size_t i = 0; i < core->count; i++) {
 		if (core->entries[i].floor)
 			continue;
@@ -363,6 +370,9 @@ int midr_core_expire(struct midr_core *core, uint64_t now_ms,
 			continue;
 		if (entry->object.state == MIDR_CORE_ACTIVE) {
 			struct midr_core_object withdrawn = entry->object;
+
+			if (withdrawn.sequence == UINT64_MAX)
+				return -ERANGE;
 			withdrawn.state = MIDR_CORE_WITHDRAWN;
 			withdrawn.sequence++;
 			withdrawn.metric = 0;

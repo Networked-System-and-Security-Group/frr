@@ -2,6 +2,7 @@
 #include "midr-engine.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,6 +11,8 @@ struct midr_engine {
 	struct midr_core *core;
 	struct midr_consumer *consumer;
 	uint64_t generation;
+	unsigned int batch_depth;
+	bool batch_dirty;
 };
 
 static int object_to_consumer(const struct midr_core_object *object,
@@ -147,7 +150,33 @@ int midr_engine_apply(struct midr_engine *engine,
 		return ret;
 	if (!had_old || !midr_core_object_semantic_equal(&old, object))
 		engine->generation++;
+	if (engine->batch_depth) {
+		engine->batch_dirty = true;
+		return 0;
+	}
 	return publish_snapshot(engine, now_ms);
+}
+
+int midr_engine_begin_batch(struct midr_engine *engine)
+{
+	if (!engine)
+		return -EINVAL;
+	if (engine->batch_depth == UINT_MAX)
+		return -ERANGE;
+	engine->batch_depth++;
+	return 0;
+}
+
+int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
+{
+	if (!engine || !engine->batch_depth)
+		return -EINVAL;
+	engine->batch_depth--;
+	if (!engine->batch_depth && engine->batch_dirty) {
+		engine->batch_dirty = false;
+		return publish_snapshot(engine, now_ms);
+	}
+	return 0;
 }
 
 int midr_engine_refresh(struct midr_engine *engine,
