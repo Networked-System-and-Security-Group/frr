@@ -11,7 +11,7 @@ CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
 	$(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-engine.o \
 	$(BUILD_DIR)/midr-spf.o $(BUILD_DIR)/midr-prefix-ipc.o \
-	$(BUILD_DIR)/midr-owned.o
+	$(BUILD_DIR)/midr-owned.o $(BUILD_DIR)/midr-scope.o
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
@@ -19,6 +19,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-spf-test $(BUILD_DIR)/midrd-engine-test \
 	$(BUILD_DIR)/midrd-prefix-ipc-test \
 	$(BUILD_DIR)/midrd-owned-test \
+	$(BUILD_DIR)/midrd-scope-test \
 	$(BUILD_DIR)/midrd
 
 $(BUILD_DIR):
@@ -44,6 +45,9 @@ $(BUILD_DIR)/midr-engine.o: midr-engine.c midr-engine.h midr-core.h midr-consume
 
 $(BUILD_DIR)/midr-owned.o: midr-owned.c midr-owned.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-owned.c -o $@
+
+$(BUILD_DIR)/midr-scope.o: midr-scope.c midr-scope.h midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-scope.c -o $@
 
 $(BUILD_DIR)/midrd-core-test.o: core-test.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c core-test.c -o $@
@@ -75,7 +79,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-engine.h midr-core.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-engine.h midr-core.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -97,6 +101,12 @@ $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c owned-test.c -o $@
 
 $(BUILD_DIR)/midrd-owned-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-owned.o $(BUILD_DIR)/midrd-owned-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-scope-test.o: scope-test.c midr-scope.h midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c scope-test.c -o $@
+
+$(BUILD_DIR)/midrd-scope-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midrd-scope-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-spf-test.o: spf-test.c midr-spf.h | $(BUILD_DIR)
@@ -125,6 +135,7 @@ test: all
 	$(BUILD_DIR)/midrd-engine-test
 	$(BUILD_DIR)/midrd-prefix-ipc-test
 	$(BUILD_DIR)/midrd-owned-test
+	$(BUILD_DIR)/midrd-scope-test
 	./extraction-boundary-test.sh
 
 clean:

@@ -6,6 +6,7 @@
 #include "midr-prefix-ipc.h"
 #include "midr-spf.h"
 #include "midr-owned.h"
+#include "midr-scope.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
 
@@ -38,6 +39,7 @@ static void on_signal(int signal_number)
 
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
+	uint32_t node_id;
 };
 
 struct midrd_snapshot_stage {
@@ -50,11 +52,13 @@ struct midrd_snapshot_stage {
 
 struct midrd {
 	uint32_t node_id;
+	uint32_t group_id;
 	uint32_t lifetime_ms;
 	uint32_t hello_ms;
 	uint64_t frame_sequence;
 	struct midr_engine *engine;
 	struct midr_owned *owned;
+	struct midr_scope *scope;
 	struct midr_consumer *consumer;
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_prefix_ipc *prefix_ipc;
@@ -259,8 +263,78 @@ static void flood_object(struct midrd *daemon,
 		if (except && midr_transport_endpoint_equal(
 				&daemon->peers[i].endpoint, except))
 			continue;
+		if (daemon->scope && !midr_scope_export(daemon->scope, object,
+						       daemon->peers[i].node_id))
+			continue;
 		(void)send_object(daemon, &daemon->peers[i].endpoint, object);
 	}
+}
+
+static void reflood_scope(struct midrd *daemon,
+			  const struct midr_transport_endpoint *except)
+{
+	struct midr_core_object *objects;
+	size_t count = 0;
+
+	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
+	if (!objects)
+		return;
+	if (!midr_engine_snapshot(daemon->engine, mono_ms(), objects,
+				  MIDRD_MAX_SNAPSHOT, &count)) {
+		for (size_t i = 0; i < count; i++)
+			if (objects[i].state == MIDR_CORE_ACTIVE)
+				flood_object(daemon, &objects[i], except);
+	}
+	free(objects);
+}
+
+static void replace_scope(struct midrd *daemon, struct midr_scope **candidate)
+{
+	struct midr_scope *old = daemon->scope;
+
+	daemon->scope = *candidate;
+	*candidate = NULL;
+	midr_scope_destroy(&old);
+}
+
+static int apply_update(struct midrd *daemon,
+			const struct midr_core_object *object,
+			uint64_t now_ms, enum midr_core_result *result,
+			bool *scope_changed)
+{
+	struct midr_scope *candidate = NULL;
+	bool membership;
+	int ret;
+
+	if (!daemon || !object || !result || !scope_changed)
+		return -EINVAL;
+	*scope_changed = false;
+	membership = object->identity.type == MIDR_CORE_MEMBERSHIP;
+	if (!membership)
+		return midr_engine_apply(daemon->engine, object, now_ms, result);
+	ret = midr_scope_clone(daemon->scope, &candidate);
+	if (ret)
+		return ret;
+	ret = midr_engine_begin_batch(daemon->engine);
+	if (!ret)
+		ret = midr_engine_apply(daemon->engine, object, now_ms, result);
+	if (!ret && *result == MIDR_CORE_ACCEPTED)
+		ret = midr_scope_apply(candidate, object);
+	if (!ret)
+		ret = midr_engine_end_batch(daemon->engine, now_ms);
+	else
+		(void)midr_engine_abort_batch(daemon->engine);
+	if (ret) {
+		midr_scope_destroy(&candidate);
+		return ret;
+	}
+	if (*result == MIDR_CORE_ACCEPTED) {
+		replace_scope(daemon, &candidate);
+		*scope_changed = true;
+	} else {
+		midr_scope_destroy(&candidate);
+	}
+	return 0;
 }
 
 static void drain_consumer(struct midrd *daemon)
@@ -348,14 +422,27 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	struct midrd *daemon = arg;
 	struct midr_core_object object;
 	enum midr_core_result result;
+	int ret;
 
 	printf("node=%" PRIu32 " rx family=%u port=%u type=%u\n",
 	       daemon->node_id, peer->family, peer->port, frame->type);
 	switch (frame->type) {
 	case MIDR_WIRE_HELLO:
+		{
+			uint32_t node_id;
+
 		if (frame->payload_len != 28U)
 			return -EINVAL;
+		memcpy(&node_id, frame->payload, sizeof(node_id));
+		node_id = ntohl(node_id);
+		for (size_t i = 0; i < daemon->peer_count; i++)
+			if (midr_transport_endpoint_equal(
+					&daemon->peers[i].endpoint, peer)) {
+				daemon->peers[i].node_id = node_id;
+				break;
+			}
 		return 0;
+		}
 	case MIDR_WIRE_KEEPALIVE:
 		return 0;
 	case MIDR_WIRE_SNAPSHOT_OBJECT:
@@ -373,16 +460,25 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		}
 	case MIDR_WIRE_UPDATE:
 	case MIDR_WIRE_WITHDRAW:
+		{
+		bool scope_changed;
+
 		if (midr_wire_decode_object(frame->payload, frame->payload_len,
 					    &object))
 			return -EINVAL;
 		if (frame->type == MIDR_WIRE_WITHDRAW)
 			object.state = MIDR_CORE_WITHDRAWN;
-		if (midr_engine_apply(daemon->engine, &object, mono_ms(), &result))
-			return -EAGAIN;
-		if (result == MIDR_CORE_ACCEPTED)
+		ret = apply_update(daemon, &object, mono_ms(), &result,
+				   &scope_changed);
+		if (ret)
+			return ret;
+		if (result == MIDR_CORE_ACCEPTED) {
 			drain_events(daemon, peer);
+			if (scope_changed)
+				reflood_scope(daemon, peer);
+		}
 		return 0;
+		}
 	case MIDR_WIRE_SNAPSHOT_BEGIN:
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer, true);
@@ -403,28 +499,48 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
 								false);
+			struct midr_scope *candidate = NULL;
+			bool scope_changed = false;
 			int ret;
 
 			printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
 			       frame->type);
 			if (!stage)
 				return 0;
-			ret = midr_engine_begin_batch(daemon->engine);
+			ret = midr_scope_clone(daemon->scope, &candidate);
+			if (!ret)
+				ret = midr_engine_begin_batch(daemon->engine);
 			if (!ret)
 				for (size_t i = 0; i < stage->count; i++) {
 					ret = midr_engine_apply(daemon->engine,
 								&stage->objects[i], mono_ms(),
 								&result);
-					if (ret)
-						break;
+						if (ret)
+							break;
+					if (result == MIDR_CORE_ACCEPTED &&
+						    stage->objects[i].identity.type ==
+							    MIDR_CORE_MEMBERSHIP) {
+							ret = midr_scope_apply(candidate,
+								       &stage->objects[i]);
+							if (ret)
+								break;
+							scope_changed = true;
+						}
 				}
 			if (!ret)
 				ret = midr_engine_end_batch(daemon->engine, mono_ms());
-			else
+			if (ret)
 				(void)midr_engine_abort_batch(daemon->engine);
-			stage_release(stage);
 			if (!ret)
+				replace_scope(daemon, &candidate);
+			stage_release(stage);
+			if (ret)
+				midr_scope_destroy(&candidate);
+			else {
 				drain_events(daemon, peer);
+				if (scope_changed)
+					reflood_scope(daemon, peer);
+			}
 			return ret;
 		}
 	default:
@@ -586,6 +702,37 @@ static int install_local_prefix(struct midrd *daemon, const char *text)
 	return midr_prefix_provider_upsert(daemon->prefix_provider, &prefix);
 }
 
+static int install_local_membership(struct midrd *daemon, uint32_t group_id)
+{
+	struct midr_core_object object = {0};
+	struct midr_scope *candidate = NULL;
+	int ret;
+
+	if (!group_id)
+		return -EINVAL;
+	object.identity.type = MIDR_CORE_MEMBERSHIP;
+	object.identity.originator = daemon->node_id;
+	object.identity.group = group_id;
+	object.state = MIDR_CORE_ACTIVE;
+	ret = midr_scope_clone(daemon->scope, &candidate);
+	if (ret)
+		return ret;
+	ret = midr_scope_apply(candidate, &object);
+	if (ret) {
+		midr_scope_destroy(&candidate);
+		return ret;
+	}
+	ret = midr_owned_upsert(daemon->owned, &object);
+	if (ret) {
+		midr_scope_destroy(&candidate);
+		return ret;
+	}
+	replace_scope(daemon, &candidate);
+	drain_events(daemon, NULL);
+	reflood_scope(daemon, NULL);
+	return 0;
+}
+
 static void periodic(struct midrd *daemon, uint64_t now)
 {
 	if (now >= daemon->next_hello) {
@@ -618,7 +765,7 @@ static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
-		"[--prefix ADDRESS/LEN] [--prefix-socket PATH] "
+		"[--group ID] [--prefix ADDRESS/LEN] [--prefix-socket PATH] "
 		"[--sequence-file PATH] [--lifetime MS] [--runtime SEC] "
 		"[--pidfile PATH]\n",
 		program);
@@ -632,6 +779,7 @@ int main(int argc, char **argv)
 	};
 	struct midr_engine_config engine_config;
 	struct midr_owned_config owned_config;
+	struct midr_scope_config scope_config;
 	struct midr_consumer_config consumer_config = {
 		.on_event = on_consumer_event,
 	};
@@ -662,6 +810,8 @@ int main(int argc, char **argv)
 			daemon.peer_count++;
 		} else if (!strcmp(argv[opt], "--prefix") && opt + 1 < argc)
 			prefix_text = argv[++opt];
+		else if (!strcmp(argv[opt], "--group") && opt + 1 < argc)
+			daemon.group_id = (uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--prefix-socket") && opt + 1 < argc)
 			prefix_socket = argv[++opt];
 		else if (!strcmp(argv[opt], "--sequence-file") && opt + 1 < argc)
@@ -695,11 +845,14 @@ int main(int argc, char **argv)
 	owned_config.max_objects = MIDRD_MAX_SNAPSHOT;
 	owned_config.lifetime_ms = daemon.lifetime_ms;
 	owned_config.sequence_file = daemon.sequence_file;
+	scope_config.local_node_id = daemon.node_id;
+	scope_config.max_memberships = MIDRD_MAX_SNAPSHOT;
 	if (midr_engine_create(&engine_config, &daemon.engine) ||
 	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
 	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
 	    midr_owned_create(&owned_config, publish_owned, &daemon,
 			       &daemon.owned) ||
+	    midr_scope_create(&scope_config, &daemon.scope) ||
 	    midr_transport_create(&transport_config, &transport_callbacks,
 				   &daemon.transport) ||
 	    midr_transport_start(daemon.transport)) {
@@ -728,6 +881,10 @@ int main(int argc, char **argv)
 		}
 	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
 		fprintf(stderr, "invalid prefix\n");
+		return 2;
+	}
+	if (daemon.group_id && install_local_membership(&daemon, daemon.group_id)) {
+		fprintf(stderr, "invalid group\n");
 		return 2;
 	}
 	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR)
@@ -783,6 +940,7 @@ int main(int argc, char **argv)
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
 	midr_owned_destroy(&daemon.owned);
+	midr_scope_destroy(&daemon.scope);
 	midr_consumer_destroy(&daemon.consumer);
 	midr_engine_destroy(&daemon.engine);
 	if (pidfile)
