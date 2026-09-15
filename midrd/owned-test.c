@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 struct publish_log {
-	struct midr_core_object objects[16];
+	struct midr_core_object objects[64];
 	size_t count;
 	bool fail;
 };
@@ -49,7 +49,10 @@ int main(void)
 		.sequence_file = path,
 	};
 	struct publish_log log = {0};
+	struct publish_log staged_log = {0};
+	struct publish_log reuse_log = {0};
 	struct midr_owned *owned = NULL;
+	struct midr_owned *staged = NULL;
 	struct midr_core_object object = prefix(77, 10);
 	struct midr_core_object saved;
 
@@ -80,6 +83,51 @@ int main(void)
 	assert(midr_owned_last_sequence(owned) == 5);
 	assert(midr_owned_upsert(owned, &object) == 0);
 	assert(log.objects[4].sequence == 6);
+
+	assert(midr_owned_clone(owned, publish, &staged_log, &staged) == 0);
+	assert(midr_owned_lookup(staged, &object.identity, &saved) == 0);
+	assert(saved.sequence == 6 && saved.metric == 11);
+	object.metric = 12;
+	assert(midr_owned_upsert(staged, &object) == 0);
+	assert(staged_log.count == 1 && staged_log.objects[0].sequence == 7);
+	assert(midr_owned_lookup(staged, &object.identity, &saved) == 0);
+	assert(saved.sequence == 7 && saved.metric == 12);
+	assert(midr_owned_lookup(owned, &object.identity, &saved) == 0);
+	assert(saved.sequence == 6 && saved.metric == 11);
+	assert(midr_owned_sequence_floor(owned,
+					 midr_owned_last_sequence(staged)) == 0);
+	midr_owned_destroy(&staged);
+	assert(midr_owned_refresh(owned, &object.identity) == 0);
+	assert(log.objects[5].sequence == 8);
+
+	staged_log.fail = true;
+	assert(midr_owned_clone(owned, publish, &staged_log, &staged) == 0);
+	object.metric = 13;
+	assert(midr_owned_upsert(staged, &object) == -EIO);
+	assert(midr_owned_lookup(owned, &object.identity, &saved) == 0);
+	assert(saved.sequence == 8 && saved.metric == 11);
+	assert(midr_owned_sequence_floor(owned,
+					 midr_owned_last_sequence(staged)) == 0);
+	assert(midr_owned_last_sequence(owned) == 9);
+	midr_owned_destroy(&staged);
+	assert(midr_owned_refresh(owned, &object.identity) == 0);
+	assert(log.objects[6].sequence == 10);
+
+	staged_log.fail = false;
+	staged_log.count = 0;
+	assert(midr_owned_clone(owned, publish, &staged_log, &staged) == 0);
+	assert(midr_owned_refresh(staged, &object.identity) == 0);
+	assert(midr_owned_withdraw(staged, &object.identity) == 0);
+	assert(staged_log.count == 2);
+	assert(staged_log.objects[0].sequence == 11);
+	assert(staged_log.objects[1].sequence == 12);
+	assert(midr_owned_count(staged) == 0);
+	assert(midr_owned_lookup(owned, &object.identity, &saved) == 0);
+	assert(saved.sequence == 10 && saved.metric == 11);
+	assert(midr_owned_sequence_floor(owned,
+					 midr_owned_last_sequence(staged)) == 0);
+	midr_owned_destroy(&staged);
+
 	assert(midr_owned_upsert(owned, &(struct midr_core_object){
 		.identity = {
 			.type = MIDR_CORE_NODE_PREFIX,
@@ -89,6 +137,16 @@ int main(void)
 		},
 		.state = MIDR_CORE_ACTIVE,
 	}) == -EINVAL);
+	midr_owned_destroy(&owned);
+	config.max_objects = 1;
+	config.sequence_file = NULL;
+	assert(midr_owned_create(&config, publish, &reuse_log, &owned) == 0);
+	assert(midr_owned_upsert(owned, &object) == 0);
+	assert(midr_owned_withdraw(owned, &object.identity) == 0);
+	object.identity.prefix[2] = 3;
+	assert(midr_owned_upsert(owned, &object) == 0);
+	assert(midr_owned_count(owned) == 1);
+	assert(midr_owned_lookup(owned, &object.identity, &saved) == 0);
 	midr_owned_destroy(&owned);
 	(void)unlink(path);
 	puts("midrd-owned-test: PASS");

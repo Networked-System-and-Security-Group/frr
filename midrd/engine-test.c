@@ -55,6 +55,8 @@ static void test_batch_abort_is_atomic(void)
 	struct midr_consumer *consumer = NULL;
 	struct midr_consumer_config consumer_config = {0};
 	struct midr_core_object object = prefix(20, MIDR_CORE_AF_IPV4);
+	struct midr_core_object objects[1];
+	size_t count = 0;
 
 	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
 	assert(midr_engine_create(&config, &engine) == 0);
@@ -64,6 +66,10 @@ static void test_batch_abort_is_atomic(void)
 	assert(midr_engine_apply(engine, &object, 1,
 				&(enum midr_core_result){0}) == 0);
 	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_snapshot(engine, 1, objects, 1, &count) == 0 &&
+	       count == 0);
+	assert(midr_engine_batch_snapshot(engine, 1, objects, 1, &count) == 0 &&
+	       count == 1);
 	assert(midr_engine_generation(engine) == 2);
 	assert(midr_consumer_pending(consumer) == 0);
 	assert(midr_engine_abort_batch(engine) == 0);

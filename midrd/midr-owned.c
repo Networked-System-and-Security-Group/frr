@@ -154,6 +154,30 @@ int midr_owned_create(const struct midr_owned_config *config,
 	return 0;
 }
 
+int midr_owned_clone(const struct midr_owned *source,
+			     midr_owned_publish_cb publish, void *arg,
+			     struct midr_owned **out)
+{
+	struct midr_owned_config config;
+	struct midr_owned *clone = NULL;
+	int ret;
+
+	if (!source || !publish || !out || *out)
+		return -EINVAL;
+	config = source->config;
+	config.sequence_file = source->sequence_file;
+	ret = midr_owned_create(&config, publish, arg, &clone);
+	if (ret)
+		return ret;
+	clone->count = source->count;
+	memcpy(clone->entries, source->entries,
+	       source->config.max_objects * sizeof(*source->entries));
+	if (clone->last_sequence < source->last_sequence)
+		clone->last_sequence = source->last_sequence;
+	*out = clone;
+	return 0;
+}
+
 void midr_owned_destroy(struct midr_owned **ownedp)
 {
 	if (!ownedp || !*ownedp)
@@ -165,11 +189,11 @@ void midr_owned_destroy(struct midr_owned **ownedp)
 }
 
 int midr_owned_upsert(struct midr_owned *owned,
-			     const struct midr_core_object *fact)
+				     const struct midr_core_object *fact)
 {
 	struct midr_core_identity identity;
 	struct midr_core_object object;
-	ssize_t index;
+	ssize_t index, reusable = -1;
 	uint64_t sequence;
 	int ret;
 
@@ -177,8 +201,15 @@ int midr_owned_upsert(struct midr_owned *owned,
 	    normalize_identity(owned, &fact->identity, &identity))
 		return -EINVAL;
 	index = find_entry(owned, &identity);
-	if (index < 0 && owned->count == owned->config.max_objects)
-		return -ENOSPC;
+	if (index < 0) {
+		for (size_t i = 0; i < owned->count; i++)
+			if (!owned->entries[i].present) {
+				reusable = (ssize_t)i;
+				break;
+			}
+		if (reusable < 0 && owned->count == owned->config.max_objects)
+			return -ENOSPC;
+	}
 	ret = allocate_sequence(owned, &sequence);
 	if (ret)
 		return ret;
@@ -190,7 +221,7 @@ int midr_owned_upsert(struct midr_owned *owned,
 	if (ret)
 		return ret;
 	if (index < 0) {
-		index = (ssize_t)owned->count++;
+		index = reusable >= 0 ? reusable : (ssize_t)owned->count++;
 		memset(&owned->entries[index], 0, sizeof(owned->entries[index]));
 	}
 	owned->entries[index].object = object;
@@ -316,4 +347,19 @@ size_t midr_owned_count(const struct midr_owned *owned)
 uint64_t midr_owned_last_sequence(const struct midr_owned *owned)
 {
 	return owned ? owned->last_sequence : 0;
+}
+
+int midr_owned_sequence_floor(struct midr_owned *owned, uint64_t sequence)
+{
+	int ret;
+
+	if (!owned)
+		return -EINVAL;
+	if (sequence <= owned->last_sequence)
+		return 0;
+	ret = save_sequence(owned->sequence_file, sequence);
+	if (ret)
+		return ret;
+	owned->last_sequence = sequence;
+	return 0;
 }

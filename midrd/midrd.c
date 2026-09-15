@@ -60,6 +60,16 @@ struct midrd_snapshot_stage {
 	bool active;
 };
 
+struct midrd_prefix_stage {
+	struct midr_prefix prefixes[MIDRD_MAX_SNAPSHOT];
+	size_t count;
+	uint64_t generation;
+	uint32_t originator;
+	bool active;
+	bool ended;
+	bool discard;
+};
+
 struct midrd {
 	uint32_t node_id;
 	uint32_t group_id;
@@ -76,18 +86,23 @@ struct midrd {
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
 	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];
+	struct midr_prefix ipc_prefixes[MIDRD_MAX_SNAPSHOT];
+	struct midrd_prefix_stage prefix_stage;
 	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
 	size_t peer_count;
 	size_t link_count;
 	size_t group_prefix_count;
+	size_t ipc_prefix_count;
+	uint64_t prefix_generation;
 	uint32_t representative_group;
 	uint32_t representative_node;
 	uint64_t takeover_ready_at;
 	bool representative_committed;
 	bool group_reconcile_pending;
+	bool prefix_commit_active;
+	uint64_t prefix_commit_now_ms;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
-	bool prefix_batch;
 	const char *sequence_file;
 	uint64_t next_hello;
 	uint64_t next_keepalive;
@@ -588,9 +603,12 @@ static int publish_owned(void *arg, const struct midr_core_object *object)
 {
 	struct midrd *daemon = arg;
 	enum midr_core_result result;
+	uint64_t now_ms;
 	int ret;
 
-	ret = midr_engine_apply(daemon->engine, object, mono_ms(), &result);
+	now_ms = daemon->prefix_commit_active ? daemon->prefix_commit_now_ms :
+		mono_ms();
+	ret = midr_engine_apply(daemon->engine, object, now_ms, &result);
 	if (ret)
 		return ret;
 	return result == MIDR_CORE_ACCEPTED ? 0 : -EAGAIN;
@@ -638,55 +656,253 @@ static int local_provider_event(void *arg,
 	return ret;
 }
 
+static bool prefix_key_equal(const struct midr_prefix *left,
+			     const struct midr_prefix *right)
+{
+	return left->family == right->family &&
+	       left->prefix_len == right->prefix_len &&
+	       !memcmp(left->address, right->address, sizeof(left->address));
+}
+
+static int prefix_find(const struct midr_prefix *prefixes, size_t count,
+		       const struct midr_prefix *prefix)
+{
+	for (size_t i = 0; i < count; i++)
+		if (prefix_key_equal(&prefixes[i], prefix))
+			return (int)i;
+	return -1;
+}
+
+static void prefix_identity(struct midrd *daemon,
+			    const struct midr_prefix *prefix,
+			    struct midr_core_identity *identity)
+{
+	memset(identity, 0, sizeof(*identity));
+	identity->type = MIDR_CORE_NODE_PREFIX;
+	identity->family = prefix->family;
+	identity->prefix_len = prefix->prefix_len;
+	identity->originator = daemon->node_id;
+	memcpy(identity->prefix, prefix->address, sizeof(identity->prefix));
+}
+
+static int preserve_staged_sequence(struct midrd *daemon,
+				    const struct midr_owned *staged,
+				    int operation_error)
+{
+	int ret = midr_owned_sequence_floor(
+		daemon->owned, midr_owned_last_sequence(staged));
+
+	return operation_error ? operation_error : ret;
+}
+
+static int commit_prefixes(struct midrd *daemon,
+			   const struct midr_prefix *prefixes, size_t count)
+{
+	struct midr_owned *staged = NULL, *old_owned = NULL;
+	struct midr_core_identity *saved_group_prefixes = NULL;
+	size_t saved_group_prefix_count;
+	uint32_t saved_representative_group;
+	uint32_t saved_representative_node;
+	uint64_t saved_takeover_ready_at;
+	bool saved_representative_committed;
+	bool saved_group_reconcile_pending;
+	bool owned_staged = false;
+	uint64_t now = mono_ms();
+	int ret;
+
+	if (!daemon || (count && !prefixes) || count > MIDRD_MAX_SNAPSHOT)
+		return -EINVAL;
+	saved_group_prefix_count = daemon->group_prefix_count;
+	saved_representative_group = daemon->representative_group;
+	saved_representative_node = daemon->representative_node;
+	saved_takeover_ready_at = daemon->takeover_ready_at;
+	saved_representative_committed = daemon->representative_committed;
+	saved_group_reconcile_pending = daemon->group_reconcile_pending;
+	ret = midr_owned_clone(daemon->owned, publish_owned, daemon, &staged);
+	if (ret)
+		return ret;
+	if (saved_group_prefix_count) {
+		saved_group_prefixes = malloc(saved_group_prefix_count *
+					     sizeof(*saved_group_prefixes));
+		if (!saved_group_prefixes) {
+			ret = -ENOMEM;
+			goto failed;
+		}
+		memcpy(saved_group_prefixes, daemon->group_prefixes,
+		       saved_group_prefix_count * sizeof(*saved_group_prefixes));
+	}
+	ret = midr_engine_begin_batch(daemon->engine);
+	if (ret)
+		goto failed;
+	daemon->prefix_commit_active = true;
+	daemon->prefix_commit_now_ms = now;
+	for (size_t i = 0; i < daemon->ipc_prefix_count; i++) {
+		struct midr_core_identity identity;
+
+		if (prefix_find(prefixes, count, &daemon->ipc_prefixes[i]) >= 0)
+			continue;
+		prefix_identity(daemon, &daemon->ipc_prefixes[i], &identity);
+		ret = midr_owned_withdraw(staged, &identity);
+		if (ret == -ENOENT)
+			ret = 0;
+		if (ret)
+			goto abort;
+	}
+	for (size_t i = 0; i < count; i++) {
+		struct midr_core_object current;
+		struct midr_core_object fact = {0};
+
+		prefix_identity(daemon, &prefixes[i], &fact.identity);
+		fact.state = MIDR_CORE_ACTIVE;
+		fact.metric = prefixes[i].metric;
+		if (!midr_owned_lookup(staged, &fact.identity, &current) &&
+		    current.state == MIDR_CORE_ACTIVE &&
+		    current.metric == fact.metric)
+			continue;
+		ret = midr_owned_upsert(staged, &fact);
+		if (ret)
+			goto abort;
+	}
+	old_owned = daemon->owned;
+	daemon->owned = staged;
+	owned_staged = true;
+	ret = reconcile_group_prefixes(daemon, now);
+	if (ret)
+		goto abort;
+	ret = midr_engine_end_batch(daemon->engine, now);
+	if (ret)
+		goto failed;
+	daemon->prefix_commit_active = false;
+	owned_staged = false;
+	staged = NULL;
+	midr_owned_destroy(&old_owned);
+	memcpy(daemon->ipc_prefixes, prefixes, count * sizeof(*prefixes));
+	daemon->ipc_prefix_count = count;
+	free(saved_group_prefixes);
+	drain_events(daemon, NULL);
+	(void)reconcile_group_prefixes(daemon, now);
+	return 0;
+
+abort:
+	daemon->prefix_commit_active = false;
+	(void)midr_engine_abort_batch(daemon->engine);
+failed:
+	daemon->prefix_commit_active = false;
+	if (owned_staged) {
+		staged = daemon->owned;
+		daemon->owned = old_owned;
+		if (saved_group_prefix_count)
+			memcpy(daemon->group_prefixes, saved_group_prefixes,
+			       saved_group_prefix_count *
+				       sizeof(*saved_group_prefixes));
+		daemon->group_prefix_count = saved_group_prefix_count;
+		daemon->representative_group = saved_representative_group;
+		daemon->representative_node = saved_representative_node;
+		daemon->takeover_ready_at = saved_takeover_ready_at;
+		daemon->representative_committed =
+			saved_representative_committed;
+		daemon->group_reconcile_pending =
+			saved_group_reconcile_pending;
+	}
+	free(saved_group_prefixes);
+	ret = preserve_staged_sequence(daemon, staged, ret);
+	midr_owned_destroy(&staged);
+	return ret;
+}
+
+static int prefix_stage_apply(struct midrd_prefix_stage *stage,
+			      const struct midr_prefix_event *event)
+{
+	int index = prefix_find(stage->prefixes, stage->count, &event->prefix);
+
+	if (event->kind == MIDR_PREFIX_UPSERT) {
+		if (index >= 0) {
+			stage->prefixes[index] = event->prefix;
+			return 0;
+		}
+		if (stage->count == MIDRD_MAX_SNAPSHOT)
+			return -ENOSPC;
+		stage->prefixes[stage->count++] = event->prefix;
+		return 0;
+	}
+	if (event->kind != MIDR_PREFIX_WITHDRAW)
+		return -EINVAL;
+	if (index >= 0)
+		stage->prefixes[index] = stage->prefixes[--stage->count];
+	return 0;
+}
+
+static void prefix_stage_reset(struct midrd_prefix_stage *stage)
+{
+	memset(stage, 0, sizeof(*stage));
+}
+
 static int prefix_event(void *arg, const struct midr_prefix_event *event)
 {
 	struct midrd *daemon = arg;
-	struct midr_core_object object = {0};
+	struct midrd_prefix_stage *stage;
 	int ret;
 
+	if (!daemon || midr_prefix_event_validate(event) ||
+	    event->originator != daemon->node_id)
+		return -EINVAL;
+	stage = &daemon->prefix_stage;
 	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN) {
-		if (daemon->prefix_batch)
-			return -EINVAL;
-		ret = midr_engine_begin_batch(daemon->engine);
-		if (!ret)
-			daemon->prefix_batch = true;
-		return ret;
-	}
-	if (event->kind == MIDR_PREFIX_EOR) {
-		if (!daemon->prefix_batch)
+		if (stage->active && event->generation < stage->generation)
 			return 0;
-		daemon->prefix_batch = false;
-		ret = midr_engine_end_batch(daemon->engine, mono_ms());
-		if (!ret) {
-			drain_events(daemon, NULL);
-			(void)reconcile_group_prefixes(daemon, mono_ms());
-		}
-		return ret;
-	}
-	if (event->kind == MIDR_PREFIX_SNAPSHOT_END)
+		prefix_stage_reset(stage);
+		stage->active = true;
+		stage->generation = event->generation;
+		stage->originator = event->originator;
+		stage->discard = event->generation <= daemon->prefix_generation;
 		return 0;
-	ret = midr_engine_apply_prefix_event(daemon->engine, event, mono_ms());
-	if (ret)
-		return ret;
-	if (event->originator == daemon->node_id &&
-	    event->kind == MIDR_PREFIX_UPSERT) {
-		object.identity.type = MIDR_CORE_NODE_PREFIX;
-		object.identity.family = event->prefix.family;
-		object.identity.prefix_len = event->prefix.prefix_len;
-		object.identity.originator = event->originator;
-		memcpy(object.identity.prefix, event->prefix.address,
-		       sizeof(object.identity.prefix));
-		daemon->local_identity = object.identity;
-		daemon->have_local_identity = true;
-	} else if (event->originator == daemon->node_id &&
-		   event->kind == MIDR_PREFIX_WITHDRAW) {
-		daemon->have_local_identity = false;
 	}
-	if (!daemon->prefix_batch) {
-		drain_events(daemon, NULL);
-		(void)reconcile_group_prefixes(daemon, mono_ms());
+	if (stage->active) {
+		if (event->generation < stage->generation)
+			return 0;
+		if (event->generation != stage->generation ||
+		    event->originator != stage->originator)
+			return -EINVAL;
+		if (event->kind == MIDR_PREFIX_SNAPSHOT_END) {
+			stage->ended = true;
+			return 0;
+		}
+		if (event->kind == MIDR_PREFIX_EOR) {
+			if (!stage->ended)
+				return -EINVAL;
+			ret = stage->discard ? 0 :
+				commit_prefixes(daemon, stage->prefixes, stage->count);
+			if (!ret && !stage->discard)
+				daemon->prefix_generation = stage->generation;
+			prefix_stage_reset(stage);
+			return ret;
+		}
+		if (stage->ended)
+			return -EINVAL;
+		return stage->discard ? 0 : prefix_stage_apply(stage, event);
 	}
-	return 0;
+	if (event->kind == MIDR_PREFIX_SNAPSHOT_END ||
+	    event->kind == MIDR_PREFIX_EOR)
+		return event->generation <= daemon->prefix_generation ? 0 : -EINVAL;
+	if (event->kind != MIDR_PREFIX_UPSERT &&
+	    event->kind != MIDR_PREFIX_WITHDRAW)
+		return -EINVAL;
+	if (event->generation <= daemon->prefix_generation)
+		return 0;
+	stage->active = true;
+	stage->ended = true;
+	stage->generation = event->generation;
+	stage->originator = event->originator;
+	memcpy(stage->prefixes, daemon->ipc_prefixes,
+	       daemon->ipc_prefix_count * sizeof(*stage->prefixes));
+	stage->count = daemon->ipc_prefix_count;
+	ret = prefix_stage_apply(stage, event);
+	if (!ret)
+		ret = commit_prefixes(daemon, stage->prefixes, stage->count);
+	if (!ret)
+		daemon->prefix_generation = event->generation;
+	prefix_stage_reset(stage);
+	return ret;
 }
 
 static int prefix_ipc_event(void *arg, const struct midr_prefix_event *event)
@@ -699,10 +915,11 @@ static void prefix_ipc_disconnect(void *arg, int reason)
 	struct midrd *daemon = arg;
 
 	(void)reason;
-	if (daemon->prefix_batch) {
-		(void)midr_engine_abort_batch(daemon->engine);
-		daemon->prefix_batch = false;
-	}
+	prefix_stage_reset(&daemon->prefix_stage);
+	/* Provider generations are ordered within one IPC connection.  A
+	 * restarted provider may begin again at generation 1; retain the last
+	 * committed Prefix view, but let its replacement establish a new epoch. */
+	daemon->prefix_generation = 0;
 }
 
 static int install_local_prefix(struct midrd *daemon, const char *text)
@@ -816,7 +1033,7 @@ static int withdraw_group_prefixes(struct midrd *daemon)
 			daemon->group_prefixes[--daemon->group_prefix_count];
 		changed = true;
 	}
-	if (changed)
+	if (changed && !daemon->prefix_commit_active)
 		drain_events(daemon, NULL);
 	return result;
 }
@@ -830,7 +1047,7 @@ static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms)
 	bool changed = false;
 	int ret = 0, result = 0;
 
-	if (!daemon || daemon->prefix_batch)
+	if (!daemon)
 		return 0;
 	if (midr_engine_membership(daemon->engine, daemon->node_id, &group) ||
 	    midr_engine_representative(daemon->engine, group, &representative)) {
@@ -863,8 +1080,11 @@ static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms)
 		ret = -ENOMEM;
 		goto done;
 	}
-	ret = midr_engine_snapshot(daemon->engine, now_ms, objects,
-				   MIDRD_MAX_SNAPSHOT, &object_count);
+	ret = daemon->prefix_commit_active ?
+		midr_engine_batch_snapshot(daemon->engine, now_ms, objects,
+					   MIDRD_MAX_SNAPSHOT, &object_count) :
+		midr_engine_snapshot(daemon->engine, now_ms, objects,
+				     MIDRD_MAX_SNAPSHOT, &object_count);
 	if (ret)
 		goto done;
 	for (size_t i = 0; i < object_count; i++) {
@@ -925,7 +1145,7 @@ static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms)
 done:
 	free(desired);
 	free(objects);
-	if (changed)
+	if (changed && !daemon->prefix_commit_active)
 		drain_events(daemon, NULL);
 	daemon->group_reconcile_pending = (ret ? ret : result) != 0;
 	return ret ? ret : result;
@@ -948,6 +1168,10 @@ static void refresh_owned(struct midrd *daemon)
 		identity.originator = daemon->node_id;
 		identity.remote = daemon->links[i].remote;
 		identity.link_id = daemon->links[i].link_id;
+		(void)midr_owned_refresh(daemon->owned, &identity);
+	}
+	for (size_t i = 0; i < daemon->ipc_prefix_count; i++) {
+		prefix_identity(daemon, &daemon->ipc_prefixes[i], &identity);
 		(void)midr_owned_refresh(daemon->owned, &identity);
 	}
 	for (size_t i = 0; i < daemon->group_prefix_count; i++)
@@ -1068,6 +1292,10 @@ int main(int argc, char **argv)
 	}
 	if (!daemon.node_id || !listen_text || !daemon.lifetime_ms)
 		return 2;
+	if (prefix_text && prefix_socket) {
+		fprintf(stderr, "--prefix and --prefix-socket are mutually exclusive\n");
+		return 2;
+	}
 	if (parse_endpoint(listen_text, &transport_config.local)) {
 		fprintf(stderr, "invalid listen endpoint\n");
 		return 2;

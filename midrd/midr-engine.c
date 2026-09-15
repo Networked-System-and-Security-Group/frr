@@ -532,7 +532,17 @@ int midr_engine_snapshot(struct midr_engine *engine, uint64_t now_ms,
 				size_t *count)
 {
 	return engine ? midr_core_snapshot(engine->core, now_ms, objects, capacity,
-							 count) : -EINVAL;
+						 count) : -EINVAL;
+}
+
+int midr_engine_batch_snapshot(struct midr_engine *engine, uint64_t now_ms,
+				      struct midr_core_object *objects,
+				      size_t capacity, size_t *count)
+{
+	if (!engine || !engine->batch_depth || !engine->batch_core)
+		return -EINVAL;
+	return midr_core_snapshot(engine->batch_core, now_ms, objects, capacity,
+				  count);
 }
 
 int midr_engine_event_next(struct midr_engine *engine,

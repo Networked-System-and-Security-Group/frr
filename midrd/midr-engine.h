@@ -39,6 +39,9 @@ int midr_engine_expire(struct midr_engine *engine, uint64_t now_ms,
 int midr_engine_snapshot(struct midr_engine *engine, uint64_t now_ms,
 				struct midr_core_object *objects, size_t capacity,
 				size_t *count);
+int midr_engine_batch_snapshot(struct midr_engine *engine, uint64_t now_ms,
+				      struct midr_core_object *objects,
+				      size_t capacity, size_t *count);
 int midr_engine_event_next(struct midr_engine *engine,
 				  struct midr_core_object *object);
 uint64_t midr_engine_generation(const struct midr_engine *engine);
