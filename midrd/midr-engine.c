@@ -535,6 +535,15 @@ int midr_engine_snapshot(struct midr_engine *engine, uint64_t now_ms,
 						 count) : -EINVAL;
 }
 
+int midr_engine_lookup(const struct midr_engine *engine,
+		       const struct midr_core_identity *identity,
+		       uint64_t now_ms, struct midr_core_object *object,
+		       uint32_t *remaining_ms)
+{
+	return engine ? midr_core_lookup(engine->core, identity, now_ms, object,
+					 remaining_ms) : -EINVAL;
+}
+
 int midr_engine_batch_snapshot(struct midr_engine *engine, uint64_t now_ms,
 				      struct midr_core_object *objects,
 				      size_t capacity, size_t *count)

@@ -29,6 +29,7 @@
 #define MIDRD_DEFAULT_LIFETIME 6000U
 #define MIDRD_DEFAULT_HELLO 1000U
 #define MIDRD_DEFAULT_TAKEOVER_DELAY 3000U
+#define MIDRD_FORWARD_BUDGET_MS 1000U
 
 static volatile sig_atomic_t stop_requested;
 
@@ -55,6 +56,7 @@ struct midrd_link_config {
 struct midrd_snapshot_stage {
 	struct midr_transport_endpoint peer;
 	struct midr_core_object *objects;
+	uint64_t *received_ns;
 	size_t count;
 	size_t capacity;
 	bool active;
@@ -143,8 +145,14 @@ static struct midrd_snapshot_stage *stage_for(struct midrd *daemon,
 	free_stage->capacity = MIDRD_MAX_SNAPSHOT;
 	free_stage->objects = calloc(free_stage->capacity,
 					      sizeof(*free_stage->objects));
-	if (!free_stage->objects)
+	free_stage->received_ns = calloc(free_stage->capacity,
+					  sizeof(*free_stage->received_ns));
+	if (!free_stage->objects || !free_stage->received_ns) {
+		free(free_stage->received_ns);
+		free(free_stage->objects);
+		memset(free_stage, 0, sizeof(*free_stage));
 		return NULL;
+	}
 	free_stage->count = 0;
 	free_stage->active = true;
 	return free_stage;
@@ -154,18 +162,45 @@ static void stage_release(struct midrd_snapshot_stage *stage)
 {
 	if (!stage)
 		return;
+	free(stage->received_ns);
 	free(stage->objects);
 	memset(stage, 0, sizeof(*stage));
 }
 
-static uint64_t mono_ms(void)
+static uint64_t mono_ns(void)
 {
 	struct timespec ts;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0;
-	return (uint64_t)ts.tv_sec * 1000U +
-	       (uint64_t)ts.tv_nsec / 1000000U;
+	return (uint64_t)ts.tv_sec * 1000000000U + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t mono_ms(void)
+{
+	return mono_ns() / 1000000U;
+}
+
+static int age_object_lifetime(const struct midrd *daemon,
+			       struct midr_core_object *object,
+			       uint64_t received_ns, uint64_t now_ns,
+			       uint32_t budget_ms)
+{
+	uint32_t remaining_ms;
+	int ret;
+
+	if (!daemon || !object)
+		return -EINVAL;
+	ret = midr_core_lifetime_remaining(object->lifetime_ms, received_ns,
+					   now_ns, budget_ms,
+					   daemon->lifetime_ms,
+					   &remaining_ms);
+	if (ret)
+		return ret;
+	if (!remaining_ms)
+		return -ESTALE;
+	object->lifetime_ms = remaining_ms;
+	return 0;
 }
 
 static int split_endpoint(const char *text, char *host, size_t host_len,
@@ -272,19 +307,28 @@ static int parse_link(const char *text, struct midrd_link_config *link)
 	return 0;
 }
 
-static int send_frame(struct midrd *daemon,
-		      const struct midr_transport_endpoint *peer,
-		      uint8_t type, const uint8_t *payload, size_t payload_len)
+static int send_frame_at(struct midrd *daemon,
+			 const struct midr_transport_endpoint *peer,
+			 uint8_t type, const uint8_t *payload,
+			 size_t payload_len, uint64_t encoded_ns)
 {
 	struct midr_transport_frame frame = {
 		.version = MIDR_WIRE_VERSION,
 		.type = type,
 		.sequence = ++daemon->frame_sequence,
+		.encoded_ns = encoded_ns,
 		.payload = payload,
 		.payload_len = payload_len,
 	};
 
 	return midr_transport_send(daemon->transport, peer, &frame);
+}
+
+static int send_frame(struct midrd *daemon,
+		      const struct midr_transport_endpoint *peer,
+		      uint8_t type, const uint8_t *payload, size_t payload_len)
+{
+	return send_frame_at(daemon, peer, type, payload, payload_len, 0);
 }
 
 static int send_hello(struct midrd *daemon,
@@ -306,32 +350,54 @@ static int send_hello(struct midrd *daemon,
 
 static int send_object(struct midrd *daemon,
 			       const struct midr_transport_endpoint *peer,
-			       const struct midr_core_object *object)
+			       const struct midr_core_object *object,
+			       uint64_t observed_ns)
 {
+	struct midr_core_object wire_object = *object;
 	uint8_t payload[MIDR_WIRE_OBJECT_LEN];
+	uint64_t encoded_ns;
 	size_t length;
 	uint8_t type = object->state == MIDR_CORE_WITHDRAWN ?
 		MIDR_WIRE_WITHDRAW : MIDR_WIRE_UPDATE;
+	int ret;
 
-	if (midr_wire_encode_object(object, payload, sizeof(payload), &length))
+	encoded_ns = mono_ns();
+	ret = age_object_lifetime(daemon, &wire_object, observed_ns, encoded_ns,
+				  MIDRD_FORWARD_BUDGET_MS);
+	if (ret)
+		return ret;
+	if (midr_wire_encode_object(&wire_object, payload, sizeof(payload),
+				    &length))
 		return -EINVAL;
-	return send_frame(daemon, peer, type, payload, length);
+	return send_frame_at(daemon, peer, type, payload, length, encoded_ns);
 }
 
 static int send_snapshot_object(struct midrd *daemon,
 				const struct midr_transport_endpoint *peer,
-				const struct midr_core_object *object)
+				const struct midr_core_object *object,
+				uint64_t observed_ns)
 {
+	struct midr_core_object wire_object = *object;
 	uint8_t payload[MIDR_WIRE_OBJECT_LEN];
+	uint64_t encoded_ns;
 	size_t length;
+	int ret;
 
-	if (midr_wire_encode_object(object, payload, sizeof(payload), &length))
+	encoded_ns = mono_ns();
+	ret = age_object_lifetime(daemon, &wire_object, observed_ns, encoded_ns,
+				  MIDRD_FORWARD_BUDGET_MS);
+	if (ret)
+		return ret;
+	if (midr_wire_encode_object(&wire_object, payload, sizeof(payload),
+				    &length))
 		return -EINVAL;
-	return send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_OBJECT, payload, length);
+	return send_frame_at(daemon, peer, MIDR_WIRE_SNAPSHOT_OBJECT, payload,
+			     length, encoded_ns);
 }
 
 static void flood_object(struct midrd *daemon,
 			 const struct midr_core_object *object,
+			 uint64_t observed_ns,
 			 const struct midr_transport_endpoint *except)
 {
 	for (size_t i = 0; i < daemon->peer_count; i++) {
@@ -341,7 +407,8 @@ static void flood_object(struct midrd *daemon,
 		if (!midr_engine_export(daemon->engine, object,
 					daemon->peers[i].node_id))
 			continue;
-		(void)send_object(daemon, &daemon->peers[i].endpoint, object);
+		(void)send_object(daemon, &daemon->peers[i].endpoint, object,
+				  observed_ns);
 	}
 }
 
@@ -349,16 +416,18 @@ static void reflood_scope(struct midrd *daemon,
 			  const struct midr_transport_endpoint *except)
 {
 	struct midr_core_object *objects;
+	uint64_t snapshot_ns;
 	size_t count = 0;
 
 	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
 	if (!objects)
 		return;
-	if (!midr_engine_snapshot(daemon->engine, mono_ms(), objects,
+	snapshot_ns = mono_ns();
+	if (!midr_engine_snapshot(daemon->engine, snapshot_ns / 1000000U, objects,
 				  MIDRD_MAX_SNAPSHOT, &count)) {
 		for (size_t i = 0; i < count; i++)
 			if (objects[i].state == MIDR_CORE_ACTIVE)
-				flood_object(daemon, &objects[i], except);
+				flood_object(daemon, &objects[i], snapshot_ns, except);
 	}
 	free(objects);
 }
@@ -410,15 +479,23 @@ static void drain_consumer(struct midrd *daemon)
 static void drain_events(struct midrd *daemon,
 			 const struct midr_transport_endpoint *except)
 {
-	struct midr_core_object object;
+	struct midr_core_object event_object;
 
-	while (midr_engine_event_next(daemon->engine, &object) == 0) {
-		flood_object(daemon, &object, except);
+	while (midr_engine_event_next(daemon->engine, &event_object) == 0) {
+		struct midr_core_object current;
+		uint64_t observed_ns = mono_ns();
+
+		if (midr_engine_lookup(daemon->engine, &event_object.identity,
+				       observed_ns / 1000000U, &current, NULL) ||
+		    current.sequence != event_object.sequence ||
+		    current.state != event_object.state)
+			continue;
+		flood_object(daemon, &current, observed_ns, except);
 		printf("node=%" PRIu32 " event state=%u type=%u originator=%" PRIu32
 		       " group=%" PRIu32 " seq=%" PRIu64 "\n",
-		       daemon->node_id, object.state, object.identity.type,
-		       object.identity.originator, object.identity.group,
-		       object.sequence);
+		       daemon->node_id, current.state, current.identity.type,
+		       current.identity.originator, current.identity.group,
+		       current.sequence);
 	}
 	drain_consumer(daemon);
 }
@@ -427,17 +504,21 @@ static void send_snapshot(struct midrd *daemon,
 			  const struct midr_transport_endpoint *peer)
 {
 	struct midr_core_object *objects;
+	uint64_t snapshot_ns;
 	size_t count = 0;
 
 	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
 	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
-	if (objects && midr_engine_snapshot(daemon->engine, mono_ms(), objects,
+	snapshot_ns = mono_ns();
+	if (objects && midr_engine_snapshot(daemon->engine,
+					    snapshot_ns / 1000000U, objects,
 					    MIDRD_MAX_SNAPSHOT, &count) == 0)
 		for (size_t i = 0; i < count; i++)
 			if (objects[i].state == MIDR_CORE_ACTIVE &&
 			    midr_engine_export(daemon->engine, &objects[i],
 					       peer_node_id(daemon, peer)))
-				(void)send_snapshot_object(daemon, peer, &objects[i]);
+				(void)send_snapshot_object(daemon, peer, &objects[i],
+						   snapshot_ns);
 	free(objects);
 	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
 	(void)send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
@@ -509,27 +590,41 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
 								false);
+			uint64_t now_ns;
 
 			if (!stage || !stage->active || stage->count == stage->capacity)
 				return -ENOSPC;
 			if (midr_wire_decode_object(frame->payload, frame->payload_len,
 						    &stage->objects[stage->count]))
 				return -EINVAL;
+			now_ns = mono_ns();
+			ret = age_object_lifetime(daemon,
+						 &stage->objects[stage->count],
+						 frame->received_ns, now_ns, 0);
+			if (ret)
+				return ret;
+			stage->received_ns[stage->count] = now_ns;
 			stage->count++;
 			return 0;
 		}
 	case MIDR_WIRE_UPDATE:
 	case MIDR_WIRE_WITHDRAW:
 		{
-		bool scope_changed;
+			bool scope_changed;
+			uint64_t now_ns;
 
-		if (midr_wire_decode_object(frame->payload, frame->payload_len,
+			if (midr_wire_decode_object(frame->payload, frame->payload_len,
 					    &object))
-			return -EINVAL;
-		if (frame->type == MIDR_WIRE_WITHDRAW)
-			object.state = MIDR_CORE_WITHDRAWN;
-		ret = apply_update(daemon, &object, mono_ms(), &result,
-				   &scope_changed);
+				return -EINVAL;
+			if (frame->type == MIDR_WIRE_WITHDRAW)
+				object.state = MIDR_CORE_WITHDRAWN;
+			now_ns = mono_ns();
+			ret = age_object_lifetime(daemon, &object, frame->received_ns,
+						 now_ns, 0);
+			if (ret)
+				return ret;
+			ret = apply_update(daemon, &object, now_ns / 1000000U, &result,
+					   &scope_changed);
 		if (ret)
 			return ret;
 		if (result == MIDR_CORE_ACCEPTED) {
@@ -561,17 +656,24 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
 								false);
 			bool scope_changed = false;
-			int ret;
+			uint64_t now_ns;
 
 			printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
 			       frame->type);
 			if (!stage)
 				return 0;
+			now_ns = mono_ns();
 			ret = midr_engine_begin_batch(daemon->engine);
 			if (!ret)
 				for (size_t i = 0; i < stage->count; i++) {
+					ret = age_object_lifetime(
+						daemon, &stage->objects[i],
+						stage->received_ns[i], now_ns, 0);
+					if (ret)
+						break;
 					ret = midr_engine_apply(daemon->engine,
-								&stage->objects[i], mono_ms(),
+								&stage->objects[i],
+								now_ns / 1000000U,
 								&result);
 						if (ret)
 							break;
@@ -582,7 +684,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 						}
 				}
 			if (!ret)
-				ret = midr_engine_end_batch(daemon->engine, mono_ms());
+				ret = midr_engine_end_batch(daemon->engine,
+						    now_ns / 1000000U);
 			if (ret)
 				(void)midr_engine_abort_batch(daemon->engine);
 			stage_release(stage);
@@ -1290,8 +1393,12 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (!daemon.node_id || !listen_text || !daemon.lifetime_ms)
+	if (!daemon.node_id || !listen_text ||
+	    daemon.lifetime_ms <= MIDRD_FORWARD_BUDGET_MS) {
+		fprintf(stderr, "lifetime must be greater than forwarding budget %u ms\n",
+			MIDRD_FORWARD_BUDGET_MS);
 		return 2;
+	}
 	if (prefix_text && prefix_socket) {
 		fprintf(stderr, "--prefix and --prefix-socket are mutually exclusive\n");
 		return 2;
@@ -1302,6 +1409,7 @@ int main(int argc, char **argv)
 	}
 	transport_config.hello_interval_ms = daemon.hello_ms;
 	transport_config.hold_time_ms = daemon.lifetime_ms;
+	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
 	transport_callbacks.arg = &daemon;
 	consumer_config.arg = &daemon;

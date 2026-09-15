@@ -142,8 +142,10 @@ midrd_midrd_SOURCES = \
 	midrd/midr-core.c midrd/midr-core.h \
 	midrd/midr-engine.c midrd/midr-engine.h \
 	midrd/midr-consumer.c midrd/midr-consumer.h \
+	midrd/midr-owned.c midrd/midr-owned.h \
 	midrd/midr-prefix-provider.c midrd/midr-prefix-provider.h \
 	midrd/midr-prefix-ipc.c midrd/midr-prefix-ipc.h \
+	midrd/midr-scope.c midrd/midr-scope.h \
 	midrd/midr-spf.c midrd/midr-spf.h \
 	midrd/midr-transport.c midrd/midr-transport.h \
 	midrd/midr-wire.c midrd/midr-wire.h

@@ -24,6 +24,7 @@ struct midr_transport_tx {
 	uint8_t *data;
 	size_t length;
 	size_t offset;
+	uint64_t encoded_ns;
 };
 
 struct midr_transport_peer {
@@ -55,14 +56,25 @@ struct midr_transport {
 	bool started;
 };
 
-static uint64_t monotonic_ms(void)
+static uint64_t monotonic_ns(void)
 {
 	struct timespec ts;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0;
-	return (uint64_t)ts.tv_sec * 1000U +
-	       (uint64_t)ts.tv_nsec / 1000000U;
+	return (uint64_t)ts.tv_sec * 1000000000U + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t transport_now_ns(const struct midr_transport *transport)
+{
+	return transport->config.now_ns
+		       ? transport->config.now_ns(transport->config.clock_arg)
+		       : monotonic_ns();
+}
+
+static uint64_t transport_now_ms(const struct midr_transport *transport)
+{
+	return transport_now_ns(transport) / 1000000U;
 }
 
 int midr_transport_endpoint_validate(
@@ -219,7 +231,7 @@ static void close_peer(struct midr_transport *transport,
 			       struct midr_transport_peer *peer, int reason)
 {
 	bool notify = peer->established || peer->connecting;
-	uint64_t now = monotonic_ms();
+	uint64_t now = transport_now_ms(transport);
 
 	if (peer->fd >= 0)
 		close(peer->fd);
@@ -256,7 +268,7 @@ static void establish_peer(struct midr_transport *transport,
 	peer->connecting = false;
 	peer->established = true;
 	peer->generation = ++transport->next_generation;
-	peer->last_rx_ms = monotonic_ms();
+	peer->last_rx_ms = transport_now_ms(transport);
 	peer->rx_length = 0;
 	if (!peer->rx_buffer) {
 		peer->rx_capacity = transport->config.max_frame_size;
@@ -277,8 +289,26 @@ static int flush_peer(struct midr_transport *transport,
 {
 	while (peer->tx_head) {
 		struct midr_transport_tx *tx = peer->tx_head;
+		uint64_t now_ns;
 		ssize_t sent;
 		int flags = 0;
+		int ret;
+
+		now_ns = transport_now_ns(transport);
+		ret = 0;
+		if (transport->config.tx_budget_ms) {
+			uint64_t budget_ns =
+				(uint64_t)transport->config.tx_budget_ms * 1000000U;
+
+			if (now_ns < tx->encoded_ns)
+				ret = -ERANGE;
+			else if (now_ns - tx->encoded_ns > budget_ns)
+				ret = -ETIMEDOUT;
+		}
+		if (ret) {
+			close_peer(transport, peer, ret);
+			return ret;
+		}
 
 #ifdef MSG_NOSIGNAL
 		flags |= MSG_NOSIGNAL;
@@ -311,7 +341,8 @@ static int flush_peer(struct midr_transport *transport,
 }
 
 static int queue_frame(struct midr_transport_peer *peer,
-			       const uint8_t *data, size_t length)
+			       const uint8_t *data, size_t length,
+			       uint64_t encoded_ns)
 {
 	struct midr_transport_tx *tx = calloc(1, sizeof(*tx));
 
@@ -324,6 +355,7 @@ static int queue_frame(struct midr_transport_peer *peer,
 	}
 	memcpy(tx->data, data, length);
 	tx->length = length;
+	tx->encoded_ns = encoded_ns;
 	if (peer->tx_tail)
 		peer->tx_tail->next = tx;
 	else
@@ -333,13 +365,14 @@ static int queue_frame(struct midr_transport_peer *peer,
 }
 
 static int parse_rx(struct midr_transport *transport,
-			    struct midr_transport_peer *peer)
+			    struct midr_transport_peer *peer,
+			    uint64_t received_ns)
 {
 	while (peer->rx_length >= MIDR_WIRE_HEADER_LEN) {
 		uint32_t magic, payload_length;
 		size_t frame_length;
 		struct midr_wire_frame wire_frame;
-		struct midr_transport_frame frame;
+		struct midr_transport_frame frame = {0};
 		int ret;
 
 		memcpy(&magic, peer->rx_buffer, sizeof(magic));
@@ -370,9 +403,10 @@ static int parse_rx(struct midr_transport *transport,
 		frame.type = wire_frame.type;
 		frame.flags = wire_frame.flags;
 		frame.sequence = wire_frame.sequence;
+		frame.received_ns = received_ns;
 		frame.payload = wire_frame.payload;
 		frame.payload_len = wire_frame.payload_len;
-		peer->last_rx_ms = monotonic_ms();
+		peer->last_rx_ms = received_ns / 1000000U;
 		ret = transport->callbacks.on_frame(transport->callbacks.arg,
 						   &peer->endpoint, &frame);
 		if (ret) {
@@ -401,6 +435,8 @@ static int read_peer(struct midr_transport *transport,
 		ssize_t received = recv(peer->fd, buffer, sizeof(buffer), 0);
 
 		if (received > 0) {
+			uint64_t received_ns = transport_now_ns(transport);
+
 			if ((size_t)received > peer->rx_capacity - peer->rx_length) {
 				close_peer(transport, peer, -EMSGSIZE);
 				return -EMSGSIZE;
@@ -409,7 +445,7 @@ static int read_peer(struct midr_transport *transport,
 			       (size_t)received);
 			peer->rx_length += (size_t)received;
 			{
-				int ret = parse_rx(transport, peer);
+				int ret = parse_rx(transport, peer, received_ns);
 
 				if (ret)
 					return ret;
@@ -614,7 +650,7 @@ int midr_transport_connect(struct midr_transport *transport,
 	peer->desired = true;
 	if (peer->fd >= 0)
 		return 0;
-	now = monotonic_ms();
+	now = transport_now_ms(transport);
 	peer->next_connect_ms = now;
 	return connect_peer_now(transport, peer, now);
 }
@@ -638,6 +674,7 @@ int midr_transport_send(struct midr_transport *transport,
 	struct midr_transport_peer *peer;
 	struct midr_wire_frame wire_frame;
 	uint8_t packet[MIDR_TRANSPORT_MAX_PACKET];
+	uint64_t encoded_ns;
 	size_t length;
 	int ret;
 
@@ -653,7 +690,9 @@ int midr_transport_send(struct midr_transport *transport,
 	if (midr_wire_encode_frame(&wire_frame, packet, sizeof(packet), &length) ||
 	    length > transport->config.max_frame_size)
 		return -EMSGSIZE;
-	ret = queue_frame(peer, packet, length);
+	encoded_ns = frame->encoded_ns ? frame->encoded_ns :
+		transport_now_ns(transport);
+	ret = queue_frame(peer, packet, length, encoded_ns);
 	if (ret)
 		return ret;
 	return peer->established ? flush_peer(transport, peer) : 0;
@@ -730,7 +769,7 @@ int midr_transport_poll(struct midr_transport *transport, int timeout_ms)
 
 	if (!transport || !transport->started || timeout_ms < 0)
 		return -EINVAL;
-	now = monotonic_ms();
+	now = transport_now_ms(transport);
 	expire_peers(transport, now);
 	retry_connections(transport, now);
 	FD_ZERO(&readfds);
@@ -788,7 +827,7 @@ int midr_transport_poll(struct midr_transport *transport, int timeout_ms)
 		    FD_ISSET(fd, &writefds))
 			(void)flush_peer(transport, peer);
 	}
-	now = monotonic_ms();
+	now = transport_now_ms(transport);
 	expire_peers(transport, now);
 	retry_connections(transport, now);
 	return ret;

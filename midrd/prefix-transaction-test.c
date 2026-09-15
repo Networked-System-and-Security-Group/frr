@@ -6,6 +6,38 @@
 
 static size_t consumer_snapshots;
 
+static void test_lifetime_accounting(void)
+{
+	struct midrd daemon = {.lifetime_ms = 10000};
+	struct midr_core_object object = {.lifetime_ms = 8000};
+
+	assert(age_object_lifetime(&daemon, &object, 1000000000U,
+				   1000000001U, 0) == 0);
+	assert(object.lifetime_ms == 7999);
+
+	object.lifetime_ms = 8000;
+	assert(age_object_lifetime(&daemon, &object, 1000000001U,
+				   1000000000U, 0) == -ERANGE);
+	assert(object.lifetime_ms == 8000);
+
+	assert(age_object_lifetime(&daemon, &object, 1000000000U,
+				   1000000000U, 1000) == 0);
+	assert(object.lifetime_ms == 7000);
+
+	object.lifetime_ms = 1000;
+	assert(age_object_lifetime(&daemon, &object, 1000000000U,
+				   1000000000U, 1000) == -ESTALE);
+	assert(object.lifetime_ms == 1000);
+
+	object.lifetime_ms = 9000;
+	assert(age_object_lifetime(&daemon, &object, 1000000000U,
+				   1000000001U, 0) == 0);
+	assert(object.lifetime_ms == 8999);
+	assert(age_object_lifetime(&daemon, &object, 1000000001U,
+				   1002000001U, 0) == 0);
+	assert(object.lifetime_ms == 8997);
+}
+
 static int record_consumer_event(void *arg,
 				 const struct midr_consumer_event *event)
 {
@@ -148,6 +180,7 @@ int main(void)
 	size_t snapshots_before, view_count, withdrawn = 0;
 	struct midr_core_object pending;
 
+	test_lifetime_accounting();
 	initialize_daemon(&daemon, 4);
 	assert(deliver(&daemon, control_event(MIDR_PREFIX_SNAPSHOT_BEGIN, 1, 88)) ==
 	       -EINVAL);

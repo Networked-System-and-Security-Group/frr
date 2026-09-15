@@ -2,6 +2,7 @@
 #include "midr-wire.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -10,7 +11,23 @@ struct callback_state {
 	unsigned int closed;
 	unsigned int frames;
 	size_t payload_bytes;
+	uint64_t received_ns;
 };
+
+struct test_clock {
+	uint64_t now_ns;
+	uint64_t advance_after_read_ns;
+};
+
+static uint64_t clock_now(void *arg)
+{
+	struct test_clock *clock = arg;
+	uint64_t now = clock->now_ns;
+
+	clock->now_ns += clock->advance_after_read_ns;
+	clock->advance_after_read_ns = 0;
+	return now;
+}
 
 static void on_established(void *arg,
 			   const struct midr_transport_endpoint *peer)
@@ -39,6 +56,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	assert(frame && frame->type == MIDR_FRAME_KEEPALIVE);
 	state->frames++;
 	state->payload_bytes += frame->payload_len;
+	state->received_ns = frame->received_ns;
 	return 0;
 }
 
@@ -62,6 +80,8 @@ static void poll_pair(struct midr_transport *left,
 int main(void)
 {
 	struct callback_state left_state = {0}, right_state = {0};
+	struct test_clock left_clock = {.now_ns = 1000000000U};
+	struct test_clock right_clock = {.now_ns = 2000000000U};
 	struct midr_transport *left = NULL, *right = NULL;
 	struct midr_transport_endpoint right_endpoint = {
 		.family = MIDR_TRANSPORT_AF_IPV4,
@@ -75,7 +95,10 @@ int main(void)
 			.address = {127, 0, 0, 1},
 		},
 		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
 		.max_frame_size = 4096,
+		.now_ns = clock_now,
+		.clock_arg = &left_clock,
 	};
 	struct midr_transport_config right_config = {
 		.local = {
@@ -84,7 +107,10 @@ int main(void)
 			.address = {127, 0, 0, 1},
 		},
 		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
 		.max_frame_size = 4096,
+		.now_ns = clock_now,
+		.clock_arg = &right_clock,
 	};
 	struct midr_transport_frame frame = {
 		.version = MIDR_WIRE_VERSION,
@@ -113,6 +139,7 @@ int main(void)
 		poll_pair(left, right);
 	assert(right_state.frames == 1);
 	assert(right_state.payload_bytes == sizeof(payload));
+	assert(right_state.received_ns == right_clock.now_ns);
 	/* Several frames exercise stream coalescing and parser boundaries. */
 	frame.payload = NULL;
 	frame.payload_len = 0;
@@ -121,6 +148,12 @@ int main(void)
 	for (unsigned int i = 0; i < 50 && right_state.frames < 17; i++)
 		poll_pair(left, right);
 	assert(right_state.frames == 17);
+	/* A frame may be written at exactly B, but not one nanosecond later. */
+	left_clock.advance_after_read_ns = 1000000000U;
+	assert(midr_transport_send(left, &right_endpoint, &frame) == 0);
+	for (unsigned int i = 0; i < 50 && right_state.frames < 18; i++)
+		poll_pair(left, right);
+	assert(right_state.frames == 18);
 	assert(midr_transport_disconnect(left, &right_endpoint) == 0);
 	assert(left_state.closed == 1);
 	/* A configured peer must reconnect to its destination port after an
@@ -132,6 +165,9 @@ int main(void)
 	     i++)
 		poll_pair(left, right);
 	assert(left_state.established == 2 && right_state.established == 2);
+	left_clock.advance_after_read_ns = 1000000001U;
+	assert(midr_transport_send(left, &right_endpoint, &frame) == -ETIMEDOUT);
+	assert(left_state.closed == 2);
 	midr_transport_destroy(&left);
 	midr_transport_destroy(&right);
 	puts("midrd-transport-test: PASS");

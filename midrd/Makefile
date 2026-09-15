@@ -15,7 +15,9 @@ CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
-	$(BUILD_DIR)/midrd-transport-test $(BUILD_DIR)/midrd-consumer-test \
+	$(BUILD_DIR)/midrd-transport-test \
+	$(BUILD_DIR)/midrd-transport-budget-test \
+	$(BUILD_DIR)/midrd-consumer-test \
 	$(BUILD_DIR)/midrd-spf-test $(BUILD_DIR)/midrd-engine-test \
 	$(BUILD_DIR)/midrd-prefix-ipc-test \
 	$(BUILD_DIR)/midrd-owned-test \
@@ -72,6 +74,12 @@ $(BUILD_DIR)/midrd-transport-test.o: transport-test.c midr-transport.h | $(BUILD
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c transport-test.c -o $@
 
 $(BUILD_DIR)/midrd-transport-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midrd-transport-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-transport-budget-test.o: transport-budget-test.c midr-transport.c midr-transport.h midr-wire.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c transport-budget-test.c -o $@
+
+$(BUILD_DIR)/midrd-transport-budget-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midrd-transport-budget-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DIR)
@@ -137,6 +145,7 @@ test: all
 	$(BUILD_DIR)/midr-prefix-provider-test
 	$(BUILD_DIR)/midrd-wire-test
 	$(BUILD_DIR)/midrd-transport-test
+	$(BUILD_DIR)/midrd-transport-budget-test
 	$(BUILD_DIR)/midrd-consumer-test
 	$(BUILD_DIR)/midrd-spf-test
 	$(BUILD_DIR)/midrd-engine-test

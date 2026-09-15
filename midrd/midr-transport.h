@@ -42,6 +42,11 @@ struct midr_transport_frame {
 	uint8_t type;
 	uint16_t flags;
 	uint64_t sequence;
+	/* Optional timestamp at which an object's remaining lifetime was encoded.
+	 * Zero lets the transport record the queue insertion time. */
+	uint64_t encoded_ns;
+	/* Local timestamp when the complete inbound frame entered the RX FIFO. */
+	uint64_t received_ns;
 	const uint8_t *payload;
 	size_t payload_len;
 };
@@ -59,11 +64,19 @@ struct midr_transport_callbacks {
 	void *arg;
 };
 
+typedef uint64_t (*midr_transport_clock_cb)(void *arg);
+
 struct midr_transport_config {
 	struct midr_transport_endpoint local;
 	uint32_t hello_interval_ms;
 	uint32_t hold_time_ms;
+	/* A queued frame older than this budget closes the session.  Zero
+	 * disables the write-age check. */
+	uint32_t tx_budget_ms;
 	size_t max_frame_size;
+	/* Optional monotonic clock injection for deterministic boundary tests. */
+	midr_transport_clock_cb now_ns;
+	void *clock_arg;
 };
 
 struct midr_transport;
