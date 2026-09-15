@@ -42,6 +42,47 @@ static uint64_t saturating_add_ms(uint64_t value, uint32_t increment)
 	return value + increment;
 }
 
+static bool address_is_zero(const uint8_t address[MIDR_CORE_ADDR_BYTES])
+{
+	for (size_t i = 0; i < MIDR_CORE_ADDR_BYTES; i++)
+		if (address[i])
+			return false;
+	return true;
+}
+
+static bool ipv4_padding_is_zero(
+	const uint8_t address[MIDR_CORE_ADDR_BYTES])
+{
+	for (size_t i = 4; i < MIDR_CORE_ADDR_BYTES; i++)
+		if (address[i])
+			return false;
+	return true;
+}
+
+static int object_payload_validate(const struct midr_core_object *object)
+{
+	if (object->state == MIDR_CORE_WITHDRAWN)
+		return object->address_family == MIDR_CORE_AF_NONE &&
+		       !object->group && !object->metric &&
+		       address_is_zero(object->local_address) &&
+		       address_is_zero(object->remote_address)
+			       ? 0
+			       : -EINVAL;
+	if (object->identity.type == MIDR_CORE_MEMBERSHIP)
+		return object->group ? 0 : -EINVAL;
+	if (object->identity.type != MIDR_CORE_LINK)
+		return object->address_family == MIDR_CORE_AF_NONE ? 0 : -EINVAL;
+	if (!object->metric || object->metric == UINT32_MAX ||
+	    (object->address_family != MIDR_CORE_AF_IPV4 &&
+	     object->address_family != MIDR_CORE_AF_IPV6))
+		return -EINVAL;
+	if (object->address_family == MIDR_CORE_AF_IPV4 &&
+	    (!ipv4_padding_is_zero(object->local_address) ||
+	     !ipv4_padding_is_zero(object->remote_address)))
+		return -EINVAL;
+	return 0;
+}
+
 int midr_core_age(uint32_t received_ms, uint64_t received_ns,
 		  uint64_t now_ns, uint32_t budget_ms,
 		  uint32_t max_age_ms, uint32_t *age_ms)
@@ -195,6 +236,7 @@ bool midr_core_object_semantic_equal(const struct midr_core_object *a,
 	if (a->state == MIDR_CORE_WITHDRAWN)
 		return true;
 	return a->group == b->group && a->metric == b->metric &&
+	       a->address_family == b->address_family &&
 	       !memcmp(a->local_address, b->local_address,
 		       sizeof(a->local_address)) &&
 	       !memcmp(a->remote_address, b->remote_address,
@@ -314,19 +356,15 @@ int midr_core_upsert(struct midr_core *core,
 	normalized = *object;
 	if (midr_core_identity_normalize(&object->identity, &normalized.identity))
 		return -EINVAL;
-	if (normalized.state == MIDR_CORE_ACTIVE &&
-	    normalized.identity.type == MIDR_CORE_MEMBERSHIP && !normalized.group)
-		return -EINVAL;
-	if (normalized.state == MIDR_CORE_ACTIVE &&
-	    normalized.identity.type == MIDR_CORE_LINK &&
-	    (!normalized.metric || normalized.metric == UINT32_MAX))
-		return -EINVAL;
 	if (normalized.state == MIDR_CORE_WITHDRAWN) {
+		normalized.address_family = MIDR_CORE_AF_NONE;
 		normalized.group = 0;
 		normalized.metric = 0;
 		memset(normalized.local_address, 0, sizeof(normalized.local_address));
 		memset(normalized.remote_address, 0, sizeof(normalized.remote_address));
 	}
+	if (object_payload_validate(&normalized))
+		return -EINVAL;
 	if (!normalized.lifetime_ms || normalized.lifetime_ms > core->config.lifetime_ms)
 		normalized.lifetime_ms = core->config.lifetime_ms;
 	entry = find_entry(core, &normalized.identity);

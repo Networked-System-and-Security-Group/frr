@@ -55,13 +55,33 @@ int main(void)
 	link.identity.remote = 43;
 	link.identity.link_id = 9;
 	link.state = MIDR_CORE_ACTIVE;
+	link.address_family = MIDR_CORE_AF_IPV6;
 	link.sequence = 11;
 	link.lifetime_ms = 1000;
 	link.metric = 25;
+	link.local_address[0] = 0x20;
+	link.local_address[1] = 0x01;
+	link.local_address[2] = 0x0d;
+	link.local_address[3] = 0xb8;
+	link.local_address[15] = 1;
+	link.remote_address[0] = 0x20;
+	link.remote_address[1] = 0x01;
+	link.remote_address[2] = 0x0d;
+	link.remote_address[3] = 0xb8;
+	link.remote_address[15] = 2;
 	assert(midr_wire_encode_object(&link, payload, sizeof(payload),
 				       &payload_len) == 0);
 	assert(midr_wire_decode_object(payload, payload_len, &decoded) == 0);
+	assert(decoded.address_family == MIDR_CORE_AF_IPV6);
 	assert(midr_core_object_semantic_equal(&link, &decoded));
+	link.address_family = MIDR_CORE_AF_IPV4;
+	memset(link.local_address + 4, 0, sizeof(link.local_address) - 4);
+	memset(link.remote_address + 4, 0, sizeof(link.remote_address) - 4);
+	assert(midr_wire_encode_object(&link, payload, sizeof(payload),
+				       &payload_len) == 0);
+	payload[64] = 1;
+	assert(midr_wire_decode_object(payload, payload_len, &decoded) == -EINVAL);
+	link.address_family = MIDR_CORE_AF_IPV6;
 	link.metric = 0;
 	assert(midr_wire_encode_object(&link, payload, sizeof(payload),
 				       &payload_len) == -EINVAL);

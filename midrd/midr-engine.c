@@ -83,11 +83,17 @@ static int object_to_consumer(const struct midr_core_object *object,
 	event->remote = object->identity.remote;
 	event->group = object->identity.group;
 	event->link_id = object->identity.link_id;
-	event->family = object->identity.family;
+	event->family = object->identity.type == MIDR_CORE_LINK
+			? object->address_family
+			: object->identity.family;
 	event->prefix_len = object->identity.prefix_len;
 	memcpy(event->prefix, object->identity.prefix,
 	       sizeof(event->prefix));
 	event->metric = object->metric;
+	memcpy(event->local_address, object->local_address,
+	       sizeof(event->local_address));
+	memcpy(event->remote_address, object->remote_address,
+	       sizeof(event->remote_address));
 	switch (object->identity.type) {
 	case MIDR_CORE_LINK:
 		event->kind = MIDR_CONSUMER_LINK;
@@ -199,7 +205,7 @@ int midr_engine_create(const struct midr_engine_config *config,
 			       struct midr_engine **out)
 {
 	struct midr_engine *engine;
-	struct midr_core_config core_config;
+	struct midr_core_config core_config = {0};
 	struct midr_scope_config scope_config;
 	int ret;
 
@@ -595,6 +601,23 @@ int midr_engine_representative(const struct midr_engine *engine,
 {
 	return engine ? midr_scope_representative(engine->scope, group, node_id) :
 		-EINVAL;
+}
+
+int midr_engine_batch_membership(const struct midr_engine *engine,
+				 uint32_t node_id, uint32_t *group)
+{
+	return engine && engine->batch_scope
+		       ? midr_scope_membership(engine->batch_scope, node_id, group)
+		       : -EINVAL;
+}
+
+int midr_engine_batch_representative(const struct midr_engine *engine,
+				     uint32_t group, uint32_t *node_id)
+{
+	return engine && engine->batch_scope
+		       ? midr_scope_representative(engine->batch_scope, group,
+						   node_id)
+		       : -EINVAL;
 }
 
 int midr_engine_apply_prefix_event(struct midr_engine *engine,

@@ -59,6 +59,10 @@ int midr_engine_membership(const struct midr_engine *engine,
 			   uint32_t node_id, uint32_t *group);
 int midr_engine_representative(const struct midr_engine *engine,
 			       uint32_t group, uint32_t *node_id);
+int midr_engine_batch_membership(const struct midr_engine *engine,
+				 uint32_t node_id, uint32_t *group);
+int midr_engine_batch_representative(const struct midr_engine *engine,
+				     uint32_t group, uint32_t *node_id);
 
 int midr_engine_apply_prefix_event(struct midr_engine *engine,
 				   const struct midr_prefix_event *event,

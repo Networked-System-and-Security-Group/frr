@@ -145,6 +145,9 @@ midrd_midrd_SOURCES = \
 	midrd/midr-owned.c midrd/midr-owned.h \
 	midrd/midr-prefix-provider.c midrd/midr-prefix-provider.h \
 	midrd/midr-prefix-ipc.c midrd/midr-prefix-ipc.h \
+	midrd/midr-cost.c midrd/midr-cost.h \
+	midrd/midr-local-provider.c midrd/midr-local-provider.h \
+	midrd/midr-local-ipc.c midrd/midr-local-ipc.h \
 	midrd/midr-scope.c midrd/midr-scope.h \
 	midrd/midr-spf.c midrd/midr-spf.h \
 	midrd/midr-transport.c midrd/midr-transport.h \

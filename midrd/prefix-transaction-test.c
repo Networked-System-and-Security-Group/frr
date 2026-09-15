@@ -38,15 +38,13 @@ static void test_lifetime_accounting(void)
 	assert(object.lifetime_ms == 8997);
 }
 
-static int record_consumer_event(void *arg,
-				 const struct midr_consumer_event *event)
+static void record_consumer_event(void *arg,
+				  const struct midr_consumer_event *event)
 {
 	(void)arg;
-	if (!event)
-		return -EINVAL;
+	assert(event);
 	if (event->kind == MIDR_CONSUMER_SNAPSHOT_BEGIN)
 		consumer_snapshots++;
-	return 0;
 }
 
 static struct midr_prefix_event control_event(enum midr_prefix_event_kind kind,

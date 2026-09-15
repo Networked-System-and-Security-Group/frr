@@ -58,6 +58,46 @@ static uint64_t get_u64(const uint8_t *p)
 	return ntohll_u64(n);
 }
 
+static bool address_is_zero(const uint8_t address[MIDR_CORE_ADDR_BYTES])
+{
+	for (size_t i = 0; i < MIDR_CORE_ADDR_BYTES; i++)
+		if (address[i])
+			return false;
+	return true;
+}
+
+static bool ipv4_padding_is_zero(
+	const uint8_t address[MIDR_CORE_ADDR_BYTES])
+{
+	for (size_t i = 4; i < MIDR_CORE_ADDR_BYTES; i++)
+		if (address[i])
+			return false;
+	return true;
+}
+
+static int object_payload_validate(const struct midr_core_object *object)
+{
+	if (object->state == MIDR_CORE_WITHDRAWN)
+		return !object->address_family && !object->group &&
+		       !object->metric && address_is_zero(object->local_address) &&
+		       address_is_zero(object->remote_address)
+			       ? 0
+			       : -EINVAL;
+	if (object->identity.type == MIDR_CORE_MEMBERSHIP)
+		return object->group && !object->address_family ? 0 : -EINVAL;
+	if (object->identity.type != MIDR_CORE_LINK)
+		return object->address_family == MIDR_CORE_AF_NONE ? 0 : -EINVAL;
+	if (!object->metric || object->metric == UINT32_MAX ||
+	    (object->address_family != MIDR_CORE_AF_IPV4 &&
+	     object->address_family != MIDR_CORE_AF_IPV6))
+		return -EINVAL;
+	if (object->address_family == MIDR_CORE_AF_IPV4 &&
+	    (!ipv4_padding_is_zero(object->local_address) ||
+	     !ipv4_padding_is_zero(object->remote_address)))
+		return -EINVAL;
+	return 0;
+}
+
 int midr_wire_encode_object(const struct midr_core_object *object,
 				   uint8_t *payload, size_t capacity,
 				   size_t *length)
@@ -70,9 +110,7 @@ int midr_wire_encode_object(const struct midr_core_object *object,
 	    (object->state != MIDR_CORE_ACTIVE &&
 	     object->state != MIDR_CORE_WITHDRAWN))
 		return -EINVAL;
-	if (object->state == MIDR_CORE_ACTIVE &&
-	    object->identity.type == MIDR_CORE_LINK &&
-	    (!object->metric || object->metric == UINT32_MAX))
+	if (object_payload_validate(object))
 		return -EINVAL;
 	id = &object->identity;
 	payload[0] = id->type;
@@ -86,7 +124,8 @@ int midr_wire_encode_object(const struct midr_core_object *object,
 	put_u64(payload + 16, id->link_id);
 	memcpy(payload + 24, id->prefix, sizeof(id->prefix));
 	payload[40] = object->state;
-	memset(payload + 41, 0, 3);
+	payload[41] = object->address_family;
+	memset(payload + 42, 0, 2);
 	put_u64(payload + 44, object->sequence);
 	put_u32(payload + 52, object->lifetime_ms);
 	put_u32(payload + 56, object->metric);
@@ -112,6 +151,7 @@ int midr_wire_decode_object(const uint8_t *payload, size_t length,
 	memcpy(object->identity.prefix, payload + 24,
 	       sizeof(object->identity.prefix));
 	object->state = payload[40];
+	object->address_family = payload[41];
 	object->sequence = get_u64(payload + 44);
 	object->lifetime_ms = get_u32(payload + 52);
 	object->metric = get_u32(payload + 56);
@@ -121,9 +161,8 @@ int midr_wire_decode_object(const uint8_t *payload, size_t length,
 		object->group = object->identity.group;
 		object->identity.group = 0;
 	}
-	if (object->state == MIDR_CORE_ACTIVE &&
-	    object->identity.type == MIDR_CORE_LINK &&
-	    (!object->metric || object->metric == UINT32_MAX))
+	if (payload[3] || payload[42] || payload[43] ||
+	    object_payload_validate(object))
 		return -EINVAL;
 	return midr_core_identity_validate(&object->identity) ? -EINVAL :
 	       ((object->state == MIDR_CORE_ACTIVE ||

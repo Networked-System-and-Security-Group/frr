@@ -275,6 +275,7 @@ int midr_owned_withdraw(struct midr_owned *owned,
 		return ret;
 	object = owned->entries[index].object;
 	object.state = MIDR_CORE_WITHDRAWN;
+	object.address_family = MIDR_CORE_AF_NONE;
 	object.sequence = sequence;
 	object.lifetime_ms = owned->config.lifetime_ms;
 	object.group = 0;

@@ -30,6 +30,7 @@ static struct midr_core_object link_object(uint32_t originator,
 	object.identity.remote = remote;
 	object.identity.link_id = 1;
 	object.state = MIDR_CORE_ACTIVE;
+	object.address_family = MIDR_CORE_AF_IPV4;
 	object.sequence = 1;
 	object.lifetime_ms = 1000;
 	object.metric = 1;

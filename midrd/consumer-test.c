@@ -1,15 +1,32 @@
 #include "midr-consumer.h"
 
 #include <assert.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <stdio.h>
 
-static int callback(void *arg, const struct midr_consumer_event *event)
+struct callback_probe {
+	struct midr_consumer *consumer;
+	uint64_t expected_generation;
+	unsigned int count;
+	bool saw_committed_snapshot;
+};
+
+static void callback(void *arg, const struct midr_consumer_event *event)
 {
-	unsigned int *count = arg;
-	(void)event;
-	(*count)++;
-	return 0;
+	struct callback_probe *probe = arg;
+
+	probe->count++;
+	if (event->kind == MIDR_CONSUMER_SNAPSHOT_BEGIN &&
+	    probe->expected_generation) {
+		struct midr_consumer_snapshot snapshot = {0};
+
+		assert(midr_consumer_snapshot_acquire(probe->consumer,
+						      &snapshot) == 0);
+		assert(snapshot.generation == probe->expected_generation);
+		probe->saw_committed_snapshot = true;
+		midr_consumer_snapshot_release(&snapshot);
+	}
 }
 
 int main(void)
@@ -33,27 +50,34 @@ int main(void)
 		.generation = 7,
 		.originator = 42,
 		.remote = 43,
+		.family = MIDR_CORE_AF_IPV6,
 	};
-	unsigned int count = 0;
+	struct callback_probe probe = {0};
 
 	config.on_event = callback;
-	config.arg = &count;
+	config.arg = &probe;
 	assert(midr_consumer_create(&config, &consumer) == 0);
+	probe.consumer = consumer;
 	assert(midr_consumer_publish(consumer, &bad_link) == -EINVAL);
 	bad_link.metric = 10;
 	assert(midr_consumer_publish(consumer, &bad_link) == 0);
 	assert(midr_consumer_event_next(consumer, &copied) == 0);
 	assert(midr_consumer_publish(consumer, &event) == 0);
-	assert(count == 2 && midr_consumer_pending(consumer) == 1);
+	assert(probe.count == 2 && midr_consumer_pending(consumer) == 1);
 	assert(midr_consumer_event_next(consumer, &copied) == 0);
 	assert(copied.originator == 42 && midr_consumer_pending(consumer) == 0);
 	committed.generation = 8;
 	committed.originator = 42;
+	probe.expected_generation = 8;
 	assert(midr_consumer_commit_snapshot(consumer, 8, 42, &committed, 1) == 0);
+	assert(probe.saw_committed_snapshot);
 	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
 	assert(snapshot.generation == 8 && snapshot.count == 1);
 	replacement.generation = 9;
+	probe.expected_generation = 9;
+	probe.saw_committed_snapshot = false;
 	assert(midr_consumer_commit_snapshot(consumer, 9, 42, &replacement, 1) == 0);
+	assert(probe.saw_committed_snapshot);
 	assert(midr_consumer_snapshot_acquire(consumer, &old_snapshot) == 0);
 	assert(snapshot.generation == 8 && snapshot.events[0].generation == 8);
 	assert(old_snapshot.generation == 9 &&

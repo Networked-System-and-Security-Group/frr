@@ -23,6 +23,15 @@ struct midr_consumer {
 	uint64_t snapshot_generation;
 };
 
+static bool ipv4_padding_is_zero(
+	const uint8_t address[MIDR_CORE_ADDR_BYTES])
+{
+	for (size_t i = 4; i < MIDR_CORE_ADDR_BYTES; i++)
+		if (address[i])
+			return false;
+	return true;
+}
+
 int midr_consumer_event_validate(const struct midr_consumer_event *event)
 {
 	if (!event || !event->generation)
@@ -37,8 +46,16 @@ int midr_consumer_event_validate(const struct midr_consumer_event *event)
 	if (!event->originator)
 		return -EINVAL;
 	if (event->kind == MIDR_CONSUMER_LINK) {
-		return event->remote && event->originator != event->remote &&
-		       event->metric && event->metric != UINT32_MAX ? 0 : -EINVAL;
+		if (!event->remote || event->originator == event->remote ||
+		    !event->metric || event->metric == UINT32_MAX ||
+		    (event->family != MIDR_CORE_AF_IPV4 &&
+		     event->family != MIDR_CORE_AF_IPV6))
+			return -EINVAL;
+		if (event->family == MIDR_CORE_AF_IPV4 &&
+		    (!ipv4_padding_is_zero(event->local_address) ||
+		     !ipv4_padding_is_zero(event->remote_address)))
+			return -EINVAL;
+		return 0;
 	}
 	if ((event->family != MIDR_CORE_AF_IPV4 &&
 	     event->family != MIDR_CORE_AF_IPV6) ||
@@ -97,18 +114,15 @@ static int publish_pending(struct midr_consumer *consumer,
 
 	if (consumer->pending == MIDR_CONSUMER_MAX_PENDING)
 		return -ENOSPC;
-	if (consumer->config.on_event) {
-		int ret = consumer->config.on_event(consumer->config.arg, event);
-
-		if (ret)
-			return ret;
-	}
 	node = malloc(sizeof(*node));
 	if (!node)
 		return -ENOMEM;
 	node->event = *event;
 	node->next = NULL;
-	return append_pending(consumer, node);
+	append_pending(consumer, node);
+	if (consumer->config.on_event)
+		consumer->config.on_event(consumer->config.arg, event);
+	return 0;
 }
 
 int midr_consumer_publish(struct midr_consumer *consumer,
@@ -131,7 +145,6 @@ int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
 	struct midr_consumer_event_node **nodes = NULL;
 	struct midr_consumer_event marker = {0};
 	size_t total;
-	int ret = 0;
 
 	if (!consumer || !generation || !originator || (count && !events) ||
 	    count > MIDR_CONSUMER_MAX_SNAPSHOT)
@@ -170,25 +183,16 @@ int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
 
 		if (i == total - 1)
 			marker.kind = MIDR_CONSUMER_SNAPSHOT_END;
-		if (consumer->config.on_event) {
-			ret = consumer->config.on_event(consumer->config.arg, source);
-			if (ret)
-				break;
-		}
 		nodes[i] = malloc(sizeof(*nodes[i]));
 		if (!nodes[i]) {
-			ret = -ENOMEM;
-			break;
+			for (size_t j = 0; j < i; j++)
+				free(nodes[j]);
+			free(nodes);
+			free(copy);
+			return -ENOMEM;
 		}
 		nodes[i]->event = *source;
 		nodes[i]->next = NULL;
-	}
-	if (ret) {
-		for (size_t i = 0; i < total; i++)
-			free(nodes[i]);
-		free(nodes);
-		free(copy);
-		return ret;
 	}
 	for (size_t i = 0; i < total; i++)
 		append_pending(consumer, nodes[i]);
@@ -197,6 +201,15 @@ int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
 	consumer->snapshot = copy;
 	consumer->snapshot_count = count;
 	consumer->snapshot_generation = generation;
+	if (consumer->config.on_event) {
+		marker.kind = MIDR_CONSUMER_SNAPSHOT_BEGIN;
+		consumer->config.on_event(consumer->config.arg, &marker);
+		for (size_t i = 0; i < count; i++)
+			consumer->config.on_event(consumer->config.arg,
+						  &consumer->snapshot[i]);
+		marker.kind = MIDR_CONSUMER_SNAPSHOT_END;
+		consumer->config.on_event(consumer->config.arg, &marker);
+	}
 	return 0;
 }
 

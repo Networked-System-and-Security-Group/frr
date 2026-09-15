@@ -27,10 +27,16 @@ struct midr_consumer_event {
 	uint8_t reserved[2];
 	uint8_t prefix[MIDR_CORE_ADDR_BYTES];
 	uint32_t metric;
+	uint8_t local_address[MIDR_CORE_ADDR_BYTES];
+	uint8_t remote_address[MIDR_CORE_ADDR_BYTES];
 };
 
-typedef int (*midr_consumer_event_cb)(void *arg,
-				      const struct midr_consumer_event *event);
+/* Post-commit notification.  The callback observes an already committed
+ * snapshot/event and cannot reject or roll it back.  Consumers that need a
+ * transactional downstream update must acquire the committed snapshot and
+ * stage that update independently. */
+typedef void (*midr_consumer_event_cb)(
+	void *arg, const struct midr_consumer_event *event);
 
 struct midr_consumer_config {
 	midr_consumer_event_cb on_event;

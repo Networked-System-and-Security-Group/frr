@@ -70,7 +70,9 @@ struct midr_core_identity {
 struct midr_core_object {
 	struct midr_core_identity identity;
 	uint8_t state;
-	uint8_t reserved[3];
+	/* Link endpoint address family.  It is payload, not identity. */
+	uint8_t address_family;
+	uint8_t reserved[2];
 	uint64_t sequence;
 	uint32_t lifetime_ms;
 	/* Membership payload.  group is not part of Membership identity. */

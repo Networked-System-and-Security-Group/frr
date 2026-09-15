@@ -270,6 +270,7 @@ static void test_membership_group_is_payload(void)
 static void test_link_cost_validation(void)
 {
 	struct midr_core_object object = {0};
+	struct midr_core_object changed;
 	enum midr_core_result result;
 
 	object.identity.type = MIDR_CORE_LINK;
@@ -278,6 +279,15 @@ static void test_link_cost_validation(void)
 	object.identity.link_id = 1;
 	object.state = MIDR_CORE_ACTIVE;
 	object.sequence = 1;
+	object.address_family = MIDR_CORE_AF_IPV4;
+	object.local_address[0] = 192;
+	object.local_address[1] = 0;
+	object.local_address[2] = 2;
+	object.local_address[3] = 1;
+	object.remote_address[0] = 192;
+	object.remote_address[1] = 0;
+	object.remote_address[2] = 2;
+	object.remote_address[3] = 2;
 	assert(midr_core_upsert(core, &object, 500, &result) == -EINVAL);
 	object.metric = UINT32_MAX;
 	assert(midr_core_upsert(core, &object, 501, &result) == -EINVAL);
@@ -285,6 +295,13 @@ static void test_link_cost_validation(void)
 	assert(midr_core_upsert(core, &object, 502, &result) == 0);
 	assert(result == MIDR_CORE_ACCEPTED);
 	drain_one(1, MIDR_CORE_ACTIVE);
+	changed = object;
+	changed.address_family = MIDR_CORE_AF_IPV6;
+	assert(!midr_core_object_semantic_equal(&object, &changed));
+	changed = object;
+	changed.local_address[4] = 1;
+	changed.sequence = 2;
+	assert(midr_core_upsert(core, &changed, 503, &result) == -EINVAL);
 }
 
 int main(void)
