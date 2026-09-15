@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* MIDR traceroute parser and IP2ASN mapping helpers. */
+/* MIDR traceroute IP2ASN mapping helpers. */
 
 #ifndef _FRR_MIDR_TRACE_OBSERVER_H
 #define _FRR_MIDR_TRACE_OBSERVER_H
@@ -8,34 +8,6 @@
 
 #include "bgpd/midr_trace_scheduler.h"
 
-#define MIDR_TRACE_LINE_MAX 1024U
-
-enum midr_trace_parse_rc {
-	MIDR_TRACE_PARSE_OK = 0,
-	MIDR_TRACE_PARSE_OUTPUT_LIMIT,
-	MIDR_TRACE_PARSE_INVALID,
-};
-
-struct midr_trace_parser {
-	struct midr_trace_raw_path path;
-	char line[MIDR_TRACE_LINE_MAX + 1];
-	size_t line_len;
-	enum midr_trace_parse_rc terminal_rc;
-	bool finished;
-};
-
-extern void midr_trace_parser_init(struct midr_trace_parser *parser);
-extern enum midr_trace_parse_rc
-midr_trace_parser_feed(struct midr_trace_parser *parser, const void *data,
-		       size_t data_len);
-extern enum midr_trace_parse_rc
-midr_trace_parser_finish(struct midr_trace_parser *parser,
-			 struct midr_trace_raw_path *path);
-
-/*
- * Construct a query-time view using the currently active IP2ASN generation.
- * This function is main-event-thread only and never yields.
- */
 extern void midr_trace_map_ip2asn(const struct midr_trace_job_result *result,
 				  struct midr_trace_query_view *view);
 

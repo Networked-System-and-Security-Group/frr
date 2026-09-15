@@ -15,9 +15,12 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "bgpd/bgp_aspath.h"
 #include "prefix.h"
+
+#define MIDR_TIER1_LIST_VERSION_MAX 64
 
 #define MIDR_TIER1_MAX_HITS 32
 #define MIDR_TIER1_MAX_OBSERVED_ASNS 128
@@ -53,7 +56,9 @@ struct midr_tier1_result {
 	bool tier1_observed;
 	bool tier1_ordered_observed;
 	bool tier1_unordered_observed;
-	const char *tier1_list_version;
+	char tier1_list_version[MIDR_TIER1_LIST_VERSION_MAX + 1];
+	bool has_tier1_list_generation;
+	uint64_t tier1_list_generation;
 	unsigned int flags;
 	unsigned int normalized_hops;
 	unsigned int ignored_private_asns;
@@ -82,13 +87,6 @@ struct midr_tier1_observer {
 	midr_tier1_observe_cb observe;
 	void *arg;
 };
-
-/*
- * Versioned starter list for early development.  Production deployments should
- * replace it with a CAIDA clique/as-rank snapshot or another explicitly
- * versioned operator policy list.
- */
-extern const struct midr_tier1_list midr_tier1_common_seed_202607;
 
 extern void midr_tier1_result_init(struct midr_tier1_result *result);
 extern bool midr_tier1_list_contains(const struct midr_tier1_list *list,

@@ -87,6 +87,7 @@
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_vty.h"
 #include "bgpd/midr_trace_scheduler.h"
+#include "bgpd/midr_tier1_list.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -9456,10 +9457,11 @@ void bgp_terminate(void)
 	/*
 	 * No further event-loop iteration is guaranteed after this function.
 	 * First settle callbacks while their consumers are alive, then perform
-	 * the executor's synchronous child/fd teardown.
+	 * the engine's event/fd teardown.
 	 */
 	midr_trace_scheduler_quiesce();
 	midr_trace_scheduler_fini();
+	midr_tier1_list_fini();
 
 	QOBJ_UNREG(bm);
 

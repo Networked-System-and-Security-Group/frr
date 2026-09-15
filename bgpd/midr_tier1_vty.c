@@ -16,6 +16,8 @@
 
 #include "bgpd/midr_ip2asn.h"
 #include "bgpd/midr_tier1.h"
+#include "bgpd/midr_tier1_list.h"
+#include "bgpd/midr_trace_engine.h"
 #include "bgpd/midr_tier1_vty.h"
 #include "bgpd/midr_trace_scheduler.h"
 
@@ -180,6 +182,9 @@ static void midr_tier1_vty_json(
 	json_object_string_add(json, "target", target);
 	json_object_string_add(json, "status", "ok");
 	json_object_string_add(json, "source", observation->source);
+	json_object_string_add(json, "evaluationStatus", "ok");
+	if (result->has_tier1_list_generation)
+		midr_json_u64_add(json, "tier1ListGeneration", result->tier1_list_generation);
 	json_object_string_add(json, "tier1ListVersion",
 			       result->tier1_list_version);
 	json_object_boolean_add(json, "tier1Observed",
@@ -199,6 +204,8 @@ static void midr_tier1_vty_json(
 	json_object_object_add(json, "tier1Hits", json_hits);
 
 	if (view) {
+		json_object_boolean_add(json, "targetReached", view->job.target_reached);
+		json_object_string_add(json, "stopReason", midr_trace_stop_reason_name(view->job.stop_reason));
 		midr_json_u64_add(json, "jobId", view->job.job_id);
 		midr_json_u64_add(json, "ip2asnGeneration",
 				  view->ip2asn_generation);
@@ -219,6 +226,9 @@ static void midr_tier1_vty_text(
 	vty_out(vty, "MIDR Tier-1 observation for %s\n", target);
 	vty_out(vty, "  Source: %s\n", observation->source);
 	if (view) {
+		vty_out(vty, "  Target reached: %s, stop reason: %s\n",
+			view->job.target_reached ? "yes" : "no",
+			midr_trace_stop_reason_name(view->job.stop_reason));
 		vty_out(vty, "  Job ID: %" PRIu64 "\n", view->job.job_id);
 		vty_out(vty, "  IP-to-ASN generation: %" PRIu64 "\n",
 			view->ip2asn_generation);
@@ -226,6 +236,8 @@ static void midr_tier1_vty_text(
 			view->job.queue_msec, view->job.execution_msec);
 	}
 	vty_out(vty, "  Tier-1 list: %s\n", result->tier1_list_version);
+	if (result->has_tier1_list_generation)
+		vty_out(vty, "  Tier-1 list generation: %" PRIu64 "\n", result->tier1_list_generation);
 	vty_out(vty, "  Observed AS path: ");
 	midr_tier1_vty_print_asn_list(vty, observation->observed_asns,
 				      observation->observed_asn_count);
@@ -281,6 +293,29 @@ static void midr_trace_raw_hops_json_add(
 	}
 }
 
+static void midr_trace_hop_details_json_add(json_object *json,
+					  const struct midr_trace_raw_path *path)
+{
+	json_object *details = json_object_new_array();
+	size_t i;
+
+	for (i = 0; i < path->hop_count; i++) {
+		const struct midr_trace_raw_hop *hop = &path->hops[i];
+		json_object *item = json_object_new_object();
+
+		json_object_int_add(item, "ttl", hop->ttl);
+		json_object_boolean_add(item, "visible", hop->visible);
+		if (hop->has_rtt)
+			json_object_int_add(item, "rttUsec", hop->rtt_usec);
+		if (hop->has_icmp) {
+			json_object_int_add(item, "icmpType", hop->icmp_type);
+			json_object_int_add(item, "icmpCode", hop->icmp_code);
+		}
+		json_object_array_add(details, item);
+	}
+	json_object_object_add(json, "hopDetails", details);
+}
+
 static void midr_trace_vty_json(
 	struct vty *vty, const char *target,
 	const struct midr_trace_query_view *view, bool has_cache_metadata,
@@ -304,6 +339,7 @@ static void midr_trace_vty_json(
 
 	midr_trace_raw_hops_json_add(json_raw, &view->job.raw_path);
 	json_object_object_add(json, "rawHops", json_raw);
+	midr_trace_hop_details_json_add(json, &view->job.raw_path);
 
 	if (view->has_ip2asn_generation)
 		midr_json_u64_add(json, "ip2asnGeneration",
@@ -316,14 +352,12 @@ static void midr_trace_vty_json(
 	}
 	json_object_object_add(json, "observedAsPath", json_path);
 
-	if (view->job.has_wait_status) {
-		json_object_boolean_add(json, "exitedNormally",
-					view->job.exited_normally);
-		json_object_int_add(json, "childExitCode",
-				    view->job.child_exit_code);
-		json_object_int_add(json, "childSignal",
-				    view->job.child_signal);
-	}
+	json_object_string_add(json, "backend", "linux-udp");
+	json_object_int_add(json, "profileVersion", MIDR_TRACE_PROFILE_VERSION);
+	json_object_boolean_add(json, "targetReached", view->job.target_reached);
+	json_object_string_add(json, "stopReason",
+			       midr_trace_stop_reason_name(view->job.stop_reason));
+	json_object_int_add(json, "systemErrno", view->job.system_errno);
 
 	if (has_cache_metadata) {
 		json_object_string_add(
@@ -377,10 +411,23 @@ static void midr_trace_vty_text(
 			view->observation.observed_asn_count);
 		vty_out(vty, "\n");
 	}
-	if (view->job.has_wait_status)
-		vty_out(vty, "  Child: %s, exit %d, signal %d\n",
-			view->job.exited_normally ? "exited" : "signaled",
-			view->job.child_exit_code, view->job.child_signal);
+	vty_out(vty, "  Backend: linux-udp, profile %u\n", MIDR_TRACE_PROFILE_VERSION);
+	vty_out(vty, "  Target reached: %s, stop reason: %s\n",
+		view->job.target_reached ? "yes" : "no",
+		midr_trace_stop_reason_name(view->job.stop_reason));
+	if (view->job.system_errno)
+		vty_out(vty, "  System error: %s\n", safe_strerror(view->job.system_errno));
+	for (i = 0; i < view->job.raw_path.hop_count; i++) {
+		const struct midr_trace_raw_hop *hop = &view->job.raw_path.hops[i];
+
+		vty_out(vty, "  TTL %u: %s", hop->ttl,
+			hop->visible ? prefix2str(&hop->address, buf, sizeof(buf)) : "*");
+		if (hop->has_rtt)
+			vty_out(vty, ", RTT %u us", hop->rtt_usec);
+		if (hop->has_icmp)
+			vty_out(vty, ", ICMP %u/%u", hop->icmp_type, hop->icmp_code);
+		vty_out(vty, "\n");
+	}
 }
 
 static void midr_trace_vty_error(struct vty *vty, bool uj,
@@ -458,6 +505,12 @@ static int midr_tier1_vty_from_view(
 {
 	struct midr_tier1_result result;
 
+	if (!midr_tier1_list_active()) {
+		midr_trace_vty_error(vty, uj, target, "tier1-list-not-loaded",
+				     "Load a Tier-1 ASN file before evaluation");
+		return CMD_WARNING;
+	}
+
 	if (view->job.status != MIDR_TRACE_OK || !view->has_observation) {
 		if (uj)
 			midr_trace_vty_json(vty, target, view, false,
@@ -468,10 +521,9 @@ static int midr_tier1_vty_from_view(
 		return CMD_WARNING;
 	}
 
-	if (midr_tier1_observed_path_check(
+	if (midr_tier1_active_path_check(
 		    view->observation.observed_asns,
-		    view->observation.observed_asn_count,
-		    &midr_tier1_common_seed_202607, &result)) {
+		    view->observation.observed_asn_count, &result)) {
 		midr_trace_vty_error(vty, uj, target, "tier1-failed",
 				     "Tier-1 path evaluation failed");
 		return CMD_WARNING;
@@ -499,6 +551,12 @@ static int midr_trace_vty_target(struct vty *vty, const char *target,
 	enum midr_trace_submit_rc submit_rc;
 	uint32_t cache_age_msec = 0;
 	uint64_t job_id = 0;
+
+	if (tier1 && !midr_tier1_list_active()) {
+		midr_trace_vty_error(vty, uj, target, "tier1-list-not-loaded",
+				     "Load a Tier-1 ASN file before evaluation");
+		return CMD_WARNING;
+	}
 
 	lookup_rc = midr_trace_cache_lookup(target_prefix, &options, &view,
 					    &cache_age_msec);
@@ -578,6 +636,12 @@ static int midr_trace_vty_job(struct vty *vty, uint64_t job_id, bool uj,
 	struct midr_trace_job_snapshot snapshot;
 	enum midr_trace_job_query_state state;
 	char target[PREFIX_STRLEN] = {};
+
+	if (tier1 && !midr_tier1_list_active()) {
+		midr_trace_vty_error(vty, uj, target, "tier1-list-not-loaded",
+				     "Load a Tier-1 ASN file before evaluation");
+		return CMD_WARNING;
+	}
 
 	state = midr_trace_job_lookup(job_id, &snapshot);
 	if (state == MIDR_TRACE_QUERY_NOT_FOUND_OR_EXPIRED) {
@@ -751,6 +815,103 @@ static void midr_ip2asn_vty_lookup_text(struct vty *vty,
 	vty_out(vty, "  ASN: %u\n", asn);
 	vty_out(vty, "  Matched prefix: %s\n",
 		prefix2str(matched_prefix, prefix_buf, sizeof(prefix_buf)));
+}
+
+DEFUN(midr_tier1_file,
+      midr_tier1_file_cmd,
+      "midr tier1 file WORD",
+      "MIDR overlay routing\n"
+      "Tier-1 ASN policy\n"
+      "Load or reload a complete ASN list\n"
+      "Local file path\n")
+{
+	char errmsg[256] = {};
+
+	if (midr_tier1_list_load_file(argv[3]->arg, false, errmsg, sizeof(errmsg))) {
+		vty_out(vty, "%% %s\n", errmsg);
+		return CMD_WARNING;
+	}
+	vty_out(vty, "Tier-1 list activated, generation %" PRIu64 "\n",
+		midr_tier1_list_generation());
+	return CMD_SUCCESS;
+}
+
+DEFUN(no_midr_tier1_file,
+      no_midr_tier1_file_cmd,
+      "no midr tier1 file",
+      NO_STR
+      "MIDR overlay routing\n"
+      "Tier-1 ASN policy\n"
+      "Clear the active list; evaluation becomes unavailable\n")
+{
+	char errmsg[256] = {};
+
+	if (midr_tier1_list_clear(errmsg, sizeof(errmsg))) {
+		vty_out(vty, "%% %s\n", errmsg);
+		return CMD_WARNING;
+	}
+	return CMD_SUCCESS;
+}
+
+DEFUN(midr_tier1_validate_file,
+      midr_tier1_validate_file_cmd,
+      "midr tier1 validate file WORD",
+      "MIDR overlay routing\n"
+      "Tier-1 ASN policy\n"
+      "Validate without changing the active list\n"
+      "Local ASN list\n"
+      "Local file path\n")
+{
+	char errmsg[256] = {};
+
+	if (midr_tier1_list_load_file(argv[4]->arg, true, errmsg, sizeof(errmsg))) {
+		vty_out(vty, "%% %s\n", errmsg);
+		return CMD_WARNING;
+	}
+	vty_out(vty, "Tier-1 file valid. No changes applied.\n");
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_tier1_list,
+      show_midr_tier1_list_cmd,
+      "show midr tier1 list [json]",
+      SHOW_STR
+      "MIDR overlay routing\n"
+      "Tier-1 ASN policy\n"
+      "Active list status and members\n"
+      JSON_STR)
+{
+	struct midr_tier1_list_status status;
+	const struct midr_tier1_list *list = midr_tier1_list_active();
+
+	midr_tier1_list_get_status(&status);
+	if (use_json(argc, argv)) {
+		json_object *json = json_object_new_object();
+		json_object *members = json_object_new_array();
+
+		json_object_boolean_add(json, "loaded", status.loaded);
+		midr_json_u64_add(json, "generation", status.generation);
+		json_object_string_add(json, "sourcePath", status.source_path ? status.source_path : "");
+		json_object_string_add(json, "version", status.version ? status.version : "");
+		json_object_int_add(json, "entries", status.count);
+		json_object_int_add(json, "duplicates", status.duplicates);
+		if (list)
+			midr_tier1_json_asn_array_add(members, list->asns, list->count);
+		json_object_object_add(json, "asns", members);
+		vty_json(vty, json);
+		return CMD_SUCCESS;
+	}
+	vty_out(vty, "MIDR Tier-1 list: %s\n", status.loaded ? "loaded" : "not loaded");
+	vty_out(vty, "  Source: %s\n", status.source_path ? status.source_path : "-");
+	vty_out(vty, "  Version: %s, generation: %" PRIu64 "\n",
+		status.version ? status.version : "-", status.generation);
+	vty_out(vty, "  Entries: %zu, duplicates removed: %zu\n", status.count, status.duplicates);
+	if (list) {
+		vty_out(vty, "  ASNs: ");
+		midr_tier1_vty_print_asn_list(vty, list->asns, list->count);
+		vty_out(vty, "\n");
+	}
+	return CMD_SUCCESS;
 }
 
 DEFUN(midr_ip2asn_file,
@@ -1012,6 +1173,12 @@ DEFUN(show_midr_tier1,
 	size_t observed_asn_count = 0;
 	int ret;
 
+	if (!midr_tier1_list_active()) {
+		midr_trace_vty_error(vty, false, target, "tier1-list-not-loaded",
+				     "Load a Tier-1 ASN file before evaluation");
+		return CMD_WARNING;
+	}
+
 	if (!midr_vty_target_parse(vty, target, &target_prefix))
 		return CMD_WARNING;
 	ret = midr_tier1_parse_observed_asns(vty, argv, argc, idx_asn,
@@ -1022,13 +1189,15 @@ DEFUN(show_midr_tier1,
 	manual.observed_asns = observed_asns;
 	manual.observed_asn_count = observed_asn_count;
 	ret = midr_tier1_target_check(&target_prefix, &observer,
-				      &midr_tier1_common_seed_202607,
+				      midr_tier1_list_active(),
 				      &result, &observation);
 	if (ret) {
 		vty_out(vty, "%% MIDR Tier-1 check failed\n");
 		XFREE(MTYPE_TMP, observed_asns);
 		return CMD_WARNING;
 	}
+	result.has_tier1_list_generation = true;
+	result.tier1_list_generation = midr_tier1_list_generation();
 	midr_tier1_vty_text(vty, target, &result, &observation, NULL);
 	XFREE(MTYPE_TMP, observed_asns);
 	return CMD_SUCCESS;
@@ -1176,6 +1345,11 @@ DEFUN(show_midr_traceroute_scheduler,
 	if (use_json(argc, argv)) {
 		json_object *json = json_object_new_object();
 
+		json_object_string_add(json, "backend", "linux-udp");
+		json_object_boolean_add(json, "ipv4Supported", midr_trace_engine_supported(AF_INET));
+		json_object_boolean_add(json, "ipv6Supported", midr_trace_engine_supported(AF_INET6));
+		json_object_int_add(json, "maxTtl", MIDR_TRACE_MAX_TTL);
+		json_object_int_add(json, "probeWaitMsec", MIDR_TRACE_PROBE_WAIT_MSEC);
 		json_object_boolean_add(json, "ready",
 					midr_trace_scheduler_is_ready());
 		json_object_boolean_add(json, "accepting", stats.accepting);
@@ -1212,17 +1386,23 @@ DEFUN(show_midr_traceroute_scheduler,
 				  stats.queue_timeouts);
 		midr_json_u64_add(json, "executionTimeouts",
 				  stats.execution_timeouts);
-		midr_json_u64_add(json, "spawnErrors", stats.spawn_errors);
-		midr_json_u64_add(json, "parseErrors", stats.parse_errors);
-		midr_json_u64_add(json, "exitErrors", stats.exit_errors);
-		midr_json_u64_add(json, "outputLimitErrors",
-				  stats.output_limit_errors);
+		midr_json_u64_add(json, "socketErrors", stats.socket_errors);
+		midr_json_u64_add(json, "sendErrors", stats.send_errors);
+		midr_json_u64_add(json, "receiveErrors", stats.receive_errors);
+		midr_json_u64_add(json, "resourceErrors",
+				  stats.resource_errors);
 		midr_json_u64_add(json, "canceled", stats.canceled);
 		vty_json(vty, json);
 		return CMD_SUCCESS;
 	}
 
 	vty_out(vty, "MIDR traceroute scheduler\n");
+	vty_out(vty, "  Backend: linux-udp, compiled IPv4/IPv6 support: %s/%s\n",
+		midr_trace_engine_supported(AF_INET) ? "yes" : "no",
+		midr_trace_engine_supported(AF_INET6) ? "yes" : "no");
+	vty_out(vty, "  Profile: %u, max TTL %u, probe wait %u ms, send interval %u ms\n",
+		MIDR_TRACE_PROFILE_VERSION, MIDR_TRACE_MAX_TTL,
+		MIDR_TRACE_PROBE_WAIT_MSEC, MIDR_TRACE_SEND_INTERVAL_MSEC);
 	vty_out(vty, "  Ready/accepting: %s/%s\n",
 		midr_trace_scheduler_is_ready() ? "yes" : "no",
 		stats.accepting ? "yes" : "no");
@@ -1248,13 +1428,13 @@ DEFUN(show_midr_traceroute_scheduler,
 		stats.cache_hits, stats.cache_misses, stats.coalesced,
 		stats.evicted);
 	vty_out(vty,
-		"  Errors queue-full/queue-timeout/exec-timeout/spawn/parse/exit/output: "
+		"  Errors queue-full/queue-timeout/exec-timeout/socket/send/receive/resource: "
 		"%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
 		"/%" PRIu64 "/%" PRIu64 "\n",
 		stats.queue_full, stats.queue_timeouts,
-		stats.execution_timeouts, stats.spawn_errors,
-		stats.parse_errors, stats.exit_errors,
-		stats.output_limit_errors);
+		stats.execution_timeouts, stats.socket_errors,
+		stats.send_errors, stats.receive_errors,
+		stats.resource_errors);
 	return CMD_SUCCESS;
 }
 
@@ -1292,6 +1472,10 @@ DEFUN(clear_midr_traceroute_cache_target,
 
 void midr_tier1_vty_init(void)
 {
+	install_element(CONFIG_NODE, &midr_tier1_file_cmd);
+	install_element(CONFIG_NODE, &no_midr_tier1_file_cmd);
+	install_element(ENABLE_NODE, &midr_tier1_validate_file_cmd);
+	install_element(VIEW_NODE, &show_midr_tier1_list_cmd);
 	install_element(CONFIG_NODE, &midr_ip2asn_file_cmd);
 	install_element(CONFIG_NODE, &no_midr_ip2asn_file_cmd);
 	install_element(ENABLE_NODE, &midr_ip2asn_update_file_cmd);

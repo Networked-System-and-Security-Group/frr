@@ -71,6 +71,7 @@
 #include "bgpd/midr_ip2asn.h"
 #include "bgpd/midr_tier1_vty.h"
 #include "bgpd/midr_trace_scheduler.h"
+#include "bgpd/midr_tier1_list.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
@@ -21932,6 +21933,8 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
+	if (midr_tier1_list_config_write(vty))
+		vty_out(vty, "!\n");
 	if (midr_ip2asn_config_write(vty))
 		vty_out(vty, "!\n");
 	if (midr_trace_scheduler_config_write(vty))

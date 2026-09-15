@@ -7,16 +7,6 @@
 
 #include "bgpd/midr_tier1.h"
 
-static const as_t midr_tier1_common_seed_202607_asns[] = {
-	174, 1299, 2914, 3257, 3356, 6453, 6762, 6939,
-};
-
-const struct midr_tier1_list midr_tier1_common_seed_202607 = {
-	.asns = midr_tier1_common_seed_202607_asns,
-	.count = array_size(midr_tier1_common_seed_202607_asns),
-	.version = "midr-common-tier1-seed-2026-07",
-};
-
 void midr_tier1_result_init(struct midr_tier1_result *result)
 {
 	if (!result)
@@ -177,7 +167,8 @@ int midr_tier1_observed_path_check(const as_t *observed_asns,
 		return -1;
 
 	midr_tier1_result_init(result);
-	result->tier1_list_version = list->version;
+	strlcpy(result->tier1_list_version, list->version ? list->version : "",
+		sizeof(result->tier1_list_version));
 
 	if (!observed_asn_count) {
 		result->flags |= MIDR_TIER1_FLAG_EMPTY_PATH;
@@ -207,7 +198,8 @@ int midr_tier1_aspath_check(const struct aspath *aspath,
 		return -1;
 
 	midr_tier1_result_init(result);
-	result->tier1_list_version = list->version;
+	strlcpy(result->tier1_list_version, list->version ? list->version : "",
+		sizeof(result->tier1_list_version));
 
 	if (!aspath->segments) {
 		result->flags |= MIDR_TIER1_FLAG_EMPTY_PATH;
