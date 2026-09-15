@@ -66,7 +66,8 @@ topology:
         - ip addr add $a_addr dev eth1
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_a --listen $a_listen
-          --peer $a_peer --group 1 --prefix $prefix_a --link $node_b:5 --lifetime 900
+          --peer $a_peer --group 1 --prefix $prefix_a --link $node_b:5
+          --takeover-delay 1500 --lifetime 900
           --runtime $owner_runtime >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
@@ -80,7 +81,7 @@ topology:
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
           --peer $b_peer --peer $b_to_c_peer --group 1 --prefix $prefix_b
-          --link $node_a:5 --link $node_c:7 --lifetime 900
+          --link $node_a:5 --link $node_c:7 --takeover-delay 1500 --lifetime 900
           --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
@@ -92,7 +93,8 @@ topology:
         - ip addr add $c_addr dev eth1
         - >-
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_c --listen $c_listen
-          --peer $c_peer --group 1 --prefix $prefix_c --link $node_b:7 --lifetime 900
+          --peer $c_peer --group 1 --prefix $prefix_c --link $node_b:7
+          --takeover-delay 1500 --lifetime 900
           --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
@@ -136,9 +138,13 @@ EOF
 	if [[ "$expected_routes" == 0 ]]; then
 		grep -q 'event state=2' "$run/b.log"
 		grep -q 'event state=2' "$run/c.log"
+		grep -q "event state=1 type=4 originator=$node_b group=1" "$run/b.log"
+		grep -q "event state=1 type=4 originator=$node_b group=1" "$run/c.log"
 	else
 		grep -q "route originator=$node_c metric=22 reachable=1" "$run/a.log"
 		grep -q "route originator=$node_a metric=22 reachable=1" "$run/c.log"
+		grep -q "event state=1 type=4 originator=$node_a group=1" "$run/a.log"
+		grep -q "event state=1 type=4 originator=$node_a group=1" "$run/c.log"
 	fi
 	echo "r7 containerlab smoke $name: PASS (logs: $run)"
 }

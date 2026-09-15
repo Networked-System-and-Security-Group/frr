@@ -28,6 +28,7 @@
 #define MIDRD_MAX_FRAME 4096U
 #define MIDRD_DEFAULT_LIFETIME 6000U
 #define MIDRD_DEFAULT_HELLO 1000U
+#define MIDRD_DEFAULT_TAKEOVER_DELAY 3000U
 
 static volatile sig_atomic_t stop_requested;
 
@@ -64,6 +65,7 @@ struct midrd {
 	uint32_t group_id;
 	uint32_t lifetime_ms;
 	uint32_t hello_ms;
+	uint32_t takeover_delay_ms;
 	uint64_t frame_sequence;
 	struct midr_engine *engine;
 	struct midr_owned *owned;
@@ -73,9 +75,16 @@ struct midrd {
 	struct midr_transport *transport;
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
+	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];
 	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
 	size_t peer_count;
 	size_t link_count;
+	size_t group_prefix_count;
+	uint32_t representative_group;
+	uint32_t representative_node;
+	uint64_t takeover_ready_at;
+	bool representative_committed;
+	bool group_reconcile_pending;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
 	bool prefix_batch;
@@ -86,6 +95,8 @@ struct midrd {
 	uint64_t next_expire;
 	uint64_t stop_at;
 };
+
+static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms);
 
 static uint32_t peer_node_id(const struct midrd *daemon,
 			     const struct midr_transport_endpoint *peer)
@@ -388,8 +399,11 @@ static void drain_events(struct midrd *daemon,
 
 	while (midr_engine_event_next(daemon->engine, &object) == 0) {
 		flood_object(daemon, &object, except);
-		printf("node=%" PRIu32 " event state=%u seq=%" PRIu64 "\n",
-		       daemon->node_id, object.state, object.sequence);
+		printf("node=%" PRIu32 " event state=%u type=%u originator=%" PRIu32
+		       " group=%" PRIu32 " seq=%" PRIu64 "\n",
+		       daemon->node_id, object.state, object.identity.type,
+		       object.identity.originator, object.identity.group,
+		       object.sequence);
 	}
 	drain_consumer(daemon);
 }
@@ -437,7 +451,9 @@ static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
 		      int reason)
 {
 	struct midrd *daemon = arg;
+	struct midrd_snapshot_stage *stage = stage_for(daemon, peer, false);
 
+	stage_release(stage);
 	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
 	       daemon->node_id, peer->family, peer->port, reason);
 }
@@ -505,6 +521,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			drain_events(daemon, peer);
 			if (scope_changed)
 				reflood_scope(daemon, peer);
+			(void)reconcile_group_prefixes(daemon, mono_ms());
 		}
 		return 0;
 		}
@@ -558,6 +575,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 				drain_events(daemon, peer);
 				if (scope_changed)
 					reflood_scope(daemon, peer);
+				(void)reconcile_group_prefixes(daemon, mono_ms());
 			}
 			return ret;
 		}
@@ -615,6 +633,7 @@ static int local_provider_event(void *arg,
 		if (object.state == MIDR_CORE_ACTIVE)
 			set_local_identity(daemon, &object.identity);
 		drain_events(daemon, NULL);
+		(void)reconcile_group_prefixes(daemon, mono_ms());
 	}
 	return ret;
 }
@@ -638,8 +657,10 @@ static int prefix_event(void *arg, const struct midr_prefix_event *event)
 			return 0;
 		daemon->prefix_batch = false;
 		ret = midr_engine_end_batch(daemon->engine, mono_ms());
-		if (!ret)
+		if (!ret) {
 			drain_events(daemon, NULL);
+			(void)reconcile_group_prefixes(daemon, mono_ms());
+		}
 		return ret;
 	}
 	if (event->kind == MIDR_PREFIX_SNAPSHOT_END)
@@ -660,6 +681,10 @@ static int prefix_event(void *arg, const struct midr_prefix_event *event)
 	} else if (event->originator == daemon->node_id &&
 		   event->kind == MIDR_PREFIX_WITHDRAW) {
 		daemon->have_local_identity = false;
+	}
+	if (!daemon->prefix_batch) {
+		drain_events(daemon, NULL);
+		(void)reconcile_group_prefixes(daemon, mono_ms());
 	}
 	return 0;
 }
@@ -761,6 +786,151 @@ static int install_local_link(struct midrd *daemon,
 	return 0;
 }
 
+static bool identity_present(const struct midr_core_identity *identities,
+			     size_t count,
+			     const struct midr_core_identity *identity)
+{
+	for (size_t i = 0; i < count; i++)
+		if (midr_core_identity_equal(&identities[i], identity))
+			return true;
+	return false;
+}
+
+static int withdraw_group_prefixes(struct midrd *daemon)
+{
+	size_t index = 0;
+	bool changed = false;
+	int result = 0;
+
+	while (index < daemon->group_prefix_count) {
+		int ret = midr_owned_withdraw(daemon->owned,
+					      &daemon->group_prefixes[index]);
+
+		if (ret) {
+			if (!result)
+				result = ret;
+			index++;
+			continue;
+		}
+		daemon->group_prefixes[index] =
+			daemon->group_prefixes[--daemon->group_prefix_count];
+		changed = true;
+	}
+	if (changed)
+		drain_events(daemon, NULL);
+	return result;
+}
+
+static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms)
+{
+	struct midr_core_object *objects = NULL;
+	struct midr_core_identity *desired = NULL;
+	uint32_t group = 0, representative = 0;
+	size_t object_count = 0, desired_count = 0, index = 0;
+	bool changed = false;
+	int ret = 0, result = 0;
+
+	if (!daemon || daemon->prefix_batch)
+		return 0;
+	if (midr_engine_membership(daemon->engine, daemon->node_id, &group) ||
+	    midr_engine_representative(daemon->engine, group, &representative)) {
+		group = 0;
+		representative = 0;
+	}
+	if (group != daemon->representative_group ||
+	    representative != daemon->representative_node) {
+		result = withdraw_group_prefixes(daemon);
+		daemon->representative_group = group;
+		daemon->representative_node = representative;
+		daemon->representative_committed = false;
+		daemon->takeover_ready_at = representative == daemon->node_id
+			? now_ms + daemon->takeover_delay_ms : 0;
+	}
+	if (!group || representative != daemon->node_id) {
+		daemon->group_reconcile_pending = result != 0;
+		return result;
+	}
+	if (!daemon->representative_committed) {
+		if (now_ms < daemon->takeover_ready_at) {
+			daemon->group_reconcile_pending = false;
+			return result;
+		}
+		daemon->representative_committed = true;
+	}
+	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
+	desired = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*desired));
+	if (!objects || !desired) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	ret = midr_engine_snapshot(daemon->engine, now_ms, objects,
+				   MIDRD_MAX_SNAPSHOT, &object_count);
+	if (ret)
+		goto done;
+	for (size_t i = 0; i < object_count; i++) {
+		struct midr_core_identity identity = {0};
+		uint32_t owner_group;
+
+		if (objects[i].state != MIDR_CORE_ACTIVE ||
+		    objects[i].identity.type != MIDR_CORE_NODE_PREFIX ||
+		    midr_engine_membership(daemon->engine,
+					   objects[i].identity.originator,
+					   &owner_group) || owner_group != group)
+			continue;
+		identity.type = MIDR_CORE_GROUP_PREFIX;
+		identity.family = objects[i].identity.family;
+		identity.prefix_len = objects[i].identity.prefix_len;
+		identity.originator = daemon->node_id;
+		identity.group = group;
+		memcpy(identity.prefix, objects[i].identity.prefix,
+		       sizeof(identity.prefix));
+		if (!identity_present(desired, desired_count, &identity))
+			desired[desired_count++] = identity;
+	}
+	while (index < daemon->group_prefix_count) {
+		if (identity_present(desired, desired_count,
+				     &daemon->group_prefixes[index])) {
+			index++;
+			continue;
+		}
+		ret = midr_owned_withdraw(daemon->owned,
+					  &daemon->group_prefixes[index]);
+		if (ret) {
+			if (!result)
+				result = ret;
+			index++;
+			continue;
+		}
+		daemon->group_prefixes[index] =
+			daemon->group_prefixes[--daemon->group_prefix_count];
+		changed = true;
+	}
+	for (size_t i = 0; i < desired_count; i++) {
+		struct midr_core_object object = {0};
+
+		if (identity_present(daemon->group_prefixes,
+				     daemon->group_prefix_count, &desired[i]))
+			continue;
+		object.identity = desired[i];
+		object.state = MIDR_CORE_ACTIVE;
+		ret = midr_owned_upsert(daemon->owned, &object);
+		if (ret) {
+			if (!result)
+				result = ret;
+			continue;
+		}
+		daemon->group_prefixes[daemon->group_prefix_count++] = desired[i];
+		changed = true;
+	}
+done:
+	free(desired);
+	free(objects);
+	if (changed)
+		drain_events(daemon, NULL);
+	daemon->group_reconcile_pending = (ret ? ret : result) != 0;
+	return ret ? ret : result;
+}
+
 static void refresh_owned(struct midrd *daemon)
 {
 	struct midr_core_identity identity = {0};
@@ -780,6 +950,9 @@ static void refresh_owned(struct midrd *daemon)
 		identity.link_id = daemon->links[i].link_id;
 		(void)midr_owned_refresh(daemon->owned, &identity);
 	}
+	for (size_t i = 0; i < daemon->group_prefix_count; i++)
+		(void)midr_owned_refresh(daemon->owned,
+					 &daemon->group_prefixes[i]);
 	drain_events(daemon, NULL);
 }
 
@@ -803,10 +976,16 @@ static void periodic(struct midrd *daemon, uint64_t now)
 	if (now >= daemon->next_expire) {
 		size_t expired = 0;
 
-		if (midr_engine_expire(daemon->engine, now, &expired) == 0 && expired)
+		if (midr_engine_expire(daemon->engine, now, &expired) == 0 && expired) {
 			drain_events(daemon, NULL);
+			(void)reconcile_group_prefixes(daemon, now);
+		}
 		daemon->next_expire = now + 100U;
 	}
+	if (daemon->group_reconcile_pending ||
+	    (!daemon->representative_committed && daemon->takeover_ready_at &&
+	     now >= daemon->takeover_ready_at))
+		(void)reconcile_group_prefixes(daemon, now);
 }
 
 static void usage(const char *program)
@@ -816,7 +995,7 @@ static void usage(const char *program)
 		"[--group ID] [--prefix ADDRESS/LEN] [--link NODE:COST]... "
 		"[--prefix-socket PATH] "
 		"[--sequence-file PATH] [--lifetime MS] [--runtime SEC] "
-		"[--pidfile PATH]\n",
+		"[--takeover-delay MS] [--pidfile PATH]\n",
 		program);
 }
 
@@ -825,6 +1004,7 @@ int main(int argc, char **argv)
 	struct midrd daemon = {
 		.lifetime_ms = MIDRD_DEFAULT_LIFETIME,
 		.hello_ms = MIDRD_DEFAULT_HELLO,
+		.takeover_delay_ms = MIDRD_DEFAULT_TAKEOVER_DELAY,
 	};
 	struct midr_engine_config engine_config;
 	struct midr_owned_config owned_config;
@@ -874,6 +1054,9 @@ int main(int argc, char **argv)
 			daemon.sequence_file = argv[++opt];
 		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
 			daemon.lifetime_ms = (uint32_t)strtoul(argv[++opt], NULL, 10);
+		else if (!strcmp(argv[opt], "--takeover-delay") && opt + 1 < argc)
+			daemon.takeover_delay_ms =
+				(uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--runtime") && opt + 1 < argc)
 			runtime_sec = atoi(argv[++opt]);
 		else if (!strcmp(argv[opt], "--pidfile") && opt + 1 < argc)
@@ -945,6 +1128,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "invalid link\n");
 			return 2;
 		}
+	(void)reconcile_group_prefixes(&daemon, mono_ms());
 	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR)
 		return 1;
 	if (pidfile) {
