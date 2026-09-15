@@ -86,5 +86,7 @@ int midr_transport_disconnect(struct midr_transport *transport,
 int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_endpoint *peer,
 			const struct midr_transport_frame *frame);
+int midr_transport_poll(struct midr_transport *transport, int timeout_ms);
+size_t midr_transport_peer_count(const struct midr_transport *transport);
 
 #endif /* MIDRD_TRANSPORT_H */
