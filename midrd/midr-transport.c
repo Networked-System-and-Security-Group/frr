@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #define MIDR_TRANSPORT_MAX_PEERS 128U
 #define MIDR_TRANSPORT_MAX_PACKET 65535U

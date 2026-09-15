@@ -76,7 +76,7 @@ int midr_consumer_publish(struct midr_consumer *consumer,
 			  const struct midr_consumer_event *event)
 {
 	struct midr_consumer_event_node *node;
-	int ret;
+	int ret = 0;
 
 	if (!consumer || (ret = midr_consumer_event_validate(event)))
 		return ret ? ret : -EINVAL;
