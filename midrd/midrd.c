@@ -160,7 +160,7 @@ static int parse_endpoint(const char *text,
 					 sizeof(service)))
 		return -EINVAL;
 	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_socktype = SOCK_STREAM;
 	ret = getaddrinfo(!strcmp(host, "*") ? NULL : host, service,
 				  &hints, &result);
 	if (ret || !result)
@@ -352,8 +352,6 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	case MIDR_WIRE_HELLO:
 		if (frame->payload_len != 28U)
 			return -EINVAL;
-		(void)send_hello(daemon, peer);
-		send_snapshot(daemon, peer);
 		return 0;
 	case MIDR_WIRE_KEEPALIVE:
 		return 0;

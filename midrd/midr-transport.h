@@ -2,7 +2,8 @@
 /*
  * Native MIDR transport contract.  No BGP session or AFI/SAFI concepts belong
  * here: IPv4/IPv6 endpoints carry MIDR frames over the implementation's native
- * socket transport.
+ * TCP transport.  The TCP stream is only a byte-stream substrate; MIDR keeps
+ * its own frame, session and lifetime semantics.
  */
 #ifndef MIDRD_TRANSPORT_H
 #define MIDRD_TRANSPORT_H
