@@ -8,6 +8,7 @@
 struct midr_core_entry {
 	struct midr_core_object object;
 	uint64_t updated_ms;
+	uint64_t floor_until_ms;
 	bool floor;
 };
 
@@ -32,6 +33,60 @@ static uint8_t prefix_byte_mask(unsigned int bits)
 	if (bits >= 8)
 		return 0xffU;
 	return (uint8_t)(0xffU << (8U - bits));
+}
+
+static uint64_t saturating_add_ms(uint64_t value, uint32_t increment)
+{
+	if (value > UINT64_MAX - increment)
+		return UINT64_MAX;
+	return value + increment;
+}
+
+int midr_core_age(uint32_t received_ms, uint64_t received_ns,
+		  uint64_t now_ns, uint32_t budget_ms,
+		  uint32_t max_age_ms, uint32_t *age_ms)
+{
+	uint64_t elapsed_ns;
+	uint64_t elapsed_ms;
+
+	if (!age_ms || !max_age_ms)
+		return -EINVAL;
+	if (now_ns < received_ns)
+		return -ERANGE;
+	elapsed_ns = now_ns - received_ns;
+	elapsed_ms = elapsed_ns / 1000000U +
+		     (elapsed_ns % 1000000U != 0);
+	/* Compare before adding so a long pause cannot wrap to a fresh age. */
+	if (received_ms >= max_age_ms ||
+	    budget_ms >= max_age_ms - received_ms ||
+	    elapsed_ms >= (uint64_t)max_age_ms - received_ms - budget_ms)
+		*age_ms = max_age_ms;
+	else
+		*age_ms = received_ms + budget_ms + (uint32_t)elapsed_ms;
+	return 0;
+}
+
+int midr_core_lifetime_remaining(uint32_t received_remaining_ms,
+				 uint64_t received_ns, uint64_t now_ns,
+				 uint32_t budget_ms,
+				 uint32_t max_lifetime_ms,
+				 uint32_t *remaining_ms)
+{
+	uint32_t received_age;
+	uint32_t age;
+	int ret;
+
+	if (!remaining_ms || !max_lifetime_ms)
+		return -EINVAL;
+	if (received_remaining_ms > max_lifetime_ms)
+		received_remaining_ms = max_lifetime_ms;
+	received_age = max_lifetime_ms - received_remaining_ms;
+	ret = midr_core_age(received_age, received_ns, now_ns, budget_ms,
+			    max_lifetime_ms, &age);
+	if (ret)
+		return ret;
+	*remaining_ms = max_lifetime_ms - age;
+	return 0;
 }
 
 int midr_core_identity_normalize(const struct midr_core_identity *input,
@@ -305,6 +360,8 @@ int midr_core_upsert(struct midr_core *core,
 	}
 	entry->object = normalized;
 	entry->updated_ms = now_ms;
+	entry->floor_until_ms =
+		saturating_add_ms(now_ms, core->config.lifetime_ms);
 	entry->floor = false;
 	*result = MIDR_CORE_ACCEPTED;
 	return 0;
@@ -357,22 +414,32 @@ int midr_core_lookup(const struct midr_core *core,
 			     struct midr_core_object *object, uint32_t *remaining_ms)
 {
 	const struct midr_core_entry *entry;
-	uint64_t elapsed;
+	uint64_t elapsed_ms;
+	uint32_t age;
+	uint32_t remaining;
+	int ret;
 
 	if (!core || !key || !object)
 		return -EINVAL;
 	entry = find_entry_const(core, key);
 	if (!entry || entry->floor)
 		return -ENOENT;
-	*object = entry->object;
 	if (now_ms < entry->updated_ms)
 		return -ERANGE;
-	elapsed = now_ms - entry->updated_ms;
-	if (elapsed >= entry->object.lifetime_ms)
+	elapsed_ms = now_ms - entry->updated_ms;
+	if (elapsed_ms >= entry->object.lifetime_ms)
 		return -ENOENT;
+	ret = midr_core_age(0, 0, elapsed_ms * 1000000U, 0,
+			    entry->object.lifetime_ms, &age);
+	if (ret)
+		return ret;
+	if (age == entry->object.lifetime_ms)
+		return -ENOENT;
+	remaining = entry->object.lifetime_ms - age;
+	*object = entry->object;
 	if (remaining_ms)
-		*remaining_ms = entry->object.lifetime_ms - (uint32_t)elapsed;
-	object->lifetime_ms = entry->object.lifetime_ms - (uint32_t)elapsed;
+		*remaining_ms = remaining;
+	object->lifetime_ms = remaining;
 	return 0;
 }
 
@@ -411,13 +478,15 @@ int midr_core_expire(struct midr_core *core, uint64_t now_ms,
 
 	if (!core)
 		return -EINVAL;
+	/* Validate the clock before mutating any entry so rollback is atomic. */
+	for (size_t i = 0; i < core->count; i++)
+		if (!core->entries[i].floor && now_ms < core->entries[i].updated_ms)
+			return -ERANGE;
 	for (size_t i = 0; i < core->count; i++) {
 		struct midr_core_entry *entry = &core->entries[i];
 
 		if (entry->floor)
 			continue;
-		if (now_ms < entry->updated_ms)
-			return -ERANGE;
 		if (now_ms - entry->updated_ms < entry->object.lifetime_ms)
 			continue;
 		/* Expiry is a local usability transition, not an owner action.
@@ -434,6 +503,61 @@ int midr_core_expire(struct midr_core *core, uint64_t now_ms,
 	return 0;
 }
 
+static bool has_event_for(const struct midr_core *core,
+			  const struct midr_core_identity *identity)
+{
+	const struct midr_core_event *event;
+
+	for (event = core->events_head; event; event = event->next)
+		if (midr_core_identity_equal(&event->object.identity, identity))
+			return true;
+	return false;
+}
+
+int midr_core_gc_enable(struct midr_core *core, bool enabled)
+{
+	if (!core)
+		return -EINVAL;
+	core->config.gc_enabled = enabled;
+	return 0;
+}
+
+int midr_core_gc(struct midr_core *core, uint64_t now_ms, size_t limit,
+		 size_t *collected, midr_core_reclaim_cb reclaim,
+		 void *reclaim_arg)
+{
+	size_t done = 0;
+	size_t i = 0;
+
+	if (!core || !limit)
+		return -EINVAL;
+	if (!core->config.gc_enabled) {
+		if (collected)
+			*collected = 0;
+		return 0;
+	}
+	while (i < core->count && done < limit) {
+		struct midr_core_entry *entry = &core->entries[i];
+
+		if (!entry->floor || now_ms < entry->floor_until_ms ||
+		    has_event_for(core, &entry->object.identity) ||
+		    (reclaim && !reclaim(&entry->object.identity, reclaim_arg))) {
+			i++;
+			continue;
+		}
+		if (i + 1 < core->count)
+			memmove(entry, entry + 1,
+				(core->count - i - 1) * sizeof(*entry));
+		core->count--;
+		memset(&core->entries[core->count], 0,
+		       sizeof(core->entries[core->count]));
+		done++;
+	}
+	if (collected)
+		*collected = done;
+	return 0;
+}
+
 size_t midr_core_count(const struct midr_core *core)
 {
 	size_t count = 0;
@@ -444,6 +568,11 @@ size_t midr_core_count(const struct midr_core *core)
 		if (!core->entries[i].floor)
 			count++;
 	return count;
+}
+
+size_t midr_core_identity_count(const struct midr_core *core)
+{
+	return core ? core->count : 0;
 }
 
 int midr_core_event_next(struct midr_core *core,

@@ -8,6 +8,18 @@
 
 static struct midr_core *core;
 
+static bool reclaim_allowed;
+
+static bool reclaim_floor(const struct midr_core_identity *identity, void *arg)
+{
+	struct midr_core_identity *seen = arg;
+
+	assert(identity);
+	if (seen)
+		*seen = *identity;
+	return reclaim_allowed;
+}
+
 static struct midr_core_identity node_key(uint8_t family)
 {
 	struct midr_core_identity key = {
@@ -81,6 +93,104 @@ static void test_versions_and_conflict(void)
 	assert(midr_core_upsert(core, &object, 104, &result) == 0);
 	assert(result == MIDR_CORE_ACCEPTED);
 	drain_one(2, MIDR_CORE_ACTIVE);
+}
+
+static void test_age_arithmetic(void)
+{
+	uint32_t value;
+
+	assert(midr_core_age(10, 50, 50, 0, 1000, &value) == 0 &&
+	       value == 10);
+	assert(midr_core_age(10, 50, 51, 3, 1000, &value) == 0 &&
+	       value == 14);
+	assert(midr_core_age(10, 0, 1000000, 0, 1000, &value) == 0 &&
+	       value == 11);
+	assert(midr_core_age(999, 0, 1, 0, 1000, &value) == 0 &&
+	       value == 1000);
+	assert(midr_core_age(0, 0, UINT64_MAX, 0, UINT32_MAX, &value) == 0 &&
+	       value == UINT32_MAX);
+	assert(midr_core_age(UINT32_MAX, 0, 0, UINT32_MAX, 1000,
+			     &value) == 0 && value == 1000);
+	assert(midr_core_age(0, 2, 1, 0, 1000, &value) == -ERANGE);
+	assert(midr_core_age(0, 0, 0, 0, 0, &value) == -EINVAL);
+	assert(midr_core_lifetime_remaining(990, 50, 51, 3, 1000,
+					    &value) == 0 && value == 986);
+	assert(midr_core_lifetime_remaining(999, 0, 1, 0, 1000,
+					    &value) == 0 && value == 998);
+	assert(midr_core_lifetime_remaining(1000, 0, UINT64_MAX, 0, 1000,
+					    &value) == 0 && value == 0);
+}
+
+static void test_floor_retention_and_gc(void)
+{
+	const struct midr_core_config config = {
+		.max_objects = 1,
+		.lifetime_ms = 1000,
+	};
+	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
+	struct midr_core_identity seen = {0};
+	struct midr_core_object object = active(&key, 1);
+	struct midr_core *store = NULL;
+	enum midr_core_result result;
+	size_t count;
+
+	object.lifetime_ms = 10;
+	assert(midr_core_create(&config, &store) == 0);
+	assert(midr_core_upsert(store, &object, 100, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_core_expire(store, 110, &count) == 0 && count == 1);
+	assert(midr_core_count(store) == 0);
+	assert(midr_core_identity_count(store) == 1);
+	/* GC is disabled by default and the queued acceptance event is also a
+	 * reference to this identity.  Neither condition may be bypassed. */
+	assert(midr_core_gc(store, 1100, 1, &count, reclaim_floor, &seen) == 0 &&
+	       count == 0);
+	assert(midr_core_gc_enable(store, true) == 0);
+	assert(midr_core_gc(store, 1100, 1, &count, reclaim_floor, &seen) == 0 &&
+	       count == 0);
+	assert(midr_core_event_next(store, &object) == 0);
+	assert(midr_core_gc(store, 1099, 1, &count, reclaim_floor, &seen) == 0 &&
+	       count == 0);
+	reclaim_allowed = false;
+	assert(midr_core_gc(store, 1100, 1, &count, reclaim_floor, &seen) == 0 &&
+	       count == 0);
+	reclaim_allowed = true;
+	assert(midr_core_gc(store, 1100, 1, &count, reclaim_floor, &seen) == 0 &&
+	       count == 1);
+	assert(midr_core_identity_equal(&seen, &key));
+	assert(midr_core_identity_count(store) == 0);
+	midr_core_destroy(&store);
+}
+
+static void test_newer_version_replaces_floor(void)
+{
+	const struct midr_core_config config = {
+		.max_objects = 1,
+		.lifetime_ms = 1000,
+	};
+	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
+	struct midr_core_object object = active(&key, 1);
+	struct midr_core_object current;
+	struct midr_core *store = NULL;
+	enum midr_core_result result;
+	size_t count;
+
+	object.lifetime_ms = 10;
+	assert(midr_core_create(&config, &store) == 0);
+	assert(midr_core_upsert(store, &object, 100, &result) == 0);
+	assert(midr_core_event_next(store, &current) == 0);
+	assert(midr_core_expire(store, 110, &count) == 0 && count == 1);
+	assert(midr_core_upsert(store, &object, 111, &result) == 0);
+	assert(result == MIDR_CORE_DUPLICATE);
+	object.sequence = 2;
+	object.lifetime_ms = 1000;
+	assert(midr_core_upsert(store, &object, 111, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_core_lookup(store, &key, 111, &current, NULL) == 0);
+	assert(current.sequence == 2);
+	assert(midr_core_count(store) == 1);
+	assert(midr_core_identity_count(store) == 1);
+	midr_core_destroy(&store);
 }
 
 static void test_ipv6_and_normalization(void)
@@ -185,6 +295,7 @@ int main(void)
 	};
 
 	assert(midr_core_create(&config, &core) == 0);
+	test_age_arithmetic();
 	test_versions_and_conflict();
 	test_ipv6_and_normalization();
 	test_refresh_withdraw_expire();
@@ -193,6 +304,8 @@ int main(void)
 	test_membership_group_is_payload();
 	test_link_cost_validation();
 	midr_core_destroy(&core);
+	test_floor_retention_and_gc();
+	test_newer_version_replaces_floor();
 	puts("midr-core-test: PASS");
 	return 0;
 }

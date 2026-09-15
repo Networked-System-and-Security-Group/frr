@@ -83,9 +83,14 @@ struct midr_core_object {
 struct midr_core_config {
 	size_t max_objects;
 	uint32_t lifetime_ms;
+	/* Floor reclamation is disabled unless explicitly enabled. */
+	bool gc_enabled;
 };
 
 struct midr_core;
+
+typedef bool (*midr_core_reclaim_cb)(
+	const struct midr_core_identity *identity, void *arg);
 
 int midr_core_identity_normalize(const struct midr_core_identity *input,
 				 struct midr_core_identity *output);
@@ -94,6 +99,21 @@ bool midr_core_identity_equal(const struct midr_core_identity *a,
 			      const struct midr_core_identity *b);
 bool midr_core_object_semantic_equal(const struct midr_core_object *a,
 				     const struct midr_core_object *b);
+
+/*
+ * Add elapsed monotonic time and a forwarding budget to an encoded age.
+ * Sub-millisecond elapsed time is rounded up and the result saturates at
+ * max_age_ms.  A monotonic clock rollback is reported as -ERANGE.
+ */
+int midr_core_age(uint32_t received_ms, uint64_t received_ns,
+		  uint64_t now_ns, uint32_t budget_ms,
+		  uint32_t max_age_ms, uint32_t *age_ms);
+/* Convert an encoded remaining lifetime using the same age arithmetic. */
+int midr_core_lifetime_remaining(uint32_t received_remaining_ms,
+				 uint64_t received_ns, uint64_t now_ns,
+				 uint32_t budget_ms,
+				 uint32_t max_lifetime_ms,
+				 uint32_t *remaining_ms);
 
 int midr_core_create(const struct midr_core_config *config,
 			     struct midr_core **out);
@@ -125,7 +145,12 @@ int midr_core_snapshot(struct midr_core *core, uint64_t now_ms,
 		       size_t *count);
 int midr_core_expire(struct midr_core *core, uint64_t now_ms,
 		     size_t *expired);
+int midr_core_gc_enable(struct midr_core *core, bool enabled);
+int midr_core_gc(struct midr_core *core, uint64_t now_ms, size_t limit,
+		 size_t *collected, midr_core_reclaim_cb reclaim,
+		 void *reclaim_arg);
 size_t midr_core_count(const struct midr_core *core);
+size_t midr_core_identity_count(const struct midr_core *core);
 int midr_core_event_next(struct midr_core *core,
 			 struct midr_core_object *object);
 
