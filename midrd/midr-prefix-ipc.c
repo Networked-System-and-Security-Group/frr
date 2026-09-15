@@ -25,6 +25,7 @@ struct midr_prefix_ipc {
 	int fd;
 	char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	midr_prefix_ipc_event_cb on_event;
+	midr_prefix_ipc_disconnect_cb on_disconnect;
 	void *arg;
 	uint8_t rx[MIDR_PREFIX_IPC_RX_CAP];
 	size_t rx_len;
@@ -115,10 +116,14 @@ static int set_nonblocking(int fd)
 
 static void close_client(struct midr_prefix_ipc *ipc)
 {
+	bool was_open = ipc->fd >= 0;
+
 	if (ipc->fd >= 0)
 		close(ipc->fd);
 	ipc->fd = -1;
 	ipc->rx_len = 0;
+	if (was_open && ipc->on_disconnect)
+		ipc->on_disconnect(ipc->arg, 0);
 }
 
 int midr_prefix_ipc_server_create(const struct midr_prefix_ipc_config *config,
@@ -137,6 +142,7 @@ int midr_prefix_ipc_server_create(const struct midr_prefix_ipc_config *config,
 	ipc->fd = -1;
 	strcpy(ipc->path, config->path);
 	ipc->on_event = config->on_event;
+	ipc->on_disconnect = config->on_disconnect;
 	ipc->arg = config->arg;
 	*out = ipc;
 	return 0;

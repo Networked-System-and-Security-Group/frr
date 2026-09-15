@@ -481,6 +481,17 @@ static int prefix_ipc_event(void *arg, const struct midr_prefix_event *event)
 	return prefix_event(arg, event);
 }
 
+static void prefix_ipc_disconnect(void *arg, int reason)
+{
+	struct midrd *daemon = arg;
+
+	(void)reason;
+	if (daemon->prefix_batch) {
+		(void)midr_engine_abort_batch(daemon->engine);
+		daemon->prefix_batch = false;
+	}
+}
+
 static int install_local_prefix(struct midrd *daemon, const char *text)
 {
 	char copy[128], *slash, *end;
@@ -634,6 +645,7 @@ int main(int argc, char **argv)
 		struct midr_prefix_ipc_config ipc_config = {
 			.path = prefix_socket,
 			.on_event = prefix_ipc_event,
+			.on_disconnect = prefix_ipc_disconnect,
 			.arg = &daemon,
 		};
 

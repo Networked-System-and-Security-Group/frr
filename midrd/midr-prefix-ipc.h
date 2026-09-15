@@ -11,10 +11,12 @@
 
 typedef int (*midr_prefix_ipc_event_cb)(
 	void *arg, const struct midr_prefix_event *event);
+typedef void (*midr_prefix_ipc_disconnect_cb)(void *arg, int reason);
 
 struct midr_prefix_ipc_config {
 	const char *path;
 	midr_prefix_ipc_event_cb on_event;
+	midr_prefix_ipc_disconnect_cb on_disconnect;
 	void *arg;
 };
 

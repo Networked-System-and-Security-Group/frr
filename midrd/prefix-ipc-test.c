@@ -8,6 +8,7 @@
 struct event_log {
 	struct midr_prefix_event events[8];
 	size_t count;
+	size_t disconnects;
 };
 
 static int record_event(void *arg, const struct midr_prefix_event *event)
@@ -17,6 +18,14 @@ static int record_event(void *arg, const struct midr_prefix_event *event)
 	assert(log->count < 8);
 	log->events[log->count++] = *event;
 	return 0;
+}
+
+static void disconnected(void *arg, int reason)
+{
+	struct event_log *log = arg;
+
+	(void)reason;
+	log->disconnects++;
 }
 
 static void pump(struct midr_prefix_ipc *server)
@@ -32,6 +41,7 @@ int main(void)
 	struct midr_prefix_ipc_config config = {
 		.path = path,
 		.on_event = record_event,
+		.on_disconnect = disconnected,
 		.arg = &log,
 	};
 	struct midr_prefix_ipc *server = NULL;
@@ -72,6 +82,8 @@ int main(void)
 	assert(log.count == 4 && log.events[1].prefix.family == MIDR_CORE_AF_IPV6);
 	assert(log.events[3].kind == MIDR_PREFIX_EOR);
 	midr_prefix_ipc_client_destroy(&client);
+	pump(server);
+	assert(log.disconnects == 1);
 	assert(midr_prefix_ipc_client_connect(path, &client) == 0);
 	assert(midr_prefix_ipc_client_send(client, &upsert) == 0);
 	pump(server);

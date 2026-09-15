@@ -23,6 +23,7 @@ int midr_engine_attach_consumer(struct midr_engine *engine,
 				struct midr_consumer *consumer);
 int midr_engine_begin_batch(struct midr_engine *engine);
 int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms);
+int midr_engine_abort_batch(struct midr_engine *engine);
 int midr_engine_apply(struct midr_engine *engine,
 			      const struct midr_core_object *object, uint64_t now_ms,
 			      enum midr_core_result *result);

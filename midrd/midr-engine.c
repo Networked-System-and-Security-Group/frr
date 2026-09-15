@@ -175,6 +175,15 @@ int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
 	return 0;
 }
 
+int midr_engine_abort_batch(struct midr_engine *engine)
+{
+	if (!engine)
+		return -EINVAL;
+	engine->batch_depth = 0;
+	engine->batch_dirty = false;
+	return 0;
+}
+
 int midr_engine_refresh(struct midr_engine *engine,
 			       const struct midr_core_identity *identity,
 			       uint64_t now_ms)
