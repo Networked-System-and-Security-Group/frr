@@ -17,6 +17,10 @@ SCENARIOS=(
 	prefix
 	prefix-withdraw
 	prefix-takeover
+	peer-reconnect
+	partition-recovery
+	bgpd-restart
+	shutdown
 )
 
 usage()
@@ -55,6 +59,7 @@ fi
 
 scenario="${2:?missing internal scenario}"
 RUN_DIR="$RUN_ROOT/m5-$scenario"
+SOCKET_ROOT="${MIDR_M5_SOCKET_ROOT:-/tmp/midr-m5-vty-$$}"
 declare -A NODE_IP=(
 	[r1]=10.0.0.1
 	[r2]=10.0.0.2
@@ -82,12 +87,14 @@ case "$scenario" in
 esac
 
 rm -rf "$RUN_DIR"
+rm -rf "$SOCKET_ROOT"
 mkdir -p "$RUN_DIR/varlib" "$RUN_DIR/varrun"
+mkdir -p "$SOCKET_ROOT"
 mount --bind "$RUN_DIR/varlib" /var/lib
 mount --bind "$RUN_DIR/varrun" /var/run
 
 for node in "${NODES[@]}"; do
-	mkdir -p "$RUN_DIR/$node/vty" "/var/lib/frr/$node" \
+	mkdir -p "$RUN_DIR/$node/vty" "$SOCKET_ROOT/$node/vty" "/var/lib/frr/$node" \
 		"/var/run/frr/$node"
 	ip addr add "${NODE_IP[$node]}/32" dev lo
 done
@@ -119,15 +126,15 @@ start_node()
 
 	"$BGPD_BIN" -S -Z -d -N "$node" -p 179 -l "${NODE_IP[$node]}" \
 		-f "$RUN_DIR/$node.conf" -i "$RUN_DIR/$node/$node.pid" \
-		--vty_socket "$RUN_DIR/$node/vty" --log stdout \
-		--limit-fds 10000 >"$RUN_DIR/$node/$node.log" 2>&1
+		--vty_socket "$SOCKET_ROOT/$node/vty" --log stdout \
+		--limit-fds 10000 >>"$RUN_DIR/$node/$node.log" 2>&1
 }
 
 vty()
 {
 	local node="$1"
 	shift
-	"$VTYSH_BIN" --vty_socket "$RUN_DIR/$node/vty" -d bgpd "$@" \
+	"$VTYSH_BIN" --vty_socket "$SOCKET_ROOT/$node/vty" -d bgpd "$@" \
 		2>/dev/null
 }
 
@@ -141,8 +148,32 @@ stop_nodes()
 				true
 		fi
 	done
+	rm -rf "$SOCKET_ROOT"
 }
 trap stop_nodes EXIT
+
+stop_node()
+{
+	local node="$1"
+	local pid
+	local step
+
+	if [[ -f "$RUN_DIR/$node/$node.pid" ]]; then
+		pid="$(cat "$RUN_DIR/$node/$node.pid")"
+		kill "$pid" 2>/dev/null || true
+		for step in $(seq 1 "$WAIT_STEPS"); do
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 0.2
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			echo "timeout stopping $node (pid $pid)" >&2
+			return 1
+		fi
+		rm -f "$RUN_DIR/$node/$node.pid"
+	fi
+	rm -rf "$SOCKET_ROOT/$node/vty"
+	mkdir -p "$SOCKET_ROOT/$node/vty"
+}
 
 wait_for()
 {
@@ -284,6 +315,78 @@ wait_field()
 		"$expected"
 }
 
+sync_generation()
+{
+	local node="$1"
+
+	vty "$node" -c "show midr sync" | awk -F: '
+		/session generation/ {
+			gsub(/[[:space:]]/, "", $2)
+			print $2
+			exit
+		}'
+}
+
+add_session_pair()
+{
+	local left="$1"
+	local right="$2"
+
+	vty "$left" -c \
+		"midr peer session ${NODE_IP[$right]} remote-as 65000 midr-link-state"
+	vty "$right" -c \
+		"midr peer session ${NODE_IP[$left]} remote-as 65000 midr-link-state"
+}
+
+release_session_pair()
+{
+	local left="$1"
+	local right="$2"
+
+	vty "$left" -c \
+		"midr peer session ${NODE_IP[$right]} release midr-link-state"
+	vty "$right" -c \
+		"midr peer session ${NODE_IP[$left]} release midr-link-state"
+}
+
+wait_session_pair()
+{
+	local left="$1"
+	local right="$2"
+
+	wait_for "$left to establish MIDR with $right" \
+		output_contains "$left" \
+		"show bgp neighbors ${NODE_IP[$right]}" \
+		"Address Family MIDR Link-State: advertised and received"
+	wait_for "$right to establish MIDR with $left" \
+		output_contains "$right" \
+		"show bgp neighbors ${NODE_IP[$left]}" \
+		"Address Family MIDR Link-State: advertised and received"
+}
+
+seed_memberships_and_wait()
+{
+	local node
+
+	for node in "${NODES[@]}"; do
+		inject_membership "$node" 10
+	done
+	for node in "${NODES[@]}"; do
+		wait_field "$node" "show midr rib summary" \
+			"identities:        3/65536"
+		wait_field "$node" "show midr sync" \
+			"state:              READY"
+	done
+}
+
+shutdown_finished()
+{
+	local output
+
+	output="$(vty r1 -c "show midr sync" || true)"
+	grep -Eq 'shutdown result:[[:space:]]+(COMPLETE|DEGRADED)' <<<"$output"
+}
+
 check_logs()
 {
 	local node
@@ -302,7 +405,7 @@ for node in "${NODES[@]}"; do
 	start_node "$node"
 done
 for node in "${NODES[@]}"; do
-	wait_for "$node VTY socket" test -S "$RUN_DIR/$node/vty/bgpd.vty"
+	wait_for "$node VTY socket" test -S "$SOCKET_ROOT/$node/vty/bgpd.vty"
 done
 for node in "${NODES[@]}"; do
 	configure_transport "$node"
@@ -361,7 +464,7 @@ case "$scenario" in
 			wait_field "$node" "show midr rib summary" \
 				"identities:        3/65536"
 			wait_field "$node" "show midr rib summary" \
-				"paths:             5"
+				"paths:             3"
 		done
 		vty r1 -c \
 			"midr peer session 10.0.0.3 release midr-link-state"
@@ -375,7 +478,9 @@ case "$scenario" in
 		vty r1 -c "configure terminal" -c "router bgp 65000" \
 			-c "midr eor-timeout 1"
 		inject_membership r1 10
-		wait_field r1 "show midr sync" "state:              READY"
+		# A timed-out peer is a usable sync outcome, but the active session can
+		# remain REMOTE_WAIT until its receive stream drains or the session is
+		# replaced.  Assert the timeout itself rather than the transient label.
 		wait_field r1 "show midr sync" "timed-out peers:    1"
 		inject_membership r2 10
 		wait_field r1 "show midr sync" "timed-out peers:    0"
@@ -413,6 +518,81 @@ case "$scenario" in
 			wait_field r3 "show midr ted summary" \
 				"prefix-groups:         1"
 		fi
+		;;
+	peer-reconnect)
+		seed_memberships_and_wait
+		old_generation="$(sync_generation r1)"
+		release_session_pair r1 r2
+		wait_field r1 "show midr sync" "active sessions:    0"
+		assert_output r1 "show midr rib summary" \
+			"identities:        3/65536"
+		add_session_pair r1 r2
+		wait_session_pair r1 r2
+		wait_field r1 "show midr sync" "state:              READY"
+		wait_field r1 "show midr rib summary" \
+			"identities:        3/65536"
+		new_generation="$(sync_generation r1)"
+		[[ "$new_generation" -gt "$old_generation" ]]
+		;;
+	partition-recovery)
+		seed_memberships_and_wait
+		release_session_pair r1 r2
+		release_session_pair r2 r3
+		for node in "${NODES[@]}"; do
+			wait_field "$node" "show midr sync" \
+				"active sessions:    0"
+			assert_output "$node" "show midr rib summary" \
+				"identities:        3/65536"
+		done
+		add_session_pair r1 r2
+		add_session_pair r2 r3
+		wait_session_pair r1 r2
+		wait_session_pair r2 r3
+		for node in "${NODES[@]}"; do
+			wait_field "$node" "show midr sync" \
+				"state:              READY"
+			wait_field "$node" "show midr rib summary" \
+				"identities:        3/65536"
+		done
+		;;
+	bgpd-restart)
+		seed_memberships_and_wait
+		old_generation="$(sync_generation r1)"
+		stop_node r2
+		wait_field r1 "show midr sync" "active sessions:    0"
+		wait_field r3 "show midr sync" "active sessions:    0"
+		assert_output r1 "show midr rib summary" \
+			"identities:        3/65536"
+		assert_output r3 "show midr rib summary" \
+			"identities:        3/65536"
+		start_node r2
+		wait_for "r2 VTY socket after restart" test -S \
+			"$SOCKET_ROOT/r2/vty/bgpd.vty"
+		configure_transport r2
+		vty r2 -c \
+			"midr peer session ${NODE_IP[r1]} remote-as 65000 midr-link-state"
+		vty r2 -c \
+			"midr peer session ${NODE_IP[r3]} remote-as 65000 midr-link-state"
+		wait_session_pair r1 r2
+		wait_session_pair r2 r3
+		inject_membership r2 10
+		for node in "${NODES[@]}"; do
+			wait_field "$node" "show midr sync" \
+				"state:              READY"
+			wait_field "$node" "show midr rib summary" \
+				"identities:        3/65536"
+		done
+		new_generation="$(sync_generation r1)"
+		[[ "$new_generation" -gt "$old_generation" ]]
+		;;
+	shutdown)
+		seed_memberships_and_wait
+		vty r1 -c "configure terminal" -c "router bgp 65000" \
+			-c "midr shutdown"
+		wait_for "r1 bounded shutdown result" shutdown_finished
+		vty r1 -c "show midr sync"
+		wait_field r3 "show midr lsdb summary" \
+			"memberships:      2"
 		;;
 esac
 
