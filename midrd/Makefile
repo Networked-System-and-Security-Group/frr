@@ -7,7 +7,7 @@ BUILD_DIR ?= build
 
 CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
-	$(BUILD_DIR)/midr-prefix-provider.o
+	$(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-engine.o
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
@@ -31,6 +31,9 @@ $(BUILD_DIR)/midr-transport.o: midr-transport.c midr-transport.h midr-wire.h | $
 
 $(BUILD_DIR)/midr-consumer.o: midr-consumer.c midr-consumer.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-consumer.c -o $@
+
+$(BUILD_DIR)/midr-engine.o: midr-engine.c midr-engine.h midr-core.h midr-consumer.h midr-prefix-provider.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-engine.c -o $@
 
 $(BUILD_DIR)/midrd-core-test.o: core-test.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c core-test.c -o $@
@@ -62,7 +65,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-core.h midr-transport.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-engine.h midr-core.h midr-prefix-provider.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)

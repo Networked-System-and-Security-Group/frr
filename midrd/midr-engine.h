@@ -4,9 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "midrd/midr-consumer.h"
-#include "midrd/midr-core.h"
-#include "midrd/midr-prefix-provider.h"
+#include "midr-consumer.h"
+#include "midr-core.h"
+#include "midr-prefix-provider.h"
 
 struct midr_engine;
 

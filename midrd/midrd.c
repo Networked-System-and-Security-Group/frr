@@ -1,63 +1,51 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
-/*
- * R7-MVP standalone MIDR daemon.
- *
- * This intentionally small runner uses native UDP (one address family per
- * process), the protocol-neutral core, and a local static Prefix provider.
- * It is a development executable for the IPv4/IPv6 containerlab smoke; BGP,
- * TCP/179 and FRR headers are not dependencies.
- */
-#include "midr-core.h"
+
+#include "midr-engine.h"
 #include "midr-prefix-provider.h"
 #include "midr-transport.h"
+#include "midr-wire.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <netdb.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MIDRD_MAGIC 0x4d494452U
-#define MIDRD_VERSION 1U
 #define MIDRD_MAX_PEERS 32U
 #define MIDRD_MAX_SNAPSHOT 4096U
-#define MIDRD_MAX_FRAME 2048U
+#define MIDRD_MAX_FRAME 4096U
 #define MIDRD_DEFAULT_LIFETIME 6000U
 #define MIDRD_DEFAULT_HELLO 1000U
 
-struct midrd_peer {
+struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
-	struct sockaddr_storage sockaddr;
-	socklen_t sockaddr_len;
-	bool active;
 };
 
 struct midrd {
-	int fd;
 	uint32_t node_id;
 	uint32_t lifetime_ms;
 	uint32_t hello_ms;
 	uint64_t frame_sequence;
-	struct midr_core *core;
+	struct midr_engine *engine;
+	struct midr_consumer *consumer;
+	struct midr_prefix_provider *prefix_provider;
+	struct midr_transport *transport;
+	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
+	size_t peer_count;
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
-	struct midrd_peer peers[MIDRD_MAX_PEERS];
-	size_t peer_count;
 	uint64_t next_hello;
 	uint64_t next_keepalive;
 	uint64_t next_refresh;
 	uint64_t next_expire;
 	uint64_t stop_at;
-	struct midr_prefix_provider *prefix_provider;
 };
 
 static uint64_t mono_ms(void)
@@ -66,54 +54,8 @@ static uint64_t mono_ms(void)
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0;
-	return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
-}
-
-static uint64_t htonll_u64(uint64_t value)
-{
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-	return ((uint64_t)htonl((uint32_t)value) << 32) |
-	       htonl((uint32_t)(value >> 32));
-#else
-	return value;
-#endif
-}
-
-static uint64_t ntohll_u64(uint64_t value)
-{
-	return htonll_u64(value);
-}
-
-static void put_u16(uint8_t *p, uint16_t value)
-{
-	uint16_t n = htons(value);
-	memcpy(p, &n, sizeof(n));
-}
-
-static void put_u32(uint8_t *p, uint32_t value)
-{
-	uint32_t n = htonl(value);
-	memcpy(p, &n, sizeof(n));
-}
-
-static void put_u64(uint8_t *p, uint64_t value)
-{
-	uint64_t n = htonll_u64(value);
-	memcpy(p, &n, sizeof(n));
-}
-
-static uint32_t get_u32(const uint8_t *p)
-{
-	uint32_t n;
-	memcpy(&n, p, sizeof(n));
-	return ntohl(n);
-}
-
-static uint64_t get_u64(const uint8_t *p)
-{
-	uint64_t n;
-	memcpy(&n, p, sizeof(n));
-	return ntohll_u64(n);
+	return (uint64_t)ts.tv_sec * 1000U +
+	       (uint64_t)ts.tv_nsec / 1000000U;
 }
 
 static int split_endpoint(const char *text, char *host, size_t host_len,
@@ -126,6 +68,7 @@ static int split_endpoint(const char *text, char *host, size_t host_len,
 		return -EINVAL;
 	if (text[0] == '[') {
 		const char *end = strchr(text, ']');
+
 		if (!end || end[1] != ':')
 			return -EINVAL;
 		len = (size_t)(end - text - 1);
@@ -133,8 +76,9 @@ static int split_endpoint(const char *text, char *host, size_t host_len,
 			return -EINVAL;
 		memcpy(host, text + 1, len);
 		host[len] = '\0';
-		snprintf(service, service_len, "%s", end + 2);
-		return service[0] ? 0 : -EINVAL;
+		if (snprintf(service, service_len, "%s", end + 2) < 1)
+			return -EINVAL;
+		return 0;
 	}
 	colon = strrchr(text, ':');
 	if (!colon || strchr(text, ':') != colon)
@@ -144,26 +88,25 @@ static int split_endpoint(const char *text, char *host, size_t host_len,
 		return -EINVAL;
 	memcpy(host, text, len);
 	host[len] = '\0';
-	snprintf(service, service_len, "%s", colon + 1);
-	return service[0] ? 0 : -EINVAL;
+	if (snprintf(service, service_len, "%s", colon + 1) < 1)
+		return -EINVAL;
+	return 0;
 }
 
-static int parse_endpoint(const char *text, struct midr_transport_endpoint *endpoint,
-			  struct sockaddr_storage *sockaddr, socklen_t *sockaddr_len,
-			  bool passive)
+static int parse_endpoint(const char *text,
+			  struct midr_transport_endpoint *endpoint)
 {
-	char host[128];
-	char service[32];
+	char host[128], service[32];
 	struct addrinfo hints = {0}, *result = NULL;
 	int ret;
 
-	if (split_endpoint(text, host, sizeof(host), service, sizeof(service)))
+	if (!endpoint || split_endpoint(text, host, sizeof(host), service,
+					 sizeof(service)))
 		return -EINVAL;
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_flags = passive ? AI_PASSIVE : 0;
-	ret = getaddrinfo(strcmp(host, "*") == 0 ? NULL : host, service,
-			  &hints, &result);
+	ret = getaddrinfo(!strcmp(host, "*") ? NULL : host, service,
+				  &hints, &result);
 	if (ret || !result)
 		return -EINVAL;
 	if (result->ai_family != AF_INET && result->ai_family != AF_INET6) {
@@ -171,173 +114,103 @@ static int parse_endpoint(const char *text, struct midr_transport_endpoint *endp
 		return -EAFNOSUPPORT;
 	}
 	memset(endpoint, 0, sizeof(*endpoint));
-	endpoint->family = result->ai_family == AF_INET ? MIDR_CORE_AF_IPV4
-						       : MIDR_CORE_AF_IPV6;
-	endpoint->port = ntohs(result->ai_family == AF_INET
-				       ? ((struct sockaddr_in *)result->ai_addr)->sin_port
-				       : ((struct sockaddr_in6 *)result->ai_addr)
-						 ->sin6_port);
-	if (result->ai_family == AF_INET)
-		memcpy(endpoint->address,
-		       &((struct sockaddr_in *)result->ai_addr)->sin_addr, 4);
-	else {
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)result->ai_addr;
-		memcpy(endpoint->address, &sin6->sin6_addr, 16);
+	endpoint->family = result->ai_family == AF_INET ?
+		MIDR_TRANSPORT_AF_IPV4 : MIDR_TRANSPORT_AF_IPV6;
+	if (result->ai_family == AF_INET) {
+		const struct sockaddr_in *sin =
+			(const struct sockaddr_in *)result->ai_addr;
+
+		endpoint->port = ntohs(sin->sin_port);
+		memcpy(endpoint->address, &sin->sin_addr, 4);
+	} else {
+		const struct sockaddr_in6 *sin6 =
+			(const struct sockaddr_in6 *)result->ai_addr;
+
+		endpoint->port = ntohs(sin6->sin6_port);
 		endpoint->scope_id = sin6->sin6_scope_id;
+		memcpy(endpoint->address, &sin6->sin6_addr, 16);
 	}
-	memcpy(sockaddr, result->ai_addr, result->ai_addrlen);
-	*sockaddr_len = (socklen_t)result->ai_addrlen;
 	freeaddrinfo(result);
 	return 0;
 }
 
-static bool endpoint_equal(const struct midr_transport_endpoint *a,
-			   const struct midr_transport_endpoint *b)
-{
-	return a->family == b->family && a->port == b->port &&
-	       a->scope_id == b->scope_id &&
-	       !memcmp(a->address, b->address, sizeof(a->address));
-}
-
-static struct midrd_peer *find_peer(struct midrd *daemon,
-				     const struct midr_transport_endpoint *endpoint)
-{
-	for (size_t i = 0; i < daemon->peer_count; i++)
-		if (daemon->peers[i].active &&
-		    endpoint_equal(&daemon->peers[i].endpoint, endpoint))
-			return &daemon->peers[i];
-	return NULL;
-}
-
-static struct midrd_peer *add_peer(struct midrd *daemon,
-				   const struct midr_transport_endpoint *endpoint,
-				   const struct sockaddr_storage *sockaddr,
-				   socklen_t sockaddr_len)
-{
-	struct midrd_peer *peer = find_peer(daemon, endpoint);
-
-	if (peer)
-		return peer;
-	if (daemon->peer_count == MIDRD_MAX_PEERS)
-		return NULL;
-	peer = &daemon->peers[daemon->peer_count++];
-	memset(peer, 0, sizeof(*peer));
-	peer->endpoint = *endpoint;
-	peer->sockaddr = *sockaddr;
-	peer->sockaddr_len = sockaddr_len;
-	peer->active = true;
-	return peer;
-}
-
-static int encode_object(const struct midr_core_object *object,
-			 uint8_t *payload, size_t capacity, size_t *length)
-{
-	const struct midr_core_identity *id;
-
-	if (!object || !payload || !length || capacity < 92U)
-		return -EINVAL;
-	id = &object->identity;
-	payload[0] = id->type;
-	payload[1] = id->family;
-	payload[2] = id->prefix_len;
-	payload[3] = 0;
-	put_u32(payload + 4, id->originator);
-	put_u32(payload + 8, id->remote);
-	put_u32(payload + 12, id->group);
-	put_u64(payload + 16, id->link_id);
-	memcpy(payload + 24, id->prefix, 16);
-	payload[40] = object->state;
-	payload[41] = payload[42] = payload[43] = 0;
-	put_u64(payload + 44, object->sequence);
-	put_u32(payload + 52, object->lifetime_ms);
-	put_u32(payload + 56, object->metric);
-	memcpy(payload + 60, object->local_address, 16);
-	memcpy(payload + 76, object->remote_address, 16);
-	*length = 92U;
-	return 0;
-}
-
-static int decode_object(const uint8_t *payload, size_t length,
-			 struct midr_core_object *object)
-{
-	if (!payload || !object || length != 92U)
-		return -EINVAL;
-	memset(object, 0, sizeof(*object));
-	object->identity.type = payload[0];
-	object->identity.family = payload[1];
-	object->identity.prefix_len = payload[2];
-	object->identity.originator = get_u32(payload + 4);
-	object->identity.remote = get_u32(payload + 8);
-	object->identity.group = get_u32(payload + 12);
-	object->identity.link_id = get_u64(payload + 16);
-	memcpy(object->identity.prefix, payload + 24, 16);
-	object->state = payload[40];
-	object->sequence = get_u64(payload + 44);
-	object->lifetime_ms = get_u32(payload + 52);
-	object->metric = get_u32(payload + 56);
-	memcpy(object->local_address, payload + 60, 16);
-	memcpy(object->remote_address, payload + 76, 16);
-	return 0;
-}
-
-static int send_frame(struct midrd *daemon, struct midrd_peer *peer,
+static int send_frame(struct midrd *daemon,
+		      const struct midr_transport_endpoint *peer,
 		      uint8_t type, const uint8_t *payload, size_t payload_len)
 {
-	uint8_t frame[20U + MIDRD_MAX_FRAME];
-	ssize_t sent;
+	struct midr_transport_frame frame = {
+		.version = MIDR_WIRE_VERSION,
+		.type = type,
+		.sequence = ++daemon->frame_sequence,
+		.payload = payload,
+		.payload_len = payload_len,
+	};
 
-	if (!daemon || !peer || payload_len > MIDRD_MAX_FRAME)
-		return -EINVAL;
-	put_u32(frame, MIDRD_MAGIC);
-	frame[4] = MIDRD_VERSION;
-	frame[5] = type;
-	put_u16(frame + 6, 0);
-	put_u64(frame + 8, ++daemon->frame_sequence);
-	put_u32(frame + 16, (uint32_t)payload_len);
-	if (payload_len)
-		memcpy(frame + 20, payload, payload_len);
-	sent = sendto(daemon->fd, frame, 20U + payload_len, 0,
-		      (struct sockaddr *)&peer->sockaddr, peer->sockaddr_len);
-	return sent == (ssize_t)(20U + payload_len) ? 0 : -errno;
+	return midr_transport_send(daemon->transport, peer, &frame);
 }
 
-static int send_hello(struct midrd *daemon, struct midrd_peer *peer)
+static int send_hello(struct midrd *daemon,
+			      const struct midr_transport_endpoint *peer)
 {
 	uint8_t payload[28] = {0};
 
-	put_u32(payload, daemon->node_id);
-	put_u32(payload + 4, daemon->lifetime_ms);
-	payload[8] = peer->endpoint.family;
-	put_u16(payload + 10, peer->endpoint.port);
-	memcpy(payload + 12, peer->endpoint.address, 16);
-	return send_frame(daemon, peer, MIDR_FRAME_HELLO, payload, sizeof(payload));
+	uint32_t node = htonl(daemon->node_id);
+	uint32_t lifetime = htonl(daemon->lifetime_ms);
+	uint16_t port = htons(peer->port);
+
+	memcpy(payload, &node, sizeof(node));
+	memcpy(payload + 4, &lifetime, sizeof(lifetime));
+	payload[8] = peer->family;
+	memcpy(payload + 10, &port, sizeof(port));
+	memcpy(payload + 12, peer->address, 16);
+	return send_frame(daemon, peer, MIDR_WIRE_HELLO, payload, sizeof(payload));
 }
 
-static int send_object(struct midrd *daemon, struct midrd_peer *peer,
-		       uint8_t frame_type, const struct midr_core_object *object)
+static int send_object(struct midrd *daemon,
+			       const struct midr_transport_endpoint *peer,
+			       const struct midr_core_object *object)
 {
-	uint8_t payload[92];
+	uint8_t payload[MIDR_WIRE_OBJECT_LEN];
+	size_t length;
+	uint8_t type = object->state == MIDR_CORE_WITHDRAWN ?
+		MIDR_WIRE_WITHDRAW : MIDR_WIRE_UPDATE;
+
+	if (midr_wire_encode_object(object, payload, sizeof(payload), &length))
+		return -EINVAL;
+	return send_frame(daemon, peer, type, payload, length);
+}
+
+static int send_snapshot_object(struct midrd *daemon,
+				const struct midr_transport_endpoint *peer,
+				const struct midr_core_object *object)
+{
+	uint8_t payload[MIDR_WIRE_OBJECT_LEN];
 	size_t length;
 
-	if (encode_object(object, payload, sizeof(payload), &length))
+	if (midr_wire_encode_object(object, payload, sizeof(payload), &length))
 		return -EINVAL;
-	return send_frame(daemon, peer, frame_type, payload, length);
+	return send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_OBJECT, payload, length);
 }
 
-static void flood_object(struct midrd *daemon, const struct midr_core_object *object,
+static void flood_object(struct midrd *daemon,
+			 const struct midr_core_object *object,
 			 const struct midr_transport_endpoint *except)
 {
-	uint8_t frame_type = object->state == MIDR_CORE_WITHDRAWN
-				     ? MIDR_FRAME_WITHDRAW : MIDR_FRAME_UPDATE;
-
 	for (size_t i = 0; i < daemon->peer_count; i++) {
-		struct midrd_peer *peer = &daemon->peers[i];
-
-		if (!peer->active ||
-		    (except && endpoint_equal(&peer->endpoint, except)))
+		if (except && midr_transport_endpoint_equal(
+				&daemon->peers[i].endpoint, except))
 			continue;
-		(void)send_object(daemon, peer, frame_type, object);
+		(void)send_object(daemon, &daemon->peers[i].endpoint, object);
 	}
+}
+
+static void drain_consumer(struct midrd *daemon)
+{
+	struct midr_consumer_event event;
+
+	while (midr_consumer_event_next(daemon->consumer, &event) == 0)
+		printf("node=%" PRIu32 " ted-event kind=%u generation=%" PRIu64 "\n",
+		       daemon->node_id, event.kind, event.generation);
 }
 
 static void drain_events(struct midrd *daemon,
@@ -345,128 +218,99 @@ static void drain_events(struct midrd *daemon,
 {
 	struct midr_core_object object;
 
-	while (midr_core_event_next(daemon->core, &object) == 0) {
+	while (midr_engine_event_next(daemon->engine, &object) == 0) {
 		flood_object(daemon, &object, except);
 		printf("node=%" PRIu32 " event state=%u seq=%" PRIu64 "\n",
 		       daemon->node_id, object.state, object.sequence);
 	}
+	drain_consumer(daemon);
 }
 
-static void send_snapshot(struct midrd *daemon, struct midrd_peer *peer)
+static void send_snapshot(struct midrd *daemon,
+			  const struct midr_transport_endpoint *peer)
 {
-	struct midr_core_object objects[MIDRD_MAX_SNAPSHOT];
+	struct midr_core_object *objects;
 	size_t count = 0;
 
-	(void)send_frame(daemon, peer, MIDR_FRAME_SNAPSHOT_BEGIN, NULL, 0);
-	if (midr_core_snapshot(daemon->core, mono_ms(), objects,
-			       MIDRD_MAX_SNAPSHOT, &count) == 0)
+	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
+	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
+	if (objects && midr_engine_snapshot(daemon->engine, mono_ms(), objects,
+					    MIDRD_MAX_SNAPSHOT, &count) == 0)
 		for (size_t i = 0; i < count; i++)
-			(void)send_object(daemon, peer, MIDR_FRAME_SNAPSHOT_OBJECT,
-					  &objects[i]);
-	(void)send_frame(daemon, peer, MIDR_FRAME_SNAPSHOT_END, NULL, 0);
-	(void)send_frame(daemon, peer, MIDR_FRAME_EOR, NULL, 0);
+			if (objects[i].state == MIDR_CORE_ACTIVE)
+				(void)send_snapshot_object(daemon, peer, &objects[i]);
+	free(objects);
+	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
+	(void)send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
 }
 
-static void receive_packet(struct midrd *daemon)
+static int on_consumer_event(void *arg, const struct midr_consumer_event *event)
 {
-	uint8_t frame[20U + MIDRD_MAX_FRAME];
-	struct sockaddr_storage source = {0};
-	socklen_t source_len = sizeof(source);
-	struct midr_transport_endpoint endpoint = {0};
-	ssize_t length;
-	char host[128], service[32];
-	struct midrd_peer *peer;
-	uint32_t payload_len;
-	uint8_t type;
+	struct midrd *daemon = arg;
+
+	(void)daemon;
+	return event ? 0 : -EINVAL;
+}
+
+static void on_established(void *arg,
+			   const struct midr_transport_endpoint *peer)
+{
+	struct midrd *daemon = arg;
+
+	printf("node=%" PRIu32 " established family=%u port=%u\n",
+	       daemon->node_id, peer->family, peer->port);
+	(void)send_hello(daemon, peer);
+	send_snapshot(daemon, peer);
+}
+
+static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
+		      int reason)
+{
+	struct midrd *daemon = arg;
+
+	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
+	       daemon->node_id, peer->family, peer->port, reason);
+}
+
+static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
+			const struct midr_transport_frame *frame)
+{
+	struct midrd *daemon = arg;
 	struct midr_core_object object;
 	enum midr_core_result result;
 
-	length = recvfrom(daemon->fd, frame, sizeof(frame), 0,
-			  (struct sockaddr *)&source, &source_len);
-	if (length < 20)
-		return;
-	if (get_u32(frame) != MIDRD_MAGIC || frame[4] != MIDRD_VERSION)
-		return;
-	type = frame[5];
-	payload_len = get_u32(frame + 16);
-	if (payload_len > MIDRD_MAX_FRAME ||
-	    length != (ssize_t)(20U + payload_len))
-		return;
-	if (source.ss_family == AF_INET) {
-		endpoint.family = MIDR_CORE_AF_IPV4;
-		endpoint.port = ntohs(((struct sockaddr_in *)&source)->sin_port);
-		memcpy(endpoint.address, &((struct sockaddr_in *)&source)->sin_addr, 4);
-	} else if (source.ss_family == AF_INET6) {
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&source;
-		endpoint.family = MIDR_CORE_AF_IPV6;
-		endpoint.port = ntohs(sin6->sin6_port);
-		endpoint.scope_id = sin6->sin6_scope_id;
-		memcpy(endpoint.address, &sin6->sin6_addr, 16);
-	} else
-		return;
-	peer = add_peer(daemon, &endpoint, &source, source_len);
-	if (!peer)
-		return;
-	if (getnameinfo((struct sockaddr *)&source, source_len, host, sizeof(host),
-			service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV) == 0)
-		printf("node=%" PRIu32 " rx=%s:%s type=%u\n",
-		       daemon->node_id, host, service, type);
-
-	switch (type) {
-	case MIDR_FRAME_HELLO:
-		if (payload_len != 28U)
-			return;
-		send_hello(daemon, peer);
+	printf("node=%" PRIu32 " rx family=%u port=%u type=%u\n",
+	       daemon->node_id, peer->family, peer->port, frame->type);
+	switch (frame->type) {
+	case MIDR_WIRE_HELLO:
+		if (frame->payload_len != 28U)
+			return -EINVAL;
+		(void)send_hello(daemon, peer);
 		send_snapshot(daemon, peer);
-		break;
-	case MIDR_FRAME_KEEPALIVE:
-		break;
-	case MIDR_FRAME_SNAPSHOT_OBJECT:
-	case MIDR_FRAME_UPDATE:
-	case MIDR_FRAME_WITHDRAW:
-		if (decode_object(frame + 20, payload_len, &object))
-			return;
-		if (type == MIDR_FRAME_WITHDRAW)
+		return 0;
+	case MIDR_WIRE_KEEPALIVE:
+		return 0;
+	case MIDR_WIRE_SNAPSHOT_OBJECT:
+	case MIDR_WIRE_UPDATE:
+	case MIDR_WIRE_WITHDRAW:
+		if (midr_wire_decode_object(frame->payload, frame->payload_len,
+					    &object))
+			return -EINVAL;
+		if (frame->type == MIDR_WIRE_WITHDRAW)
 			object.state = MIDR_CORE_WITHDRAWN;
-		if (midr_core_upsert(daemon->core, &object, mono_ms(), &result))
-			return;
+		if (midr_engine_apply(daemon->engine, &object, mono_ms(), &result))
+			return -EAGAIN;
 		if (result == MIDR_CORE_ACCEPTED)
-			drain_events(daemon, &endpoint);
-		break;
-	case MIDR_FRAME_SNAPSHOT_BEGIN:
-	case MIDR_FRAME_SNAPSHOT_END:
-	case MIDR_FRAME_EOR:
-		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id, type);
-		break;
+			drain_events(daemon, peer);
+		return 0;
+	case MIDR_WIRE_SNAPSHOT_BEGIN:
+	case MIDR_WIRE_SNAPSHOT_END:
+	case MIDR_WIRE_EOR:
+		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
+		       frame->type);
+		return 0;
 	default:
-		break;
-	}
-}
-
-static void periodic(struct midrd *daemon, uint64_t now)
-{
-	if (now >= daemon->next_hello) {
-		for (size_t i = 0; i < daemon->peer_count; i++)
-			if (daemon->peers[i].active)
-				(void)send_hello(daemon, &daemon->peers[i]);
-		daemon->next_hello = now + daemon->hello_ms;
-	}
-	if (now >= daemon->next_keepalive) {
-		for (size_t i = 0; i < daemon->peer_count; i++)
-			if (daemon->peers[i].active)
-				(void)send_frame(daemon, &daemon->peers[i],
-						 MIDR_FRAME_KEEPALIVE, NULL, 0);
-		daemon->next_keepalive = now + daemon->hello_ms;
-	}
-	if (daemon->have_local_identity && now >= daemon->next_refresh) {
-		if (midr_core_refresh(daemon->core, &daemon->local_identity, now) == 0)
-			drain_events(daemon, NULL);
-		daemon->next_refresh = now + daemon->lifetime_ms / 3U;
-	}
-	if (now >= daemon->next_expire) {
-		(void)midr_core_expire(daemon->core, now, NULL);
-		drain_events(daemon, NULL);
-		daemon->next_expire = now + 100U;
+		return -EINVAL;
 	}
 }
 
@@ -474,85 +318,91 @@ static int prefix_event(void *arg, const struct midr_prefix_event *event)
 {
 	struct midrd *daemon = arg;
 	struct midr_core_object object = {0};
-	enum midr_core_result result;
 	int ret;
 
-	if (!daemon || !event)
-		return -EINVAL;
-	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN ||
-	    event->kind == MIDR_PREFIX_SNAPSHOT_END)
-		return 0;
-	object.identity.type = MIDR_CORE_NODE_PREFIX;
-	object.identity.family = event->prefix.family;
-	object.identity.prefix_len = event->prefix.prefix_len;
-	object.identity.originator = event->originator;
-	memcpy(object.identity.prefix, event->prefix.address,
-	       sizeof(object.identity.prefix));
-	object.state = event->kind == MIDR_PREFIX_WITHDRAW
-			      ? MIDR_CORE_WITHDRAWN : MIDR_CORE_ACTIVE;
-	object.sequence = event->generation;
-	object.lifetime_ms = daemon->lifetime_ms;
-	object.metric = event->prefix.metric;
-	ret = midr_core_upsert(daemon->core, &object, mono_ms(), &result);
+	ret = midr_engine_apply_prefix_event(daemon->engine, event, mono_ms());
 	if (ret)
 		return ret;
-	if (result == MIDR_CORE_ACCEPTED &&
-	    event->kind == MIDR_PREFIX_UPSERT) {
+	if (event->kind == MIDR_PREFIX_UPSERT) {
+		object.identity.type = MIDR_CORE_NODE_PREFIX;
+		object.identity.family = event->prefix.family;
+		object.identity.prefix_len = event->prefix.prefix_len;
+		object.identity.originator = event->originator;
+		memcpy(object.identity.prefix, event->prefix.address,
+		       sizeof(object.identity.prefix));
 		daemon->local_identity = object.identity;
 		daemon->have_local_identity = true;
-	} else if (event->kind == MIDR_PREFIX_WITHDRAW &&
-		   midr_core_identity_equal(&daemon->local_identity,
-					    &object.identity)) {
+	} else if (event->kind == MIDR_PREFIX_WITHDRAW) {
 		daemon->have_local_identity = false;
 	}
 	return 0;
 }
 
-static int install_local_prefix(struct midrd *daemon, const char *prefix_text)
+static int install_local_prefix(struct midrd *daemon, const char *text)
 {
-	char copy[128];
-	char *slash;
-	struct midr_prefix prefix = {0};
-	struct midr_prefix_provider_config provider_config = {0};
-	struct in_addr addr4;
-	struct in6_addr addr6;
-	unsigned long plen;
-	char *end;
+	char copy[128], *slash, *end;
+	struct midr_prefix prefix = {.metric = 10};
+	struct midr_prefix_provider_config config = {0};
+	struct in_addr address4;
+	struct in6_addr address6;
+	unsigned long length;
 
-	if (!prefix_text || strlen(prefix_text) >= sizeof(copy))
+	if (!text || strlen(text) >= sizeof(copy))
 		return -EINVAL;
-	strcpy(copy, prefix_text);
+	strcpy(copy, text);
 	slash = strchr(copy, '/');
 	if (!slash)
 		return -EINVAL;
 	*slash++ = '\0';
-	plen = strtoul(slash, &end, 10);
-	if (*end || plen > 128)
+	length = strtoul(slash, &end, 10);
+	if (*end || length > 128)
 		return -EINVAL;
-	prefix.metric = 10;
-	if (inet_pton(AF_INET, copy, &addr4) == 1) {
-		if (plen > 32)
+	if (inet_pton(AF_INET, copy, &address4) == 1) {
+		if (length > 32)
 			return -EINVAL;
 		prefix.family = MIDR_CORE_AF_IPV4;
-		prefix.prefix_len = (uint8_t)plen;
-		memcpy(prefix.address, &addr4, 4);
-	} else if (inet_pton(AF_INET6, copy, &addr6) == 1) {
+		prefix.prefix_len = (uint8_t)length;
+		memcpy(prefix.address, &address4, 4);
+	} else if (inet_pton(AF_INET6, copy, &address6) == 1) {
 		prefix.family = MIDR_CORE_AF_IPV6;
-		prefix.prefix_len = (uint8_t)plen;
-		memcpy(prefix.address, &addr6, 16);
-	} else
-		return -EINVAL;
-	provider_config.originator = daemon->node_id;
-	provider_config.on_event = prefix_event;
-	provider_config.arg = daemon;
-	if (midr_prefix_provider_create(&provider_config,
-					&daemon->prefix_provider))
-		return -ENOMEM;
-	if (midr_prefix_provider_upsert(daemon->prefix_provider, &prefix)) {
-		midr_prefix_provider_destroy(&daemon->prefix_provider);
+		prefix.prefix_len = (uint8_t)length;
+		memcpy(prefix.address, &address6, 16);
+	} else {
 		return -EINVAL;
 	}
-	return 0;
+	config.originator = daemon->node_id;
+	config.on_event = prefix_event;
+	config.arg = daemon;
+	if (midr_prefix_provider_create(&config, &daemon->prefix_provider))
+		return -ENOMEM;
+	return midr_prefix_provider_upsert(daemon->prefix_provider, &prefix);
+}
+
+static void periodic(struct midrd *daemon, uint64_t now)
+{
+	if (now >= daemon->next_hello) {
+		for (size_t i = 0; i < daemon->peer_count; i++)
+			(void)send_hello(daemon, &daemon->peers[i].endpoint);
+		daemon->next_hello = now + daemon->hello_ms;
+	}
+	if (now >= daemon->next_keepalive) {
+		for (size_t i = 0; i < daemon->peer_count; i++)
+			(void)send_frame(daemon, &daemon->peers[i].endpoint,
+					 MIDR_WIRE_KEEPALIVE, NULL, 0);
+		daemon->next_keepalive = now + daemon->hello_ms;
+	}
+	if (daemon->have_local_identity && now >= daemon->next_refresh) {
+		if (midr_engine_refresh(daemon->engine, &daemon->local_identity, now) == 0)
+			drain_events(daemon, NULL);
+		daemon->next_refresh = now + daemon->lifetime_ms / 3U;
+	}
+	if (now >= daemon->next_expire) {
+		size_t expired = 0;
+
+		if (midr_engine_expire(daemon->engine, now, &expired) == 0 && expired)
+			drain_events(daemon, NULL);
+		daemon->next_expire = now + 100U;
+	}
 }
 
 static void usage(const char *program)
@@ -566,17 +416,21 @@ static void usage(const char *program)
 int main(int argc, char **argv)
 {
 	struct midrd daemon = {
-		.fd = -1,
 		.lifetime_ms = MIDRD_DEFAULT_LIFETIME,
 		.hello_ms = MIDRD_DEFAULT_HELLO,
 	};
-	struct midr_core_config core_config;
-	struct midr_transport_endpoint listen_endpoint = {0};
-	const char *listen_text = NULL;
-	const char *prefix_text = NULL;
+	struct midr_engine_config engine_config;
+	struct midr_consumer_config consumer_config = {
+		.on_event = on_consumer_event,
+	};
+	struct midr_transport_config transport_config = {0};
+	struct midr_transport_callbacks transport_callbacks = {
+		.on_frame = on_frame,
+		.on_established = on_established,
+		.on_closed = on_closed,
+	};
+	const char *listen_text = NULL, *prefix_text = NULL;
 	int runtime_sec = 0;
-	struct sockaddr_storage listen_sockaddr = {0};
-	socklen_t listen_sockaddr_len = 0;
 	int opt;
 
 	for (opt = 1; opt < argc; opt++) {
@@ -587,14 +441,11 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[opt], "--peer") && opt + 1 < argc) {
 			if (daemon.peer_count == MIDRD_MAX_PEERS ||
 			    parse_endpoint(argv[++opt],
-					   &daemon.peers[daemon.peer_count].endpoint,
-					   &daemon.peers[daemon.peer_count].sockaddr,
-					   &daemon.peers[daemon.peer_count].sockaddr_len,
-					   false)) {
+					   &daemon.peers[daemon.peer_count].endpoint)) {
 				usage(argv[0]);
 				return 2;
 			}
-			daemon.peers[daemon.peer_count++].active = true;
+			daemon.peer_count++;
 		} else if (!strcmp(argv[opt], "--prefix") && opt + 1 < argc)
 			prefix_text = argv[++opt];
 		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
@@ -606,66 +457,71 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (!daemon.node_id || !listen_text) {
-		usage(argv[0]);
+	if (!daemon.node_id || !listen_text || !daemon.lifetime_ms)
 		return 2;
-	}
-	if (parse_endpoint(listen_text, &listen_endpoint, &listen_sockaddr,
-			   &listen_sockaddr_len, true)) {
+	if (parse_endpoint(listen_text, &transport_config.local)) {
 		fprintf(stderr, "invalid listen endpoint\n");
 		return 2;
 	}
-	daemon.fd = socket(listen_sockaddr.ss_family, SOCK_DGRAM, 0);
-	if (daemon.fd < 0 || bind(daemon.fd, (struct sockaddr *)&listen_sockaddr,
-				  listen_sockaddr_len) < 0) {
-		perror("midrd socket/bind");
+	transport_config.hello_interval_ms = daemon.hello_ms;
+	transport_config.hold_time_ms = daemon.lifetime_ms;
+	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
+	transport_callbacks.arg = &daemon;
+	consumer_config.arg = &daemon;
+	engine_config.node_id = daemon.node_id;
+	engine_config.max_objects = MIDRD_MAX_SNAPSHOT;
+	engine_config.lifetime_ms = daemon.lifetime_ms;
+	if (midr_engine_create(&engine_config, &daemon.engine) ||
+	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
+	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
+	    midr_transport_create(&transport_config, &transport_callbacks,
+				   &daemon.transport) ||
+	    midr_transport_start(daemon.transport)) {
+		fprintf(stderr, "midrd initialization failed\n");
 		return 1;
-	}
-	core_config.max_objects = 4096;
-	core_config.lifetime_ms = daemon.lifetime_ms;
-	if (midr_core_create(&core_config, &daemon.core)) {
-		fprintf(stderr, "midrd core create failed\n");
-		close(daemon.fd);
-		return 1;
-	}
-	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
-		fprintf(stderr, "invalid prefix\n");
-		midr_core_destroy(&daemon.core);
-		close(daemon.fd);
-		return 2;
 	}
 	for (size_t i = 0; i < daemon.peer_count; i++)
-		(void)send_hello(&daemon, &daemon.peers[i]);
+		if (midr_transport_connect(daemon.transport,
+					    &daemon.peers[i].endpoint)) {
+			fprintf(stderr, "peer connection setup failed\n");
+			return 1;
+		}
+	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
+		fprintf(stderr, "invalid prefix\n");
+		return 2;
+	}
 	{
 		uint64_t now = mono_ms();
+
 		daemon.next_hello = now + daemon.hello_ms;
 		daemon.next_keepalive = now + daemon.hello_ms / 2U;
 		daemon.next_refresh = now + daemon.lifetime_ms / 3U;
 		daemon.next_expire = now + 100U;
-		daemon.stop_at = runtime_sec > 0 ? now + (uint64_t)runtime_sec * 1000U : 0;
+		daemon.stop_at = runtime_sec > 0 ?
+			now + (uint64_t)runtime_sec * 1000U : 0;
 	}
 	printf("midrd node=%" PRIu32 " family=%u listen-port=%u\n",
-	       daemon.node_id, listen_endpoint.family, listen_endpoint.port);
+	       daemon.node_id, transport_config.local.family,
+	       transport_config.local.port);
 	drain_events(&daemon, NULL);
-
 	for (;;) {
-		fd_set readfds;
-		struct timeval timeout = {.tv_sec = 0, .tv_usec = 100000};
 		uint64_t now = mono_ms();
 
 		if (daemon.stop_at && now >= daemon.stop_at)
 			break;
-		FD_ZERO(&readfds);
-		FD_SET(daemon.fd, &readfds);
-		if (select(daemon.fd + 1, &readfds, NULL, NULL, &timeout) > 0 &&
-		    FD_ISSET(daemon.fd, &readfds))
-			receive_packet(&daemon);
+		(void)midr_transport_poll(daemon.transport, 100);
 		periodic(&daemon, mono_ms());
 	}
-	printf("midrd node=%" PRIu32 " final-objects=%zu\n",
-	       daemon.node_id, midr_core_count(daemon.core));
+	if (daemon.have_local_identity) {
+		if (!midr_engine_withdraw(daemon.engine, &daemon.local_identity,
+					   mono_ms()))
+			drain_events(&daemon, NULL);
+	}
+	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
+	       midr_engine_count(daemon.engine));
+	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
-	midr_core_destroy(&daemon.core);
-	close(daemon.fd);
+	midr_consumer_destroy(&daemon.consumer);
+	midr_engine_destroy(&daemon.engine);
 	return 0;
 }
