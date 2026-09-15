@@ -49,8 +49,9 @@ static int object_to_consumer(const struct midr_core_object *object,
 static int publish_snapshot(struct midr_engine *engine, uint64_t now_ms)
 {
 	struct midr_core_object *objects;
-	struct midr_consumer_event event;
+	struct midr_consumer_event *events;
 	size_t count = 0;
+	size_t event_count = 0;
 	int ret;
 
 	if (!engine->consumer)
@@ -58,35 +59,30 @@ static int publish_snapshot(struct midr_engine *engine, uint64_t now_ms)
 	objects = calloc(engine->config.max_objects, sizeof(*objects));
 	if (!objects)
 		return -ENOMEM;
+	events = calloc(engine->config.max_objects, sizeof(*events));
+	if (!events) {
+		free(objects);
+		return -ENOMEM;
+	}
 	ret = midr_core_snapshot(engine->core, now_ms, objects,
 				 engine->config.max_objects, &count);
-	if (ret)
-		goto done;
-	memset(&event, 0, sizeof(event));
-	event.kind = MIDR_CONSUMER_SNAPSHOT_BEGIN;
-	event.originator = engine->config.node_id;
-	event.generation = engine->generation;
-	ret = midr_consumer_publish(engine->consumer, &event);
 	if (ret)
 		goto done;
 	for (size_t i = 0; i < count; i++) {
 		if (objects[i].state != MIDR_CORE_ACTIVE)
 			continue;
-		ret = object_to_consumer(&objects[i], engine->generation, &event);
+		ret = object_to_consumer(&objects[i], engine->generation,
+					 &events[event_count]);
 		if (ret == -ENOENT)
 			continue;
 		if (ret)
 			goto done;
-		ret = midr_consumer_publish(engine->consumer, &event);
-		if (ret)
-			goto done;
+		event_count++;
 	}
-	memset(&event, 0, sizeof(event));
-	event.kind = MIDR_CONSUMER_SNAPSHOT_END;
-	event.originator = engine->config.node_id;
-	event.generation = engine->generation;
-	ret = midr_consumer_publish(engine->consumer, &event);
+	ret = midr_consumer_commit_snapshot(engine->consumer, engine->generation,
+					    engine->config.node_id, events, event_count);
 done:
+	free(events);
 	free(objects);
 	return ret;
 }

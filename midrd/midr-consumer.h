@@ -1,8 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * Optional neutral consumer contract for a later TED/SPF/Zebra adapter.
- * R6-A freezes the event boundary only; it does not link any third-group code.
- */
 #ifndef MIDRD_CONSUMER_H
 #define MIDRD_CONSUMER_H
 
@@ -41,6 +37,12 @@ struct midr_consumer_config {
 	void *arg;
 };
 
+struct midr_consumer_snapshot {
+	uint64_t generation;
+	size_t count;
+	struct midr_consumer_event *events;
+};
+
 struct midr_consumer;
 
 int midr_consumer_create(const struct midr_consumer_config *config,
@@ -48,6 +50,14 @@ int midr_consumer_create(const struct midr_consumer_config *config,
 void midr_consumer_destroy(struct midr_consumer **consumer);
 int midr_consumer_publish(struct midr_consumer *consumer,
 			  const struct midr_consumer_event *event);
+int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
+				  uint64_t generation,
+				  uint32_t originator,
+				  const struct midr_consumer_event *events,
+				  size_t count);
+int midr_consumer_snapshot_acquire(const struct midr_consumer *consumer,
+				   struct midr_consumer_snapshot *snapshot);
+void midr_consumer_snapshot_release(struct midr_consumer_snapshot *snapshot);
 int midr_consumer_event_validate(const struct midr_consumer_event *event);
 int midr_consumer_event_next(struct midr_consumer *consumer,
 			     struct midr_consumer_event *event);

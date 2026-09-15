@@ -3,6 +3,7 @@
 
 #include "midr-engine.h"
 #include "midr-prefix-provider.h"
+#include "midr-spf.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
 
@@ -250,10 +251,21 @@ static void flood_object(struct midrd *daemon,
 static void drain_consumer(struct midrd *daemon)
 {
 	struct midr_consumer_event event;
+	struct midr_consumer_snapshot snapshot = {0};
+	struct midr_spf_route routes[MIDRD_MAX_SNAPSHOT];
+	size_t route_count = 0;
 
 	while (midr_consumer_event_next(daemon->consumer, &event) == 0)
 		printf("node=%" PRIu32 " ted-event kind=%u generation=%" PRIu64 "\n",
 		       daemon->node_id, event.kind, event.generation);
+	if (midr_consumer_snapshot_acquire(daemon->consumer, &snapshot) == 0) {
+		if (midr_spf_compute(&snapshot, routes, MIDRD_MAX_SNAPSHOT,
+				     &route_count) == 0)
+			printf("node=%" PRIu32 " spf generation=%" PRIu64
+			       " routes=%zu\n", daemon->node_id, snapshot.generation,
+			       route_count);
+		midr_consumer_snapshot_release(&snapshot);
+	}
 }
 
 static void drain_events(struct midrd *daemon,

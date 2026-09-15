@@ -7,11 +7,13 @@ BUILD_DIR ?= build
 
 CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
-	$(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-engine.o
+	$(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-engine.o \
+	$(BUILD_DIR)/midr-spf.o
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
 	$(BUILD_DIR)/midrd-transport-test $(BUILD_DIR)/midrd-consumer-test \
+	$(BUILD_DIR)/midrd-spf-test $(BUILD_DIR)/midrd-engine-test \
 	$(BUILD_DIR)/midrd
 
 $(BUILD_DIR):
@@ -65,11 +67,26 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-engine.h midr-core.h midr-prefix-provider.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-engine.h midr-core.h midr-prefix-provider.h midr-spf.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-prefix-provider.c -o $@
+
+$(BUILD_DIR)/midr-spf.o: midr-spf.c midr-spf.h midr-consumer.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-spf.c -o $@
+
+$(BUILD_DIR)/midrd-spf-test.o: spf-test.c midr-spf.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c spf-test.c -o $@
+
+$(BUILD_DIR)/midrd-spf-test: $(BUILD_DIR)/midr-spf.o $(BUILD_DIR)/midrd-spf-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-engine-test.o: engine-test.c midr-engine.h midr-spf.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c engine-test.c -o $@
+
+$(BUILD_DIR)/midrd-engine-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-engine-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(BUILD_DIR)/midrd.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
@@ -81,6 +98,8 @@ test: all
 	$(BUILD_DIR)/midrd-wire-test
 	$(BUILD_DIR)/midrd-transport-test
 	$(BUILD_DIR)/midrd-consumer-test
+	$(BUILD_DIR)/midrd-spf-test
+	$(BUILD_DIR)/midrd-engine-test
 	./extraction-boundary-test.sh
 
 clean:
