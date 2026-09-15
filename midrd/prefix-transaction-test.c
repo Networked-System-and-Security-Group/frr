@@ -41,8 +41,10 @@ static void test_lifetime_accounting(void)
 static void record_consumer_event(void *arg,
 				  const struct midr_consumer_event *event)
 {
-	(void)arg;
+	struct midrd *daemon = arg;
+
 	assert(event);
+	on_consumer_event(daemon, event);
 	if (event->kind == MIDR_CONSUMER_SNAPSHOT_BEGIN)
 		consumer_snapshots++;
 }
@@ -97,6 +99,9 @@ static void initialize_daemon(struct midrd *daemon, size_t capacity)
 		.max_objects = capacity,
 		.lifetime_ms = 60000,
 	};
+	struct midr_ted_config ted_config = {
+		.max_events = capacity + 1U,
+	};
 	struct midr_consumer_config consumer_config = {
 		.on_event = record_consumer_event,
 		.arg = daemon,
@@ -118,6 +123,7 @@ static void initialize_daemon(struct midrd *daemon, size_t capacity)
 	daemon->lifetime_ms = 60000;
 	consumer_snapshots = 0;
 	assert(midr_engine_create(&engine_config, &daemon->engine) == 0);
+	assert(midr_ted_create(&ted_config, &daemon->ted) == 0);
 	assert(midr_consumer_create(&consumer_config, &daemon->consumer) == 0);
 	assert(midr_engine_attach_consumer(daemon->engine, daemon->consumer) == 0);
 	assert(midr_engine_apply(daemon->engine, &membership, mono_ms(), &result) ==
@@ -133,6 +139,7 @@ static void initialize_daemon(struct midrd *daemon, size_t capacity)
 static void destroy_daemon(struct midrd *daemon)
 {
 	midr_owned_destroy(&daemon->owned);
+	midr_ted_destroy(&daemon->ted);
 	midr_consumer_destroy(&daemon->consumer);
 	midr_engine_destroy(&daemon->engine);
 }

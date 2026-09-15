@@ -1,5 +1,6 @@
 #include "midr-engine.h"
 #include "midr-spf.h"
+#include "midr-ted.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -43,6 +44,85 @@ static void drain(struct midr_consumer *consumer)
 
 	while (midr_consumer_event_next(consumer, &event) == 0)
 		;
+}
+
+struct ted_bridge {
+	struct midr_consumer *consumer;
+	struct midr_ted *ted;
+	int last_error;
+};
+
+static void apply_ted_snapshot(void *arg,
+			       const struct midr_consumer_event *event)
+{
+	struct ted_bridge *bridge = arg;
+	struct midr_consumer_snapshot snapshot = {0};
+
+	if (event->kind != MIDR_CONSUMER_SNAPSHOT_END)
+		return;
+	bridge->last_error = midr_consumer_snapshot_acquire(bridge->consumer,
+							    &snapshot);
+	if (!bridge->last_error) {
+		bridge->last_error = midr_ted_apply_snapshot(bridge->ted,
+							     &snapshot);
+		midr_consumer_snapshot_release(&snapshot);
+	}
+}
+
+static void test_ted_failure_preserves_old_view(void)
+{
+	struct midr_engine_config engine_config = {
+		.node_id = 300,
+		.max_objects = 8,
+		.lifetime_ms = 1000,
+	};
+	struct midr_ted_config ted_config = {.max_events = 8};
+	struct ted_bridge bridge = {0};
+	struct midr_consumer_config consumer_config = {
+		.on_event = apply_ted_snapshot,
+		.arg = &bridge,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_ted *ted = NULL;
+	struct midr_core_object local = membership(300, 1);
+	struct midr_core_object object = prefix(300, MIDR_CORE_AF_IPV4);
+	struct midr_consumer_snapshot snapshot = {0};
+	enum midr_core_result result;
+	uint64_t old_generation;
+
+	assert(midr_engine_create(&engine_config, &engine) == 0);
+	assert(midr_ted_create(&ted_config, &ted) == 0);
+	bridge.ted = ted;
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	bridge.consumer = consumer;
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	assert(bridge.last_error == 0 && midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_engine_apply(engine, &local, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &object, 1, &result) == 0);
+	old_generation = midr_ted_generation(ted);
+	assert(midr_ted_test_fail_next(ted, -ENOMEM) == 0);
+	object.sequence++;
+	object.metric++;
+	assert(midr_engine_apply(engine, &object, 2, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED && bridge.last_error == -ENOMEM);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.generation > old_generation && snapshot.count == 1);
+	midr_consumer_snapshot_release(&snapshot);
+	assert(midr_ted_generation(ted) == old_generation);
+	assert(midr_ted_state(ted) == MIDR_TED_NOT_READY);
+	assert(midr_ted_snapshot_acquire(ted, &snapshot) == -EAGAIN);
+
+	object.sequence++;
+	object.metric++;
+	assert(midr_engine_apply(engine, &object, 3, &result) == 0);
+	assert(bridge.last_error == 0 && midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(midr_ted_generation(ted) == snapshot.generation);
+	midr_consumer_snapshot_release(&snapshot);
+	midr_ted_destroy(&ted);
+	midr_consumer_destroy(&consumer);
+	midr_engine_destroy(&engine);
 }
 
 static void test_batch_abort_is_atomic(void)
@@ -310,6 +390,7 @@ int main(void)
 	test_membership_scope_lifecycle();
 	test_scope_rollback_is_atomic();
 	test_snapshot_rebuilds_expired_scope();
+	test_ted_failure_preserves_old_view();
 	struct midr_engine_config engine_config = {
 		.node_id = 100,
 		.max_objects = 16,

@@ -8,6 +8,7 @@
 #include "midr-prefix-provider.h"
 #include "midr-prefix-ipc.h"
 #include "midr-spf.h"
+#include "midr-ted.h"
 #include "midr-owned.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
@@ -33,6 +34,7 @@
 #define MIDRD_DEFAULT_HELLO 1000U
 #define MIDRD_DEFAULT_TAKEOVER_DELAY 3000U
 #define MIDRD_FORWARD_BUDGET_MS 1000U
+#define MIDRD_TED_RETRY_MS 1000U
 
 static volatile sig_atomic_t stop_requested;
 
@@ -113,6 +115,7 @@ struct midrd {
 	struct midr_engine *engine;
 	struct midr_owned *owned;
 	struct midr_consumer *consumer;
+	struct midr_ted *ted;
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_prefix_ipc *prefix_ipc;
 	struct midr_local_ipc *local_ipc;
@@ -147,7 +150,10 @@ struct midrd {
 	uint64_t next_keepalive;
 	uint64_t next_refresh;
 	uint64_t next_expire;
+	uint64_t next_ted_retry;
+	uint64_t last_spf_generation;
 	uint64_t stop_at;
+	bool ted_rebuild_pending;
 };
 
 static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms);
@@ -487,6 +493,41 @@ static int apply_update(struct midrd *daemon,
 	return ret;
 }
 
+static int rebuild_ted(struct midrd *daemon)
+{
+	struct midr_consumer_snapshot snapshot = {0};
+	enum midr_ted_state previous_state;
+	int previous_error;
+	int ret;
+
+	if (!daemon || !daemon->consumer || !daemon->ted)
+		return -EINVAL;
+	previous_state = midr_ted_state(daemon->ted);
+	previous_error = midr_ted_last_error(daemon->ted);
+	ret = midr_consumer_snapshot_acquire(daemon->consumer, &snapshot);
+	if (ret)
+		(void)midr_ted_invalidate(daemon->ted, ret);
+	else {
+		ret = midr_ted_apply_snapshot(daemon->ted, &snapshot);
+		midr_consumer_snapshot_release(&snapshot);
+		if (ret)
+			(void)midr_ted_invalidate(daemon->ted, ret);
+	}
+	daemon->ted_rebuild_pending = ret != 0;
+	if (ret) {
+		if (previous_state != MIDR_TED_NOT_READY ||
+		    previous_error != ret)
+			fprintf(stderr,
+				"node=%" PRIu32 " ted-state=NOT_READY error=%d\n",
+				daemon->node_id, ret);
+		return ret;
+	}
+	if (previous_state != MIDR_TED_READY)
+		printf("node=%" PRIu32 " ted-state=READY generation=%" PRIu64
+		       "\n", daemon->node_id, midr_ted_generation(daemon->ted));
+	return 0;
+}
+
 static void drain_consumer(struct midrd *daemon)
 {
 	struct midr_consumer_event event;
@@ -497,10 +538,15 @@ static void drain_consumer(struct midrd *daemon)
 	while (midr_consumer_event_next(daemon->consumer, &event) == 0)
 		printf("node=%" PRIu32 " ted-event kind=%u generation=%" PRIu64 "\n",
 		       daemon->node_id, event.kind, event.generation);
-	if (midr_consumer_snapshot_acquire(daemon->consumer, &snapshot) == 0) {
+	if (midr_ted_snapshot_acquire(daemon->ted, &snapshot) == 0) {
+		if (snapshot.generation == daemon->last_spf_generation) {
+			midr_consumer_snapshot_release(&snapshot);
+			return;
+		}
 		if (midr_spf_compute(&snapshot, daemon->node_id, routes,
 				     MIDRD_MAX_SNAPSHOT,
 				     &route_count) == 0) {
+			daemon->last_spf_generation = snapshot.generation;
 			printf("node=%" PRIu32 " spf generation=%" PRIu64
 			       " routes=%zu\n", daemon->node_id, snapshot.generation,
 			       route_count);
@@ -567,8 +613,9 @@ static void on_consumer_event(void *arg,
 {
 	struct midrd *daemon = arg;
 
-	(void)daemon;
-	(void)event;
+	if (!daemon || !event || event->kind != MIDR_CONSUMER_SNAPSHOT_END)
+		return;
+	(void)rebuild_ted(daemon);
 }
 
 static void on_established(void *arg,
@@ -1887,6 +1934,10 @@ static void refresh_owned(struct midrd *daemon)
 static void periodic(struct midrd *daemon, uint64_t now)
 {
 	(void)publish_pending_link_costs_at(daemon, now);
+	if (daemon->ted_rebuild_pending && now >= daemon->next_ted_retry) {
+		(void)rebuild_ted(daemon);
+		daemon->next_ted_retry = now + MIDRD_TED_RETRY_MS;
+	}
 	if (now >= daemon->next_hello) {
 		for (size_t i = 0; i < daemon->peer_count; i++)
 			(void)send_hello(daemon, &daemon->peers[i].endpoint);
@@ -1937,6 +1988,9 @@ int main(int argc, char **argv)
 	};
 	struct midr_engine_config engine_config;
 	struct midr_owned_config owned_config;
+	struct midr_ted_config ted_config = {
+		.max_events = MIDRD_MAX_SNAPSHOT,
+	};
 	struct midr_consumer_config consumer_config = {
 		.on_event = on_consumer_event,
 	};
@@ -2039,6 +2093,7 @@ int main(int argc, char **argv)
 	owned_config.lifetime_ms = daemon.lifetime_ms;
 	owned_config.sequence_file = daemon.sequence_file;
 	if (midr_engine_create(&engine_config, &daemon.engine) ||
+	    midr_ted_create(&ted_config, &daemon.ted) ||
 	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
 	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
 	    midr_owned_create(&owned_config, publish_owned, &daemon,
@@ -2120,6 +2175,7 @@ int main(int argc, char **argv)
 		daemon.next_keepalive = now + daemon.hello_ms / 2U;
 		daemon.next_refresh = now + daemon.lifetime_ms / 3U;
 		daemon.next_expire = now + 100U;
+		daemon.next_ted_retry = now + MIDRD_TED_RETRY_MS;
 		daemon.stop_at = runtime_sec > 0 ?
 			now + (uint64_t)runtime_sec * 1000U : 0;
 	}
@@ -2152,6 +2208,7 @@ int main(int argc, char **argv)
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
 	midr_owned_destroy(&daemon.owned);
+	midr_ted_destroy(&daemon.ted);
 	midr_consumer_destroy(&daemon.consumer);
 	midr_engine_destroy(&daemon.engine);
 	if (pidfile)

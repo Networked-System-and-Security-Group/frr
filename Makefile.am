@@ -150,6 +150,7 @@ midrd_midrd_SOURCES = \
 	midrd/midr-local-ipc.c midrd/midr-local-ipc.h \
 	midrd/midr-scope.c midrd/midr-scope.h \
 	midrd/midr-spf.c midrd/midr-spf.h \
+	midrd/midr-ted.c midrd/midr-ted.h \
 	midrd/midr-transport.c midrd/midr-transport.h \
 	midrd/midr-wire.c midrd/midr-wire.h
 midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd

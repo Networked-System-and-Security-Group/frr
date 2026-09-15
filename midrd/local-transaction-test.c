@@ -5,6 +5,7 @@
 #include <assert.h>
 
 struct consumer_probe {
+	struct midrd *daemon;
 	size_t snapshots;
 };
 
@@ -14,6 +15,7 @@ static void probe_consumer(void *arg,
 	struct consumer_probe *probe = arg;
 
 	assert(event);
+	on_consumer_event(probe->daemon, event);
 	if (event->kind == MIDR_CONSUMER_SNAPSHOT_BEGIN)
 		probe->snapshots++;
 }
@@ -98,6 +100,9 @@ static void initialize_daemon(struct midrd *daemon,
 		.max_objects = capacity,
 		.lifetime_ms = 600000,
 	};
+	struct midr_ted_config ted_config = {
+		.max_events = capacity,
+	};
 	struct midr_consumer_config consumer_config = {
 		.on_event = probe_consumer,
 		.arg = probe,
@@ -107,7 +112,9 @@ static void initialize_daemon(struct midrd *daemon,
 	memset(probe, 0, sizeof(*probe));
 	daemon->node_id = 77;
 	daemon->lifetime_ms = 600000;
+	probe->daemon = daemon;
 	assert(midr_engine_create(&engine_config, &daemon->engine) == 0);
+	assert(midr_ted_create(&ted_config, &daemon->ted) == 0);
 	assert(midr_consumer_create(&consumer_config, &daemon->consumer) == 0);
 	assert(midr_engine_attach_consumer(daemon->engine, daemon->consumer) == 0);
 	assert(midr_owned_create(&owned_config, publish_owned, daemon,
@@ -117,6 +124,7 @@ static void initialize_daemon(struct midrd *daemon,
 static void destroy_daemon(struct midrd *daemon)
 {
 	midr_owned_destroy(&daemon->owned);
+	midr_ted_destroy(&daemon->ted);
 	midr_consumer_destroy(&daemon->consumer);
 	midr_engine_destroy(&daemon->engine);
 }
@@ -128,6 +136,8 @@ static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
 
 	assert(midr_consumer_snapshot_acquire(daemon->consumer, &snapshot) == 0);
 	generation = snapshot.generation;
+	assert(midr_ted_state(daemon->ted) == MIDR_TED_READY);
+	assert(midr_ted_generation(daemon->ted) == generation);
 	if (count)
 		*count = snapshot.count;
 	midr_consumer_snapshot_release(&snapshot);
