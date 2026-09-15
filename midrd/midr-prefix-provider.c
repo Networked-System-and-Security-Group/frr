@@ -129,7 +129,13 @@ int midr_prefix_provider_snapshot(struct midr_prefix_provider *provider)
 		if (ret)
 			return ret;
 	}
-	return emit(provider, MIDR_PREFIX_SNAPSHOT_END, NULL);
+	ret = emit(provider, MIDR_PREFIX_SNAPSHOT_END, NULL);
+	if (ret)
+		return ret;
+	/* EOR is the commit boundary for consumers that stage a provider
+	 * snapshot.  SNAPSHOT_END alone is only framing and must not publish a
+	 * partial view after a reconnect. */
+	return emit(provider, MIDR_PREFIX_EOR, NULL);
 }
 
 int midr_prefix_provider_upsert(struct midr_prefix_provider *provider,

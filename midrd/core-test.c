@@ -101,18 +101,25 @@ static void test_ipv6_and_normalization(void)
 static void test_refresh_withdraw_expire(void)
 {
 	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
+	struct midr_core_identity remote_key = node_key(MIDR_CORE_AF_IPV6);
 	struct midr_core_object object;
 	uint32_t remaining;
 	size_t expired;
 
 	assert(midr_core_refresh(core, &key, 200) == 0);
 	drain_one(3, MIDR_CORE_ACTIVE);
+	/* Remote expiry only removes the object from the usable view.  It must
+	 * not fabricate an owner WITHDRAWN event or advance the remote sequence. */
+	assert(midr_core_expire(core, 1110, &expired) == 0);
+	assert(expired == 1);
+	assert(midr_core_event_next(core, &object) == -ENOENT);
+	assert(midr_core_lookup(core, &remote_key, 1110, &object, NULL) == -ENOENT);
 	assert(midr_core_lookup(core, &key, 250, &object, &remaining) == 0);
 	assert(object.sequence == 3 && remaining == 950);
 	assert(midr_core_withdraw(core, &key, 300) == 0);
 	drain_one(4, MIDR_CORE_WITHDRAWN);
 	assert(midr_core_expire(core, 1299, &expired) == 0);
-	assert(expired == 1);
+	assert(expired == 0);
 	assert(midr_core_expire(core, 1300, &expired) == 0);
 	assert(expired == 1);
 	assert(midr_core_count(core) == 0);

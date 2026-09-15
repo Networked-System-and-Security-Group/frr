@@ -391,21 +391,12 @@ int midr_core_expire(struct midr_core *core, uint64_t now_ms,
 			return -ERANGE;
 		if (now_ms - entry->updated_ms < entry->object.lifetime_ms)
 			continue;
-		if (entry->object.state == MIDR_CORE_ACTIVE) {
-			struct midr_core_object withdrawn = entry->object;
-
-			if (withdrawn.sequence == UINT64_MAX)
-				return -ERANGE;
-			withdrawn.state = MIDR_CORE_WITHDRAWN;
-			withdrawn.sequence++;
-			withdrawn.metric = 0;
-			memset(withdrawn.local_address, 0,
-			       sizeof(withdrawn.local_address));
-			memset(withdrawn.remote_address, 0,
-			       sizeof(withdrawn.remote_address));
-			if (enqueue_event(core, &withdrawn))
-				return -ENOMEM;
-		}
+		/* Expiry is a local usability transition, not an owner action.
+		 * Do not synthesize a WITHDRAWN object with the remote originator:
+		 * only that owner may allocate the next sequence and withdraw it.
+		 * The floor is removed from snapshots immediately; peers independently
+		 * age the same object and the owning node may later publish a real
+		 * WITHDRAWN through its owned store. */
 		entry->floor = true;
 		count++;
 	}

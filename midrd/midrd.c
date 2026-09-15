@@ -5,6 +5,7 @@
 #include "midr-prefix-provider.h"
 #include "midr-prefix-ipc.h"
 #include "midr-spf.h"
+#include "midr-owned.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
 
@@ -53,6 +54,7 @@ struct midrd {
 	uint32_t hello_ms;
 	uint64_t frame_sequence;
 	struct midr_engine *engine;
+	struct midr_owned *owned;
 	struct midr_consumer *consumer;
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_prefix_ipc *prefix_ipc;
@@ -63,6 +65,7 @@ struct midrd {
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
 	bool prefix_batch;
+	const char *sequence_file;
 	uint64_t next_hello;
 	uint64_t next_keepalive;
 	uint64_t next_refresh;
@@ -429,6 +432,59 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	}
 }
 
+static int publish_owned(void *arg, const struct midr_core_object *object)
+{
+	struct midrd *daemon = arg;
+	enum midr_core_result result;
+	int ret;
+
+	ret = midr_engine_apply(daemon->engine, object, mono_ms(), &result);
+	if (ret)
+		return ret;
+	return result == MIDR_CORE_ACCEPTED ? 0 : -EAGAIN;
+}
+
+static void set_local_identity(struct midrd *daemon,
+			       const struct midr_core_identity *identity)
+{
+	daemon->local_identity = *identity;
+	daemon->have_local_identity = true;
+}
+
+static int local_provider_event(void *arg,
+				const struct midr_prefix_event *event)
+{
+	struct midrd *daemon = arg;
+	struct midr_core_object object = {0};
+	int ret;
+
+	if (!event)
+		return -EINVAL;
+	if (event->kind == MIDR_PREFIX_SNAPSHOT_BEGIN ||
+	    event->kind == MIDR_PREFIX_SNAPSHOT_END ||
+	    event->kind == MIDR_PREFIX_EOR)
+		return 0;
+	object.identity.type = MIDR_CORE_NODE_PREFIX;
+	object.identity.family = event->prefix.family;
+	object.identity.prefix_len = event->prefix.prefix_len;
+	object.identity.originator = event->originator;
+	memcpy(object.identity.prefix, event->prefix.address,
+	       sizeof(object.identity.prefix));
+	object.state = event->kind == MIDR_PREFIX_WITHDRAW
+			       ? MIDR_CORE_WITHDRAWN : MIDR_CORE_ACTIVE;
+	object.metric = event->prefix.metric;
+	if (object.state == MIDR_CORE_WITHDRAWN)
+		ret = midr_owned_withdraw(daemon->owned, &object.identity);
+	else
+		ret = midr_owned_upsert(daemon->owned, &object);
+	if (!ret) {
+		if (object.state == MIDR_CORE_ACTIVE)
+			set_local_identity(daemon, &object.identity);
+		drain_events(daemon, NULL);
+	}
+	return ret;
+}
+
 static int prefix_event(void *arg, const struct midr_prefix_event *event)
 {
 	struct midrd *daemon = arg;
@@ -523,7 +579,7 @@ static int install_local_prefix(struct midrd *daemon, const char *text)
 		return -EINVAL;
 	}
 	config.originator = daemon->node_id;
-	config.on_event = prefix_event;
+	config.on_event = local_provider_event;
 	config.arg = daemon;
 	if (midr_prefix_provider_create(&config, &daemon->prefix_provider))
 		return -ENOMEM;
@@ -544,7 +600,8 @@ static void periodic(struct midrd *daemon, uint64_t now)
 		daemon->next_keepalive = now + daemon->hello_ms;
 	}
 	if (daemon->have_local_identity && now >= daemon->next_refresh) {
-		if (midr_engine_refresh(daemon->engine, &daemon->local_identity, now) == 0)
+		if (midr_owned_refresh(daemon->owned,
+				       &daemon->local_identity) == 0)
 			drain_events(daemon, NULL);
 		daemon->next_refresh = now + daemon->lifetime_ms / 3U;
 	}
@@ -562,7 +619,8 @@ static void usage(const char *program)
 	fprintf(stderr,
 		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
 		"[--prefix ADDRESS/LEN] [--prefix-socket PATH] "
-		"[--lifetime MS] [--runtime SEC] [--pidfile PATH]\n",
+		"[--sequence-file PATH] [--lifetime MS] [--runtime SEC] "
+		"[--pidfile PATH]\n",
 		program);
 }
 
@@ -573,6 +631,7 @@ int main(int argc, char **argv)
 		.hello_ms = MIDRD_DEFAULT_HELLO,
 	};
 	struct midr_engine_config engine_config;
+	struct midr_owned_config owned_config;
 	struct midr_consumer_config consumer_config = {
 		.on_event = on_consumer_event,
 	};
@@ -605,6 +664,8 @@ int main(int argc, char **argv)
 			prefix_text = argv[++opt];
 		else if (!strcmp(argv[opt], "--prefix-socket") && opt + 1 < argc)
 			prefix_socket = argv[++opt];
+		else if (!strcmp(argv[opt], "--sequence-file") && opt + 1 < argc)
+			daemon.sequence_file = argv[++opt];
 		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
 			daemon.lifetime_ms = (uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--runtime") && opt + 1 < argc)
@@ -630,9 +691,15 @@ int main(int argc, char **argv)
 	engine_config.node_id = daemon.node_id;
 	engine_config.max_objects = MIDRD_MAX_SNAPSHOT;
 	engine_config.lifetime_ms = daemon.lifetime_ms;
+	owned_config.originator = daemon.node_id;
+	owned_config.max_objects = MIDRD_MAX_SNAPSHOT;
+	owned_config.lifetime_ms = daemon.lifetime_ms;
+	owned_config.sequence_file = daemon.sequence_file;
 	if (midr_engine_create(&engine_config, &daemon.engine) ||
 	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
 	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
+	    midr_owned_create(&owned_config, publish_owned, &daemon,
+			       &daemon.owned) ||
 	    midr_transport_create(&transport_config, &transport_callbacks,
 				   &daemon.transport) ||
 	    midr_transport_start(daemon.transport)) {
@@ -702,9 +769,10 @@ int main(int argc, char **argv)
 		(void)midr_transport_poll(daemon.transport, 100);
 		periodic(&daemon, mono_ms());
 	}
-	if (daemon.have_local_identity) {
-		if (!midr_engine_withdraw(daemon.engine, &daemon.local_identity,
-					   mono_ms()))
+	if (daemon.owned) {
+		size_t withdrawn = 0;
+
+		if (!midr_owned_withdraw_all(daemon.owned, &withdrawn) && withdrawn)
 			drain_events(&daemon, NULL);
 	}
 	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
@@ -714,6 +782,7 @@ int main(int argc, char **argv)
 	midr_prefix_ipc_server_destroy(&daemon.prefix_ipc);
 	midr_transport_destroy(&daemon.transport);
 	midr_prefix_provider_destroy(&daemon.prefix_provider);
+	midr_owned_destroy(&daemon.owned);
 	midr_consumer_destroy(&daemon.consumer);
 	midr_engine_destroy(&daemon.engine);
 	if (pidfile)

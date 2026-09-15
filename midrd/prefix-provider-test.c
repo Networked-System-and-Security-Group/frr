@@ -42,14 +42,15 @@ int main(void)
 	assert(log.count == 1 && log.events[0].kind == MIDR_PREFIX_UPSERT);
 	assert(log.events[0].generation == 1);
 	assert(midr_prefix_provider_snapshot(provider) == 0);
-	assert(log.count == 4);
+	assert(log.count == 5);
 	assert(log.events[1].kind == MIDR_PREFIX_SNAPSHOT_BEGIN);
 	assert(log.events[2].kind == MIDR_PREFIX_UPSERT);
 	assert(log.events[3].kind == MIDR_PREFIX_SNAPSHOT_END);
+	assert(log.events[4].kind == MIDR_PREFIX_EOR);
 	invalid.address[3] = 1;
 	assert(midr_prefix_provider_upsert(provider, &invalid) == -EINVAL);
 	assert(midr_prefix_provider_withdraw(provider, &prefix) == 0);
-	assert(log.count == 5 && log.events[4].kind == MIDR_PREFIX_WITHDRAW);
+	assert(log.count == 6 && log.events[5].kind == MIDR_PREFIX_WITHDRAW);
 	midr_prefix_provider_destroy(&provider);
 	assert(provider == NULL);
 	puts("midr-prefix-provider-test: PASS");
