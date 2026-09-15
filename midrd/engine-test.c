@@ -2,8 +2,11 @@
 #include "midr-spf.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+
+static struct midr_core_object prefix(uint32_t originator, uint8_t family);
 
 static void drain(struct midr_consumer *consumer)
 {
@@ -11,6 +14,99 @@ static void drain(struct midr_consumer *consumer)
 
 	while (midr_consumer_event_next(consumer, &event) == 0)
 		;
+}
+
+static void test_batch_abort_is_atomic(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 200,
+		.max_objects = 4,
+		.lifetime_ms = 1000,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_core_object object = prefix(20, MIDR_CORE_AF_IPV4);
+
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	drain(consumer);
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_apply(engine, &object, 1,
+				&(enum midr_core_result){0}) == 0);
+	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_generation(engine) == 2);
+	assert(midr_consumer_pending(consumer) == 0);
+	assert(midr_engine_abort_batch(engine) == 0);
+	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_generation(engine) == 1);
+	assert(midr_consumer_pending(consumer) == 0);
+	midr_engine_destroy(&engine);
+	midr_consumer_destroy(&consumer);
+}
+
+static void test_batch_failure_does_not_publish(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 201,
+		.max_objects = 1,
+		.lifetime_ms = 1000,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_core_object first = prefix(21, MIDR_CORE_AF_IPV4);
+	struct midr_core_object second = prefix(22, MIDR_CORE_AF_IPV4);
+	enum midr_core_result result;
+
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	drain(consumer);
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_apply(engine, &first, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &second, 1, &result) == -ENOSPC);
+	assert(midr_engine_end_batch(engine, 1) == -ENOSPC);
+	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_generation(engine) == 1);
+	assert(midr_consumer_pending(consumer) == 0);
+	/* The failed transaction was discarded by end_batch(). */
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_apply(engine, &first, 2, &result) == 0);
+	assert(midr_engine_end_batch(engine, 2) == 0);
+	assert(midr_engine_count(engine) == 1);
+	assert(midr_engine_generation(engine) == 2);
+	midr_engine_destroy(&engine);
+	midr_consumer_destroy(&consumer);
+}
+
+static void test_batch_invalid_is_atomic(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 202,
+		.max_objects = 4,
+		.lifetime_ms = 1000,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_core_object invalid = prefix(23, MIDR_CORE_AF_IPV4);
+	enum midr_core_result result;
+
+	invalid.identity.originator = 0;
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	drain(consumer);
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_apply(engine, &invalid, 1, &result) == -EINVAL);
+	assert(midr_engine_end_batch(engine, 1) == -EINVAL);
+	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_generation(engine) == 1);
+	assert(midr_consumer_pending(consumer) == 0);
+	midr_engine_destroy(&engine);
+	midr_consumer_destroy(&consumer);
 }
 
 static struct midr_core_object prefix(uint32_t originator, uint8_t family)
@@ -33,6 +129,9 @@ static struct midr_core_object prefix(uint32_t originator, uint8_t family)
 
 int main(void)
 {
+	test_batch_abort_is_atomic();
+	test_batch_failure_does_not_publish();
+	test_batch_invalid_is_atomic();
 	struct midr_engine_config engine_config = {
 		.node_id = 100,
 		.max_objects = 16,

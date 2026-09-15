@@ -181,6 +181,29 @@ int midr_core_create(const struct midr_core_config *config,
 	return 0;
 }
 
+int midr_core_clone(const struct midr_core *source,
+			   struct midr_core **out)
+{
+	struct midr_core *clone = NULL;
+	const struct midr_core_event *event;
+
+	if (!source || !out || *out)
+		return -EINVAL;
+	if (midr_core_create(&source->config, &clone))
+		return -ENOMEM;
+	clone->count = source->count;
+	memcpy(clone->entries, source->entries,
+	       source->capacity * sizeof(*source->entries));
+	for (event = source->events_head; event; event = event->next) {
+		if (enqueue_event(clone, &event->object)) {
+			midr_core_destroy(&clone);
+			return -ENOMEM;
+		}
+	}
+	*out = clone;
+	return 0;
+}
+
 void midr_core_destroy(struct midr_core **corep)
 {
 	struct midr_core *core;

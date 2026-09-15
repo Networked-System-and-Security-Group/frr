@@ -93,7 +93,10 @@ bool midr_core_object_semantic_equal(const struct midr_core_object *a,
 				     const struct midr_core_object *b);
 
 int midr_core_create(const struct midr_core_config *config,
-		     struct midr_core **out);
+			     struct midr_core **out);
+/* Create an independent value copy, including pending events. */
+int midr_core_clone(const struct midr_core *source,
+			   struct midr_core **out);
 void midr_core_destroy(struct midr_core **core);
 
 /*

@@ -420,7 +420,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			if (!ret)
 				ret = midr_engine_end_batch(daemon->engine, mono_ms());
 			else
-				(void)midr_engine_end_batch(daemon->engine, mono_ms());
+				(void)midr_engine_abort_batch(daemon->engine);
 			stage_release(stage);
 			if (!ret)
 				drain_events(daemon, peer);

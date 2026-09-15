@@ -9,11 +9,20 @@
 struct midr_engine {
 	struct midr_engine_config config;
 	struct midr_core *core;
+	struct midr_core *batch_core;
 	struct midr_consumer *consumer;
 	uint64_t generation;
+	uint64_t batch_generation;
 	unsigned int batch_depth;
 	bool batch_dirty;
+	bool batch_failed;
+	int batch_error;
 };
+
+static struct midr_core *active_core(struct midr_engine *engine)
+{
+	return engine->batch_core ? engine->batch_core : engine->core;
+}
 
 static int object_to_consumer(const struct midr_core_object *object,
 				      uint64_t generation,
@@ -46,7 +55,8 @@ static int object_to_consumer(const struct midr_core_object *object,
 	return 0;
 }
 
-static int publish_snapshot(struct midr_engine *engine, uint64_t now_ms)
+static int publish_snapshot(struct midr_engine *engine, struct midr_core *core,
+				    uint64_t now_ms)
 {
 	struct midr_core_object *objects;
 	struct midr_consumer_event *events;
@@ -64,7 +74,7 @@ static int publish_snapshot(struct midr_engine *engine, uint64_t now_ms)
 		free(objects);
 		return -ENOMEM;
 	}
-	ret = midr_core_snapshot(engine->core, now_ms, objects,
+	ret = midr_core_snapshot(core, now_ms, objects,
 				 engine->config.max_objects, &count);
 	if (ret)
 		goto done;
@@ -115,6 +125,7 @@ void midr_engine_destroy(struct midr_engine **enginep)
 {
 	if (!enginep || !*enginep)
 		return;
+	midr_core_destroy(&(*enginep)->batch_core);
 	midr_core_destroy(&(*enginep)->core);
 	free(*enginep);
 	*enginep = NULL;
@@ -126,7 +137,7 @@ int midr_engine_attach_consumer(struct midr_engine *engine,
 	if (!engine)
 		return -EINVAL;
 	engine->consumer = consumer;
-	return publish_snapshot(engine, 0);
+	return publish_snapshot(engine, engine->core, 0);
 }
 
 int midr_engine_apply(struct midr_engine *engine,
@@ -139,18 +150,25 @@ int midr_engine_apply(struct midr_engine *engine,
 
 	if (!engine || !object || !result)
 		return -EINVAL;
-	had_old = midr_core_lookup(engine->core, &object->identity, now_ms,
-				   &old, NULL) == 0;
-	ret = midr_core_upsert(engine->core, object, now_ms, result);
-	if (ret || *result != MIDR_CORE_ACCEPTED)
+	if (engine->batch_failed)
+		return engine->batch_error;
+	had_old = midr_core_lookup(active_core(engine), &object->identity, now_ms,
+					&old, NULL) == 0;
+	ret = midr_core_upsert(active_core(engine), object, now_ms, result);
+	if (ret || *result != MIDR_CORE_ACCEPTED) {
+		if (ret && engine->batch_core) {
+			engine->batch_failed = true;
+			engine->batch_error = ret;
+		}
 		return ret;
+	}
 	if (!had_old || !midr_core_object_semantic_equal(&old, object))
 		engine->generation++;
 	if (engine->batch_depth) {
 		engine->batch_dirty = true;
 		return 0;
 	}
-	return publish_snapshot(engine, now_ms);
+	return publish_snapshot(engine, engine->core, now_ms);
 }
 
 int midr_engine_begin_batch(struct midr_engine *engine)
@@ -159,6 +177,13 @@ int midr_engine_begin_batch(struct midr_engine *engine)
 		return -EINVAL;
 	if (engine->batch_depth == UINT_MAX)
 		return -ERANGE;
+	if (!engine->batch_depth) {
+		if (midr_core_clone(engine->core, &engine->batch_core))
+			return -ENOMEM;
+		engine->batch_generation = engine->generation;
+		engine->batch_failed = false;
+		engine->batch_error = 0;
+	}
 	engine->batch_depth++;
 	return 0;
 }
@@ -168,9 +193,34 @@ int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
 	if (!engine || !engine->batch_depth)
 		return -EINVAL;
 	engine->batch_depth--;
-	if (!engine->batch_depth && engine->batch_dirty) {
+	if (!engine->batch_depth) {
+		int ret;
+
+		if (engine->batch_failed) {
+			int error = engine->batch_error;
+
+			(void)midr_engine_abort_batch(engine);
+			return error;
+		}
+		if (!engine->batch_dirty) {
+			midr_core_destroy(&engine->batch_core);
+			return 0;
+		}
+		ret = publish_snapshot(engine, engine->batch_core, now_ms);
+		if (ret) {
+			(void)midr_engine_abort_batch(engine);
+			return ret;
+		}
+		{
+			struct midr_core *old_core = engine->core;
+
+			engine->core = engine->batch_core;
+			engine->batch_core = NULL;
+			midr_core_destroy(&old_core);
+		}
 		engine->batch_dirty = false;
-		return publish_snapshot(engine, now_ms);
+		engine->batch_failed = false;
+		engine->batch_error = 0;
 	}
 	return 0;
 }
@@ -179,8 +229,15 @@ int midr_engine_abort_batch(struct midr_engine *engine)
 {
 	if (!engine)
 		return -EINVAL;
+	if (!engine->batch_core && !engine->batch_depth)
+		return 0;
+	if (engine->batch_core)
+		midr_core_destroy(&engine->batch_core);
 	engine->batch_depth = 0;
 	engine->batch_dirty = false;
+	engine->batch_failed = false;
+	engine->batch_error = 0;
+	engine->generation = engine->batch_generation;
 	return 0;
 }
 
@@ -193,12 +250,24 @@ int midr_engine_refresh(struct midr_engine *engine,
 
 	if (!engine || !identity)
 		return -EINVAL;
-	ret = midr_core_lookup(engine->core, identity, now_ms, &old, NULL);
+	if (engine->batch_failed)
+		return engine->batch_error;
+	ret = midr_core_lookup(active_core(engine), identity, now_ms, &old, NULL);
 	if (ret)
 		return ret;
-	ret = midr_core_refresh(engine->core, identity, now_ms);
-	if (!ret)
-		ret = publish_snapshot(engine, now_ms);
+	ret = midr_core_refresh(active_core(engine), identity, now_ms);
+	if (ret) {
+		if (engine->batch_core) {
+			engine->batch_failed = true;
+			engine->batch_error = ret;
+		}
+		return ret;
+	}
+	if (engine->batch_depth) {
+		engine->batch_dirty = true;
+		return 0;
+	}
+	ret = publish_snapshot(engine, engine->core, now_ms);
 	return ret;
 }
 
@@ -210,10 +279,20 @@ int midr_engine_withdraw(struct midr_engine *engine,
 
 	if (!engine || !identity)
 		return -EINVAL;
-	ret = midr_core_withdraw(engine->core, identity, now_ms);
+	if (engine->batch_failed)
+		return engine->batch_error;
+	ret = midr_core_withdraw(active_core(engine), identity, now_ms);
+	if (ret && engine->batch_core) {
+		engine->batch_failed = true;
+		engine->batch_error = ret;
+	}
 	if (!ret) {
 		engine->generation++;
-		ret = publish_snapshot(engine, now_ms);
+		if (engine->batch_depth) {
+			engine->batch_dirty = true;
+			return 0;
+		}
+		ret = publish_snapshot(engine, engine->core, now_ms);
 	}
 	return ret;
 }
@@ -225,10 +304,20 @@ int midr_engine_expire(struct midr_engine *engine, uint64_t now_ms,
 
 	if (!engine)
 		return -EINVAL;
-	ret = midr_core_expire(engine->core, now_ms, expired);
+	if (engine->batch_failed)
+		return engine->batch_error;
+	ret = midr_core_expire(active_core(engine), now_ms, expired);
+	if (ret && engine->batch_core) {
+		engine->batch_failed = true;
+		engine->batch_error = ret;
+	}
 	if (!ret && expired && *expired) {
 		engine->generation++;
-		ret = publish_snapshot(engine, now_ms);
+		if (engine->batch_depth) {
+			engine->batch_dirty = true;
+			return 0;
+		}
+		ret = publish_snapshot(engine, engine->core, now_ms);
 	}
 	return ret;
 }
@@ -238,7 +327,7 @@ int midr_engine_snapshot(struct midr_engine *engine, uint64_t now_ms,
 				size_t *count)
 {
 	return engine ? midr_core_snapshot(engine->core, now_ms, objects, capacity,
-						 count) : -EINVAL;
+							 count) : -EINVAL;
 }
 
 int midr_engine_event_next(struct midr_engine *engine,
