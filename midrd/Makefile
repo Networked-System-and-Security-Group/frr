@@ -3,9 +3,16 @@ CPPFLAGS ?= -I.
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic
 BUILD_DIR ?= build
 
-.PHONY: all test clean
+.PHONY: all test clean boundary
 
-all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test $(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd
+CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
+	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
+	$(BUILD_DIR)/midr-prefix-provider.o
+
+all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
+	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
+	$(BUILD_DIR)/midrd-transport-test $(BUILD_DIR)/midrd-consumer-test \
+	$(BUILD_DIR)/midrd
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -15,6 +22,15 @@ $(BUILD_DIR)/midrd-contract-test: contract-test.c midr-core.h midr-transport.h 	
 
 $(BUILD_DIR)/midr-core.o: midr-core.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-core.c -o $@
+
+$(BUILD_DIR)/midr-wire.o: midr-wire.c midr-wire.h midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-wire.c -o $@
+
+$(BUILD_DIR)/midr-transport.o: midr-transport.c midr-transport.h midr-wire.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-transport.c -o $@
+
+$(BUILD_DIR)/midr-consumer.o: midr-consumer.c midr-consumer.h midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-consumer.c -o $@
 
 $(BUILD_DIR)/midrd-core-test.o: core-test.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c core-test.c -o $@
@@ -28,19 +44,41 @@ $(BUILD_DIR)/midr-prefix-provider-test.o: prefix-provider-test.c midr-prefix-pro
 $(BUILD_DIR)/midr-prefix-provider-test: $(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-prefix-provider-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
+$(BUILD_DIR)/midrd-wire-test.o: wire-test.c midr-wire.h midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c wire-test.c -o $@
+
+$(BUILD_DIR)/midrd-wire-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midrd-wire-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-transport-test.o: transport-test.c midr-transport.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c transport-test.c -o $@
+
+$(BUILD_DIR)/midrd-transport-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midrd-transport-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c consumer-test.c -o $@
+
+$(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
 $(BUILD_DIR)/midrd.o: midrd.c midr-core.h midr-transport.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-prefix-provider.c -o $@
 
-$(BUILD_DIR)/midrd: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midrd.o
+$(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(BUILD_DIR)/midrd.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-test: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test $(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd
+test: all
 	$(BUILD_DIR)/midrd-contract-test
 	$(BUILD_DIR)/midrd-core-test
 	$(BUILD_DIR)/midr-prefix-provider-test
+	$(BUILD_DIR)/midrd-wire-test
+	$(BUILD_DIR)/midrd-transport-test
+	$(BUILD_DIR)/midrd-consumer-test
+	./extraction-boundary-test.sh
 
 clean:
 	rm -rf $(BUILD_DIR)
