@@ -50,6 +50,20 @@ int main(void)
 	assert(midr_wire_decode_object(payload, payload_len, &decoded) == 0);
 	assert(decoded.identity.group == 0 && decoded.group == 7);
 	assert(midr_core_object_semantic_equal(&membership, &decoded));
+	membership.state = MIDR_CORE_WITHDRAWN;
+	membership.sequence++;
+	membership.group = 0;
+	assert(midr_wire_encode_object(&membership, payload, sizeof(payload),
+				       &payload_len) == 0);
+	assert(midr_wire_decode_object(payload, payload_len, &decoded) == 0);
+	assert(decoded.state == MIDR_CORE_WITHDRAWN && decoded.group == 0);
+	membership.local_address[0] = 1;
+	assert(midr_wire_encode_object(&membership, payload, sizeof(payload),
+				       &payload_len) == -EINVAL);
+	membership.local_address[0] = 0;
+	membership.metric = 1;
+	assert(midr_wire_encode_object(&membership, payload, sizeof(payload),
+				       &payload_len) == -EINVAL);
 	link.identity.type = MIDR_CORE_LINK;
 	link.identity.originator = 42;
 	link.identity.remote = 43;

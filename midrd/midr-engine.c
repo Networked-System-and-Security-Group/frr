@@ -460,8 +460,13 @@ int midr_engine_refresh(struct midr_engine *engine,
 	if (engine->batch_failed)
 		return engine->batch_error;
 	ret = midr_core_lookup(active_core(engine), identity, now_ms, &old, NULL);
-	if (ret)
+	if (ret) {
+		if (engine->batch_core) {
+			engine->batch_failed = true;
+			engine->batch_error = ret;
+		}
 		return ret;
+	}
 	ret = midr_core_refresh(active_core(engine), identity, now_ms);
 	if (ret) {
 		if (engine->batch_core) {
@@ -745,6 +750,7 @@ int midr_engine_apply_prefix_event(struct midr_engine *engine,
 			     ? MIDR_CORE_WITHDRAWN : MIDR_CORE_ACTIVE;
 	object.sequence = event->generation;
 	object.lifetime_ms = engine->config.lifetime_ms;
-	object.metric = event->prefix.metric;
+	object.metric = object.state == MIDR_CORE_WITHDRAWN ? 0 :
+			event->prefix.metric;
 	return midr_engine_apply(engine, &object, now_ms, &result);
 }

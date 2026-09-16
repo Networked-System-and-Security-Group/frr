@@ -38,9 +38,11 @@ int main(void)
 	struct midr_prefix invalid = prefix;
 
 	assert(midr_prefix_provider_create(&config, &provider) == 0);
+	assert(midr_prefix_provider_generation(provider) == 0);
 	assert(midr_prefix_provider_upsert(provider, &prefix) == 0);
 	assert(log.count == 1 && log.events[0].kind == MIDR_PREFIX_UPSERT);
 	assert(log.events[0].generation == 1);
+	assert(midr_prefix_provider_generation(provider) == 1);
 	assert(midr_prefix_provider_snapshot(provider) == 0);
 	assert(log.count == 5);
 	assert(log.events[1].kind == MIDR_PREFIX_SNAPSHOT_BEGIN);
@@ -51,8 +53,10 @@ int main(void)
 	assert(midr_prefix_provider_upsert(provider, &invalid) == -EINVAL);
 	assert(midr_prefix_provider_withdraw(provider, &prefix) == 0);
 	assert(log.count == 6 && log.events[5].kind == MIDR_PREFIX_WITHDRAW);
+	assert(midr_prefix_provider_generation(provider) == 2);
 	midr_prefix_provider_destroy(&provider);
 	assert(provider == NULL);
+	assert(midr_prefix_provider_generation(provider) == 0);
 	puts("midr-prefix-provider-test: PASS");
 	return 0;
 }

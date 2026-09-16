@@ -268,6 +268,27 @@ static void test_ipv6_and_normalization(void)
 	assert(midr_core_count(core) == 2);
 }
 
+static void test_non_octet_prefix_normalization(void)
+{
+	struct midr_core_identity input = node_key(MIDR_CORE_AF_IPV4);
+	struct midr_core_identity normalized;
+
+	input.prefix_len = 25;
+	input.prefix[3] = 0xff;
+	assert(midr_core_identity_normalize(&input, &normalized) == 0);
+	assert(normalized.prefix[3] == 0x80);
+	assert(midr_core_identity_validate(&input) == -EINVAL);
+	assert(midr_core_identity_validate(&normalized) == 0);
+
+	input = node_key(MIDR_CORE_AF_IPV6);
+	input.prefix_len = 65;
+	input.prefix[8] = 0xff;
+	assert(midr_core_identity_normalize(&input, &normalized) == 0);
+	assert(normalized.prefix[8] == 0x80);
+	assert(midr_core_identity_validate(&input) == -EINVAL);
+	assert(midr_core_identity_validate(&normalized) == 0);
+}
+
 static void test_refresh_withdraw_expire(void)
 {
 	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
@@ -375,6 +396,7 @@ int main(void)
 	test_age_arithmetic();
 	test_versions_and_conflict();
 	test_ipv6_and_normalization();
+	test_non_octet_prefix_normalization();
 	test_refresh_withdraw_expire();
 	/* The earlier prefix entries have expired; reuse the same core to verify
 	 * a Membership group change remains one canonical identity. */

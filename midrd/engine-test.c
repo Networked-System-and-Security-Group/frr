@@ -662,6 +662,144 @@ static void test_snapshot_rebuilds_expired_scope(void)
 	midr_consumer_destroy(&consumer);
 }
 
+static void test_refresh_and_scope_queries(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 1,
+		.max_objects = 8,
+		.lifetime_ms = 1000,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_core_object local = membership(1, 10);
+	struct midr_core_object peer = membership(2, 10);
+	struct midr_core_object object = prefix(2, MIDR_CORE_AF_IPV4);
+	struct midr_core_object withdrawn = object;
+	struct midr_core_object current;
+	struct midr_core_identity missing = object.identity;
+	enum midr_core_result result;
+	uint64_t generation;
+
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_apply(engine, &local, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &peer, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &object, 1, &result) == 0);
+	assert(midr_engine_export(engine, &local, 2));
+	assert(midr_engine_usable(engine, &local));
+	assert(midr_engine_export(engine, &object, 2));
+	assert(midr_engine_usable(engine, &object));
+
+	withdrawn.state = MIDR_CORE_WITHDRAWN;
+	withdrawn.address_family = MIDR_CORE_AF_NONE;
+	withdrawn.group = 0;
+	withdrawn.metric = 0;
+	memset(withdrawn.local_address, 0, sizeof(withdrawn.local_address));
+	memset(withdrawn.remote_address, 0, sizeof(withdrawn.remote_address));
+	assert(midr_engine_export(engine, &withdrawn, 99));
+	assert(!midr_engine_usable(engine, &withdrawn));
+
+	generation = midr_engine_generation(engine);
+	assert(midr_engine_refresh(engine, &object.identity, 100) == 0);
+	assert(midr_engine_generation(engine) == generation);
+	assert(midr_engine_lookup(engine, &object.identity, 100, &current, NULL) == 0);
+	assert(current.sequence == object.sequence + 1U);
+	assert(midr_core_object_semantic_equal(&current, &object));
+
+	missing.originator = 3;
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_refresh(engine, &missing, 101) == -ENOENT);
+	assert(midr_engine_end_batch(engine, 101) == -ENOENT);
+	assert(midr_engine_lookup(engine, &object.identity, 101, &current, NULL) == 0);
+	assert(current.sequence == object.sequence + 1U);
+	midr_engine_destroy(&engine);
+}
+
+static struct midr_prefix_event prefix_event(
+	enum midr_prefix_event_kind kind, uint64_t generation,
+	uint32_t originator, uint8_t family)
+{
+	struct midr_prefix_event event = {
+		.kind = kind,
+		.generation = generation,
+		.originator = originator,
+		.prefix = {
+			.family = family,
+			.prefix_len = family == MIDR_CORE_AF_IPV4 ? 32U : 128U,
+			.metric = 10,
+		},
+	};
+
+	if (family == MIDR_CORE_AF_IPV4) {
+		event.prefix.address[0] = 192;
+		event.prefix.address[1] = 0;
+		event.prefix.address[2] = 2;
+		event.prefix.address[3] = (uint8_t)originator;
+	} else {
+		event.prefix.address[0] = 0x20;
+		event.prefix.address[1] = 0x01;
+		event.prefix.address[2] = 0x0d;
+		event.prefix.address[3] = 0xb8;
+		event.prefix.address[15] = (uint8_t)originator;
+	}
+	return event;
+}
+
+static void test_prefix_events(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 1,
+		.max_objects = 4,
+		.lifetime_ms = 1000,
+	};
+	struct midr_engine *engine = NULL;
+	struct midr_prefix_event v4 = prefix_event(
+		MIDR_PREFIX_UPSERT, 1, 2, MIDR_CORE_AF_IPV4);
+	struct midr_prefix_event v6 = prefix_event(
+		MIDR_PREFIX_UPSERT, 1, 3, MIDR_CORE_AF_IPV6);
+	struct midr_prefix_event control = {
+		.kind = MIDR_PREFIX_SNAPSHOT_BEGIN,
+		.generation = 1,
+		.originator = 1,
+	};
+	struct midr_core_object current;
+	struct midr_core_identity v4_key = {
+		.type = MIDR_CORE_NODE_PREFIX,
+		.family = MIDR_CORE_AF_IPV4,
+		.prefix_len = 32,
+		.originator = 2,
+		.prefix = {192, 0, 2, 2},
+	};
+	struct midr_core_identity v6_key = {
+		.type = MIDR_CORE_NODE_PREFIX,
+		.family = MIDR_CORE_AF_IPV6,
+		.prefix_len = 128,
+		.originator = 3,
+		.prefix = {0x20, 0x01, 0x0d, 0xb8},
+	};
+
+	v6_key.prefix[15] = 3;
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_apply_prefix_event(engine, &control, 1) == 0);
+	assert(midr_engine_count(engine) == 0);
+	assert(midr_engine_apply_prefix_event(engine, &v4, 1) == 0);
+	assert(midr_engine_apply_prefix_event(engine, &v6, 1) == 0);
+	assert(midr_engine_lookup(engine, &v4_key, 1, &current, NULL) == 0);
+	assert(current.state == MIDR_CORE_ACTIVE && current.metric == 10);
+	assert(midr_engine_lookup(engine, &v6_key, 1, &current, NULL) == 0);
+	assert(current.state == MIDR_CORE_ACTIVE && current.metric == 10);
+
+	v4.kind = MIDR_PREFIX_WITHDRAW;
+	v4.generation = 2;
+	v6.kind = MIDR_PREFIX_WITHDRAW;
+	v6.generation = 2;
+	assert(midr_engine_apply_prefix_event(engine, &v4, 2) == 0);
+	assert(midr_engine_apply_prefix_event(engine, &v6, 2) == 0);
+	assert(midr_engine_lookup(engine, &v4_key, 2, &current, NULL) == 0);
+	assert(current.state == MIDR_CORE_WITHDRAWN && current.metric == 0);
+	assert(midr_engine_lookup(engine, &v6_key, 2, &current, NULL) == 0);
+	assert(current.state == MIDR_CORE_WITHDRAWN && current.metric == 0);
+	midr_engine_destroy(&engine);
+}
+
 static struct midr_core_object prefix(uint32_t originator, uint8_t family)
 {
 	struct midr_core_object object = {0};
@@ -689,6 +827,8 @@ int main(void)
 	test_membership_scope_lifecycle();
 	test_scope_rollback_is_atomic();
 	test_snapshot_rebuilds_expired_scope();
+	test_refresh_and_scope_queries();
+	test_prefix_events();
 	test_ted_failure_preserves_old_view();
 	test_lsdb_pending_and_failure_split();
 	test_formal_ted_derivation();
