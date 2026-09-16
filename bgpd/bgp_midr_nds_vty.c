@@ -1054,6 +1054,62 @@ DEFUN(show_midr_nodes,
 	return CMD_SUCCESS;
 }
 
+static const char *midr_link_status_str(enum midr_link_status status)
+{
+	switch (status) {
+	case MIDR_LINK_UP:
+		return "up";
+	case MIDR_LINK_DEGRADED:
+		return "degraded";
+	case MIDR_LINK_DOWN:
+		return "down";
+	}
+	return "?";
+}
+
+DEFUN(show_midr_links,
+      show_midr_links_cmd,
+      "show midr links",
+      SHOW_STR
+      "MIDR information\n"
+      "Show PM measurements towards each probed node\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct midr_link_entry *link;
+	struct listnode *node;
+
+	if (!bgp || !bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "%-15s %-39s %-8s %-10s %-10s %-9s %s\n", "Router-ID",
+		"Transport-Addr", "Status", "LT-RTT(us)", "ST-RTT(us)",
+		"LT-Loss", "Admission");
+	for (ALL_LIST_ELEMENTS_RO(bgp->midr_nds_info->global_view->links, node,
+				  link)) {
+		struct ipaddr transport;
+		char taddr[IPADDR_STRING_SIZE] = "-";
+		const char *admission = "-";
+
+		if (midr_nds_node_transport_get(bgp, &link->remote_node_id,
+						&transport)) {
+			ipaddr2str(&transport, taddr, sizeof(taddr));
+			if (midr_admission_candidate_blocked(bgp, transport))
+				admission = "blocked";
+			else if (midr_admission_has_intent(bgp, transport))
+				admission = "tracked";
+		}
+		vty_out(vty, "%-15pI4 %-39s %-8s %-10u %-10u %-9.4f %s\n",
+			&link->remote_node_id.u.prefix4, taddr,
+			midr_link_status_str(link->status),
+			link->long_term.rtt_us, link->short_term.rtt_us,
+			link->long_term.loss_rate, admission);
+	}
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(show_midr_reps,
       show_midr_reps_cmd,
       "show midr reps",
@@ -2221,6 +2277,7 @@ void bgp_midr_nds_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_self_cmd);
 	install_element(VIEW_NODE, &show_midr_group2_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
+	install_element(VIEW_NODE, &show_midr_links_cmd);
 	install_element(VIEW_NODE, &show_midr_reps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstrap_seeds_cmd);
