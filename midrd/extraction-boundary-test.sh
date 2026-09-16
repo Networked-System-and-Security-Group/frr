@@ -4,11 +4,15 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 # Includes and types from the standalone public surface must remain protocol
-# neutral.  Comments may mention the excluded adapter; source dependencies may
-# not.
+# neutral. Comments may mention external adapters; source dependencies may not.
 if grep -RInE '#[[:space:]]*include[[:space:]]+[<"](bgpd|bgp_|zebra/)' \
     "$root"/*.c "$root"/*.h; then
 	printf '%s\n' 'standalone boundary scan: forbidden include' >&2
+	exit 1
+fi
+if grep -RInE '\b(struct[[:space:]]+(bgp|peer|bgp_path_info)|AFI_BGP|SAFI_MIDR_LS|BGP_(OPEN|UPDATE))\b' \
+    "$root"/*.c "$root"/*.h; then
+	printf '%s\n' 'standalone boundary scan: forbidden BGP dependency' >&2
 	exit 1
 fi
 
@@ -22,8 +26,13 @@ cd "$root"
 cat >"$tmp/contract.c" <<'EOF'
 #include "midr-core.h"
 #include "midr-consumer.h"
-#include "midr-prefix-provider.h"
+#include "midr-engine.h"
+#include "midr-local-ipc.h"
+#include "midr-local-provider.h"
 #include "midr-prefix-ipc.h"
+#include "midr-prefix-provider.h"
+#include "midr-spf.h"
+#include "midr-ted.h"
 #include "midr-transport.h"
 int main(void) { return MIDR_CORE_WIRE_VERSION == 1U ? 0 : 1; }
 EOF

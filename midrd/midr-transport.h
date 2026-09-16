@@ -42,6 +42,8 @@ struct midr_transport_frame {
 	uint8_t type;
 	uint16_t flags;
 	uint64_t sequence;
+	/* Connection generation assigned when the stream was established. */
+	uint64_t generation;
 	/* Optional timestamp at which an object's remaining lifetime was encoded.
 	 * Zero lets the transport record the queue insertion time. */
 	uint64_t encoded_ns;
@@ -55,12 +57,24 @@ typedef int (*midr_transport_frame_cb)(
 	void *arg, const struct midr_transport_endpoint *peer,
 	const struct midr_transport_frame *frame);
 
+/* Called exactly once after a queued frame has been completely written. */
+typedef void (*midr_transport_written_cb)(
+	void *arg, const struct midr_transport_endpoint *peer,
+	uint64_t generation, uint64_t sequence);
+
+/* Called once for each queued frame discarded when a stream is closed. */
+typedef void (*midr_transport_dropped_cb)(
+	void *arg, const struct midr_transport_endpoint *peer,
+	uint64_t generation, uint64_t sequence, int reason);
+
 struct midr_transport_callbacks {
 	midr_transport_frame_cb on_frame;
 	void (*on_established)(void *arg,
 			       const struct midr_transport_endpoint *peer);
 	void (*on_closed)(void *arg, const struct midr_transport_endpoint *peer,
 			  int reason);
+	midr_transport_written_cb on_frame_written;
+	midr_transport_dropped_cb on_frame_dropped;
 	void *arg;
 };
 
@@ -102,5 +116,7 @@ int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_frame *frame);
 int midr_transport_poll(struct midr_transport *transport, int timeout_ms);
 size_t midr_transport_peer_count(const struct midr_transport *transport);
+/* Number of frames still queued or partially written on all peers. */
+size_t midr_transport_pending(const struct midr_transport *transport);
 
 #endif /* MIDRD_TRANSPORT_H */

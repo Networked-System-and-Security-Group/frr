@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #define MIDR_LOCAL_IPC_MAGIC 0x4d4c4643U
-#define MIDR_LOCAL_IPC_VERSION 1U
+#define MIDR_LOCAL_IPC_VERSION 2U
 #define MIDR_LOCAL_IPC_RX_CAP (MIDR_LOCAL_IPC_FRAME_LEN * 8U)
 
 struct midr_local_ipc {
@@ -100,15 +100,18 @@ static int encode(const struct midr_local_event *event,
 	frame[5] = (uint8_t)event->kind;
 	put_u64(frame + 8, event->generation);
 	put_u32(frame + 16, event->originator);
-	if (event->kind == MIDR_LOCAL_MEMBERSHIP) {
+	if (event->kind == MIDR_LOCAL_MEMBERSHIP ||
+	    event->kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW) {
 		put_u32(frame + 20, event->fact.membership.group);
 		put_u64(frame + 24, event->fact.membership.version);
 		return 0;
 	}
-	if (event->kind != MIDR_LOCAL_LINK)
+	if (event->kind != MIDR_LOCAL_LINK &&
+	    event->kind != MIDR_LOCAL_LINK_WITHDRAW)
 		return 0;
 	link = &event->fact.link;
 	put_u32(frame + 32, link->remote_node_id);
+	put_u32(frame + 120, link->local_ifindex);
 	frame[36] = link->family;
 	put_u64(frame + 40, link->link_id);
 	put_u64(frame + 48, link->version);
@@ -136,19 +139,22 @@ static int decode(const uint8_t frame[MIDR_LOCAL_IPC_FRAME_LEN],
 	event->kind = (enum midr_local_event_kind)frame[5];
 	event->generation = get_u64(frame + 8);
 	event->originator = get_u32(frame + 16);
-	if (event->kind == MIDR_LOCAL_MEMBERSHIP) {
+	if (event->kind == MIDR_LOCAL_MEMBERSHIP ||
+	    event->kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW) {
 		if (!bytes_are_zero(frame + 32, 96))
 			return -EBADMSG;
 		event->fact.membership.group = get_u32(frame + 20);
 		event->fact.membership.version = get_u64(frame + 24);
-	} else if (event->kind == MIDR_LOCAL_LINK) {
+	} else if (event->kind == MIDR_LOCAL_LINK ||
+		   event->kind == MIDR_LOCAL_LINK_WITHDRAW) {
 		if (!bytes_are_zero(frame + 20, 12) ||
 		    !bytes_are_zero(frame + 37, 3) ||
 		    !bytes_are_zero(frame + 68, 4) ||
-		    !bytes_are_zero(frame + 120, 8))
+		    !bytes_are_zero(frame + 124, 4))
 			return -EBADMSG;
 		link = &event->fact.link;
 		link->remote_node_id = get_u32(frame + 32);
+		link->local_ifindex = get_u32(frame + 120);
 		link->family = frame[36];
 		link->link_id = get_u64(frame + 40);
 		link->version = get_u64(frame + 48);

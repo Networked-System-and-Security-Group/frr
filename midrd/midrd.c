@@ -35,6 +35,7 @@
 #define MIDRD_DEFAULT_TAKEOVER_DELAY 3000U
 #define MIDRD_FORWARD_BUDGET_MS 1000U
 #define MIDRD_TED_RETRY_MS 1000U
+#define MIDRD_SHUTDOWN_WAIT_MS 1000U
 
 static volatile sig_atomic_t stop_requested;
 
@@ -54,6 +55,7 @@ struct midrd_peer_config {
  * parameters needed for a single link between two nodes. */
 struct midrd_link_config {
 	uint32_t remote;
+	uint32_t local_ifindex;
 	uint32_t metric;
 	uint32_t candidate_metric;
 	uint64_t link_id;
@@ -72,9 +74,14 @@ struct midrd_snapshot_stage {
 	struct midr_transport_endpoint peer;
 	struct midr_core_object *objects;
 	uint64_t *received_ns;
+	struct midr_core_object *updates;
+	uint64_t *update_received_ns;
 	size_t count;
+	size_t update_count;
 	size_t capacity;
 	bool active;
+	bool ended;
+	uint64_t generation;
 };
 
 struct midrd_prefix_stage {
@@ -87,10 +94,19 @@ struct midrd_prefix_stage {
 	bool discard;
 };
 
+struct midrd_local_link_version {
+	uint32_t remote;
+	uint64_t link_id;
+	uint64_t version;
+};
+
 struct midrd_local_stage {
 	struct midr_local_membership membership;
 	struct midr_local_link links[MIDRD_MAX_LINKS];
+	struct midrd_local_link_version link_versions[MIDRD_MAX_SNAPSHOT];
 	size_t link_count;
+	size_t link_version_count;
+	uint64_t membership_floor;
 	uint64_t generation;
 	uint32_t originator;
 	bool membership_present;
@@ -99,17 +115,12 @@ struct midrd_local_stage {
 	bool discard;
 };
 
-struct midrd_local_link_version {
-	uint32_t remote;
-	uint64_t link_id;
-	uint64_t version;
-};
-
 struct midrd {
 	uint32_t node_id;
 	uint32_t group_id;
 	uint32_t lifetime_ms;
 	uint32_t hello_ms;
+	uint32_t hold_time_ms;
 	uint32_t takeover_delay_ms;
 	uint64_t frame_sequence;
 	struct midr_engine *engine;
@@ -154,6 +165,12 @@ struct midrd {
 	uint64_t last_spf_generation;
 	uint64_t stop_at;
 	bool ted_rebuild_pending;
+	/* Keep the previous consistent TED view while an inbound EoR batch is
+	 * being committed; publish a new derived view only after the barrier. */
+	bool sync_derivation_wait;
+	uint64_t shutdown_generation_failures;
+	bool shutdown_active;
+	uint64_t shutdown_write_failures;
 };
 
 static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms);
@@ -190,8 +207,15 @@ static struct midrd_snapshot_stage *stage_for(struct midrd *daemon,
 					      sizeof(*free_stage->objects));
 	free_stage->received_ns = calloc(free_stage->capacity,
 					  sizeof(*free_stage->received_ns));
-	if (!free_stage->objects || !free_stage->received_ns) {
+	free_stage->updates = calloc(free_stage->capacity,
+					 sizeof(*free_stage->updates));
+	free_stage->update_received_ns = calloc(free_stage->capacity,
+						 sizeof(*free_stage->update_received_ns));
+	if (!free_stage->objects || !free_stage->received_ns ||
+	    !free_stage->updates || !free_stage->update_received_ns) {
 		free(free_stage->received_ns);
+		free(free_stage->update_received_ns);
+		free(free_stage->updates);
 		free(free_stage->objects);
 		memset(free_stage, 0, sizeof(*free_stage));
 		return NULL;
@@ -206,6 +230,8 @@ static void stage_release(struct midrd_snapshot_stage *stage)
 	if (!stage)
 		return;
 	free(stage->received_ns);
+	free(stage->update_received_ns);
+	free(stage->updates);
 	free(stage->objects);
 	memset(stage, 0, sizeof(*stage));
 }
@@ -476,6 +502,28 @@ static void reflood_scope(struct midrd *daemon,
 	free(objects);
 }
 
+static void note_engine_publication(struct midrd *daemon)
+{
+	int error;
+	enum midr_ted_state previous_state;
+	int previous_error;
+
+	if (!daemon || !daemon->engine || !daemon->ted ||
+	    !midr_engine_publication_pending(daemon->engine))
+		return;
+	error = midr_engine_publication_error(daemon->engine);
+	if (!error)
+		error = -EIO;
+	previous_state = midr_ted_state(daemon->ted);
+	previous_error = midr_ted_last_error(daemon->ted);
+	(void)midr_ted_invalidate(daemon->ted, error);
+	daemon->ted_rebuild_pending = true;
+	if (previous_state != MIDR_TED_NOT_READY || previous_error != error)
+		fprintf(stderr,
+			"node=%" PRIu32 " ted-state=NOT_READY error=%d\n",
+			daemon->node_id, error);
+}
+
 static int apply_update(struct midrd *daemon,
 			const struct midr_core_object *object,
 			uint64_t now_ms, enum midr_core_result *result,
@@ -487,6 +535,8 @@ static int apply_update(struct midrd *daemon,
 		return -EINVAL;
 	*scope_changed = false;
 	ret = midr_engine_apply(daemon->engine, object, now_ms, result);
+	if (!ret)
+		note_engine_publication(daemon);
 	if (!ret && *result == MIDR_CORE_ACCEPTED &&
 	    object->identity.type == MIDR_CORE_MEMBERSHIP)
 		*scope_changed = true;
@@ -504,10 +554,15 @@ static int rebuild_ted(struct midrd *daemon)
 		return -EINVAL;
 	previous_state = midr_ted_state(daemon->ted);
 	previous_error = midr_ted_last_error(daemon->ted);
-	ret = midr_consumer_snapshot_acquire(daemon->consumer, &snapshot);
+	ret = midr_engine_retry_publication(daemon->engine, mono_ms());
+	if (!ret)
+		ret = midr_consumer_snapshot_acquire(daemon->consumer, &snapshot);
 	if (ret)
 		(void)midr_ted_invalidate(daemon->ted, ret);
-	else {
+	else if (midr_ted_state(daemon->ted) == MIDR_TED_READY &&
+		 midr_ted_source_generation(daemon->ted) == snapshot.generation) {
+		midr_consumer_snapshot_release(&snapshot);
+	} else {
 		ret = midr_ted_apply_snapshot(daemon->ted, &snapshot);
 		midr_consumer_snapshot_release(&snapshot);
 		if (ret)
@@ -531,32 +586,68 @@ static int rebuild_ted(struct midrd *daemon)
 static void drain_consumer(struct midrd *daemon)
 {
 	struct midr_consumer_event event;
-	struct midr_consumer_snapshot snapshot = {0};
+	struct midr_ted_view view = {0};
 	struct midr_spf_route routes[MIDRD_MAX_SNAPSHOT];
 	size_t route_count = 0;
 
 	while (midr_consumer_event_next(daemon->consumer, &event) == 0)
 		printf("node=%" PRIu32 " ted-event kind=%u generation=%" PRIu64 "\n",
 		       daemon->node_id, event.kind, event.generation);
-	if (midr_ted_snapshot_acquire(daemon->ted, &snapshot) == 0) {
-		if (snapshot.generation == daemon->last_spf_generation) {
-			midr_consumer_snapshot_release(&snapshot);
+	if (midr_ted_view_acquire(daemon->ted, &view) == 0) {
+		if (view.local_group_id) {
+			if (view.generation == daemon->last_spf_generation) {
+				midr_ted_view_release(&view);
+				return;
+			}
+			if (midr_spf_compute_ted(&view, routes, MIDRD_MAX_SNAPSHOT,
+						 &route_count) == 0) {
+				daemon->last_spf_generation = view.generation;
+				printf("node=%" PRIu32 " spf generation=%" PRIu64
+				       " routes=%zu\n", daemon->node_id, view.generation,
+				       route_count);
+				for (size_t i = 0; i < route_count; i++)
+					printf("node=%" PRIu32 " route originator=%" PRIu32
+					       " metric=%" PRIu64
+					       " reachable=%u nexthops=%zu\n",
+					       daemon->node_id, routes[i].originator,
+					       routes[i].metric,
+					       routes[i].reachable ? 1U : 0U,
+					       routes[i].nexthop_count);
+				midr_spf_routes_clear(routes, route_count);
+			}
+			midr_ted_view_release(&view);
 			return;
 		}
-		if (midr_spf_compute(&snapshot, daemon->node_id, routes,
-				     MIDRD_MAX_SNAPSHOT,
-				     &route_count) == 0) {
-			daemon->last_spf_generation = snapshot.generation;
-			printf("node=%" PRIu32 " spf generation=%" PRIu64
-			       " routes=%zu\n", daemon->node_id, snapshot.generation,
-			       route_count);
-			for (size_t i = 0; i < route_count; i++)
-				printf("node=%" PRIu32 " route originator=%" PRIu32
-				       " metric=%" PRIu32 " reachable=%u\n",
-				       daemon->node_id, routes[i].originator,
-				       routes[i].metric, routes[i].reachable ? 1U : 0U);
+		midr_ted_view_release(&view);
+	}
+	/* A local prefix-only deployment has no group-level TED yet. */
+	{
+		struct midr_consumer_snapshot snapshot = {0};
+
+		if (midr_ted_snapshot_acquire(daemon->ted, &snapshot) == 0) {
+			if (snapshot.generation == daemon->last_spf_generation) {
+				midr_consumer_snapshot_release(&snapshot);
+				return;
+			}
+			if (midr_spf_compute(&snapshot, daemon->node_id, routes,
+					     MIDRD_MAX_SNAPSHOT,
+					     &route_count) == 0) {
+				daemon->last_spf_generation = snapshot.generation;
+				printf("node=%" PRIu32 " spf generation=%" PRIu64
+				       " routes=%zu\n", daemon->node_id,
+				       snapshot.generation, route_count);
+				for (size_t i = 0; i < route_count; i++)
+					printf("node=%" PRIu32 " route originator=%" PRIu32
+					       " metric=%" PRIu64
+					       " reachable=%u nexthops=%zu\n",
+					       daemon->node_id, routes[i].originator,
+					       routes[i].metric,
+					       routes[i].reachable ? 1U : 0U,
+					       routes[i].nexthop_count);
+				midr_spf_routes_clear(routes, route_count);
+			}
+			midr_consumer_snapshot_release(&snapshot);
 		}
-		midr_consumer_snapshot_release(&snapshot);
 	}
 }
 
@@ -615,6 +706,13 @@ static void on_consumer_event(void *arg,
 
 	if (!daemon || !event || event->kind != MIDR_CONSUMER_SNAPSHOT_END)
 		return;
+	if (daemon->ted && midr_ted_state(daemon->ted) == MIDR_TED_READY &&
+	    midr_ted_source_generation(daemon->ted) == event->generation)
+		return;
+	if (daemon->sync_derivation_wait) {
+		daemon->ted_rebuild_pending = true;
+		return;
+	}
 	(void)rebuild_ted(daemon);
 }
 
@@ -629,8 +727,27 @@ static void on_established(void *arg,
 	send_snapshot(daemon, peer);
 }
 
+static int stage_queue_update(struct midrd_snapshot_stage *stage,
+			      const struct midr_core_object *object,
+			      uint64_t received_ns)
+{
+	if (!stage || !stage->active || stage->update_count == stage->capacity)
+		return -ENOSPC;
+	stage->updates[stage->update_count] = *object;
+	stage->update_received_ns[stage->update_count] = received_ns;
+	stage->update_count++;
+	return 0;
+}
+
+static int stage_generation_check(const struct midrd_snapshot_stage *stage,
+				  const struct midr_transport_frame *frame)
+{
+	return stage && frame && stage->generation == frame->generation ? 0 :
+		-EPROTO;
+}
+
 static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
-		      int reason)
+			      int reason)
 {
 	struct midrd *daemon = arg;
 	struct midrd_snapshot_stage *stage = stage_for(daemon, peer, false);
@@ -638,6 +755,35 @@ static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
 	stage_release(stage);
 	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
 	       daemon->node_id, peer->family, peer->port, reason);
+}
+
+static void on_frame_written(void *arg,
+			     const struct midr_transport_endpoint *peer,
+			     uint64_t generation, uint64_t sequence)
+{
+	struct midrd *daemon = arg;
+
+	if (!daemon || !peer)
+		return;
+	printf("node=%" PRIu32 " tx-complete family=%u port=%u gen=%" PRIu64
+	       " seq=%" PRIu64 "\n", daemon->node_id, peer->family,
+	       peer->port, generation, sequence);
+}
+
+static void on_frame_dropped(void *arg,
+			     const struct midr_transport_endpoint *peer,
+			     uint64_t generation, uint64_t sequence, int reason)
+{
+	struct midrd *daemon = arg;
+
+	if (!daemon || !peer)
+		return;
+	if (daemon->shutdown_active)
+		daemon->shutdown_write_failures++;
+	fprintf(stderr,
+		"node=%" PRIu32 " tx-dropped family=%u port=%u gen=%" PRIu64
+		" seq=%" PRIu64 " reason=%d\n", daemon->node_id, peer->family,
+		peer->port, generation, sequence, reason);
 }
 
 static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
@@ -671,14 +817,20 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		return 0;
 		}
 	case MIDR_WIRE_KEEPALIVE:
-		return 0;
+		return frame->payload_len ? -EINVAL : 0;
 	case MIDR_WIRE_SNAPSHOT_OBJECT:
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
 								false);
 			uint64_t now_ns;
 
-			if (!stage || !stage->active || stage->count == stage->capacity)
+			if (!stage || !stage->active)
+				return -EPROTO;
+			if (stage_generation_check(stage, frame))
+				return -EPROTO;
+			if (stage->ended)
+				return -EPROTO;
+			if (stage->count == stage->capacity)
 				return -ENOSPC;
 			if (midr_wire_decode_object(frame->payload, frame->payload_len,
 						    &stage->objects[stage->count]))
@@ -696,6 +848,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	case MIDR_WIRE_UPDATE:
 	case MIDR_WIRE_WITHDRAW:
 		{
+			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
+								false);
 			bool scope_changed;
 			uint64_t now_ns;
 
@@ -709,34 +863,65 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 						 now_ns, 0);
 			if (ret)
 				return ret;
+			/* Incremental objects received before EoR belong to the same
+			 * snapshot transaction.  Queue them so a reconnect cannot expose
+			 * a half-applied full view or publish an intermediate TED. */
+			if (stage && stage->active) {
+				if (stage_generation_check(stage, frame))
+					return -EPROTO;
+				return stage_queue_update(stage, &object, now_ns);
+			}
 			ret = apply_update(daemon, &object, now_ns / 1000000U, &result,
 					   &scope_changed);
-		if (ret)
-			return ret;
-		if (result == MIDR_CORE_ACCEPTED) {
-			drain_events(daemon, peer);
-			if (scope_changed)
-				reflood_scope(daemon, peer);
-			(void)reconcile_group_prefixes(daemon, mono_ms());
-		}
-		return 0;
+			if (ret)
+				return ret;
+			if (result == MIDR_CORE_ACCEPTED) {
+				drain_events(daemon, peer);
+				if (scope_changed)
+					reflood_scope(daemon, peer);
+				(void)reconcile_group_prefixes(daemon, mono_ms());
+			}
+			return 0;
 		}
 	case MIDR_WIRE_SNAPSHOT_BEGIN:
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer, true);
 
+			if (frame->payload_len)
+				return -EINVAL;
 			if (!stage)
 				return -ENOSPC;
+			/* A delayed begin from an older connection must not reset a
+			 * snapshot already being assembled for a newer generation. */
+			if (stage->generation && frame->generation < stage->generation)
+				return -EPROTO;
 			/* A repeated begin starts a fresh snapshot generation. */
 			stage->count = 0;
+			stage->update_count = 0;
+			stage->ended = false;
+			stage->generation = frame->generation;
 		}
 		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
 		       frame->type);
 		return 0;
 	case MIDR_WIRE_SNAPSHOT_END:
-		printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
-		       frame->type);
-		return 0;
+		{
+			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
+								false);
+
+			printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
+			       frame->type);
+			if (frame->payload_len)
+				return -EINVAL;
+			if (!stage)
+				return -EPROTO;
+			if (stage_generation_check(stage, frame))
+				return -EPROTO;
+			if (stage->ended)
+				return -EPROTO;
+			stage->ended = true;
+			return 0;
+		}
 	case MIDR_WIRE_EOR:
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
@@ -746,9 +931,19 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 
 			printf("node=%" PRIu32 " sync type=%u\n", daemon->node_id,
 			       frame->type);
+			if (frame->payload_len)
+				return -EINVAL;
 			if (!stage)
 				return 0;
+			if (stage_generation_check(stage, frame))
+				return -EPROTO;
+			if (!stage->ended)
+				return -EPROTO;
 			now_ns = mono_ns();
+			/* Keep the previous derived view available during the transaction;
+			 * the callback from engine_end_batch() is serviced below, after EoR
+			 * has established a complete canonical view. */
+			daemon->sync_derivation_wait = true;
 			ret = midr_engine_begin_batch(daemon->engine);
 			if (!ret)
 				for (size_t i = 0; i < stage->count; i++) {
@@ -766,14 +961,38 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					if (result == MIDR_CORE_ACCEPTED &&
 						    stage->objects[i].identity.type ==
 							    MIDR_CORE_MEMBERSHIP) {
-							scope_changed = true;
-						}
+						scope_changed = true;
+					}
+				}
+			if (!ret)
+				for (size_t i = 0; i < stage->update_count; i++) {
+					ret = age_object_lifetime(
+						daemon, &stage->updates[i],
+						stage->update_received_ns[i], now_ns, 0);
+					if (ret)
+						break;
+					ret = midr_engine_apply(daemon->engine,
+								&stage->updates[i],
+								now_ns / 1000000U,
+								&result);
+					if (ret)
+						break;
+					if (result == MIDR_CORE_ACCEPTED &&
+						    stage->updates[i].identity.type ==
+							    MIDR_CORE_MEMBERSHIP)
+						scope_changed = true;
 				}
 			if (!ret)
 				ret = midr_engine_end_batch(daemon->engine,
 						    now_ns / 1000000U);
+			daemon->sync_derivation_wait = false;
+			if (!ret)
+				note_engine_publication(daemon);
 			if (ret)
 				(void)midr_engine_abort_batch(daemon->engine);
+			else if (daemon->ted_rebuild_pending &&
+				 !midr_engine_publication_pending(daemon->engine))
+				(void)rebuild_ted(daemon);
 			stage_release(stage);
 			if (!ret) {
 				drain_events(daemon, peer);
@@ -800,6 +1019,7 @@ static int publish_owned(void *arg, const struct midr_core_object *object)
 	ret = midr_engine_apply(daemon->engine, object, now_ms, &result);
 	if (ret)
 		return ret;
+	note_engine_publication(daemon);
 	return result == MIDR_CORE_ACCEPTED ? 0 : -EAGAIN;
 }
 
@@ -961,6 +1181,7 @@ static int commit_prefixes(struct midrd *daemon,
 	ret = midr_engine_end_batch(daemon->engine, now);
 	if (ret)
 		goto failed;
+	note_engine_publication(daemon);
 	daemon->owned_commit_active = false;
 	owned_staged = false;
 	staged = NULL;
@@ -1148,10 +1369,36 @@ static int local_link_version_find(
 	return -1;
 }
 
+static int local_link_version_set(
+	struct midrd_local_link_version *versions, size_t *count,
+	uint32_t remote, uint64_t link_id, uint64_t version)
+{
+	if (!versions || !count || !remote || !version)
+		return -EINVAL;
+	for (size_t i = 0; i < *count; i++) {
+		if (versions[i].remote != remote ||
+		    versions[i].link_id != link_id)
+			continue;
+		if (version > versions[i].version)
+			versions[i].version = version;
+		return 0;
+	}
+	if (*count == MIDRD_MAX_SNAPSHOT)
+		return -ENOSPC;
+	versions[*count] = (struct midrd_local_link_version){
+		.remote = remote,
+		.link_id = link_id,
+		.version = version,
+	};
+	(*count)++;
+	return 0;
+}
+
 static bool local_link_input_equal(const struct midrd_link_config *current,
 				   const struct midr_local_link *input)
 {
 	return current->input_version == input->version &&
+	       current->local_ifindex == input->local_ifindex &&
 	       current->address_family == input->family &&
 	       current->latest_metrics.rtt_us == input->rtt_us &&
 	       current->latest_metrics.loss_ppm == input->loss_ppm &&
@@ -1215,6 +1462,7 @@ static int local_link_config_at(const struct midr_local_link *input,
 		 memcmp(current->remote_address, input->remote_address,
 			sizeof(current->remote_address)));
 	config->remote = input->remote_node_id;
+	config->local_ifindex = input->local_ifindex;
 	config->link_id = input->link_id;
 	config->address_family = input->family;
 	memcpy(config->local_address, input->local_address,
@@ -1271,12 +1519,55 @@ static void link_object(struct midrd *daemon,
 	       sizeof(object->remote_address));
 }
 
+static uint32_t local_ifindex_lookup(void *arg, uint32_t local_node_id,
+				     uint32_t remote_node_id,
+				     uint64_t link_id)
+{
+	const struct midrd *daemon = arg;
+
+	if (!daemon || local_node_id != daemon->node_id)
+		return 0;
+	for (size_t i = 0; i < daemon->link_count; i++)
+		if (daemon->links[i].remote == remote_node_id &&
+		    daemon->links[i].link_id == link_id)
+			return daemon->links[i].local_ifindex;
+	return 0;
+}
+
+static bool local_ifindices_equal(const struct midrd_link_config *left,
+				  size_t left_count,
+				  const struct midrd_link_config *right,
+				  size_t right_count)
+{
+	if (left_count != right_count)
+		return false;
+	for (size_t i = 0; i < left_count; i++) {
+		bool found = false;
+
+		for (size_t j = 0; j < right_count; j++) {
+			if (left[i].remote != right[j].remote ||
+			    left[i].link_id != right[j].link_id)
+				continue;
+			if (left[i].local_ifindex != right[j].local_ifindex)
+				return false;
+			found = true;
+			break;
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
 static int commit_local_facts_at(
 	struct midrd *daemon, const struct midr_local_membership *membership,
 	bool membership_present, const struct midr_local_link *links,
-	size_t link_count, uint64_t now_ms)
+	size_t link_count, uint64_t membership_floor,
+	const struct midrd_local_link_version *version_floors,
+	size_t version_floor_count, uint64_t now_ms)
 {
 	struct midrd_link_config desired_links[MIDRD_MAX_LINKS];
+	struct midrd_link_config saved_links[MIDRD_MAX_LINKS];
 	struct midrd_local_link_version desired_versions[MIDRD_MAX_SNAPSHOT];
 	struct midr_owned *staged = NULL, *old_owned = NULL;
 	struct midr_core_identity *saved_group_prefixes = NULL;
@@ -1284,21 +1575,28 @@ static int commit_local_facts_at(
 		.type = MIDR_CORE_MEMBERSHIP,
 	};
 	size_t saved_group_prefix_count;
+	size_t saved_link_count;
 	uint32_t saved_representative_group;
 	uint32_t saved_representative_node;
 	uint64_t saved_takeover_ready_at;
 	bool saved_representative_committed;
 	bool saved_group_reconcile_pending;
 	bool membership_changed = false;
+	bool local_ifindex_changed;
 	bool owned_staged = false;
 	bool allow_version_reset;
 	size_t desired_version_count;
 	int ret;
 
 	if (!daemon || (membership_present && !membership) ||
-	    (link_count && !links) || link_count > MIDRD_MAX_LINKS)
+	    (link_count && !links) || link_count > MIDRD_MAX_LINKS ||
+	    (version_floor_count && !version_floors) ||
+	    version_floor_count > MIDRD_MAX_SNAPSHOT)
 		return -EINVAL;
 	allow_version_reset = daemon->local_generation == 0;
+	saved_link_count = daemon->link_count;
+	memcpy(saved_links, daemon->links,
+	       saved_link_count * sizeof(*saved_links));
 	desired_version_count = allow_version_reset
 				? 0
 				: daemon->local_link_version_count;
@@ -1346,6 +1644,16 @@ static int commit_local_facts_at(
 		}
 		desired_versions[version_index].version = links[i].version;
 	}
+	for (size_t i = 0; i < version_floor_count; i++) {
+		ret = local_link_version_set(
+			desired_versions, &desired_version_count,
+			version_floors[i].remote, version_floors[i].link_id,
+			version_floors[i].version);
+		if (ret)
+			return ret;
+	}
+	local_ifindex_changed = !local_ifindices_equal(
+		saved_links, saved_link_count, desired_links, link_count);
 	saved_group_prefix_count = daemon->group_prefix_count;
 	saved_representative_group = daemon->representative_group;
 	saved_representative_node = daemon->representative_node;
@@ -1419,10 +1727,12 @@ static int commit_local_facts_at(
 		struct midr_core_object object;
 
 		link_object(daemon, &desired_links[i], &object);
-		if (!midr_owned_lookup(staged, &object.identity, &current) &&
-		    current.state == MIDR_CORE_ACTIVE &&
-		    midr_core_object_semantic_equal(&current, &object))
-			continue;
+		{
+			if (!midr_owned_lookup(staged, &object.identity, &current) &&
+			    current.state == MIDR_CORE_ACTIVE &&
+			    midr_core_object_semantic_equal(&current, &object))
+				continue;
+		}
 		ret = midr_owned_upsert(staged, &object);
 		if (ret)
 			goto abort;
@@ -1433,9 +1743,23 @@ static int commit_local_facts_at(
 	ret = reconcile_group_prefixes(daemon, now_ms);
 	if (ret)
 		goto abort;
-	ret = midr_engine_end_batch(daemon->engine, now_ms);
-	if (ret)
-		goto failed;
+	/* TED derivation runs synchronously inside engine_end_batch().  Expose the
+	 * candidate local metadata for that derivation, and restore it if the
+	 * canonical transaction itself fails. */
+	memcpy(daemon->links, desired_links,
+	       link_count * sizeof(*desired_links));
+	daemon->link_count = link_count;
+	{
+		uint64_t generation = midr_engine_generation(daemon->engine);
+
+		ret = midr_engine_end_batch(daemon->engine, now_ms);
+		if (ret)
+			goto failed;
+		if (local_ifindex_changed &&
+		    midr_engine_generation(daemon->engine) == generation)
+			(void)midr_engine_republish(daemon->engine, now_ms);
+	}
+	note_engine_publication(daemon);
 	daemon->owned_commit_active = false;
 	owned_staged = false;
 	staged = NULL;
@@ -1443,11 +1767,8 @@ static int commit_local_facts_at(
 	daemon->group_id = membership_present ? membership->group : 0;
 	if (membership_present)
 		daemon->membership_version = membership->version;
-	else if (allow_version_reset)
-		daemon->membership_version = 0;
-	memcpy(daemon->links, desired_links,
-	       link_count * sizeof(*desired_links));
-	daemon->link_count = link_count;
+	else
+		daemon->membership_version = membership_floor;
 	memcpy(daemon->local_link_versions, desired_versions,
 	       desired_version_count * sizeof(*desired_versions));
 	daemon->local_link_version_count = desired_version_count;
@@ -1463,6 +1784,9 @@ abort:
 	(void)midr_engine_abort_batch(daemon->engine);
 failed:
 	daemon->owned_commit_active = false;
+	memcpy(daemon->links, saved_links,
+	       saved_link_count * sizeof(*saved_links));
+	daemon->link_count = saved_link_count;
 	if (owned_staged) {
 		staged = daemon->owned;
 		daemon->owned = old_owned;
@@ -1511,6 +1835,136 @@ static int local_stage_apply(struct midrd_local_stage *stage,
 	return 0;
 }
 
+static int local_stage_delta_apply(struct midrd_local_stage *stage,
+				   const struct midr_local_event *event)
+{
+	const struct midr_local_link *link = &event->fact.link;
+	int index;
+	int version_index;
+
+	if (event->kind == MIDR_LOCAL_MEMBERSHIP) {
+		if (stage->membership_floor > event->fact.membership.version)
+			return -ESTALE;
+		if (stage->membership_floor == event->fact.membership.version) {
+			if (!stage->membership_present)
+				return -ESTALE;
+			if (stage->membership.group != event->fact.membership.group)
+				return -EEXIST;
+			return 0;
+		}
+		stage->membership = event->fact.membership;
+		stage->membership_present = true;
+		stage->membership_floor = event->fact.membership.version;
+		return 0;
+	}
+	if (event->kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW) {
+		if (event->fact.membership.version < stage->membership_floor)
+			return -ESTALE;
+		if (event->fact.membership.version == stage->membership_floor &&
+		    !stage->membership_present)
+			return 0;
+		if (event->fact.membership.version == stage->membership_floor &&
+		    stage->membership_present)
+			return -EEXIST;
+		stage->membership_present = false;
+		stage->membership_floor = event->fact.membership.version;
+		memset(&stage->membership, 0, sizeof(stage->membership));
+		return 0;
+	}
+	if (event->kind != MIDR_LOCAL_LINK &&
+	    event->kind != MIDR_LOCAL_LINK_WITHDRAW)
+		return -EINVAL;
+	version_index = local_link_version_find(stage->link_versions,
+						stage->link_version_count, link);
+	if (version_index >= 0 &&
+	    link->version < stage->link_versions[version_index].version)
+		return -ESTALE;
+	index = local_link_find(stage->links, stage->link_count, link);
+	if (event->kind == MIDR_LOCAL_LINK_WITHDRAW) {
+		if (version_index >= 0 &&
+		    link->version == stage->link_versions[version_index].version) {
+			if (index < 0)
+				return 0;
+			return -EEXIST;
+		}
+		if (index >= 0)
+			stage->links[index] = stage->links[--stage->link_count];
+		return local_link_version_set(stage->link_versions,
+					       &stage->link_version_count,
+					       link->remote_node_id, link->link_id,
+					       link->version);
+	}
+	if (version_index >= 0 &&
+	    link->version == stage->link_versions[version_index].version) {
+		if (index < 0)
+			return -ESTALE;
+		if (memcmp(&stage->links[index], link, sizeof(*link)))
+			return -EEXIST;
+		return 0;
+	}
+	if (index >= 0)
+		stage->links[index] = *link;
+	else {
+		if (stage->link_count == MIDRD_MAX_LINKS)
+			return -ENOSPC;
+		stage->links[stage->link_count++] = *link;
+	}
+	return 0;
+}
+
+static int local_delta_at(struct midrd *daemon,
+			  const struct midr_local_event *event, uint64_t now_ms)
+{
+	struct midrd_local_stage stage = {0};
+	int ret;
+
+	if (!daemon || !event || !daemon->local_generation ||
+	    event->generation != daemon->local_generation)
+		return event && event->generation < daemon->local_generation ? 0 :
+			-EAGAIN;
+	stage.generation = daemon->local_generation;
+	stage.originator = daemon->node_id;
+	stage.membership_present = daemon->group_id != 0;
+	stage.membership.group = daemon->group_id;
+	stage.membership.version = daemon->membership_version;
+	stage.membership_floor = daemon->membership_version;
+	for (size_t i = 0; i < daemon->link_count; i++) {
+		stage.links[i].remote_node_id = daemon->links[i].remote;
+		stage.links[i].local_ifindex = daemon->links[i].local_ifindex;
+		stage.links[i].family = daemon->links[i].address_family;
+		stage.links[i].link_id = daemon->links[i].link_id;
+		stage.links[i].version = daemon->links[i].input_version;
+		stage.links[i].rtt_us = daemon->links[i].latest_metrics.rtt_us;
+		stage.links[i].loss_ppm = daemon->links[i].latest_metrics.loss_ppm;
+		stage.links[i].available_bandwidth_kbps =
+			daemon->links[i].latest_metrics.available_bandwidth_kbps;
+		stage.links[i].measurement_sequence =
+			daemon->links[i].measurement_sequence;
+		stage.links[i].measurement_timestamp_ms =
+			daemon->links[i].measurement_timestamp_ms;
+		memcpy(stage.links[i].local_address,
+		       daemon->links[i].local_address,
+		       sizeof(stage.links[i].local_address));
+		memcpy(stage.links[i].remote_address,
+		       daemon->links[i].remote_address,
+		       sizeof(stage.links[i].remote_address));
+	}
+	stage.link_count = daemon->link_count;
+	stage.link_version_count = daemon->local_link_version_count;
+	memcpy(stage.link_versions, daemon->local_link_versions,
+	       daemon->local_link_version_count * sizeof(*stage.link_versions));
+	ret = local_stage_delta_apply(&stage, event);
+	if (ret)
+		return ret;
+	ret = commit_local_facts_at(
+		daemon,
+		stage.membership_present ? &stage.membership : NULL,
+		stage.membership_present, stage.links, stage.link_count,
+		stage.membership_floor, stage.link_versions,
+		stage.link_version_count, now_ms);
+	return ret;
+}
+
 static int local_event_at(void *arg, const struct midr_local_event *event,
 			  uint64_t now_ms)
 {
@@ -1530,9 +1984,25 @@ static int local_event_at(void *arg, const struct midr_local_event *event,
 		stage->generation = event->generation;
 		stage->originator = event->originator;
 		stage->discard = event->generation <= daemon->local_generation;
+		if (!stage->discard && daemon->local_generation) {
+			stage->membership_floor = daemon->membership_version;
+			stage->link_version_count = daemon->local_link_version_count;
+			memcpy(stage->link_versions, daemon->local_link_versions,
+			       stage->link_version_count * sizeof(*stage->link_versions));
+		}
 		return 0;
 	}
 	if (!stage->active) {
+		if ((event->kind == MIDR_LOCAL_MEMBERSHIP ||
+		     event->kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW ||
+		     event->kind == MIDR_LOCAL_LINK ||
+		     event->kind == MIDR_LOCAL_LINK_WITHDRAW)) {
+			if (event->generation < daemon->local_generation)
+				return 0;
+			if (event->generation > daemon->local_generation)
+				return -EAGAIN;
+			return local_delta_at(daemon, event, now_ms);
+		}
 		if (event->kind == MIDR_LOCAL_SNAPSHOT_END ||
 		    event->kind == MIDR_LOCAL_EOR)
 			return event->generation <= daemon->local_generation ? 0 :
@@ -1555,19 +2025,30 @@ static int local_event_at(void *arg, const struct midr_local_event *event,
 			      ? 0
 			      : commit_local_facts_at(
 					daemon,
-					stage->membership_present
-						? &stage->membership
-						: NULL,
-					stage->membership_present,
-					stage->links, stage->link_count, now_ms);
+								stage->membership_present
+									? &stage->membership
+									: NULL,
+								stage->membership_present,
+								stage->links, stage->link_count,
+								stage->membership_floor,
+								stage->link_versions,
+								stage->link_version_count, now_ms);
 		if (!ret && !stage->discard)
 			daemon->local_generation = stage->generation;
 		local_stage_reset(stage);
 		return ret;
 	}
-	if (stage->ended)
-		return -EINVAL;
-	return stage->discard ? 0 : local_stage_apply(stage, event);
+	if (stage->ended) {
+		if (stage->discard)
+			return 0;
+		return local_stage_delta_apply(stage, event);
+	}
+	if (stage->discard)
+		return 0;
+	if (event->kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW ||
+	    event->kind == MIDR_LOCAL_LINK_WITHDRAW)
+		return local_stage_delta_apply(stage, event);
+	return local_stage_apply(stage, event);
 }
 
 static int local_event(void *arg, const struct midr_local_event *event)
@@ -1641,6 +2122,7 @@ static int publish_pending_link_costs_at(struct midrd *daemon,
 	ret = midr_engine_end_batch(daemon->engine, now_ms);
 	if (ret)
 		goto failed;
+	note_engine_publication(daemon);
 	daemon->owned_commit_active = false;
 	old_owned = daemon->owned;
 	daemon->owned = staged;
@@ -1955,8 +2437,12 @@ static void periodic(struct midrd *daemon, uint64_t now)
 	}
 	if (now >= daemon->next_expire) {
 		size_t expired = 0;
+		int ret;
 
-		if (midr_engine_expire(daemon->engine, now, &expired) == 0 && expired) {
+		ret = midr_engine_expire(daemon->engine, now, &expired);
+		if (!ret)
+			note_engine_publication(daemon);
+		if (!ret && expired) {
 			drain_events(daemon, NULL);
 			(void)reconcile_group_prefixes(daemon, now);
 		}
@@ -1968,13 +2454,95 @@ static void periodic(struct midrd *daemon, uint64_t now)
 		(void)reconcile_group_prefixes(daemon, now);
 }
 
+enum midrd_shutdown_result {
+	MIDRD_SHUTDOWN_COMPLETE,
+	MIDRD_SHUTDOWN_DEGRADED,
+	MIDRD_SHUTDOWN_GENERATION_FAILED,
+};
+
+static enum midrd_shutdown_result shutdown_result(size_t remaining,
+						 size_t pending,
+						 uint64_t write_failures)
+{
+	if (remaining)
+		return MIDRD_SHUTDOWN_GENERATION_FAILED;
+	if (pending || write_failures)
+		return MIDRD_SHUTDOWN_DEGRADED;
+	return MIDRD_SHUTDOWN_COMPLETE;
+}
+
+static void shutdown_withdraw(struct midrd *daemon)
+{
+	uint64_t deadline;
+	bool generation_failed = false;
+	bool attempted = false;
+
+	if (!daemon || !daemon->owned)
+		return;
+	daemon->shutdown_active = true;
+	daemon->shutdown_write_failures = 0;
+	deadline = mono_ms() + MIDRD_SHUTDOWN_WAIT_MS;
+	for (;;) {
+		size_t withdrawn = 0;
+		int ret = midr_owned_withdraw_all(daemon->owned, &withdrawn);
+
+		attempted = true;
+		if (withdrawn)
+			drain_events(daemon, NULL);
+		if (ret)
+			generation_failed = true;
+		if (!midr_owned_count(daemon->owned))
+			break;
+		if (mono_ms() >= deadline)
+			break;
+		if (daemon->transport)
+			(void)midr_transport_poll(daemon->transport, 10);
+	}
+	/* Count one failure for this teardown generation.  Repeated polls below
+	 * are retries, not additional teardown generations. */
+	if (generation_failed)
+		daemon->shutdown_generation_failures++;
+	{
+		size_t remaining = midr_owned_count(daemon->owned);
+		size_t pending = daemon->transport
+			? midr_transport_pending(daemon->transport) : 0;
+		enum midrd_shutdown_result result =
+			shutdown_result(remaining, pending, daemon->shutdown_write_failures);
+
+		switch (result) {
+		case MIDRD_SHUTDOWN_GENERATION_FAILED:
+			printf("node=%" PRIu32
+			       " shutdown=GENERATION_FAILED remaining=%zu failures=%" PRIu64
+			       "\n", daemon->node_id, remaining,
+			       daemon->shutdown_generation_failures);
+			break;
+		case MIDRD_SHUTDOWN_DEGRADED:
+			printf("node=%" PRIu32
+			       " shutdown=DEGRADED pending=%zu dropped=%" PRIu64
+			       " generation-failures=%" PRIu64 "\n", daemon->node_id,
+			       pending, daemon->shutdown_write_failures,
+			       daemon->shutdown_generation_failures);
+			break;
+		case MIDRD_SHUTDOWN_COMPLETE:
+			if (attempted)
+				printf("node=%" PRIu32
+				       " shutdown=COMPLETE generation-failures=%" PRIu64
+				       "\n", daemon->node_id,
+				       daemon->shutdown_generation_failures);
+			break;
+		}
+	}
+	daemon->shutdown_active = false;
+}
+
 static void usage(const char *program)
 {
 	fprintf(stderr,
 		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
 		"[--group ID] [--prefix ADDRESS/LEN] [--link NODE:COST]... "
 		"[--local-fact-socket PATH] [--prefix-socket PATH] "
-		"[--sequence-file PATH] [--lifetime MS] [--runtime SEC] "
+		"[--sequence-file PATH] [--lifetime MS] [--hold-time MS] "
+		"[--runtime SEC] "
 		"[--takeover-delay MS] [--pidfile PATH]\n",
 		program);
 }
@@ -1990,6 +2558,8 @@ int main(int argc, char **argv)
 	struct midr_owned_config owned_config;
 	struct midr_ted_config ted_config = {
 		.max_events = MIDRD_MAX_SNAPSHOT,
+		.local_ifindex_lookup = local_ifindex_lookup,
+		.local_ifindex_arg = &daemon,
 	};
 	struct midr_consumer_config consumer_config = {
 		.on_event = on_consumer_event,
@@ -1999,6 +2569,8 @@ int main(int argc, char **argv)
 		.on_frame = on_frame,
 		.on_established = on_established,
 		.on_closed = on_closed,
+		.on_frame_written = on_frame_written,
+		.on_frame_dropped = on_frame_dropped,
 	};
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
@@ -2041,6 +2613,9 @@ int main(int argc, char **argv)
 			daemon.sequence_file = argv[++opt];
 		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
 			daemon.lifetime_ms = (uint32_t)strtoul(argv[++opt], NULL, 10);
+		else if (!strcmp(argv[opt], "--hold-time") && opt + 1 < argc)
+			daemon.hold_time_ms =
+				(uint32_t)strtoul(argv[++opt], NULL, 10);
 		else if (!strcmp(argv[opt], "--takeover-delay") && opt + 1 < argc)
 			daemon.takeover_delay_ms =
 				(uint32_t)strtoul(argv[++opt], NULL, 10);
@@ -2053,10 +2628,17 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	if (!daemon.hold_time_ms)
+		daemon.hold_time_ms = daemon.lifetime_ms;
 	if (!daemon.node_id || !listen_text ||
 	    daemon.lifetime_ms <= MIDRD_FORWARD_BUDGET_MS) {
 		fprintf(stderr, "lifetime must be greater than forwarding budget %u ms\n",
 			MIDRD_FORWARD_BUDGET_MS);
+		return 2;
+	}
+	if (daemon.hold_time_ms <= daemon.hello_ms) {
+		fprintf(stderr, "hold time must be greater than hello interval %u ms\n",
+			daemon.hello_ms);
 		return 2;
 	}
 	if (prefix_text && prefix_socket) {
@@ -2080,7 +2662,7 @@ int main(int argc, char **argv)
 		daemon.links[i].last_cost_advertised_ms = mono_ms();
 	}
 	transport_config.hello_interval_ms = daemon.hello_ms;
-	transport_config.hold_time_ms = daemon.lifetime_ms;
+	transport_config.hold_time_ms = daemon.hold_time_ms;
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
 	transport_callbacks.arg = &daemon;
@@ -2095,6 +2677,7 @@ int main(int argc, char **argv)
 	if (midr_engine_create(&engine_config, &daemon.engine) ||
 	    midr_ted_create(&ted_config, &daemon.ted) ||
 	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
+	    midr_engine_attach_ted(daemon.engine, daemon.ted) ||
 	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
 	    midr_owned_create(&owned_config, publish_owned, &daemon,
 			       &daemon.owned) ||
@@ -2193,12 +2776,7 @@ int main(int argc, char **argv)
 		(void)midr_transport_poll(daemon.transport, 100);
 		periodic(&daemon, mono_ms());
 	}
-	if (daemon.owned) {
-		size_t withdrawn = 0;
-
-		if (!midr_owned_withdraw_all(daemon.owned, &withdrawn) && withdrawn)
-			drain_events(&daemon, NULL);
-	}
+	shutdown_withdraw(&daemon);
 	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
 	       midr_engine_count(daemon.engine));
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)

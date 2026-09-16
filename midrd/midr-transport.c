@@ -25,6 +25,8 @@ struct midr_transport_tx {
 	size_t length;
 	size_t offset;
 	uint64_t encoded_ns;
+	uint64_t generation;
+	uint64_t sequence;
 };
 
 struct midr_transport_peer {
@@ -107,6 +109,23 @@ static bool endpoint_address_equal(const struct midr_transport_endpoint *a,
 	       !memcmp(a->address, b->address, sizeof(a->address));
 }
 
+static int endpoint_compare(const struct midr_transport_endpoint *a,
+			    const struct midr_transport_endpoint *b)
+{
+	int ret;
+
+	if (a->family != b->family)
+		return a->family < b->family ? -1 : 1;
+	ret = memcmp(a->address, b->address, sizeof(a->address));
+	if (ret)
+		return ret;
+	if (a->scope_id != b->scope_id)
+		return a->scope_id < b->scope_id ? -1 : 1;
+	if (a->port != b->port)
+		return a->port < b->port ? -1 : 1;
+	return 0;
+}
+
 static int endpoint_to_sockaddr(const struct midr_transport_endpoint *endpoint,
 				struct sockaddr_storage *address,
 				socklen_t *length)
@@ -151,6 +170,24 @@ static void sockaddr_to_endpoint(const struct sockaddr_storage *address,
 		endpoint->scope_id = sin6->sin6_scope_id;
 		memcpy(endpoint->address, &sin6->sin6_addr, 16);
 	}
+}
+
+static bool local_keeps_outbound(const struct midr_transport *transport,
+				 int accepted_fd,
+				 const struct midr_transport_peer *peer)
+{
+	struct sockaddr_storage address;
+	struct midr_transport_endpoint local = transport->config.local;
+	socklen_t address_len = sizeof(address);
+
+	/* getsockname() resolves a wildcard listener to the concrete address used
+	 * by this connection.  Both endpoints can therefore make the same choice:
+	 * the lower listening endpoint keeps its outbound stream and the higher
+	 * endpoint keeps the matching inbound stream. */
+	if (getsockname(accepted_fd, (struct sockaddr *)&address,
+			&address_len) == 0)
+		sockaddr_to_endpoint(&address, &local);
+	return endpoint_compare(&local, &peer->endpoint) <= 0;
 }
 
 static struct midr_transport_peer *find_peer(
@@ -215,12 +252,17 @@ initialize:
 	return peer;
 }
 
-static void free_tx(struct midr_transport_peer *peer)
+static void free_tx(struct midr_transport *transport,
+			struct midr_transport_peer *peer, int reason)
 {
 	struct midr_transport_tx *tx;
 
 	while ((tx = peer->tx_head)) {
 		peer->tx_head = tx->next;
+		if (transport->callbacks.on_frame_dropped)
+			transport->callbacks.on_frame_dropped(
+				transport->callbacks.arg, &peer->endpoint,
+				tx->generation, tx->sequence, reason);
 		free(tx->data);
 		free(tx);
 	}
@@ -239,7 +281,7 @@ static void close_peer(struct midr_transport *transport,
 	peer->connecting = false;
 	peer->established = false;
 	peer->rx_length = 0;
-	free_tx(peer);
+	free_tx(transport, peer, reason);
 	if (notify && transport->callbacks.on_closed)
 		transport->callbacks.on_closed(transport->callbacks.arg,
 					       &peer->endpoint, reason);
@@ -262,12 +304,26 @@ static int set_nonblocking(int fd)
 	return 0;
 }
 
+/* Frames may be queued while a non-blocking connect is still in progress.
+ * Their connection generation is not known at enqueue time; bind those
+ * frames to the generation assigned by establish_peer() before any bytes
+ * are written.  Frames from a previous established stream are discarded by
+ * close_peer(), so retagging here cannot let an old completion leak forward.
+ */
+static void retag_queued_frames(struct midr_transport_peer *peer,
+				uint64_t generation)
+{
+	for (struct midr_transport_tx *tx = peer->tx_head; tx; tx = tx->next)
+		tx->generation = generation;
+}
+
 static void establish_peer(struct midr_transport *transport,
 			   struct midr_transport_peer *peer)
 {
 	peer->connecting = false;
 	peer->established = true;
 	peer->generation = ++transport->next_generation;
+	retag_queued_frames(peer, peer->generation);
 	peer->last_rx_ms = transport_now_ms(transport);
 	peer->rx_length = 0;
 	if (!peer->rx_buffer) {
@@ -318,11 +374,18 @@ static int flush_peer(struct midr_transport *transport,
 		if (sent > 0) {
 			tx->offset += (size_t)sent;
 			if (tx->offset == tx->length) {
+				uint64_t generation = tx->generation;
+				uint64_t sequence = tx->sequence;
+
 				peer->tx_head = tx->next;
 				if (!peer->tx_head)
 					peer->tx_tail = NULL;
 				free(tx->data);
 				free(tx);
+				if (transport->callbacks.on_frame_written)
+					transport->callbacks.on_frame_written(
+						transport->callbacks.arg,
+						&peer->endpoint, generation, sequence);
 			}
 			continue;
 		}
@@ -340,9 +403,9 @@ static int flush_peer(struct midr_transport *transport,
 	return 0;
 }
 
-static int queue_frame(struct midr_transport_peer *peer,
-			       const uint8_t *data, size_t length,
-			       uint64_t encoded_ns)
+static int queue_frame_with_sequence(struct midr_transport_peer *peer,
+				      const uint8_t *data, size_t length,
+				      uint64_t encoded_ns, uint64_t sequence)
 {
 	struct midr_transport_tx *tx = calloc(1, sizeof(*tx));
 
@@ -356,6 +419,8 @@ static int queue_frame(struct midr_transport_peer *peer,
 	memcpy(tx->data, data, length);
 	tx->length = length;
 	tx->encoded_ns = encoded_ns;
+	tx->generation = peer->generation;
+	tx->sequence = sequence;
 	if (peer->tx_tail)
 		peer->tx_tail->next = tx;
 	else
@@ -373,6 +438,8 @@ static int parse_rx(struct midr_transport *transport,
 		size_t frame_length;
 		struct midr_wire_frame wire_frame;
 		struct midr_transport_frame frame = {0};
+		uint64_t generation;
+		int fd;
 		int ret;
 
 		memcpy(&magic, peer->rx_buffer, sizeof(magic));
@@ -403,10 +470,13 @@ static int parse_rx(struct midr_transport *transport,
 		frame.type = wire_frame.type;
 		frame.flags = wire_frame.flags;
 		frame.sequence = wire_frame.sequence;
+		frame.generation = peer->generation;
 		frame.received_ns = received_ns;
 		frame.payload = wire_frame.payload;
 		frame.payload_len = wire_frame.payload_len;
 		peer->last_rx_ms = received_ns / 1000000U;
+		fd = peer->fd;
+		generation = peer->generation;
 		ret = transport->callbacks.on_frame(transport->callbacks.arg,
 						   &peer->endpoint, &frame);
 		if (ret) {
@@ -415,9 +485,18 @@ static int parse_rx(struct midr_transport *transport,
 			 * connection before returning so the unconsumed frame cannot be
 			 * delivered again on the next poll.  The desired peer remains
 			 * registered and will follow the normal reconnect path. */
-			close_peer(transport, peer, ret);
+			if (peer->used && peer->fd == fd &&
+			    peer->generation == generation)
+				close_peer(transport, peer, ret);
 			return ret;
 		}
+		/* Callbacks may synchronously close this stream, for example when a
+		 * response or reflood hits EPIPE.  close_peer() resets rx_length (and
+		 * may free the buffer), so never consume bytes from the old stream
+		 * after its fd or generation changed. */
+		if (!peer->used || !peer->established || peer->fd != fd ||
+		    peer->generation != generation)
+			return 0;
 		peer->rx_length -= frame_length;
 		if (peer->rx_length)
 			memmove(peer->rx_buffer, peer->rx_buffer + frame_length,
@@ -432,7 +511,8 @@ static int read_peer(struct midr_transport *transport,
 	uint8_t buffer[4096];
 
 	for (;;) {
-		ssize_t received = recv(peer->fd, buffer, sizeof(buffer), 0);
+		int fd = peer->fd;
+		ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
 
 		if (received > 0) {
 			uint64_t received_ns = transport_now_ns(transport);
@@ -450,6 +530,8 @@ static int read_peer(struct midr_transport *transport,
 				if (ret)
 					return ret;
 			}
+			if (!peer->used || !peer->established || peer->fd != fd)
+				return 0;
 			continue;
 		}
 		if (received < 0 && errno == EINTR)
@@ -692,7 +774,8 @@ int midr_transport_send(struct midr_transport *transport,
 		return -EMSGSIZE;
 	encoded_ns = frame->encoded_ns ? frame->encoded_ns :
 		transport_now_ns(transport);
-	ret = queue_frame(peer, packet, length, encoded_ns);
+	ret = queue_frame_with_sequence(peer, packet, length, encoded_ns,
+				       frame->sequence);
 	if (ret)
 		return ret;
 	return peer->established ? flush_peer(transport, peer) : 0;
@@ -730,11 +813,14 @@ static int accept_peers(struct midr_transport *transport)
 		if (peer) {
 			endpoint = peer->endpoint;
 			if (peer->fd >= 0) {
-				/* Keep an already selected connection.  In particular, do
-				 * not replace an outbound connect-in-progress with its
-				 * simultaneous inbound duplicate. */
-				close(fd);
-				continue;
+				if (local_keeps_outbound(transport, fd, peer)) {
+					close(fd);
+					continue;
+				}
+				/* Both endpoints may initiate at the same time.  Replace the
+				 * losing outbound stream so both sides retain the same TCP
+				 * connection instead of repeatedly closing each other. */
+				close_peer(transport, peer, -ECONNABORTED);
 			}
 			/* A configured peer retains its destination port for future
 			 * reconnects.  Accepted TCP sockets expose the remote's
@@ -843,5 +929,21 @@ size_t midr_transport_peer_count(const struct midr_transport *transport)
 		if (transport->peers[i].used &&
 		    (transport->peers[i].desired || transport->peers[i].fd >= 0))
 			count++;
+	return count;
+}
+
+size_t midr_transport_pending(const struct midr_transport *transport)
+{
+	size_t count = 0;
+
+	if (!transport)
+		return 0;
+	for (size_t i = 0; i < transport->peer_count; i++) {
+		const struct midr_transport_peer *peer = &transport->peers[i];
+
+		for (const struct midr_transport_tx *tx = peer->tx_head; tx;
+		     tx = tx->next)
+			count++;
+	}
 	return count;
 }

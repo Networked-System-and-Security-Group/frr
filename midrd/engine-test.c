@@ -46,27 +46,111 @@ static void drain(struct midr_consumer *consumer)
 		;
 }
 
-struct ted_bridge {
-	struct midr_consumer *consumer;
-	struct midr_ted *ted;
-	int last_error;
+struct ted_callback_observer {
+	size_t count;
+	uint64_t generation;
+	uint32_t flags;
 };
 
-static void apply_ted_snapshot(void *arg,
-			       const struct midr_consumer_event *event)
+static void ted_changed(struct midr_ted *ted, uint64_t generation,
+				uint32_t flags, void *arg)
 {
-	struct ted_bridge *bridge = arg;
-	struct midr_consumer_snapshot snapshot = {0};
+	struct ted_callback_observer *observer = arg;
 
-	if (event->kind != MIDR_CONSUMER_SNAPSHOT_END)
-		return;
-	bridge->last_error = midr_consumer_snapshot_acquire(bridge->consumer,
-							    &snapshot);
-	if (!bridge->last_error) {
-		bridge->last_error = midr_ted_apply_snapshot(bridge->ted,
-							     &snapshot);
-		midr_consumer_snapshot_release(&snapshot);
-	}
+	assert(ted);
+	observer->count++;
+	observer->generation = generation;
+	observer->flags |= flags;
+}
+
+static uint32_t test_local_ifindex(void *arg, uint32_t local_node_id,
+				   uint32_t remote_node_id, uint64_t link_id)
+{
+	(void)arg;
+	(void)local_node_id;
+	(void)remote_node_id;
+	(void)link_id;
+	return 42;
+}
+
+static size_t fill_pending(struct midr_consumer *consumer)
+{
+	const struct midr_consumer_event event = {
+		.kind = MIDR_CONSUMER_NODE_PREFIX,
+		.generation = 1,
+		.originator = 999,
+		.family = MIDR_CORE_AF_IPV4,
+		.prefix_len = 32,
+	};
+	size_t count = 0;
+	int ret;
+
+	while ((ret = midr_consumer_publish(consumer, &event)) == 0)
+		count++;
+	assert(ret == -ENOSPC);
+	return count;
+}
+
+static void test_publication_failure_keeps_canonical(void)
+{
+	struct midr_engine_config config = {
+		.node_id = 203,
+		.max_objects = 8,
+		.lifetime_ms = 1000,
+	};
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_core_object local = membership(203, 1);
+	struct midr_core_object owner1 = membership(31, 1);
+	struct midr_core_object owner2 = membership(32, 1);
+	struct midr_core_object first = prefix(31, MIDR_CORE_AF_IPV4);
+	struct midr_core_object second = prefix(32, MIDR_CORE_AF_IPV4);
+	struct midr_core_object current;
+	struct midr_consumer_snapshot snapshot = {0};
+	enum midr_core_result result;
+
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_create(&config, &engine) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	drain(consumer);
+	assert(midr_engine_apply(engine, &local, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &owner1, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &owner2, 1, &result) == 0);
+	drain(consumer);
+	assert(fill_pending(consumer) > 0);
+	assert(midr_engine_apply(engine, &first, 1, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_engine_lookup(engine, &first.identity, 1, &current, NULL) == 0);
+	assert(midr_engine_publication_pending(engine));
+	assert(midr_engine_publication_error(engine) == -ENOSPC);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.count == 0);
+	midr_consumer_snapshot_release(&snapshot);
+	drain(consumer);
+	assert(midr_engine_retry_publication(engine, 1) == 0);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.count == 1);
+	midr_consumer_snapshot_release(&snapshot);
+	drain(consumer);
+
+	assert(fill_pending(consumer) > 0);
+	assert(midr_engine_begin_batch(engine) == 0);
+	assert(midr_engine_apply(engine, &second, 2, &result) == 0);
+	assert(midr_engine_end_batch(engine, 2) == 0);
+	assert(midr_engine_count(engine) == 5);
+	assert(midr_engine_lookup(engine, &second.identity, 2, &current, NULL) == 0);
+	assert(midr_engine_publication_pending(engine));
+	assert(midr_engine_publication_error(engine) == -ENOSPC);
+	drain(consumer);
+	assert(midr_engine_retry_publication(engine, 2) == 0);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.count == 2);
+	midr_consumer_snapshot_release(&snapshot);
+	midr_engine_destroy(&engine);
+	midr_consumer_destroy(&consumer);
 }
 
 static void test_ted_failure_preserves_old_view(void)
@@ -77,52 +161,266 @@ static void test_ted_failure_preserves_old_view(void)
 		.lifetime_ms = 1000,
 	};
 	struct midr_ted_config ted_config = {.max_events = 8};
-	struct ted_bridge bridge = {0};
-	struct midr_consumer_config consumer_config = {
-		.on_event = apply_ted_snapshot,
-		.arg = &bridge,
-	};
+	struct midr_consumer_config consumer_config = {0};
 	struct midr_engine *engine = NULL;
 	struct midr_consumer *consumer = NULL;
 	struct midr_ted *ted = NULL;
 	struct midr_core_object local = membership(300, 1);
-	struct midr_core_object object = prefix(300, MIDR_CORE_AF_IPV4);
+	struct midr_core_object owner = membership(301, 1);
+	struct midr_core_object object = prefix(301, MIDR_CORE_AF_IPV4);
+	struct midr_core_object current;
 	struct midr_consumer_snapshot snapshot = {0};
+	struct midr_lsdb_snapshot lsdb = {0};
 	enum midr_core_result result;
-	uint64_t old_generation;
+	uint64_t old_consumer_generation;
+	uint64_t old_lsdb_generation;
+	uint64_t old_ted_generation;
 
 	assert(midr_engine_create(&engine_config, &engine) == 0);
 	assert(midr_ted_create(&ted_config, &ted) == 0);
-	bridge.ted = ted;
 	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
-	bridge.consumer = consumer;
+	assert(midr_engine_attach_ted(engine, ted) == 0);
 	assert(midr_engine_attach_consumer(engine, consumer) == 0);
-	assert(bridge.last_error == 0 && midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_ted_state(ted) == MIDR_TED_READY);
 	assert(midr_engine_apply(engine, &local, 1, &result) == 0);
+	assert(midr_engine_apply(engine, &owner, 1, &result) == 0);
 	assert(midr_engine_apply(engine, &object, 1, &result) == 0);
-	old_generation = midr_ted_generation(ted);
+	drain(consumer);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.count == 1 && snapshot.events[0].metric == 301);
+	old_consumer_generation = snapshot.generation;
+	midr_consumer_snapshot_release(&snapshot);
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	old_lsdb_generation = lsdb.generation;
+	midr_lsdb_snapshot_release(&lsdb);
+	old_ted_generation = midr_ted_generation(ted);
 	assert(midr_ted_test_fail_next(ted, -ENOMEM) == 0);
 	object.sequence++;
 	object.metric++;
 	assert(midr_engine_apply(engine, &object, 2, &result) == 0);
-	assert(result == MIDR_CORE_ACCEPTED && bridge.last_error == -ENOMEM);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_engine_lookup(engine, &object.identity, 2, &current, NULL) == 0);
+	assert(current.metric == object.metric);
+	assert(midr_engine_publication_pending(engine));
+	assert(midr_engine_publication_error(engine) == -ENOMEM);
 	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
-	assert(snapshot.generation > old_generation && snapshot.count == 1);
+	assert(snapshot.generation == old_consumer_generation &&
+	       snapshot.count == 1 && snapshot.events[0].metric == 301);
 	midr_consumer_snapshot_release(&snapshot);
-	assert(midr_ted_generation(ted) == old_generation);
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	assert(lsdb.generation == old_lsdb_generation);
+	midr_lsdb_snapshot_release(&lsdb);
+	assert(midr_ted_generation(ted) == old_ted_generation + 1U);
 	assert(midr_ted_state(ted) == MIDR_TED_NOT_READY);
 	assert(midr_ted_snapshot_acquire(ted, &snapshot) == -EAGAIN);
 
-	object.sequence++;
-	object.metric++;
-	assert(midr_engine_apply(engine, &object, 3, &result) == 0);
-	assert(bridge.last_error == 0 && midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_engine_retry_publication(engine, 2) == 0);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_ted_state(ted) == MIDR_TED_READY);
 	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
-	assert(midr_ted_generation(ted) == snapshot.generation);
+	assert(snapshot.generation == midr_engine_generation(engine) &&
+	       snapshot.events[0].metric == object.metric);
+	assert(midr_ted_source_generation(ted) == snapshot.generation);
+	assert(midr_ted_generation(ted) == old_ted_generation + 2U);
 	midr_consumer_snapshot_release(&snapshot);
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	assert(lsdb.generation == midr_engine_generation(engine));
+	midr_lsdb_snapshot_release(&lsdb);
 	midr_ted_destroy(&ted);
 	midr_consumer_destroy(&consumer);
 	midr_engine_destroy(&engine);
+}
+
+static void test_lsdb_pending_and_failure_split(void)
+{
+	struct midr_engine_config engine_config = {
+		.node_id = 1,
+		.max_objects = 8,
+		.lifetime_ms = 1000,
+	};
+	struct midr_ted_config ted_config = {.max_events = 8};
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_ted *ted = NULL;
+	struct midr_core_object local = membership(1, 10);
+	struct midr_core_object remote = membership(2, 10);
+	struct midr_core_object link = link_object(1, 2);
+	struct midr_core_object current;
+	struct midr_consumer_snapshot consumer_snapshot = {0};
+	struct midr_lsdb_snapshot lsdb = {0};
+	enum midr_core_result result;
+	uint64_t lsdb_generation;
+	uint64_t ted_generation;
+
+	assert(midr_engine_create(&engine_config, &engine) == 0);
+	assert(midr_ted_create(&ted_config, &ted) == 0);
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_attach_ted(engine, ted) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	drain(consumer);
+	assert(midr_engine_apply(engine, &local, 1, &result) == 0);
+	drain(consumer);
+	assert(midr_engine_apply(engine, &link, 1, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	assert(lsdb.count == 2 && lsdb.pending_count == 1 &&
+	       lsdb.usable_count == 1);
+	midr_lsdb_snapshot_release(&lsdb);
+	assert(midr_consumer_snapshot_acquire(consumer, &consumer_snapshot) == 0);
+	assert(consumer_snapshot.count == 0);
+	midr_consumer_snapshot_release(&consumer_snapshot);
+
+	assert(midr_engine_apply(engine, &remote, 2, &result) == 0);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	assert(lsdb.count == 3 && lsdb.pending_count == 0 &&
+	       lsdb.usable_count == 3);
+	lsdb_generation = lsdb.generation;
+	midr_lsdb_snapshot_release(&lsdb);
+	assert(midr_consumer_snapshot_acquire(consumer, &consumer_snapshot) == 0);
+	assert(consumer_snapshot.count == 1 &&
+	       consumer_snapshot.events[0].kind == MIDR_CONSUMER_LINK &&
+	       consumer_snapshot.events[0].metric == 1);
+	midr_consumer_snapshot_release(&consumer_snapshot);
+	ted_generation = midr_ted_generation(ted);
+
+	assert(midr_engine_test_fail_next_lsdb(engine, -ENOMEM) == 0);
+	link.sequence++;
+	link.metric = 20;
+	assert(midr_engine_apply(engine, &link, 3, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_engine_lookup(engine, &link.identity, 3, &current, NULL) == 0);
+	assert(current.metric == 20);
+	assert(midr_engine_publication_pending(engine));
+	assert(midr_engine_publication_error(engine) == -ENOMEM);
+	assert(midr_ted_state(ted) == MIDR_TED_NOT_READY);
+	assert(midr_ted_generation(ted) == ted_generation + 1U);
+	assert(midr_engine_lsdb_snapshot_acquire(engine, &lsdb) == 0);
+	assert(lsdb.generation == lsdb_generation);
+	midr_lsdb_snapshot_release(&lsdb);
+	assert(midr_consumer_snapshot_acquire(consumer, &consumer_snapshot) == 0);
+	assert(consumer_snapshot.events[0].metric == 1);
+	midr_consumer_snapshot_release(&consumer_snapshot);
+
+	drain(consumer);
+	assert(midr_engine_retry_publication(engine, 3) == 0);
+	assert(!midr_engine_publication_pending(engine));
+	assert(midr_ted_state(ted) == MIDR_TED_READY);
+	assert(midr_ted_generation(ted) == ted_generation + 2U);
+	assert(midr_consumer_snapshot_acquire(consumer, &consumer_snapshot) == 0);
+	assert(consumer_snapshot.events[0].metric == 20);
+	assert(midr_ted_source_generation(ted) == consumer_snapshot.generation);
+	midr_consumer_snapshot_release(&consumer_snapshot);
+	midr_ted_destroy(&ted);
+	midr_consumer_destroy(&consumer);
+	midr_engine_destroy(&engine);
+}
+
+static void test_formal_ted_derivation(void)
+{
+	struct midr_engine_config engine_config = {
+		.node_id = 1,
+		.max_objects = 16,
+		.lifetime_ms = 1000,
+	};
+	struct midr_ted_config ted_config = {
+		.max_events = 16,
+		.local_ifindex_lookup = test_local_ifindex,
+	};
+	struct midr_consumer_config consumer_config = {0};
+	struct midr_engine *engine = NULL;
+	struct midr_consumer *consumer = NULL;
+	struct midr_ted *ted = NULL;
+	struct midr_core_object objects[11];
+	struct midr_ted_view view = {0};
+	struct midr_spf_route routes[8] = {0};
+	struct midr_ted_consumer *ted_consumer = NULL;
+	struct ted_callback_observer observer = {0};
+	const struct midr_ted_consumer_ops ted_ops = {
+		.snapshot_changed = ted_changed,
+	};
+	enum midr_core_result result;
+	size_t route_count = 0;
+	uint64_t spf_generation;
+
+	objects[0] = membership(1, 10);
+	objects[1] = membership(2, 10);
+	objects[2] = membership(3, 20);
+	objects[3] = membership(4, 20);
+	objects[4] = link_object(1, 2);
+	objects[4].metric = 5;
+	objects[5] = link_object(1, 3);
+	objects[5].identity.link_id = 2;
+	objects[5].metric = 30;
+	objects[6] = link_object(2, 4);
+	objects[6].identity.link_id = 3;
+	objects[6].metric = 20;
+	objects[7] = link_object(3, 1);
+	objects[7].identity.link_id = 4;
+	objects[7].metric = 7;
+	objects[8] = prefix(2, MIDR_CORE_AF_IPV4);
+	objects[9] = prefix(3, MIDR_CORE_AF_IPV6);
+	objects[10] = prefix(3, MIDR_CORE_AF_IPV6);
+	objects[10].identity.type = MIDR_CORE_GROUP_PREFIX;
+	objects[10].identity.group = 20;
+	objects[10].identity.prefix[15] = 1;
+
+	assert(midr_engine_create(&engine_config, &engine) == 0);
+	assert(midr_ted_create(&ted_config, &ted) == 0);
+	assert(midr_ted_consumer_register(ted, &ted_ops, &observer,
+					 &ted_consumer) == 0);
+	assert(observer.count == 0);
+	assert(midr_consumer_create(&consumer_config, &consumer) == 0);
+	assert(midr_engine_attach_ted(engine, ted) == 0);
+	assert(midr_engine_attach_consumer(engine, consumer) == 0);
+	for (size_t i = 0; i < sizeof(objects) / sizeof(objects[0]); i++) {
+		assert(midr_engine_apply(engine, &objects[i], 1, &result) == 0);
+		assert(result == MIDR_CORE_ACCEPTED);
+		drain(consumer);
+	}
+	assert(midr_ted_view_acquire(ted, &view) == 0);
+	assert(view.local_node_id == 1 && view.local_group_id == 10);
+	assert(view.node_count == 2 && view.nodes[0].node_id == 1 &&
+	       view.nodes[1].node_id == 2);
+	assert(view.intra_link_count == 1 &&
+	       view.intra_links[0].canonical_cost == 5 &&
+	       view.intra_links[0].local_ifindex == 42);
+	assert(view.egress_link_count == 2 &&
+	       view.egress_links[0].canonical_cost == 30 &&
+	       view.egress_links[0].local_ifindex == 42 &&
+	       view.egress_links[1].canonical_cost == 20 &&
+	       view.egress_links[1].local_ifindex == 0);
+	assert(view.node_prefix_count == 1 &&
+	       view.node_prefixes[0].node_id == 2);
+	assert(view.group_edge_count == 2);
+	assert(view.group_edges[0].source_group_id == 10 &&
+	       view.group_edges[0].target_group_id == 20 &&
+	       view.group_edges[0].aggregate_cost == 20);
+	assert(view.group_edges[1].source_group_id == 20 &&
+	       view.group_edges[1].target_group_id == 10 &&
+	       view.group_edges[1].aggregate_cost == 7);
+	assert(view.prefix_group_count == 1 &&
+	       view.prefix_groups[0].group_id == 20);
+	assert(observer.count > 0 && observer.generation == view.generation &&
+	       (observer.flags & MIDR_TED_CHANGE_ALL) == MIDR_TED_CHANGE_ALL &&
+	       midr_ted_generation_is_current(ted, view.generation));
+	assert(midr_spf_compute_ted(&view, routes, 8, &route_count) == 0);
+	assert(route_count == 2);
+	midr_spf_routes_clear(routes, route_count);
+	spf_generation = view.generation;
+	midr_ted_view_release(&view);
+	objects[4].sequence++;
+	objects[4].metric++;
+	assert(midr_engine_apply(engine, &objects[4], 2, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(!midr_ted_generation_is_current(ted, spf_generation));
+	midr_ted_consumer_unregister(ted, &ted_consumer);
+	midr_engine_destroy(&engine);
+	midr_consumer_destroy(&consumer);
+	midr_ted_destroy(&ted);
 }
 
 static void test_batch_abort_is_atomic(void)
@@ -387,10 +685,13 @@ int main(void)
 	test_batch_abort_is_atomic();
 	test_batch_failure_does_not_publish();
 	test_batch_invalid_is_atomic();
+	test_publication_failure_keeps_canonical();
 	test_membership_scope_lifecycle();
 	test_scope_rollback_is_atomic();
 	test_snapshot_rebuilds_expired_scope();
 	test_ted_failure_preserves_old_view();
+	test_lsdb_pending_and_failure_split();
+	test_formal_ted_derivation();
 	struct midr_engine_config engine_config = {
 		.node_id = 100,
 		.max_objects = 16,
@@ -431,6 +732,7 @@ int main(void)
 	assert(snapshot.count == 2 && snapshot.generation == 6);
 	assert(midr_spf_compute(&snapshot, engine_config.node_id, routes, 4,
 				       &count) == 0 && count == 2);
+	midr_spf_routes_clear(routes, count);
 	midr_consumer_snapshot_release(&snapshot);
 	drain(consumer);
 	assert(midr_engine_withdraw(engine, &v4.identity, 2) == 0);

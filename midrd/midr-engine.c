@@ -12,7 +12,9 @@ struct midr_engine {
 	struct midr_core *batch_core;
 	struct midr_scope *scope;
 	struct midr_scope *batch_scope;
+	struct midr_lsdb *lsdb;
 	struct midr_consumer *consumer;
+	struct midr_ted *ted;
 	uint64_t generation;
 	uint64_t batch_generation;
 	unsigned int batch_depth;
@@ -20,6 +22,10 @@ struct midr_engine {
 	bool batch_view_dirty;
 	bool batch_failed;
 	int batch_error;
+	bool publication_pending;
+	bool publication_local_metadata;
+	int publication_error;
+	bool scope_rebuild_pending;
 };
 
 static struct midr_core *active_core(struct midr_engine *engine)
@@ -73,43 +79,6 @@ static int rebuild_scope(struct midr_engine *engine, struct midr_core *core,
 	return 0;
 }
 
-static int object_to_consumer(const struct midr_core_object *object,
-				      uint64_t generation,
-				      struct midr_consumer_event *event)
-{
-	memset(event, 0, sizeof(*event));
-	event->generation = generation;
-	event->originator = object->identity.originator;
-	event->remote = object->identity.remote;
-	event->group = object->identity.group;
-	event->link_id = object->identity.link_id;
-	event->family = object->identity.type == MIDR_CORE_LINK
-			? object->address_family
-			: object->identity.family;
-	event->prefix_len = object->identity.prefix_len;
-	memcpy(event->prefix, object->identity.prefix,
-	       sizeof(event->prefix));
-	event->metric = object->metric;
-	memcpy(event->local_address, object->local_address,
-	       sizeof(event->local_address));
-	memcpy(event->remote_address, object->remote_address,
-	       sizeof(event->remote_address));
-	switch (object->identity.type) {
-	case MIDR_CORE_LINK:
-		event->kind = MIDR_CONSUMER_LINK;
-		break;
-	case MIDR_CORE_NODE_PREFIX:
-		event->kind = MIDR_CONSUMER_NODE_PREFIX;
-		break;
-	case MIDR_CORE_GROUP_PREFIX:
-		event->kind = MIDR_CONSUMER_GROUP_PREFIX;
-		break;
-	default:
-		return -ENOENT;
-	}
-	return 0;
-}
-
 /* midr_core_snapshot() expires entries as part of its read contract.  Keep
  * the engine's scope in lockstep when a caller reaches a snapshot between
  * periodic expiry passes; otherwise a just-expired Membership could still
@@ -125,12 +94,18 @@ static int synchronize_expiry(struct midr_engine *engine,
 	int ret;
 
 	ret = midr_core_expire(core, now_ms, &expired);
-	if (ret || !expired)
-		return ret;
-	ret = rebuild_scope(engine, core, now_ms, &rebuilt);
 	if (ret)
 		return ret;
-	engine->generation++;
+	if (!expired && !engine->scope_rebuild_pending)
+		return 0;
+	if (expired)
+		engine->generation++;
+	ret = rebuild_scope(engine, core, now_ms, &rebuilt);
+	if (ret) {
+		if (core == engine->core)
+			engine->scope_rebuild_pending = true;
+		return ret;
+	}
 	if (core == engine->batch_core) {
 		old_scope = engine->batch_scope;
 		engine->batch_scope = rebuilt;
@@ -139,6 +114,7 @@ static int synchronize_expiry(struct midr_engine *engine,
 	} else if (core == engine->core) {
 		old_scope = engine->scope;
 		engine->scope = rebuilt;
+		engine->scope_rebuild_pending = false;
 	} else {
 		midr_scope_destroy(&rebuilt);
 		return -EINVAL;
@@ -151,12 +127,15 @@ static int synchronize_expiry(struct midr_engine *engine,
 }
 
 static int publish_snapshot(struct midr_engine *engine, struct midr_core *core,
-			    struct midr_scope *scope, uint64_t now_ms)
+			    struct midr_scope *scope, uint64_t now_ms,
+			    bool local_metadata_update)
 {
-	struct midr_core_object *objects;
-	struct midr_consumer_event *events;
+	struct midr_core_object *objects = NULL;
+	struct midr_lsdb_stage *lsdb_stage = NULL;
+	struct midr_ted_stage *ted_stage = NULL;
+	struct midr_consumer_stage *consumer_stage = NULL;
+	struct midr_consumer_snapshot snapshot = {0};
 	size_t count = 0;
-	size_t event_count = 0;
 	int ret;
 
 	if (!engine->consumer)
@@ -172,32 +151,66 @@ static int publish_snapshot(struct midr_engine *engine, struct midr_core *core,
 	objects = calloc(engine->config.max_objects, sizeof(*objects));
 	if (!objects)
 		return -ENOMEM;
-	events = calloc(engine->config.max_objects, sizeof(*events));
-	if (!events) {
-		free(objects);
-		return -ENOMEM;
-	}
 	ret = midr_core_snapshot(core, now_ms, objects,
 				 engine->config.max_objects, &count);
 	if (ret)
 		goto done;
-	for (size_t i = 0; i < count; i++) {
-		if (objects[i].state != MIDR_CORE_ACTIVE ||
-		    !midr_scope_usable(scope, &objects[i]))
-			continue;
-		ret = object_to_consumer(&objects[i], engine->generation,
-					 &events[event_count]);
-		if (ret == -ENOENT)
-			continue;
+	ret = midr_lsdb_prepare(engine->lsdb, engine->generation, objects, count,
+				scope, &lsdb_stage);
+	if (ret)
+		goto done;
+	ret = midr_lsdb_stage_consumer_snapshot(lsdb_stage, &snapshot);
+	if (ret)
+		goto done;
+	ret = midr_consumer_prepare_snapshot(
+		engine->consumer, snapshot.generation, engine->config.node_id,
+		snapshot.events, snapshot.count, &consumer_stage);
+	if (ret)
+		goto done;
+	if (engine->ted) {
+		ret = midr_ted_prepare_lsdb(engine->ted, engine->config.node_id,
+					    lsdb_stage, &snapshot,
+					    local_metadata_update, &ted_stage);
 		if (ret)
 			goto done;
-		event_count++;
 	}
-	ret = midr_consumer_commit_snapshot(engine->consumer, engine->generation,
-					    engine->config.node_id, events, event_count);
+	/* Every allocation and validation has completed.  These commits only swap
+	 * prepared ownership; Consumer callbacks run last and observe a matching
+	 * LSDB/TED generation. */
+	midr_lsdb_commit_prepared(engine->lsdb, &lsdb_stage);
+	if (engine->ted)
+		midr_ted_commit_prepared(engine->ted, &ted_stage);
+	midr_consumer_commit_prepared(engine->consumer, &consumer_stage);
+	ret = 0;
 done:
-	free(events);
+	midr_consumer_abort_prepared(&consumer_stage);
+	midr_ted_abort_prepared(&ted_stage);
+	midr_lsdb_abort_prepared(&lsdb_stage);
 	free(objects);
+	return ret;
+}
+
+static int publish_current_snapshot(struct midr_engine *engine,
+				    uint64_t now_ms,
+				    bool local_metadata_update)
+{
+	int ret;
+
+	/* Clear the marker before invoking the Consumer callback.  A successful
+	 * commit callback may synchronously inspect or retry the engine and must
+	 * observe that the latest view is already published. */
+	engine->publication_pending = false;
+	engine->publication_local_metadata = false;
+	engine->publication_error = 0;
+	ret = publish_snapshot(engine, engine->core, engine->scope, now_ms,
+			       local_metadata_update);
+	if (ret) {
+		engine->publication_pending = true;
+		engine->publication_local_metadata = local_metadata_update;
+		engine->publication_error = ret;
+		if (engine->ted)
+			(void)midr_ted_invalidate(engine->ted, ret);
+	}
 	return ret;
 }
 
@@ -206,6 +219,7 @@ int midr_engine_create(const struct midr_engine_config *config,
 {
 	struct midr_engine *engine;
 	struct midr_core_config core_config = {0};
+	struct midr_lsdb_config lsdb_config;
 	struct midr_scope_config scope_config;
 	int ret;
 
@@ -231,6 +245,14 @@ int midr_engine_create(const struct midr_engine_config *config,
 		free(engine);
 		return ret;
 	}
+	lsdb_config.max_objects = config->max_objects;
+	ret = midr_lsdb_create(&lsdb_config, &engine->lsdb);
+	if (ret) {
+		midr_scope_destroy(&engine->scope);
+		midr_core_destroy(&engine->core);
+		free(engine);
+		return ret;
+	}
 	engine->generation = 1;
 	*out = engine;
 	return 0;
@@ -242,6 +264,7 @@ void midr_engine_destroy(struct midr_engine **enginep)
 		return;
 	midr_scope_destroy(&(*enginep)->batch_scope);
 	midr_scope_destroy(&(*enginep)->scope);
+	midr_lsdb_destroy(&(*enginep)->lsdb);
 	midr_core_destroy(&(*enginep)->batch_core);
 	midr_core_destroy(&(*enginep)->core);
 	free(*enginep);
@@ -254,7 +277,15 @@ int midr_engine_attach_consumer(struct midr_engine *engine,
 	if (!engine)
 		return -EINVAL;
 	engine->consumer = consumer;
-	return publish_snapshot(engine, engine->core, engine->scope, 0);
+	return publish_current_snapshot(engine, 0, false);
+}
+
+int midr_engine_attach_ted(struct midr_engine *engine, struct midr_ted *ted)
+{
+	if (!engine)
+		return -EINVAL;
+	engine->ted = ted;
+	return engine->consumer ? publish_current_snapshot(engine, 0, false) : 0;
 }
 
 int midr_engine_apply(struct midr_engine *engine,
@@ -299,9 +330,18 @@ int midr_engine_apply(struct midr_engine *engine,
 	if (semantic_changed && object->identity.type == MIDR_CORE_MEMBERSHIP) {
 		ret = midr_scope_apply(active_scope(engine), object);
 		if (ret) {
-			engine->batch_failed = true;
-			engine->batch_error = ret;
-			return ret;
+			if (engine->batch_core) {
+				engine->batch_failed = true;
+				engine->batch_error = ret;
+				return ret;
+			}
+			/* Canonical already accepted the object.  Gate scope-dependent
+			 * export and retry a complete scope/publication rebuild. */
+			engine->generation++;
+			engine->scope_rebuild_pending = true;
+			engine->publication_pending = true;
+			engine->publication_error = ret;
+			return 0;
 		}
 	}
 	if (semantic_changed)
@@ -311,8 +351,12 @@ int midr_engine_apply(struct midr_engine *engine,
 		engine->batch_view_dirty |= semantic_changed;
 		return 0;
 	}
-	return semantic_changed ?
-		publish_snapshot(engine, engine->core, engine->scope, now_ms) : 0;
+	if (semantic_changed)
+		(void)publish_current_snapshot(engine, now_ms, false);
+	/* Canonical acceptance is independent from downstream publication.  The
+	 * caller observes publication_pending and keeps the derived view gated
+	 * until retry_publication() succeeds. */
+	return 0;
 }
 
 int midr_engine_begin_batch(struct midr_engine *engine)
@@ -346,7 +390,7 @@ int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
 		return -EINVAL;
 	engine->batch_depth--;
 	if (!engine->batch_depth) {
-		int ret;
+		bool publish;
 
 		if (engine->batch_failed) {
 			int error = engine->batch_error;
@@ -359,14 +403,7 @@ int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
 			midr_scope_destroy(&engine->batch_scope);
 			return 0;
 		}
-		if (engine->batch_view_dirty) {
-			ret = publish_snapshot(engine, engine->batch_core,
-					       engine->batch_scope, now_ms);
-			if (ret) {
-				(void)midr_engine_abort_batch(engine);
-				return ret;
-			}
-		}
+		publish = engine->batch_view_dirty;
 		{
 			struct midr_core *old_core = engine->core;
 			struct midr_scope *old_scope = engine->scope;
@@ -386,6 +423,8 @@ int midr_engine_end_batch(struct midr_engine *engine, uint64_t now_ms)
 		engine->batch_view_dirty = false;
 		engine->batch_failed = false;
 		engine->batch_error = 0;
+		if (publish)
+			(void)publish_current_snapshot(engine, now_ms, false);
 	}
 	return 0;
 }
@@ -435,8 +474,8 @@ int midr_engine_refresh(struct midr_engine *engine,
 		engine->batch_dirty = true;
 		return 0;
 	}
-	ret = publish_snapshot(engine, engine->core, engine->scope, now_ms);
-	return ret;
+	(void)publish_current_snapshot(engine, now_ms, false);
+	return 0;
 }
 
 int midr_engine_withdraw(struct midr_engine *engine,
@@ -464,8 +503,12 @@ int midr_engine_withdraw(struct midr_engine *engine,
 				if (engine->batch_core) {
 					engine->batch_failed = true;
 					engine->batch_error = ret;
+					return ret;
 				}
-				return ret;
+				engine->scope_rebuild_pending = true;
+				engine->publication_pending = true;
+				engine->publication_error = ret;
+				return 0;
 			}
 			if (engine->batch_core) {
 				midr_scope_destroy(&engine->batch_scope);
@@ -482,7 +525,8 @@ int midr_engine_withdraw(struct midr_engine *engine,
 			engine->batch_dirty = true;
 			return 0;
 		}
-		ret = publish_snapshot(engine, engine->core, engine->scope, now_ms);
+		(void)publish_current_snapshot(engine, now_ms, false);
+		ret = 0;
 	}
 	return ret;
 }
@@ -510,8 +554,12 @@ int midr_engine_expire(struct midr_engine *engine, uint64_t now_ms,
 			if (engine->batch_core) {
 				engine->batch_failed = true;
 				engine->batch_error = ret;
+				return ret;
 			}
-			return ret;
+			engine->scope_rebuild_pending = true;
+			engine->publication_pending = true;
+			engine->publication_error = ret;
+			return 0;
 		}
 		if (engine->batch_core) {
 			midr_scope_destroy(&engine->batch_scope);
@@ -528,7 +576,8 @@ int midr_engine_expire(struct midr_engine *engine, uint64_t now_ms,
 			engine->batch_view_dirty = true;
 			return 0;
 		}
-		ret = publish_snapshot(engine, engine->core, engine->scope, now_ms);
+		(void)publish_current_snapshot(engine, now_ms, false);
+		ret = 0;
 	}
 	return ret;
 }
@@ -566,6 +615,46 @@ int midr_engine_event_next(struct midr_engine *engine,
 	return engine ? midr_core_event_next(engine->core, object) : -EINVAL;
 }
 
+int midr_engine_retry_publication(struct midr_engine *engine,
+					  uint64_t now_ms)
+{
+	if (!engine)
+		return -EINVAL;
+	if (!engine->publication_pending)
+		return 0;
+	return publish_current_snapshot(engine, now_ms,
+					engine->publication_local_metadata);
+}
+
+int midr_engine_republish(struct midr_engine *engine, uint64_t now_ms)
+{
+	return engine ? publish_current_snapshot(engine, now_ms, true) : -EINVAL;
+}
+
+bool midr_engine_publication_pending(const struct midr_engine *engine)
+{
+	return engine && engine->publication_pending;
+}
+
+int midr_engine_publication_error(const struct midr_engine *engine)
+{
+	return engine && engine->publication_pending
+		       ? engine->publication_error : 0;
+}
+
+int midr_engine_lsdb_snapshot_acquire(const struct midr_engine *engine,
+				      struct midr_lsdb_snapshot *snapshot)
+{
+	return engine ? midr_lsdb_snapshot_acquire(engine->lsdb, snapshot) :
+		-EINVAL;
+}
+
+int midr_engine_test_fail_next_lsdb(struct midr_engine *engine, int error)
+{
+	return engine ? midr_lsdb_test_fail_next(engine->lsdb, error) :
+		-EINVAL;
+}
+
 uint64_t midr_engine_generation(const struct midr_engine *engine)
 {
 	return engine ? engine->generation : 0;
@@ -580,27 +669,40 @@ bool midr_engine_export(const struct midr_engine *engine,
 			const struct midr_core_object *object,
 			uint32_t peer_node_id)
 {
-	return engine && midr_scope_export(engine->scope, object, peer_node_id);
+	if (!engine || !object)
+		return false;
+	if (engine->scope_rebuild_pending &&
+	    object->state != MIDR_CORE_WITHDRAWN &&
+	    object->identity.type != MIDR_CORE_MEMBERSHIP)
+		return false;
+	return midr_scope_export(engine->scope, object, peer_node_id);
 }
 
 bool midr_engine_usable(const struct midr_engine *engine,
 			const struct midr_core_object *object)
 {
-	return engine && midr_scope_usable(engine->scope, object);
+	return engine && !engine->scope_rebuild_pending &&
+	       midr_scope_usable(engine->scope, object);
 }
 
 int midr_engine_membership(const struct midr_engine *engine,
 			   uint32_t node_id, uint32_t *group)
 {
-	return engine ? midr_scope_membership(engine->scope, node_id, group) :
-		-EINVAL;
+	if (!engine)
+		return -EINVAL;
+	if (engine->scope_rebuild_pending)
+		return -EAGAIN;
+	return midr_scope_membership(engine->scope, node_id, group);
 }
 
 int midr_engine_representative(const struct midr_engine *engine,
 			       uint32_t group, uint32_t *node_id)
 {
-	return engine ? midr_scope_representative(engine->scope, group, node_id) :
-		-EINVAL;
+	if (!engine)
+		return -EINVAL;
+	if (engine->scope_rebuild_pending)
+		return -EAGAIN;
+	return midr_scope_representative(engine->scope, group, node_id);
 }
 
 int midr_engine_batch_membership(const struct midr_engine *engine,

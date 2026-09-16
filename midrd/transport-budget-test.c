@@ -40,6 +40,9 @@ struct budget_clock {
 struct close_state {
 	unsigned int count;
 	int reason;
+	unsigned int dropped;
+	uint64_t dropped_generation;
+	uint64_t dropped_sequence;
 };
 
 static uint64_t budget_now(void *arg)
@@ -58,6 +61,18 @@ static void record_close(void *arg,
 	state->reason = reason;
 }
 
+static void record_drop(void *arg,
+			const struct midr_transport_endpoint *endpoint,
+			uint64_t generation, uint64_t sequence, int reason)
+{
+	struct close_state *state = arg;
+
+	assert(endpoint && reason < 0);
+	state->dropped++;
+	state->dropped_generation = generation;
+	state->dropped_sequence = sequence;
+}
+
 static void initialize(struct midr_transport *transport,
 		       struct midr_transport_peer *peer,
 		       struct budget_clock *clock,
@@ -69,6 +84,7 @@ static void initialize(struct midr_transport *transport,
 	transport->config.now_ns = budget_now;
 	transport->config.clock_arg = clock;
 	transport->callbacks.on_closed = record_close;
+	transport->callbacks.on_frame_dropped = record_drop;
 	transport->callbacks.arg = closed;
 	transport->listen_fd = -1;
 	peer->endpoint.family = MIDR_TRANSPORT_AF_IPV4;
@@ -88,9 +104,32 @@ static void queue_partial(struct midr_transport *transport,
 	static const uint8_t bytes[] = {1, 2, 3, 4};
 
 	mock_send_calls = 0;
-	assert(queue_frame(peer, bytes, sizeof(bytes), encoded_ns) == 0);
+	assert(queue_frame_with_sequence(peer, bytes, sizeof(bytes), encoded_ns, 1) == 0);
 	assert(flush_peer(transport, peer) == 0);
 	assert(peer->tx_head && peer->tx_head->offset == 1U);
+}
+
+static void test_connecting_frame_generation(void)
+{
+	struct midr_transport transport;
+	struct midr_transport_peer peer;
+	struct budget_clock clock = {0};
+	struct close_state closed = {0};
+
+	initialize(&transport, &peer, &clock, &closed);
+	transport.config.max_frame_size = 4096;
+	peer.established = false;
+	peer.connecting = true;
+	peer.generation = 0;
+	assert(queue_frame_with_sequence(&peer, (const uint8_t *)"queued", 6,
+					 0, 7) == 0);
+	assert(peer.tx_head->generation == 0);
+	/* The non-blocking connect completes after the frame was queued. */
+	establish_peer(&transport, &peer);
+	assert(peer.generation == 1);
+	assert(peer.tx_head && peer.tx_head->generation == peer.generation);
+	close_peer(&transport, &peer, -ECONNRESET);
+	free(peer.rx_buffer);
 }
 
 int main(void)
@@ -100,6 +139,7 @@ int main(void)
 	struct budget_clock clock = {0};
 	struct close_state closed = {0};
 
+	test_connecting_frame_generation();
 	initialize(&transport, &peer, &clock, &closed);
 	queue_partial(&transport, &peer, 0);
 	clock.now_ns = 1000000000U;
@@ -115,14 +155,30 @@ int main(void)
 	assert(flush_peer(&transport, &peer) == -ETIMEDOUT);
 	assert(!peer.tx_head && peer.fd == -1);
 	assert(closed.count == 1 && closed.reason == -ETIMEDOUT);
+	assert(closed.dropped == 1 && closed.dropped_sequence == 1);
 
 	memset(&closed, 0, sizeof(closed));
 	clock.now_ns = 99;
 	initialize(&transport, &peer, &clock, &closed);
-	assert(queue_frame(&peer, (const uint8_t *)"x", 1, 100) == 0);
+	assert(queue_frame_with_sequence(&peer, (const uint8_t *)"x", 1, 100, 1) == 0);
 	assert(flush_peer(&transport, &peer) == -ERANGE);
 	assert(!peer.tx_head && peer.fd == -1);
 	assert(closed.count == 1 && closed.reason == -ERANGE);
+	assert(closed.dropped == 1 && closed.dropped_sequence == 1);
+
+	/* Budget is attached to each queued frame.  Progress on a newer head
+	 * must not hide an already expired frame behind it. */
+	memset(&closed, 0, sizeof(closed));
+	clock.now_ns = 1000000001U;
+	initialize(&transport, &peer, &clock, &closed);
+	assert(queue_frame_with_sequence(&peer, (const uint8_t *)"new", 3,
+			   clock.now_ns, 1) == 0);
+	assert(queue_frame_with_sequence(&peer, (const uint8_t *)"old", 3, 0, 2) == 0);
+	mock_send_calls = 2;
+	assert(flush_peer(&transport, &peer) == -ETIMEDOUT);
+	assert(!peer.tx_head && peer.fd == -1);
+	assert(closed.count == 1 && closed.reason == -ETIMEDOUT);
+	assert(closed.dropped == 1 && closed.dropped_sequence == 2);
 
 	puts("midrd-transport-budget-test: PASS");
 	return 0;

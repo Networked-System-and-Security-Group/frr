@@ -9,10 +9,14 @@
 
 enum midr_local_event_kind {
 	MIDR_LOCAL_SNAPSHOT_BEGIN = 1,
+	/* Membership and Link are upsert events both in a snapshot and as
+	 * post-commit deltas. */
 	MIDR_LOCAL_MEMBERSHIP = 2,
 	MIDR_LOCAL_LINK = 3,
 	MIDR_LOCAL_SNAPSHOT_END = 4,
 	MIDR_LOCAL_EOR = 5,
+	MIDR_LOCAL_MEMBERSHIP_WITHDRAW = 6,
+	MIDR_LOCAL_LINK_WITHDRAW = 7,
 };
 
 struct midr_local_membership {
@@ -22,6 +26,7 @@ struct midr_local_membership {
 
 struct midr_local_link {
 	uint32_t remote_node_id;
+	uint32_t local_ifindex;
 	uint8_t family;
 	uint8_t reserved[3];
 	uint64_t link_id;

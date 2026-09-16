@@ -38,6 +38,9 @@ int midr_local_event_validate(const struct midr_local_event *event)
 		       event->fact.membership.version
 			       ? 0
 			       : -EINVAL;
+	case MIDR_LOCAL_MEMBERSHIP_WITHDRAW:
+		return !event->fact.membership.group &&
+		       event->fact.membership.version ? 0 : -EINVAL;
 	case MIDR_LOCAL_LINK:
 		link = &event->fact.link;
 		if (!link->remote_node_id ||
@@ -53,6 +56,19 @@ int midr_local_event_validate(const struct midr_local_event *event)
 		if (link->family == MIDR_CORE_AF_IPV4 &&
 		    (!ipv4_padding_is_zero(link->local_address) ||
 		     !ipv4_padding_is_zero(link->remote_address)))
+			return -EINVAL;
+		return 0;
+	case MIDR_LOCAL_LINK_WITHDRAW:
+		link = &event->fact.link;
+		if (!link->remote_node_id ||
+		    link->remote_node_id == event->originator || !link->version ||
+		    link->local_ifindex || link->family || link->reserved[0] ||
+		    link->reserved[1] ||
+		    link->reserved[2] || link->rtt_us || link->loss_ppm ||
+		    link->available_bandwidth_kbps || link->measurement_sequence ||
+		    link->measurement_timestamp_ms ||
+		    !address_is_zero(link->local_address) ||
+		    !address_is_zero(link->remote_address))
 			return -EINVAL;
 		return 0;
 	default:

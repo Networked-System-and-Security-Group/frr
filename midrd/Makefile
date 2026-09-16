@@ -5,7 +5,7 @@ BUILD_DIR ?= build
 PREFIX ?= /usr/local
 SBINDIR ?= $(PREFIX)/sbin
 
-.PHONY: all test clean boundary install
+.PHONY: all test clean boundary install native-smoke hardening-smoke
 
 CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
@@ -13,7 +13,8 @@ CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-spf.o $(BUILD_DIR)/midr-prefix-ipc.o \
 	$(BUILD_DIR)/midr-owned.o $(BUILD_DIR)/midr-scope.o \
 	$(BUILD_DIR)/midr-cost.o $(BUILD_DIR)/midr-local-provider.o \
-	$(BUILD_DIR)/midr-local-ipc.o $(BUILD_DIR)/midr-ted.o
+	$(BUILD_DIR)/midr-local-ipc.o $(BUILD_DIR)/midr-lsdb.o \
+	$(BUILD_DIR)/midr-ted.o
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
@@ -27,7 +28,9 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-scope-test $(BUILD_DIR)/midrd-cost-test \
 	$(BUILD_DIR)/midrd-local-ipc-test \
 	$(BUILD_DIR)/midrd-local-transaction-test \
+	$(BUILD_DIR)/midrd-lsdb-test \
 	$(BUILD_DIR)/midrd-ted-test \
+	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
 	$(BUILD_DIR)/midrd
 
 $(BUILD_DIR):
@@ -66,13 +69,22 @@ $(BUILD_DIR)/midr-local-provider.o: midr-local-provider.c midr-local-provider.h 
 $(BUILD_DIR)/midr-local-ipc.o: midr-local-ipc.c midr-local-ipc.h midr-local-provider.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-local-ipc.c -o $@
 
-$(BUILD_DIR)/midr-ted.o: midr-ted.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
+$(BUILD_DIR)/midr-ted.o: midr-ted.c midr-ted.h midr-consumer.h midr-lsdb.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-ted.c -o $@
+
+$(BUILD_DIR)/midr-lsdb.o: midr-lsdb.c midr-lsdb.h midr-core.h midr-scope.h midr-consumer.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-lsdb.c -o $@
 
 $(BUILD_DIR)/midrd-core-test.o: core-test.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c core-test.c -o $@
 
 $(BUILD_DIR)/midrd-core-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midrd-core-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-scale-test.o: scale-test.c midr-core.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c scale-test.c -o $@
+
+$(BUILD_DIR)/midrd-scale-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midrd-scale-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midr-prefix-provider-test.o: prefix-provider-test.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -111,7 +123,7 @@ $(BUILD_DIR)/midrd.o: midrd.c midr-cost.h midr-engine.h midr-core.h midr-local-i
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-prefix-provider.c -o $@
 
-$(BUILD_DIR)/midr-spf.o: midr-spf.c midr-spf.h midr-consumer.h | $(BUILD_DIR)
+$(BUILD_DIR)/midr-spf.o: midr-spf.c midr-spf.h midr-consumer.h midr-ted.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-spf.c -o $@
 
 $(BUILD_DIR)/midr-prefix-ipc.o: midr-prefix-ipc.c midr-prefix-ipc.h midr-prefix-provider.h | $(BUILD_DIR)
@@ -144,7 +156,19 @@ $(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-lo
 $(BUILD_DIR)/midrd-ted-test.o: ted-test.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c ted-test.c -o $@
 
-$(BUILD_DIR)/midrd-ted-test: $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-ted.o $(BUILD_DIR)/midrd-ted-test.o
+$(BUILD_DIR)/midrd-ted-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midr-lsdb.o $(BUILD_DIR)/midr-ted.o $(BUILD_DIR)/midrd-ted-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-lsdb-test.o: lsdb-test.c midr-lsdb.h midr-scope.h midr-core.h midr-consumer.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c lsdb-test.c -o $@
+
+$(BUILD_DIR)/midrd-lsdb-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midr-lsdb.o $(BUILD_DIR)/midrd-lsdb-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+
+$(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-transport.h midr-engine.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c sync-test.c -o $@
+
+$(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD_DIR)
@@ -165,7 +189,8 @@ $(BUILD_DIR)/midrd-scope-test.o: scope-test.c midr-scope.h midr-core.h | $(BUILD
 $(BUILD_DIR)/midrd-scope-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midrd-scope-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd-spf-test.o: spf-test.c midr-spf.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd-spf-test.o: spf-test.c midr-spf.h midr-ted.h \
+		midr-consumer.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c spf-test.c -o $@
 
 $(BUILD_DIR)/midrd-spf-test: $(BUILD_DIR)/midr-spf.o $(BUILD_DIR)/midrd-spf-test.o
@@ -197,8 +222,19 @@ test: all
 	$(BUILD_DIR)/midrd-cost-test
 	$(BUILD_DIR)/midrd-local-ipc-test
 	$(BUILD_DIR)/midrd-local-transaction-test
+	$(BUILD_DIR)/midrd-lsdb-test
 	$(BUILD_DIR)/midrd-ted-test
+	$(BUILD_DIR)/midrd-sync-test
+	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh
+
+native-smoke: $(BUILD_DIR)/midrd
+	MIDRD_BIN=$(abspath $(BUILD_DIR)/midrd) ./r7-native-smoke.sh
+
+hardening-smoke: $(BUILD_DIR)/midrd $(BUILD_DIR)/midrd-scale-test
+	MIDRD_BIN=$(abspath $(BUILD_DIR)/midrd) \
+	MIDRD_SCALE_BIN=$(abspath $(BUILD_DIR)/midrd-scale-test) \
+	./r7-hardening-smoke.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -23,6 +23,16 @@ struct midr_consumer {
 	uint64_t snapshot_generation;
 };
 
+struct midr_consumer_stage {
+	struct midr_consumer_event_node *head;
+	struct midr_consumer_event_node *tail;
+	struct midr_consumer_event *snapshot;
+	size_t snapshot_count;
+	size_t pending;
+	uint64_t generation;
+	uint32_t originator;
+};
+
 static bool ipv4_padding_is_zero(
 	const uint8_t address[MIDR_CORE_ADDR_BYTES])
 {
@@ -135,81 +145,147 @@ int midr_consumer_publish(struct midr_consumer *consumer,
 	return publish_pending(consumer, event);
 }
 
-int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
-				  uint64_t generation,
-				  uint32_t originator,
-				  const struct midr_consumer_event *events,
-				  size_t count)
+void midr_consumer_abort_prepared(struct midr_consumer_stage **stagep)
 {
-	struct midr_consumer_event *copy = NULL;
-	struct midr_consumer_event_node **nodes = NULL;
+	struct midr_consumer_event_node *node;
+
+	if (!stagep || !*stagep)
+		return;
+	while ((node = (*stagep)->head)) {
+		(*stagep)->head = node->next;
+		free(node);
+	}
+	free((*stagep)->snapshot);
+	free(*stagep);
+	*stagep = NULL;
+}
+
+int midr_consumer_prepare_snapshot(struct midr_consumer *consumer,
+				   uint64_t generation,
+				   uint32_t originator,
+				   const struct midr_consumer_event *events,
+				   size_t count,
+				   struct midr_consumer_stage **stagep)
+{
+	struct midr_consumer_stage *stage = NULL;
 	struct midr_consumer_event marker = {0};
 	size_t total;
 
-	if (!consumer || !generation || !originator || (count && !events) ||
-	    count > MIDR_CONSUMER_MAX_SNAPSHOT)
+	if (!consumer || !generation || !originator || !stagep || *stagep ||
+	    (count && !events) || count > MIDR_CONSUMER_MAX_SNAPSHOT)
 		return -EINVAL;
 	if (count > SIZE_MAX - 2U)
 		return -EOVERFLOW;
 	total = count + 2U;
 	if (consumer->pending > MIDR_CONSUMER_MAX_PENDING - total)
 		return -ENOSPC;
+	stage = calloc(1, sizeof(*stage));
+	if (!stage)
+		return -ENOMEM;
 	if (count) {
-		copy = calloc(count, sizeof(*copy));
-		if (!copy)
+		stage->snapshot = calloc(count, sizeof(*stage->snapshot));
+		if (!stage->snapshot) {
+			midr_consumer_abort_prepared(&stage);
 			return -ENOMEM;
+		}
 	}
 	for (size_t i = 0; i < count; i++) {
 		if (events[i].generation != generation ||
 		    midr_consumer_event_validate(&events[i]) ||
 		    events[i].kind == MIDR_CONSUMER_SNAPSHOT_BEGIN ||
 		    events[i].kind == MIDR_CONSUMER_SNAPSHOT_END) {
-			free(copy);
+			midr_consumer_abort_prepared(&stage);
 			return -EINVAL;
 		}
-		copy[i] = events[i];
+		stage->snapshot[i] = events[i];
 	}
 	marker.kind = MIDR_CONSUMER_SNAPSHOT_BEGIN;
 	marker.generation = generation;
 	marker.originator = originator;
-	nodes = calloc(total, sizeof(*nodes));
-	if (!nodes) {
-		free(copy);
-		return -ENOMEM;
-	}
 	for (size_t i = 0; i < total; i++) {
-		const struct midr_consumer_event *source = i == 0 ? &marker :
-			(i == total - 1 ? &marker : &copy[i - 1]);
+		struct midr_consumer_event_node *node;
+		const struct midr_consumer_event *source;
 
-		if (i == total - 1)
+		if (i == 0)
+			source = &marker;
+		else if (i == total - 1) {
 			marker.kind = MIDR_CONSUMER_SNAPSHOT_END;
-		nodes[i] = malloc(sizeof(*nodes[i]));
-		if (!nodes[i]) {
-			for (size_t j = 0; j < i; j++)
-				free(nodes[j]);
-			free(nodes);
-			free(copy);
+			source = &marker;
+		} else
+			source = &stage->snapshot[i - 1];
+		node = malloc(sizeof(*node));
+		if (!node) {
+			midr_consumer_abort_prepared(&stage);
 			return -ENOMEM;
 		}
-		nodes[i]->event = *source;
-		nodes[i]->next = NULL;
+		node->event = *source;
+		node->next = NULL;
+		if (stage->tail)
+			stage->tail->next = node;
+		else
+			stage->head = node;
+		stage->tail = node;
+		stage->pending++;
 	}
-	for (size_t i = 0; i < total; i++)
-		append_pending(consumer, nodes[i]);
-	free(nodes);
+	stage->snapshot_count = count;
+	stage->generation = generation;
+	stage->originator = originator;
+	*stagep = stage;
+	return 0;
+}
+
+void midr_consumer_commit_prepared(struct midr_consumer *consumer,
+				   struct midr_consumer_stage **stagep)
+{
+	struct midr_consumer_stage *stage;
+	struct midr_consumer_event marker = {0};
+
+	if (!consumer || !stagep || !*stagep)
+		return;
+	stage = *stagep;
+	if (consumer->tail)
+		consumer->tail->next = stage->head;
+	else
+		consumer->head = stage->head;
+	consumer->tail = stage->tail;
+	consumer->pending += stage->pending;
+	stage->head = NULL;
+	stage->tail = NULL;
+	stage->pending = 0;
 	free(consumer->snapshot);
-	consumer->snapshot = copy;
-	consumer->snapshot_count = count;
-	consumer->snapshot_generation = generation;
+	consumer->snapshot = stage->snapshot;
+	consumer->snapshot_count = stage->snapshot_count;
+	consumer->snapshot_generation = stage->generation;
+	stage->snapshot = NULL;
 	if (consumer->config.on_event) {
 		marker.kind = MIDR_CONSUMER_SNAPSHOT_BEGIN;
+		marker.generation = stage->generation;
+		marker.originator = stage->originator;
 		consumer->config.on_event(consumer->config.arg, &marker);
-		for (size_t i = 0; i < count; i++)
+		for (size_t i = 0; i < consumer->snapshot_count; i++)
 			consumer->config.on_event(consumer->config.arg,
 						  &consumer->snapshot[i]);
 		marker.kind = MIDR_CONSUMER_SNAPSHOT_END;
 		consumer->config.on_event(consumer->config.arg, &marker);
 	}
+	free(stage);
+	*stagep = NULL;
+}
+
+int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
+				  uint64_t generation,
+				  uint32_t originator,
+				  const struct midr_consumer_event *events,
+				  size_t count)
+{
+	struct midr_consumer_stage *stage = NULL;
+	int ret;
+
+	ret = midr_consumer_prepare_snapshot(consumer, generation, originator,
+					     events, count, &stage);
+	if (ret)
+		return ret;
+	midr_consumer_commit_prepared(consumer, &stage);
 	return 0;
 }
 

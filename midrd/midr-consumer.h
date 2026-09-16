@@ -50,6 +50,7 @@ struct midr_consumer_snapshot {
 };
 
 struct midr_consumer;
+struct midr_consumer_stage;
 
 int midr_consumer_create(const struct midr_consumer_config *config,
 			 struct midr_consumer **out);
@@ -61,6 +62,16 @@ int midr_consumer_commit_snapshot(struct midr_consumer *consumer,
 				  uint32_t originator,
 				  const struct midr_consumer_event *events,
 				  size_t count);
+int midr_consumer_prepare_snapshot(struct midr_consumer *consumer,
+				   uint64_t generation,
+				   uint32_t originator,
+				   const struct midr_consumer_event *events,
+				   size_t count,
+				   struct midr_consumer_stage **stage);
+/* A prepared stage owns every allocation needed by commit. */
+void midr_consumer_commit_prepared(struct midr_consumer *consumer,
+				   struct midr_consumer_stage **stage);
+void midr_consumer_abort_prepared(struct midr_consumer_stage **stage);
 int midr_consumer_snapshot_acquire(const struct midr_consumer *consumer,
 				   struct midr_consumer_snapshot *snapshot);
 void midr_consumer_snapshot_release(struct midr_consumer_snapshot *snapshot);

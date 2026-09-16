@@ -103,15 +103,28 @@ static void test_age_arithmetic(void)
 	       value == 10);
 	assert(midr_core_age(10, 50, 51, 3, 1000, &value) == 0 &&
 	       value == 14);
+	assert(midr_core_age(10, 0, 999999, 0, 1000, &value) == 0 &&
+	       value == 11);
 	assert(midr_core_age(10, 0, 1000000, 0, 1000, &value) == 0 &&
 	       value == 11);
+	assert(midr_core_age(1000, 0, 0, 0, 1000, &value) == 0 &&
+	       value == 1000);
+	assert(midr_core_age(1001, 0, 0, 0, 1000, &value) == 0 &&
+	       value == 1000);
+	assert(midr_core_age(900, 0, 0, 100, 1000, &value) == 0 &&
+	       value == 1000);
+	assert(midr_core_age(999, 0, 1000000, 0, 1000, &value) == 0 &&
+	       value == 1000);
 	assert(midr_core_age(999, 0, 1, 0, 1000, &value) == 0 &&
 	       value == 1000);
 	assert(midr_core_age(0, 0, UINT64_MAX, 0, UINT32_MAX, &value) == 0 &&
 	       value == UINT32_MAX);
 	assert(midr_core_age(UINT32_MAX, 0, 0, UINT32_MAX, 1000,
 			     &value) == 0 && value == 1000);
+	value = 123;
 	assert(midr_core_age(0, 2, 1, 0, 1000, &value) == -ERANGE);
+	assert(value == 123);
+	assert(midr_core_age(0, 0, 0, 0, 1000, NULL) == -EINVAL);
 	assert(midr_core_age(0, 0, 0, 0, 0, &value) == -EINVAL);
 	assert(midr_core_lifetime_remaining(990, 50, 51, 3, 1000,
 					    &value) == 0 && value == 986);
@@ -119,6 +132,14 @@ static void test_age_arithmetic(void)
 					    &value) == 0 && value == 998);
 	assert(midr_core_lifetime_remaining(1000, 0, UINT64_MAX, 0, 1000,
 					    &value) == 0 && value == 0);
+	assert(midr_core_lifetime_remaining(2000, 0, 0, 0, 1000,
+					    &value) == 0 && value == 1000);
+	value = 456;
+	assert(midr_core_lifetime_remaining(1000, 2, 1, 0, 1000,
+					    &value) == -ERANGE);
+	assert(value == 456);
+	assert(midr_core_lifetime_remaining(1000, 0, 0, 0, 1000,
+					    NULL) == -EINVAL);
 }
 
 static void test_floor_retention_and_gc(void)
@@ -138,7 +159,9 @@ static void test_floor_retention_and_gc(void)
 	assert(midr_core_create(&config, &store) == 0);
 	assert(midr_core_upsert(store, &object, 100, &result) == 0);
 	assert(result == MIDR_CORE_ACCEPTED);
-	assert(midr_core_expire(store, 110, &count) == 0 && count == 1);
+	/* Running expiry late must not extend the floor.  Its deadline remains
+	 * based on the first accepted version at t=100. */
+	assert(midr_core_expire(store, 700, &count) == 0 && count == 1);
 	assert(midr_core_count(store) == 0);
 	assert(midr_core_identity_count(store) == 1);
 	/* GC is disabled by default and the queued acceptance event is also a
@@ -159,6 +182,13 @@ static void test_floor_retention_and_gc(void)
 	       count == 1);
 	assert(midr_core_identity_equal(&seen, &key));
 	assert(midr_core_identity_count(store) == 0);
+	/* Reclaiming the floor must return real identity capacity. */
+	key = node_key(MIDR_CORE_AF_IPV6);
+	object = active(&key, 1);
+	object.lifetime_ms = 10;
+	assert(midr_core_upsert(store, &object, 1101, &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(midr_core_identity_count(store) == 1);
 	midr_core_destroy(&store);
 }
 
@@ -169,7 +199,7 @@ static void test_newer_version_replaces_floor(void)
 		.lifetime_ms = 1000,
 	};
 	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
-	struct midr_core_object object = active(&key, 1);
+	struct midr_core_object object = active(&key, 2);
 	struct midr_core_object current;
 	struct midr_core *store = NULL;
 	enum midr_core_result result;
@@ -180,16 +210,46 @@ static void test_newer_version_replaces_floor(void)
 	assert(midr_core_upsert(store, &object, 100, &result) == 0);
 	assert(midr_core_event_next(store, &current) == 0);
 	assert(midr_core_expire(store, 110, &count) == 0 && count == 1);
+	object.sequence = 1;
+	assert(midr_core_upsert(store, &object, 111, &result) == 0);
+	assert(result == MIDR_CORE_OLDER);
+	object.sequence = 2;
 	assert(midr_core_upsert(store, &object, 111, &result) == 0);
 	assert(result == MIDR_CORE_DUPLICATE);
-	object.sequence = 2;
+	object.sequence = 3;
 	object.lifetime_ms = 1000;
 	assert(midr_core_upsert(store, &object, 111, &result) == 0);
 	assert(result == MIDR_CORE_ACCEPTED);
 	assert(midr_core_lookup(store, &key, 111, &current, NULL) == 0);
-	assert(current.sequence == 2);
+	assert(current.sequence == 3);
 	assert(midr_core_count(store) == 1);
 	assert(midr_core_identity_count(store) == 1);
+	midr_core_destroy(&store);
+}
+
+static void test_floor_deadline_saturates(void)
+{
+	const struct midr_core_config config = {
+		.max_objects = 1,
+		.lifetime_ms = 1000,
+	};
+	struct midr_core_identity key = node_key(MIDR_CORE_AF_IPV4);
+	struct midr_core_object object = active(&key, 1);
+	struct midr_core *store = NULL;
+	enum midr_core_result result;
+	size_t count;
+
+	object.lifetime_ms = 10;
+	assert(midr_core_create(&config, &store) == 0);
+	assert(midr_core_upsert(store, &object, UINT64_MAX - 500, &result) == 0);
+	assert(midr_core_event_next(store, &object) == 0);
+	assert(midr_core_expire(store, UINT64_MAX - 490, &count) == 0 &&
+	       count == 1);
+	assert(midr_core_gc_enable(store, true) == 0);
+	assert(midr_core_gc(store, UINT64_MAX - 1, 1, &count, NULL, NULL) == 0 &&
+	       count == 0);
+	assert(midr_core_gc(store, UINT64_MAX, 1, &count, NULL, NULL) == 0 &&
+	       count == 1);
 	midr_core_destroy(&store);
 }
 
@@ -323,6 +383,7 @@ int main(void)
 	midr_core_destroy(&core);
 	test_floor_retention_and_gc();
 	test_newer_version_replaces_floor();
+	test_floor_deadline_saturates();
 	puts("midr-core-test: PASS");
 	return 0;
 }

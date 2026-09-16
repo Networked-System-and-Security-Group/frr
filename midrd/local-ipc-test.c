@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #define TEST_MAGIC 0x4d4c4643U
+#define TEST_VERSION 2U
 
 struct event_log {
 	struct midr_local_event events[16];
@@ -107,6 +108,7 @@ static struct midr_local_event link_event(uint64_t generation, uint8_t family,
 							generation);
 
 	event.fact.link.remote_node_id = 88U + suffix;
+	event.fact.link.local_ifindex = 100U + suffix;
 	event.fact.link.family = family;
 	event.fact.link.link_id = 12U + suffix;
 	event.fact.link.version = 7;
@@ -151,7 +153,7 @@ int main(void)
 	};
 	struct midr_local_ipc *server = NULL;
 	struct midr_local_ipc *client = NULL;
-	struct midr_local_event events[6];
+	struct midr_local_event events[8];
 	uint8_t malformed[MIDR_LOCAL_IPC_FRAME_LEN] = {0};
 	int fd;
 
@@ -165,6 +167,12 @@ int main(void)
 	events[3] = link_event(4, MIDR_CORE_AF_IPV6, 2);
 	events[4] = control_event(MIDR_LOCAL_SNAPSHOT_END, 4);
 	events[5] = control_event(MIDR_LOCAL_EOR, 4);
+	events[6] = control_event(MIDR_LOCAL_MEMBERSHIP_WITHDRAW, 4);
+	events[6].fact.membership.version = 4;
+	events[7] = control_event(MIDR_LOCAL_LINK_WITHDRAW, 4);
+	events[7].fact.link.remote_node_id = 89;
+	events[7].fact.link.link_id = 14;
+	events[7].fact.link.version = 8;
 
 	(void)unlink(path);
 	assert(midr_local_ipc_server_create(&config, &server) == 0);
@@ -179,11 +187,17 @@ int main(void)
 		assert(midr_local_ipc_client_send(client, &invalid) == -EINVAL);
 	}
 	assert(poll_until_result(server) == 0);
-	assert(log.count == 6);
+	assert(log.count == 8);
 	assert(log.events[2].fact.link.family == MIDR_CORE_AF_IPV4);
+	assert(log.events[2].fact.link.local_ifindex == 101);
 	assert(log.events[2].fact.link.local_address[3] == 1);
 	assert(log.events[3].fact.link.family == MIDR_CORE_AF_IPV6);
 	assert(log.events[3].fact.link.remote_address[15] == 3);
+	assert(log.events[6].kind == MIDR_LOCAL_MEMBERSHIP_WITHDRAW &&
+	       log.events[6].fact.membership.group == 0);
+	assert(log.events[7].kind == MIDR_LOCAL_LINK_WITHDRAW &&
+	       log.events[7].fact.link.remote_node_id == 89 &&
+	       log.events[7].fact.link.family == MIDR_CORE_AF_NONE);
 	midr_local_ipc_client_destroy(&client);
 	assert(poll_until_result(server) == -ECONNRESET);
 	assert(log.reasons[log.disconnects - 1U] == -ECONNRESET);
@@ -191,7 +205,7 @@ int main(void)
 	fd = raw_connect(path);
 	assert(midr_local_ipc_server_poll(server, 10) == 0);
 	put_u32(malformed, TEST_MAGIC);
-	malformed[4] = 1;
+	malformed[4] = TEST_VERSION;
 	malformed[5] = MIDR_LOCAL_SNAPSHOT_BEGIN;
 	malformed[6] = 1;
 	put_u64(malformed + 8, 5);
@@ -241,9 +255,9 @@ int main(void)
 	(void)close(fd);
 	assert(midr_local_ipc_client_send(client, &events[0]) == 0);
 	assert(midr_local_ipc_server_poll(server, 10) == 0);
-	assert(log.count == 7);
-	assert(log.events[6].kind == MIDR_LOCAL_SNAPSHOT_BEGIN);
-	assert(log.events[6].generation == 4);
+	assert(log.count == 9);
+	assert(log.events[8].kind == MIDR_LOCAL_SNAPSHOT_BEGIN);
+	assert(log.events[8].generation == 4);
 	midr_local_ipc_client_destroy(&client);
 	assert(poll_until_result(server) == -ECONNRESET);
 	midr_local_ipc_server_destroy(&server);

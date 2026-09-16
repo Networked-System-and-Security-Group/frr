@@ -39,6 +39,39 @@ static struct midr_core_object prefix(uint32_t originator, uint32_t metric)
 	return object;
 }
 
+static void test_restart_sequence_recovery(void)
+{
+	const char *path = "/tmp/midrd-owned-restart-test.seq";
+	struct midr_owned_config config = {
+		.originator = 91,
+		.max_objects = 2,
+		.lifetime_ms = 1000,
+		.sequence_file = path,
+	};
+	struct publish_log first_log = {0};
+	struct publish_log second_log = {0};
+	struct midr_owned *first = NULL;
+	struct midr_owned *second = NULL;
+	struct midr_core_object object = prefix(91, 10);
+	uint64_t high_water;
+
+	(void)unlink(path);
+	assert(midr_owned_create(&config, publish, &first_log, &first) == 0);
+	assert(midr_owned_upsert(first, &object) == 0);
+	assert(midr_owned_refresh(first, &object.identity) == 0);
+	high_water = midr_owned_last_sequence(first);
+	assert(high_water == 2);
+	midr_owned_destroy(&first);
+
+	assert(midr_owned_create(&config, publish, &second_log, &second) == 0);
+	assert(midr_owned_last_sequence(second) == high_water);
+	assert(midr_owned_upsert(second, &object) == 0);
+	assert(second_log.count == 1);
+	assert(second_log.objects[0].sequence > high_water);
+	midr_owned_destroy(&second);
+	(void)unlink(path);
+}
+
 int main(void)
 {
 	const char *path = "/tmp/midrd-owned-test.seq";
@@ -55,6 +88,8 @@ int main(void)
 	struct midr_owned *staged = NULL;
 	struct midr_core_object object = prefix(77, 10);
 	struct midr_core_object saved;
+
+	test_restart_sequence_recovery();
 
 	(void)unlink(path);
 	assert(midr_owned_create(&config, publish, &log, &owned) == 0);

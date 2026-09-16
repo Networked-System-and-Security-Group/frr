@@ -10,6 +10,7 @@ static void test_lifetime_accounting(void)
 {
 	struct midrd daemon = {.lifetime_ms = 10000};
 	struct midr_core_object object = {.lifetime_ms = 8000};
+	struct midr_core_object before;
 
 	assert(age_object_lifetime(&daemon, &object, 1000000000U,
 				   1000000001U, 0) == 0);
@@ -25,17 +26,25 @@ static void test_lifetime_accounting(void)
 	assert(object.lifetime_ms == 7000);
 
 	object.lifetime_ms = 1000;
+	before = object;
 	assert(age_object_lifetime(&daemon, &object, 1000000000U,
 				   1000000000U, 1000) == -ESTALE);
-	assert(object.lifetime_ms == 1000);
+	assert(!memcmp(&object, &before, sizeof(object)));
 
-	object.lifetime_ms = 9000;
+	/* Each hop starts from the remaining lifetime encoded by the previous
+	 * hop, then adds its own receive wait and forwarding budget. */
+	object.lifetime_ms = 10000;
 	assert(age_object_lifetime(&daemon, &object, 1000000000U,
-				   1000000001U, 0) == 0);
+				   1000500000U, 1000) == 0);
 	assert(object.lifetime_ms == 8999);
-	assert(age_object_lifetime(&daemon, &object, 1000000001U,
-				   1002000001U, 0) == 0);
-	assert(object.lifetime_ms == 8997);
+	assert(age_object_lifetime(&daemon, &object, 2000000000U,
+				   2001500000U, 1000) == 0);
+	assert(object.lifetime_ms == 7997);
+
+	before = object;
+	assert(age_object_lifetime(&daemon, &object, 3000000001U,
+				   3000000000U, 0) == -ERANGE);
+	assert(!memcmp(&object, &before, sizeof(object)));
 }
 
 static void record_consumer_event(void *arg,
@@ -125,6 +134,7 @@ static void initialize_daemon(struct midrd *daemon, size_t capacity)
 	assert(midr_engine_create(&engine_config, &daemon->engine) == 0);
 	assert(midr_ted_create(&ted_config, &daemon->ted) == 0);
 	assert(midr_consumer_create(&consumer_config, &daemon->consumer) == 0);
+	assert(midr_engine_attach_ted(daemon->engine, daemon->ted) == 0);
 	assert(midr_engine_attach_consumer(daemon->engine, daemon->consumer) == 0);
 	assert(midr_engine_apply(daemon->engine, &membership, mono_ms(), &result) ==
 	       0);

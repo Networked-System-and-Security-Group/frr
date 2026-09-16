@@ -45,6 +45,7 @@ int main(void)
 	struct midr_consumer_event replacement = event;
 	struct midr_consumer_snapshot snapshot = {0};
 	struct midr_consumer_snapshot old_snapshot = {0};
+	struct midr_consumer_stage *stage = NULL;
 	struct midr_consumer_event bad_link = {
 		.kind = MIDR_CONSUMER_LINK,
 		.generation = 7,
@@ -85,6 +86,25 @@ int main(void)
 	/* Acquired snapshots own their event arrays and outlive a commit. */
 	midr_consumer_snapshot_release(&snapshot);
 	midr_consumer_snapshot_release(&old_snapshot);
+
+	replacement.generation = 10;
+	probe.expected_generation = 10;
+	probe.saw_committed_snapshot = false;
+	assert(midr_consumer_prepare_snapshot(consumer, 10, 42, &replacement, 1,
+					      &stage) == 0);
+	assert(!probe.saw_committed_snapshot);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.generation == 9);
+	midr_consumer_snapshot_release(&snapshot);
+	midr_consumer_abort_prepared(&stage);
+	assert(!stage && !probe.saw_committed_snapshot);
+	assert(midr_consumer_prepare_snapshot(consumer, 10, 42, &replacement, 1,
+					      &stage) == 0);
+	midr_consumer_commit_prepared(consumer, &stage);
+	assert(!stage && probe.saw_committed_snapshot);
+	assert(midr_consumer_snapshot_acquire(consumer, &snapshot) == 0);
+	assert(snapshot.generation == 10);
+	midr_consumer_snapshot_release(&snapshot);
 	midr_consumer_destroy(&consumer);
 	puts("midrd-consumer-test: PASS");
 	return 0;

@@ -149,6 +149,7 @@ midrd_midrd_SOURCES = \
 	midrd/midr-local-provider.c midrd/midr-local-provider.h \
 	midrd/midr-local-ipc.c midrd/midr-local-ipc.h \
 	midrd/midr-scope.c midrd/midr-scope.h \
+	midrd/midr-lsdb.c midrd/midr-lsdb.h \
 	midrd/midr-spf.c midrd/midr-spf.h \
 	midrd/midr-ted.c midrd/midr-ted.h \
 	midrd/midr-transport.c midrd/midr-transport.h \

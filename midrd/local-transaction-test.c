@@ -55,6 +55,7 @@ static struct midr_local_event link_event(uint64_t generation,
 							generation);
 
 	event.fact.link.remote_node_id = remote;
+	event.fact.link.local_ifindex = remote + 1000U;
 	event.fact.link.family = family;
 	event.fact.link.link_id = remote;
 	event.fact.link.version = version;
@@ -87,6 +88,29 @@ static struct midr_local_event link_event(uint64_t generation,
 	return event;
 }
 
+static struct midr_local_event membership_withdraw_event(uint64_t generation,
+						  uint64_t version)
+{
+	struct midr_local_event event =
+		local_control(MIDR_LOCAL_MEMBERSHIP_WITHDRAW, generation);
+
+	event.fact.membership.version = version;
+	return event;
+}
+
+static struct midr_local_event link_withdraw_event(uint64_t generation,
+					    uint64_t version,
+					    uint32_t remote)
+{
+	struct midr_local_event event =
+		local_control(MIDR_LOCAL_LINK_WITHDRAW, generation);
+
+	event.fact.link.remote_node_id = remote;
+	event.fact.link.link_id = remote;
+	event.fact.link.version = version;
+	return event;
+}
+
 static void initialize_daemon(struct midrd *daemon,
 			      struct consumer_probe *probe, size_t capacity)
 {
@@ -102,6 +126,8 @@ static void initialize_daemon(struct midrd *daemon,
 	};
 	struct midr_ted_config ted_config = {
 		.max_events = capacity,
+		.local_ifindex_lookup = local_ifindex_lookup,
+		.local_ifindex_arg = daemon,
 	};
 	struct midr_consumer_config consumer_config = {
 		.on_event = probe_consumer,
@@ -116,6 +142,7 @@ static void initialize_daemon(struct midrd *daemon,
 	assert(midr_engine_create(&engine_config, &daemon->engine) == 0);
 	assert(midr_ted_create(&ted_config, &daemon->ted) == 0);
 	assert(midr_consumer_create(&consumer_config, &daemon->consumer) == 0);
+	assert(midr_engine_attach_ted(daemon->engine, daemon->ted) == 0);
 	assert(midr_engine_attach_consumer(daemon->engine, daemon->consumer) == 0);
 	assert(midr_owned_create(&owned_config, publish_owned, daemon,
 				 &daemon->owned) == 0);
@@ -129,18 +156,25 @@ static void destroy_daemon(struct midrd *daemon)
 	midr_engine_destroy(&daemon->engine);
 }
 
-static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
+static uint64_t consumer_view_generation(struct midrd *daemon, size_t *count)
 {
 	struct midr_consumer_snapshot snapshot = {0};
 	uint64_t generation;
 
 	assert(midr_consumer_snapshot_acquire(daemon->consumer, &snapshot) == 0);
 	generation = snapshot.generation;
-	assert(midr_ted_state(daemon->ted) == MIDR_TED_READY);
-	assert(midr_ted_generation(daemon->ted) == generation);
 	if (count)
 		*count = snapshot.count;
 	midr_consumer_snapshot_release(&snapshot);
+	return generation;
+}
+
+static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
+{
+	uint64_t generation = consumer_view_generation(daemon, count);
+
+	assert(midr_ted_state(daemon->ted) == MIDR_TED_READY);
+	assert(midr_ted_source_generation(daemon->ted) == generation);
 	return generation;
 }
 
@@ -245,7 +279,6 @@ static void test_atomic_and_cost(void)
 	uint64_t generation;
 	uint64_t view_generation;
 	uint64_t sequence;
-	uint64_t failed_sequence;
 	uint32_t baseline_cost;
 	uint32_t candidate_cost;
 	size_t pending;
@@ -258,6 +291,7 @@ static void test_atomic_and_cost(void)
 	assert(daemon.local_generation == 1 && daemon.group_id == 9);
 	assert(daemon.membership_version == 1 && daemon.link_count == 2);
 	assert(daemon.links[0].address_family == MIDR_CORE_AF_IPV4);
+	assert(daemon.links[0].local_ifindex == 1088);
 	assert(daemon.links[1].address_family == MIDR_CORE_AF_IPV6);
 	object = owned_link(&daemon, &links[0]);
 	assert(object.address_family == MIDR_CORE_AF_IPV4);
@@ -311,23 +345,25 @@ static void test_atomic_and_cost(void)
 	assert(publish_pending_link_costs_at(
 		       &daemon,
 		       start + MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MS) ==
-	       -ENOSPC);
-	assert(daemon.links[0].cost_pending);
-	assert(daemon.links[0].metric == baseline_cost);
-	assert(owned_link(&daemon, &links[0]).metric == baseline_cost);
-	assert(midr_engine_generation(daemon.engine) == generation);
-	assert(consumer_generation(&daemon, &count) == view_generation);
-	assert(midr_consumer_pending(daemon.consumer) == pending);
-	assert_no_engine_events(&daemon);
-	failed_sequence = midr_owned_last_sequence(daemon.owned);
-	assert(failed_sequence > sequence);
-	drain_consumer_events(daemon.consumer);
-	assert(publish_pending_link_costs_at(
-		       &daemon,
-		       start + MIDR_LINK_COST_MIN_ADVERTISEMENT_INTERVAL_MS) == 0);
+	       0);
 	assert(!daemon.links[0].cost_pending);
+	assert(daemon.links[0].metric == candidate_cost);
 	assert(owned_link(&daemon, &links[0]).metric == candidate_cost);
-	assert(midr_owned_last_sequence(daemon.owned) > failed_sequence);
+	assert(midr_engine_generation(daemon.engine) > generation);
+	assert(consumer_view_generation(&daemon, &count) == view_generation);
+	assert(midr_consumer_pending(daemon.consumer) == 0);
+	assert(midr_engine_publication_pending(daemon.engine));
+	assert(midr_engine_publication_error(daemon.engine) == -ENOSPC);
+	assert(daemon.ted_rebuild_pending);
+	assert(midr_ted_state(daemon.ted) == MIDR_TED_NOT_READY);
+	assert_no_engine_events(&daemon);
+	assert(midr_owned_last_sequence(daemon.owned) > sequence);
+	assert(rebuild_ted(&daemon) == 0);
+	assert(!midr_engine_publication_pending(daemon.engine));
+	assert(!daemon.ted_rebuild_pending);
+	assert(midr_ted_state(daemon.ted) == MIDR_TED_READY);
+	assert(consumer_generation(&daemon, &count) ==
+	       midr_engine_generation(daemon.engine));
 
 	/* The latest candidate may cancel a pending update. */
 	membership = membership_event(4, 4, 9);
@@ -416,8 +452,6 @@ static void test_failed_commits_and_version_floors(void)
 	uint64_t generation;
 	uint64_t view_generation;
 	uint64_t sequence;
-	uint64_t failed_sequence;
-	size_t pending;
 	size_t count;
 
 	initialize_daemon(&daemon, &probe, 2);
@@ -441,31 +475,34 @@ static void test_failed_commits_and_version_floors(void)
 	assert(midr_owned_last_sequence(daemon.owned) == sequence);
 	assert_no_engine_events(&daemon);
 
-	/* Consumer queue exhaustion is detected before publication.  The staged
-	 * core and owned state are discarded, while the consumed sequence numbers
-	 * remain reserved for the retry. */
+	/* Consumer queue exhaustion gates the derived view without rolling back a
+	 * complete canonical/owned transaction. */
 	drain_consumer_events(daemon.consumer);
-	pending = fill_consumer(daemon.consumer);
+	(void)fill_consumer(daemon.consumer);
 	membership = membership_event(3, 3, 10);
 	links[0].generation = 3;
 	links[0].fact.link.version = 3;
 	links[0].fact.link.rtt_us = 1500000;
 	assert(deliver_snapshot(&daemon, 3000, 3, &membership, links, 1) ==
-	       -ENOSPC);
-	assert(daemon.local_generation == 1 && daemon.group_id == 9);
-	assert(daemon.links[0].input_version == 1);
-	assert(midr_engine_generation(daemon.engine) == generation);
-	assert(consumer_generation(&daemon, &count) == view_generation);
-	assert(owned_link(&daemon, &links[0]).metric == before.metric);
-	assert(midr_consumer_pending(daemon.consumer) == pending);
-	assert_no_engine_events(&daemon);
-	failed_sequence = midr_owned_last_sequence(daemon.owned);
-	assert(failed_sequence > sequence);
-	drain_consumer_events(daemon.consumer);
-	assert(deliver_snapshot(&daemon, 3000, 3, &membership, links, 1) == 0);
+	       0);
 	assert(daemon.local_generation == 3 && daemon.group_id == 10);
 	assert(daemon.links[0].input_version == 3);
-	assert(midr_owned_last_sequence(daemon.owned) > failed_sequence);
+	assert(midr_engine_generation(daemon.engine) > generation);
+	assert(consumer_view_generation(&daemon, &count) == view_generation);
+	assert(daemon.links[0].cost_pending);
+	assert(owned_link(&daemon, &links[0]).metric == before.metric);
+	assert(midr_consumer_pending(daemon.consumer) == 0);
+	assert(midr_engine_publication_pending(daemon.engine));
+	assert(midr_engine_publication_error(daemon.engine) == -ENOSPC);
+	assert(daemon.ted_rebuild_pending);
+	assert(midr_ted_state(daemon.ted) == MIDR_TED_NOT_READY);
+	assert_no_engine_events(&daemon);
+	assert(midr_owned_last_sequence(daemon.owned) > sequence);
+	assert(rebuild_ted(&daemon) == 0);
+	assert(!midr_engine_publication_pending(daemon.engine));
+	assert(!daemon.ted_rebuild_pending);
+	assert(consumer_generation(&daemon, &count) ==
+	       midr_engine_generation(daemon.engine));
 
 	/* Absence records an input-version floor; the same old version cannot
 	 * resurrect the Link in the same provider epoch. */
@@ -546,7 +583,7 @@ static void test_snapshot_generation_guards(void)
 	assert(local_event_at(&daemon, &event, 2100) == 0);
 	link.generation = 2;
 	link.fact.link.version = 2;
-	assert(local_event_at(&daemon, &link, 2100) == -EINVAL);
+	assert(local_event_at(&daemon, &link, 2100) == 0);
 	assert(midr_engine_generation(daemon.engine) == generation);
 	assert(consumer_generation(&daemon, &count) == view_generation);
 
@@ -569,11 +606,135 @@ static void test_snapshot_generation_guards(void)
 	destroy_daemon(&daemon);
 }
 
+static void test_incremental_withdraw_and_barrier(void)
+{
+	struct midrd daemon;
+	struct consumer_probe probe;
+	struct midr_local_event membership = membership_event(1, 1, 9);
+	struct midr_local_event link =
+		link_event(1, 1, 88, MIDR_CORE_AF_IPV4, 1000000, 1);
+	struct midr_local_event event;
+	uint64_t generation;
+
+	initialize_daemon(&daemon, &probe, 8);
+	assert(deliver_snapshot(&daemon, 1000, 1, &membership, &link, 1) == 0);
+	generation = midr_engine_generation(daemon.engine);
+
+	link.fact.link.version = 2;
+	link.fact.link.rtt_us = 1200000;
+	assert(local_event_at(&daemon, &link, 2000) == 0);
+	assert(daemon.local_generation == 1 && daemon.link_count == 1);
+	assert(daemon.links[0].input_version == 2);
+	assert(midr_engine_generation(daemon.engine) >= generation);
+
+	event = link_withdraw_event(1, 3, 88);
+	assert(local_event_at(&daemon, &event, 3000) == 0);
+	assert(daemon.link_count == 0 && daemon.local_link_version_count == 1);
+	link.fact.link.version = 3;
+	assert(local_event_at(&daemon, &link, 3100) == -ESTALE);
+	link.fact.link.version = 4;
+	assert(local_event_at(&daemon, &link, 3200) == 0);
+	assert(daemon.link_count == 1 && daemon.links[0].input_version == 4);
+
+	event = membership_withdraw_event(1, 2);
+	assert(local_event_at(&daemon, &event, 4000) == 0);
+	assert(daemon.group_id == 0 && daemon.membership_version == 2);
+	membership = membership_event(1, 2, 10);
+	assert(local_event_at(&daemon, &membership, 4100) == -ESTALE);
+	membership.fact.membership.version = 3;
+	assert(local_event_at(&daemon, &membership, 4200) == 0);
+	assert(daemon.group_id == 10 && daemon.membership_version == 3);
+
+	/* A future delta cannot cross the provider generation barrier without a
+	 * complete snapshot. */
+	link.generation = 2;
+	link.fact.link.version = 5;
+	assert(local_event_at(&daemon, &link, 5000) == -EAGAIN);
+	assert(daemon.local_generation == 1 && daemon.links[0].input_version == 4);
+
+	event = local_control(MIDR_LOCAL_SNAPSHOT_BEGIN, 2);
+	assert(local_event_at(&daemon, &event, 6000) == 0);
+	membership = membership_event(2, 4, 11);
+	assert(local_event_at(&daemon, &membership, 6000) == 0);
+	link.generation = 2;
+	assert(local_event_at(&daemon, &link, 6000) == 0);
+	event = local_control(MIDR_LOCAL_SNAPSHOT_END, 2);
+	assert(local_event_at(&daemon, &event, 6000) == 0);
+	event = link_withdraw_event(2, 6, 88);
+	assert(local_event_at(&daemon, &event, 6000) == 0);
+	assert(daemon.local_generation == 1 && daemon.group_id == 10 &&
+	       daemon.link_count == 1);
+	event = local_control(MIDR_LOCAL_EOR, 2);
+	assert(local_event_at(&daemon, &event, 6000) == 0);
+	assert(daemon.local_generation == 2 && daemon.group_id == 11 &&
+	       daemon.link_count == 0);
+	destroy_daemon(&daemon);
+}
+
+static void test_local_ifindex_metadata(void)
+{
+	struct midrd daemon;
+	struct consumer_probe probe;
+	struct midr_local_event membership = membership_event(1, 1, 9);
+	struct midr_local_event link =
+		link_event(1, 1, 88, MIDR_CORE_AF_IPV4, 1000000, 1);
+	struct midr_core_object remote_membership = {
+		.identity = {
+			.type = MIDR_CORE_MEMBERSHIP,
+			.originator = 88,
+		},
+		.sequence = 1,
+		.state = MIDR_CORE_ACTIVE,
+		.lifetime_ms = 600000,
+		.group = 9,
+	};
+	struct midr_ted_view view = {0};
+	enum midr_core_result result;
+	uint64_t engine_generation;
+	uint64_t owned_sequence;
+	uint64_t ted_generation;
+	uint64_t source_generation;
+	uint64_t start = mono_ms();
+
+	initialize_daemon(&daemon, &probe, 16);
+	assert(midr_engine_apply(daemon.engine, &remote_membership, start,
+				 &result) == 0);
+	assert(result == MIDR_CORE_ACCEPTED);
+	assert(deliver_snapshot(&daemon, start, 1, &membership, &link, 1) == 0);
+	assert(midr_ted_view_acquire(daemon.ted, &view) == 0);
+	assert(view.intra_link_count == 1);
+	assert(view.intra_links[0].local_node_id == 77 &&
+	       view.intra_links[0].local_ifindex == 1088);
+	midr_ted_view_release(&view);
+	engine_generation = midr_engine_generation(daemon.engine);
+	owned_sequence = midr_owned_last_sequence(daemon.owned);
+	ted_generation = midr_ted_generation(daemon.ted);
+	source_generation = midr_ted_source_generation(daemon.ted);
+
+	/* A local-ifindex-only update changes only the local TED metadata. */
+	membership = membership_event(2, 2, 9);
+	link = link_event(2, 2, 88, MIDR_CORE_AF_IPV4, 1000000, 2);
+	link.fact.link.local_ifindex = 2088;
+	assert(deliver_snapshot(&daemon, start + 1000U, 2, &membership, &link, 1) ==
+	       0);
+	assert(midr_owned_last_sequence(daemon.owned) == owned_sequence);
+	assert(midr_engine_generation(daemon.engine) == engine_generation);
+	assert(midr_ted_source_generation(daemon.ted) == source_generation);
+	assert(midr_ted_generation(daemon.ted) == ted_generation + 1U);
+	assert(midr_ted_view_acquire(daemon.ted, &view) == 0);
+	assert(view.intra_link_count == 1);
+	assert(view.intra_links[0].local_ifindex == 2088);
+	midr_ted_view_release(&view);
+	destroy_daemon(&daemon);
+}
+
 int main(void)
 {
 	test_atomic_and_cost();
 	test_failed_commits_and_version_floors();
 	test_snapshot_generation_guards();
+	test_incremental_withdraw_and_barrier();
+	test_local_ifindex_metadata();
 	puts("midrd-local-transaction-test: PASS");
 	return 0;
 }
