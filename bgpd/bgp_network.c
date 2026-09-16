@@ -25,6 +25,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_admission.h"
+#include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_open.h"
 #include "bgpd/bgp_fsm.h"
 #include "bgpd/bgp_attr.h"

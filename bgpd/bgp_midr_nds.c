@@ -3451,6 +3451,7 @@ static void midr_join_round_start(struct bgp *bgp)
  * 标 SEED 来源（排手配之后）。midr_store_seed_load 逐条调本函数。
  * last_seen 本路用不上（候选次序由 MANUAL/SEED 分组决定，不按时间排）——库里
  * 的行本就按 last_seen 新→旧吐出，同组内自然新的在前。 */
+#ifdef HAVE_SQLITE3
 static void midr_bootstrap_seed_load_cb(const char *transport, uint32_t asn,
 					const char *rid, time_t last_seen,
 					void *arg)
@@ -3470,6 +3471,7 @@ static void midr_bootstrap_seed_load_cb(const char *transport, uint32_t asn,
 	midr_bootstrap_list_add(bgp->midr_nds_info, locator, (as_t)asn,
 				rid_addr, MIDR_BOOTSTRAP_SEED);
 }
+#endif /* HAVE_SQLITE3 */
 
 /*
  * §8.31 种子自举定时器（启动后延迟 MIDR_BOOTSTRAP_SELF_BOOT_SECS 触发一次）：

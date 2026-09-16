@@ -154,7 +154,8 @@ static void pm_push_i5(struct midr_probe_ctx *ctx,
 		bw_score = sqrt(1.5)
 			   / (rtt_s
 			      * sqrt(fmax(loss, MIDR_PM_BW_SCORE_LOSS_FLOOR)));
-		st.bw_score = (uint32_t)fmin(bw_score, (double)UINT32_MAX);
+		bw_score = fmin(bw_score, (double)UINT32_MAX);
+		st.bw_score = (uint32_t)bw_score;
 	}
 
 	if (ctx->lt_init) {
@@ -168,8 +169,8 @@ static void pm_push_i5(struct midr_probe_ctx *ctx,
 				   / (rtt_s
 				      * sqrt(fmax(ctx->lt_loss_rate,
 						  MIDR_PM_BW_SCORE_LOSS_FLOOR)));
-			lt.bw_score =
-				(uint32_t)fmin(bw_score, (double)UINT32_MAX);
+			bw_score = fmin(bw_score, (double)UINT32_MAX);
+			lt.bw_score = (uint32_t)bw_score;
 		}
 	}
 
