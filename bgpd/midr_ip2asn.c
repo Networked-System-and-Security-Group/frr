@@ -609,7 +609,7 @@ int midr_ip2asn_load_file_ex(const char *path, unsigned int flags,
 
 	midr_ip2asn_snapshot_destroy(&candidate);
 	midr_ip2asn_assert_invariants();
-	hook_call(midr_policy_changed);
+	midr_policy_notify_changed();
 	return 0;
 }
 
@@ -668,7 +668,7 @@ int midr_ip2asn_clear_ex(unsigned int flags, char *errmsg,
 
 	midr_ip2asn_snapshot_destroy(&old_snapshot);
 	midr_ip2asn_assert_invariants();
-	hook_call(midr_policy_changed);
+	midr_policy_notify_changed();
 	return 0;
 }
 
@@ -1620,7 +1620,7 @@ midr_ip2asn_update_commit(const char *path,
 	}
 
 	midr_ip2asn_assert_invariants();
-	hook_call(midr_policy_changed);
+	midr_policy_notify_changed();
 	return 0;
 }
 

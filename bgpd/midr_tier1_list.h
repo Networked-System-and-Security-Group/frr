@@ -6,7 +6,9 @@
 #include "hook.h"
 
 /* Main-loop notification after a successful policy/map publication. */
-DECLARE_HOOK(midr_policy_changed, (void), ());
+DECLARE_HOOK(midr_policy_changed, (), ());
+/* hook_call is private to the translation unit defining the hook. */
+void midr_policy_notify_changed(void);
 
 #define MIDR_TIER1_LIST_MAX 4096U
 #define MIDR_TIER1_LIST_FILE_MAX (128U * 1024U)

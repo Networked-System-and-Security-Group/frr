@@ -162,8 +162,22 @@ for marker in ('peer_source_matches(peer, e)', 'connection->su_local',
     if marker not in admission_body:
         errors.append(f'missing admission context/recovery guard: {marker}')
 for name, expected in [('bgpd/midr_ip2asn.c', 3), ('bgpd/midr_tier1_list.c', 2)]:
-    if clean_source(name).count('hook_call(midr_policy_changed)') != expected:
+    if clean_source(name).count('midr_policy_notify_changed();') != expected:
         errors.append(f'policy publication notification missing: {name}')
+for name in ('bgpd/midr_tier1_list.h', 'bgpd/midr_tier1_list.c'):
+    if re.search(r'(?:DECLARE|DEFINE)_HOOK\(midr_policy_changed,\s*\(void\)',
+                 clean_source(name)):
+        errors.append(f'no-argument FRR hooks require (), not (void): {name}')
+if 'hook_call(midr_policy_changed)' in clean_source('bgpd/midr_ip2asn.c'):
+    errors.append('IP2ASN cannot call the Tier1 translation unit private hook dispatcher')
+if clean_source('bgpd/midr_tier1_list.c').count('hook_call(midr_policy_changed)') != 1:
+    errors.append('policy notifier must dispatch the hook in its defining translation unit')
+if '#include "bgpd/bgp_vty.h"' not in (root/'bgpd/bgp_midr_admission.c').read_text(encoding='utf-8'):
+    errors.append('admission requires bgp_vty.h for bgp_config_inprocess')
+state_enum = re.search(r'enum admission_state\s*\{([^}]+)\}', admission_body)
+if not state_enum or any(not value.strip().startswith('ADMISSION_')
+                         for value in state_enum[1].split(',') if value.strip()):
+    errors.append('admission state enumerators must use the ADMISSION_ prefix')
 nds_vty = clean_source('bgpd/bgp_midr_nds_vty.c')
 for node, command in [('BGP_NODE', 'midr_avoid_tier1_cmd'),
                       ('VIEW_NODE', 'show_midr_admission_cmd')]:

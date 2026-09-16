@@ -11,6 +11,7 @@
 #include "vrf.h"
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_fsm.h"
+#include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_admission.h"
 #include "bgpd/midr_ip2asn.h"
@@ -30,7 +31,13 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_ADMISSION, "MIDR admission manager");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ADMISSION_ENTRY, "MIDR admission intent");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ADMISSION_TOKEN, "MIDR admission callback token");
 
-enum admission_state { WAIT_DATA, WAIT_TRACE, ALLOWED, BLOCKED, UNKNOWN };
+enum admission_state {
+	ADMISSION_WAIT_DATA,
+	ADMISSION_WAIT_TRACE,
+	ADMISSION_ALLOWED,
+	ADMISSION_BLOCKED,
+	ADMISSION_UNKNOWN,
+};
 struct admission_entry;
 /* The scheduler owns this token until its one terminal callback, including
  * cancellation. Clearing owner before cancel makes per-instance deletion safe. */
@@ -223,7 +230,7 @@ static bool current_path(struct admission_entry *e)
 
 static bool fresh_permit(struct admission_entry *e)
 {
-	return e && valid_owners(e) && e->state == ALLOWED && e->permit && current_path(e) &&
+	return e && valid_owners(e) && e->state == ADMISSION_ALLOWED && e->permit && current_path(e) &&
 	       current_data(e) && now_ms() - e->measured_at <= ADMISSION_MAX_AGE_MS;
 }
 
@@ -359,7 +366,7 @@ static void queue_resume(struct admission_entry *e)
 static void retry_later(struct admission_entry *e, const char *detail)
 {
 	e->permit = 0;
-	e->state = UNKNOWN;
+	e->state = ADMISSION_UNKNOWN;
 	e->detail = detail;
 	e->backoff = e->backoff ? MIN(e->backoff * 2, ADMISSION_RETRY_MAX_MS)
 				: ADMISSION_RETRY_MIN_MS;
@@ -380,7 +387,7 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 	e->token = NULL;
 	XFREE(MTYPE_MIDR_ADMISSION_TOKEN, token);
 	if (delivery->status == MIDR_TRACE_ERR_SHUTDOWN) {
-		e->state = WAIT_DATA;
+		e->state = ADMISSION_WAIT_DATA;
 		e->detail = "scheduler-shutdown";
 		return;
 	}
@@ -395,7 +402,7 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 	}
 	result = midr_admission_evaluate(&delivery->view.job, &e->result);
 	if (result == MIDR_ADMISSION_READY) {
-		e->state = ALLOWED;
+		e->state = ADMISSION_ALLOWED;
 		e->detail = "no-tier1-observed";
 		e->permit = next_serial();
 		e->measured_at = now_ms() - (delivery->has_cache_metadata ?
@@ -403,7 +410,7 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 		e->backoff = 0;
 		queue_resume(e);
 	} else if (result == MIDR_ADMISSION_BLOCKED) {
-		e->state = BLOCKED;
+		e->state = ADMISSION_BLOCKED;
 		e->detail = "tier1-observed";
 		e->permit = 0;
 		e->retry_at = now_ms() + ADMISSION_RETRY_MAX_MS;
@@ -432,17 +439,17 @@ static void start_trace(struct admission_entry *e)
 	if (e->token || bgp_config_inprocess() || ongoing_permit(e))
 		return;
 	if (!room_for(e)) {
-		e->state = WAIT_DATA;
+		e->state = ADMISSION_WAIT_DATA;
 		e->detail = "candidate-slots-full";
 		return;
 	}
 	if (!current_path(e) || e->manager->bgp->vrf_id != VRF_DEFAULT) {
-		e->state = WAIT_DATA;
+		e->state = ADMISSION_WAIT_DATA;
 		e->detail = "unsupported-or-inactive-context";
 		return;
 	}
 	if (!midr_ip2asn_is_loaded() || !midr_tier1_list_active()) {
-		e->state = WAIT_DATA;
+		e->state = ADMISSION_WAIT_DATA;
 		e->detail = "ip2asn-or-tier1-list-not-loaded";
 		return;
 	}
@@ -466,7 +473,7 @@ static void start_trace(struct admission_entry *e)
 		retry_later(e, "scheduler-not-ready-or-full");
 		return;
 	}
-	e->state = WAIT_TRACE;
+	e->state = ADMISSION_WAIT_TRACE;
 	e->detail = "queued-or-probing";
 }
 
@@ -544,7 +551,7 @@ static void invalidate(struct midr_admission *m)
 		event_cancel(&e->resume);
 		e->permit = 0;
 		e->retry_at = 0;
-		e->state = WAIT_DATA;
+		e->state = ADMISSION_WAIT_DATA;
 		e->detail = "policy-or-data-changed";
 	}
 	/* Queue stop, never delete peers while traversing the instance list. */
@@ -721,7 +728,7 @@ enum midr_admission_result midr_admission_gate(struct bgp *bgp,
 		e->nudge_reasons |= 1U << reason;
 	if (fresh_permit(e) || ongoing_permit(e))
 		return MIDR_ADMISSION_READY;
-	if (e->state == BLOCKED && current_data(e) && now_ms() < e->retry_at)
+	if (e->state == ADMISSION_BLOCKED && current_data(e) && now_ms() < e->retry_at)
 		return MIDR_ADMISSION_BLOCKED;
 	if (!e->token && now_ms() >= e->retry_at)
 		start_trace(e);
@@ -819,8 +826,8 @@ bool midr_admission_unavailable(struct bgp *bgp, struct ipaddr target)
 {
 	struct admission_entry *e = find_entry(bgp, target);
 	return bgp->midr_nds_info->avoid_tier1 && e &&
-	       ((e->state == BLOCKED && current_data(e) && now_ms() < e->retry_at) ||
-		(e->state == UNKNOWN && now_ms() < e->retry_at) || e->token);
+	       ((e->state == ADMISSION_BLOCKED && current_data(e) && now_ms() < e->retry_at) ||
+		(e->state == ADMISSION_UNKNOWN && now_ms() < e->retry_at) || e->token);
 }
 
 bool midr_admission_candidate_blocked(const struct bgp *bgp, struct ipaddr target)
@@ -830,7 +837,7 @@ bool midr_admission_candidate_blocked(const struct bgp *bgp, struct ipaddr targe
 	if (peer && peer->connection && peer->connection->status == Established)
 		return false;
 	return bgp->midr_nds_info->avoid_tier1 && e &&
-	       (e->state == BLOCKED || e->state == UNKNOWN) &&
+	       (e->state == ADMISSION_BLOCKED || e->state == ADMISSION_UNKNOWN) &&
 	       current_data(e) && now_ms() < e->retry_at;
 }
 
