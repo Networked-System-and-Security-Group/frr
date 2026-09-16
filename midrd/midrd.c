@@ -38,6 +38,28 @@
 
 static struct midr_context *midrd_runtime;
 
+struct midr_spf_results {
+	size_t references;
+	uint64_t generation;
+	struct midr_spf_route *routes;
+	size_t count;
+};
+
+struct midr_spf_consumer {
+	struct midr_spf_consumer *next;
+	struct midr_context *ctx;
+	struct midr_ted_consumer *ted_consumer;
+	struct midr_spf_consumer_ops ops;
+	void *arg;
+	size_t notify_depth;
+	bool removed;
+};
+
+struct midr_context *midr_context_get_default(void)
+{
+	return midrd_runtime;
+}
+
 static FRR_NORETURN void midrd_terminate(int status);
 
 static void midrd_sighup(void)
@@ -2025,6 +2047,515 @@ static int local_event(void *arg, const struct midr_local_event *event)
 	return local_event_at(arg, event, mono_ms());
 }
 
+static bool topology_policy_valid(enum midr_policy_state policy)
+{
+	return policy == MIDR_POLICY_ALLOWED || policy == MIDR_POLICY_BLOCKED;
+}
+
+static int topology_address_copy(const struct ipaddr *address, uint8_t *family,
+				 uint8_t destination[MIDR_CORE_ADDR_BYTES])
+{
+	if (IS_IPADDR_V4(address)) {
+		*family = MIDR_CORE_AF_IPV4;
+		memcpy(destination, &address->ipaddr_v4,
+		       sizeof(address->ipaddr_v4));
+		return 0;
+	}
+	if (IS_IPADDR_V6(address)) {
+		*family = MIDR_CORE_AF_IPV6;
+		memcpy(destination, &address->ipaddr_v6,
+		       sizeof(address->ipaddr_v6));
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int topology_link_event(struct midr_context *daemon,
+			       const struct midr_link_update *link,
+			       enum midr_local_event_kind kind,
+			       struct midr_local_event *event)
+{
+	uint8_t remote_family;
+
+	if (!daemon || !link || !event ||
+	    link->key.local_node_id != daemon->node_id ||
+	    !link->key.remote_node_id ||
+	    link->key.remote_node_id == daemon->node_id ||
+	    !topology_policy_valid(link->policy_state) || !link->version)
+		return -EINVAL;
+	memset(event, 0, sizeof(*event));
+	event->kind = kind;
+	event->generation = 1;
+	event->originator = daemon->node_id;
+	event->fact.link.remote_node_id = link->key.remote_node_id;
+	event->fact.link.link_id = link->key.link_id;
+	event->fact.link.version = link->version;
+	if (kind == MIDR_LOCAL_LINK_WITHDRAW)
+		return 0;
+	if (!link->metrics.has_rtt_us || !link->metrics.has_loss_ppm ||
+	    !link->metrics.has_available_bandwidth_kbps)
+		return -EINVAL;
+	event->fact.link.local_ifindex = link->local_ifindex;
+	if (topology_address_copy(&link->link_local_address,
+				  &event->fact.link.family,
+				  event->fact.link.local_address) ||
+	    topology_address_copy(&link->link_remote_address, &remote_family,
+				  event->fact.link.remote_address) ||
+	    event->fact.link.family != remote_family)
+		return -EINVAL;
+	event->fact.link.rtt_us = link->metrics.rtt_us;
+	event->fact.link.loss_ppm = link->metrics.loss_ppm;
+	event->fact.link.available_bandwidth_kbps =
+		link->metrics.available_bandwidth_kbps;
+	event->fact.link.measurement_sequence =
+		link->metrics.measurement_seqno;
+	event->fact.link.measurement_timestamp_ms =
+		link->metrics.measurement_timestamp_ms;
+	return midr_local_event_validate(event);
+}
+
+static int topology_submit_event(struct midr_context *daemon,
+				 struct midr_local_event *event)
+{
+	struct midr_local_event control = {
+		.originator = daemon ? daemon->node_id : 0,
+	};
+	uint64_t now_ms = mono_ms();
+	int ret;
+
+	if (!daemon || !event)
+		return -EINVAL;
+	if (daemon->topology_resync_required)
+		return -EAGAIN;
+	if (daemon->topology_write_active)
+		return -EBUSY;
+	daemon->topology_write_active = true;
+	if (daemon->local_generation) {
+		event->generation = daemon->local_generation;
+		ret = local_event_at(daemon, event, now_ms);
+		goto done;
+	}
+	control.generation = 1;
+	control.kind = MIDR_LOCAL_SNAPSHOT_BEGIN;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (ret)
+		goto done;
+	event->generation = control.generation;
+	ret = local_event_at(daemon, event, now_ms);
+	if (ret)
+		goto failed;
+	control.kind = MIDR_LOCAL_SNAPSHOT_END;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (ret)
+		goto failed;
+	control.kind = MIDR_LOCAL_EOR;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (!ret)
+		goto done;
+failed:
+	local_stage_reset(&daemon->local_stage);
+
+done:
+	daemon->topology_write_active = false;
+	return ret;
+}
+
+int midr_topology_node_upsert(struct midr_context *daemon,
+			      const struct midr_node_update *node)
+{
+	struct midr_local_event event = {0};
+
+	if (!daemon || !node || node->node_id != daemon->node_id ||
+	    !node->group_id || !node->version ||
+	    !topology_policy_valid(node->policy_state))
+		return -EINVAL;
+	if (node->policy_state == MIDR_POLICY_BLOCKED)
+		return midr_topology_node_withdraw(daemon, node->node_id,
+					   node->version);
+	event.kind = MIDR_LOCAL_MEMBERSHIP;
+	event.originator = daemon->node_id;
+	event.fact.membership.group = node->group_id;
+	event.fact.membership.version = node->version;
+	return topology_submit_event(daemon, &event);
+}
+
+int midr_topology_node_withdraw(struct midr_context *daemon, uint32_t node_id,
+				uint64_t version)
+{
+	struct midr_local_event event = {0};
+
+	if (!daemon || node_id != daemon->node_id || !version)
+		return -EINVAL;
+	event.kind = MIDR_LOCAL_MEMBERSHIP_WITHDRAW;
+	event.originator = daemon->node_id;
+	event.fact.membership.version = version;
+	return topology_submit_event(daemon, &event);
+}
+
+int midr_topology_link_upsert(struct midr_context *daemon,
+			      const struct midr_link_update *link)
+{
+	struct midr_local_event event;
+	int ret;
+
+	if (!link)
+		return -EINVAL;
+	if (link->policy_state == MIDR_POLICY_BLOCKED)
+		return midr_topology_link_withdraw(daemon, &link->key,
+					   link->version);
+	ret = topology_link_event(daemon, link, MIDR_LOCAL_LINK, &event);
+	return ret ? ret : topology_submit_event(daemon, &event);
+}
+
+int midr_topology_link_withdraw(struct midr_context *daemon,
+				const struct midr_link_key *key,
+				uint64_t version)
+{
+	struct midr_link_update link = {0};
+	struct midr_local_event event;
+	int ret;
+
+	if (!key)
+		return -EINVAL;
+	link.key = *key;
+	link.policy_state = MIDR_POLICY_ALLOWED;
+	link.version = version;
+	ret = topology_link_event(daemon, &link, MIDR_LOCAL_LINK_WITHDRAW,
+				  &event);
+	return ret ? ret : topology_submit_event(daemon, &event);
+}
+
+int midr_topology_snapshot_apply(
+	struct midr_context *daemon, const struct midr_topology_snapshot *snapshot)
+{
+	struct midr_local_event events[MIDRD_MAX_LINKS + 1U];
+	struct midr_local_event control = {0};
+	size_t count = 0;
+	uint64_t now_ms;
+	int ret;
+
+	if (!daemon || !snapshot || !snapshot->snapshot_version ||
+	    snapshot->node_count > 1U || snapshot->link_count > MIDRD_MAX_LINKS ||
+	    (snapshot->node_count && !snapshot->nodes) ||
+	    (snapshot->link_count && !snapshot->links))
+		return -EINVAL;
+	if (daemon->local_generation &&
+	    snapshot->snapshot_version <= daemon->local_generation)
+		return -ESTALE;
+	if (snapshot->node_count) {
+		const struct midr_node_update *node = &snapshot->nodes[0];
+
+		if (node->node_id != daemon->node_id || !node->group_id ||
+		    !node->version || !topology_policy_valid(node->policy_state))
+			return -EINVAL;
+		if (node->policy_state == MIDR_POLICY_ALLOWED) {
+			events[count].kind = MIDR_LOCAL_MEMBERSHIP;
+			events[count].originator = daemon->node_id;
+			events[count].fact.membership.group = node->group_id;
+			events[count].fact.membership.version = node->version;
+			count++;
+		}
+	}
+	for (size_t i = 0; i < snapshot->link_count; i++) {
+		if (snapshot->links[i].policy_state == MIDR_POLICY_BLOCKED)
+			continue;
+		ret = topology_link_event(daemon, &snapshot->links[i],
+					  MIDR_LOCAL_LINK, &events[count]);
+		if (ret)
+			return ret;
+		count++;
+	}
+	control.originator = daemon->node_id;
+	control.generation = snapshot->snapshot_version;
+	now_ms = mono_ms();
+	if (daemon->topology_write_active)
+		return -EBUSY;
+	daemon->topology_write_active = true;
+	control.kind = MIDR_LOCAL_SNAPSHOT_BEGIN;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (ret)
+		goto done;
+	for (size_t i = 0; i < count; i++) {
+		events[i].generation = control.generation;
+		ret = local_event_at(daemon, &events[i], now_ms);
+		if (ret)
+			goto failed;
+	}
+	control.kind = MIDR_LOCAL_SNAPSHOT_END;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (ret)
+		goto failed;
+	control.kind = MIDR_LOCAL_EOR;
+	ret = local_event_at(daemon, &control, now_ms);
+	if (ret)
+		goto failed;
+	daemon->topology_resync_required = false;
+	goto done;
+failed:
+	local_stage_reset(&daemon->local_stage);
+
+done:
+	daemon->topology_write_active = false;
+	return ret;
+}
+
+int midr_topology_provider_register(
+	struct midr_context *daemon, midr_topology_snapshot_get_cb snapshot_get,
+	midr_topology_snapshot_release_cb snapshot_release)
+{
+	if (!daemon || !snapshot_get || !snapshot_release)
+		return -EINVAL;
+	if (daemon->topology_snapshot_get || daemon->topology_snapshot_release)
+		return -EALREADY;
+	daemon->topology_snapshot_get = snapshot_get;
+	daemon->topology_snapshot_release = snapshot_release;
+	return 0;
+}
+
+void midr_topology_provider_unregister(struct midr_context *daemon)
+{
+	if (!daemon)
+		return;
+	daemon->topology_snapshot_get = NULL;
+	daemon->topology_snapshot_release = NULL;
+}
+
+int midr_topology_resync_begin(struct midr_context *daemon,
+			       enum midr_topology_resync_reason reason)
+{
+	struct midr_topology_snapshot snapshot = {0};
+	int ret;
+
+	if (!daemon || reason < MIDR_TOPOLOGY_RESYNC_VERSION_LOST ||
+	    reason > MIDR_TOPOLOGY_RESYNC_STATE_INCONSISTENT)
+		return -EINVAL;
+	if (!daemon->topology_snapshot_get ||
+	    !daemon->topology_snapshot_release)
+		return -ENOSYS;
+	daemon->topology_resync_required = true;
+	local_stage_reset(&daemon->local_stage);
+	ret = daemon->topology_snapshot_get(daemon, &snapshot);
+	if (!ret) {
+		daemon->local_generation = 0;
+		ret = midr_topology_snapshot_apply(daemon, &snapshot);
+		daemon->topology_snapshot_release(daemon, &snapshot);
+	}
+	return ret;
+}
+
+int midr_spf_results_get(struct midr_context *daemon,
+			 const struct midr_spf_results **out)
+{
+	struct midr_consumer_snapshot snapshot = {0};
+	struct midr_ted_view view = {0};
+	struct midr_spf_results *results;
+	size_t capacity;
+	int ret;
+
+	if (!out || *out)
+		return -EINVAL;
+	if (!daemon || !daemon->ted)
+		return -ENOENT;
+	results = calloc(1, sizeof(*results));
+	if (!results)
+		return -ENOMEM;
+	ret = midr_ted_view_acquire(daemon->ted, &view);
+	if (ret)
+		goto failed;
+	if (view.local_group_id) {
+		if (view.node_prefix_count >
+		    SIZE_MAX - view.prefix_group_count) {
+			ret = -EOVERFLOW;
+			goto failed;
+		}
+		capacity = view.node_prefix_count + view.prefix_group_count;
+		if (capacity) {
+			results->routes = calloc(capacity, sizeof(*results->routes));
+			if (!results->routes) {
+				ret = -ENOMEM;
+				goto failed;
+			}
+		}
+		results->generation = view.generation;
+		ret = midr_spf_compute_ted(&view, results->routes, capacity,
+					   &results->count);
+		midr_ted_view_release(&view);
+		if (ret)
+			goto failed;
+	} else {
+		midr_ted_view_release(&view);
+		ret = midr_ted_snapshot_acquire(daemon->ted, &snapshot);
+		if (ret)
+			goto failed;
+		capacity = snapshot.count;
+		if (capacity) {
+			results->routes = calloc(capacity, sizeof(*results->routes));
+			if (!results->routes) {
+				ret = -ENOMEM;
+				goto failed;
+			}
+		}
+		results->generation = snapshot.generation;
+		ret = midr_spf_compute(&snapshot, daemon->node_id,
+				       results->routes, capacity, &results->count);
+		midr_consumer_snapshot_release(&snapshot);
+		if (ret)
+			goto failed;
+	}
+	if (!midr_ted_generation_is_current(daemon->ted,
+					    results->generation)) {
+		ret = -EAGAIN;
+		goto failed;
+	}
+	results->references = 1;
+	*out = results;
+	return 0;
+
+failed:
+	midr_ted_view_release(&view);
+	midr_consumer_snapshot_release(&snapshot);
+	midr_spf_routes_clear(results->routes, results->count);
+	free(results->routes);
+	free(results);
+	return ret;
+}
+
+const struct midr_spf_results *midr_spf_results_acquire(
+	const struct midr_spf_results *results)
+{
+	struct midr_spf_results *mutable;
+
+	if (!results || !results->references || results->references == SIZE_MAX)
+		return NULL;
+	mutable = (struct midr_spf_results *)results;
+	mutable->references++;
+	return results;
+}
+
+void midr_spf_results_release(const struct midr_spf_results **resultsp)
+{
+	struct midr_spf_results *results;
+
+	if (!resultsp || !*resultsp)
+		return;
+	results = (struct midr_spf_results *)*resultsp;
+	*resultsp = NULL;
+	if (!results->references || --results->references)
+		return;
+	midr_spf_routes_clear(results->routes, results->count);
+	free(results->routes);
+	free(results);
+}
+
+uint64_t midr_spf_results_generation(const struct midr_spf_results *results)
+{
+	return results ? results->generation : 0;
+}
+
+size_t midr_spf_results_count(const struct midr_spf_results *results)
+{
+	return results ? results->count : 0;
+}
+
+const struct midr_spf_route *midr_spf_results_at(
+	const struct midr_spf_results *results, size_t index)
+{
+	return results && index < results->count ? &results->routes[index] : NULL;
+}
+
+const struct midr_spf_route *midr_spf_results_lookup(
+	const struct midr_spf_results *results,
+	const struct midr_ted_prefix_key *prefix)
+{
+	if (!results || !prefix)
+		return NULL;
+	for (size_t i = 0; i < results->count; i++)
+		if (results->routes[i].family == prefix->family &&
+		    results->routes[i].prefix_len == prefix->prefix_len &&
+		    !memcmp(results->routes[i].prefix, prefix->prefix,
+			    sizeof(results->routes[i].prefix)))
+			return &results->routes[i];
+	return NULL;
+}
+
+static void spf_consumer_ted_changed(struct midr_ted *ted,
+				     uint64_t generation,
+				     uint32_t change_flags, void *arg)
+{
+	struct midr_spf_consumer *consumer = arg;
+	enum midr_ted_state state;
+	int error;
+
+	if (!consumer || consumer->removed || !consumer->ops.results_changed)
+		return;
+	state = midr_ted_state(ted);
+	error = state == MIDR_TED_READY ? 0 : midr_ted_last_error(ted);
+	if (state != MIDR_TED_READY && !error)
+		error = -EAGAIN;
+	consumer->notify_depth++;
+	consumer->ops.results_changed(consumer->ctx, generation, change_flags,
+				      state, error, consumer->arg);
+	consumer->notify_depth--;
+	if (consumer->removed && !consumer->notify_depth)
+		free(consumer);
+}
+
+int midr_spf_consumer_register(struct midr_context *daemon,
+			       const struct midr_spf_consumer_ops *ops,
+			       void *arg,
+			       struct midr_spf_consumer **consumerp)
+{
+	static const struct midr_ted_consumer_ops ted_ops = {
+		.snapshot_changed = spf_consumer_ted_changed,
+	};
+	struct midr_spf_consumer *consumer;
+	int ret;
+
+	if (!daemon || !daemon->ted || !ops || !ops->results_changed ||
+	    !consumerp || *consumerp)
+		return -EINVAL;
+	consumer = calloc(1, sizeof(*consumer));
+	if (!consumer)
+		return -ENOMEM;
+	consumer->ctx = daemon;
+	consumer->ops = *ops;
+	consumer->arg = arg;
+	ret = midr_ted_consumer_register(daemon->ted, &ted_ops, consumer,
+					 &consumer->ted_consumer);
+	if (ret) {
+		free(consumer);
+		return ret;
+	}
+	consumer->next = daemon->spf_consumers;
+	daemon->spf_consumers = consumer;
+	*consumerp = consumer;
+	return 0;
+}
+
+void midr_spf_consumer_unregister(struct midr_context *daemon,
+				  struct midr_spf_consumer **consumerp)
+{
+	struct midr_spf_consumer **cursor;
+	struct midr_spf_consumer *consumer;
+
+	if (!daemon || !consumerp || !*consumerp)
+		return;
+	consumer = *consumerp;
+	if (consumer->ctx != daemon)
+		return;
+	*consumerp = NULL;
+	for (cursor = &daemon->spf_consumers; *cursor;
+	     cursor = &(*cursor)->next)
+		if (*cursor == consumer) {
+			*cursor = consumer->next;
+			break;
+		}
+	midr_ted_consumer_unregister(daemon->ted, &consumer->ted_consumer);
+	consumer->removed = true;
+	if (!consumer->notify_depth)
+		free(consumer);
+}
+
 static void local_ipc_disconnect(void *arg, int reason)
 {
 	struct midr_context *daemon = arg;
@@ -2522,8 +3053,12 @@ static void shutdown_withdraw(struct midr_context *daemon)
 
 static void midr_context_finish(struct midr_context *daemon)
 {
+	struct midr_spf_consumer *spf_consumer;
+
 	if (!daemon)
 		return;
+	while ((spf_consumer = daemon->spf_consumers))
+		midr_spf_consumer_unregister(daemon, &spf_consumer);
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
 		stage_release(&daemon->stages[i]);
 	midr_local_ipc_server_destroy(&daemon->local_ipc);

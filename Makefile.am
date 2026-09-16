@@ -140,6 +140,7 @@ sbin_PROGRAMS += midrd/midrd
 midrd_midrd_SOURCES = \
 	midrd/midrd.c \
 	midrd/midr-context.h midrd/midr-context-private.h \
+	midrd/midr-topology.h \
 	midrd/midr-core.c midrd/midr-core.h \
 	midrd/midr-engine.c midrd/midr-engine.h \
 	midrd/midr-consumer.c midrd/midr-consumer.h \

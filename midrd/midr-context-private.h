@@ -17,7 +17,9 @@
 #include "midr-owned.h"
 #include "midr-prefix-ipc.h"
 #include "midr-prefix-provider.h"
+#include "midr-spf.h"
 #include "midr-ted.h"
+#include "midr-topology.h"
 #include "midr-transport.h"
 
 #define MIDRD_MAX_PEERS 32U
@@ -120,6 +122,7 @@ struct midr_context {
 	struct midr_prefix_ipc *prefix_ipc;
 	struct midr_local_ipc *local_ipc;
 	struct midr_transport *transport;
+	struct midr_spf_consumer *spf_consumers;
 	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
 	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];
@@ -135,12 +138,16 @@ struct midr_context {
 	size_t local_link_version_count;
 	uint64_t prefix_generation;
 	uint64_t local_generation;
+	midr_topology_snapshot_get_cb topology_snapshot_get;
+	midr_topology_snapshot_release_cb topology_snapshot_release;
 	uint64_t membership_version;
 	uint32_t representative_group;
 	uint32_t representative_node;
 	uint64_t takeover_ready_at;
 	bool representative_committed;
 	bool group_reconcile_pending;
+	bool topology_resync_required;
+	bool topology_write_active;
 	bool owned_commit_active;
 	uint64_t owned_commit_now_ms;
 	struct midr_core_identity local_identity;

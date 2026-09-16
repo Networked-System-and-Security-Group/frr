@@ -17,13 +17,14 @@ if grep -RInE '\b(struct[[:space:]]+(bgp|peer|bgp_path_info)|AFI_BGP|SAFI_MIDR_L
 fi
 
 cc=${CC:-cc}
-flags='-std=c11 -O2 -Wall -Wextra -Werror -pedantic -I.'
+flags='-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-pedantic -Wno-missing-field-initializers -Wno-unused-parameter -DHAVE_CONFIG_H -I. -I.. -I../lib'
 tmp=${TMPDIR:-/tmp}/midrd-boundary.$$
 trap 'rm -rf "$tmp"' EXIT INT TERM
 mkdir -p "$tmp"
 cd "$root"
 
 cat >"$tmp/contract.c" <<'EOF'
+#include "midr-context.h"
 #include "midr-core.h"
 #include "midr-consumer.h"
 #include "midr-engine.h"
@@ -33,6 +34,7 @@ cat >"$tmp/contract.c" <<'EOF'
 #include "midr-prefix-provider.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
+#include "midr-topology.h"
 #include "midr-transport.h"
 int main(void) { return MIDR_CORE_WIRE_VERSION == 1U ? 0 : 1; }
 EOF

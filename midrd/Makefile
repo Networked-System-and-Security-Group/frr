@@ -36,6 +36,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-local-transaction-test \
 	$(BUILD_DIR)/midrd-lsdb-test \
 	$(BUILD_DIR)/midrd-ted-test \
+	$(BUILD_DIR)/midrd-interface-test \
 	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
 	$(BUILD_DIR)/midrd
 
@@ -123,7 +124,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -157,6 +158,12 @@ $(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c mi
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c local-transaction-test.c -o $@
 
 $(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
+$(BUILD_DIR)/midrd-interface-test.o: interface-test.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-spf.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c interface-test.c -o $@
+
+$(BUILD_DIR)/midrd-interface-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-interface-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-ted-test.o: ted-test.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
@@ -230,6 +237,7 @@ test: all
 	$(BUILD_DIR)/midrd-local-transaction-test
 	$(BUILD_DIR)/midrd-lsdb-test
 	$(BUILD_DIR)/midrd-ted-test
+	$(BUILD_DIR)/midrd-interface-test
 	$(BUILD_DIR)/midrd-sync-test
 	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh

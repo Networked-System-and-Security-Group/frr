@@ -9,6 +9,10 @@
 #include "midr-consumer.h"
 #include "midr-ted.h"
 
+struct midr_context;
+struct midr_spf_consumer;
+struct midr_spf_results;
+
 enum midr_spf_route_scope {
 	MIDR_SPF_ROUTE_UNREACHABLE = 0,
 	MIDR_SPF_ROUTE_LOCAL,
@@ -61,5 +65,39 @@ int midr_spf_compute_ted(const struct midr_ted_view *view,
 			 size_t *count);
 
 void midr_spf_routes_clear(struct midr_spf_route *routes, size_t count);
+
+/* Context-level handoff for the route-installation module.  Each get returns
+ * a complete immutable result set derived from one committed TED generation.
+ * Result references and consumer registration are event-thread operations. */
+int midr_spf_results_get(struct midr_context *ctx,
+			 const struct midr_spf_results **out);
+const struct midr_spf_results *midr_spf_results_acquire(
+	const struct midr_spf_results *results);
+void midr_spf_results_release(const struct midr_spf_results **results);
+uint64_t midr_spf_results_generation(
+	const struct midr_spf_results *results);
+size_t midr_spf_results_count(const struct midr_spf_results *results);
+const struct midr_spf_route *midr_spf_results_at(
+	const struct midr_spf_results *results, size_t index);
+const struct midr_spf_route *midr_spf_results_lookup(
+	const struct midr_spf_results *results,
+	const struct midr_ted_prefix_key *prefix);
+
+struct midr_spf_consumer_ops {
+	/* The callback may acquire results or unregister itself.  It must not
+	 * synchronously enter a topology write transaction; schedule such work on
+	 * the event loop instead. */
+	void (*results_changed)(struct midr_context *ctx, uint64_t generation,
+				uint32_t change_flags,
+				enum midr_ted_state state, int error,
+				void *arg);
+};
+
+int midr_spf_consumer_register(struct midr_context *ctx,
+			       const struct midr_spf_consumer_ops *ops,
+			       void *arg,
+			       struct midr_spf_consumer **consumer);
+void midr_spf_consumer_unregister(struct midr_context *ctx,
+				  struct midr_spf_consumer **consumer);
 
 #endif /* MIDRD_SPF_H */
