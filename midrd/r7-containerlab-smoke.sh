@@ -18,18 +18,35 @@ command -v docker >/dev/null 2>&1 || {
 	exit 2
 }
 
+resolve_dependency() {
+	ldd "$1" | awk -v library="$2" '$1 == library { print $3; exit }'
+}
+
+LIBFRR=${MIDRD_LIBFRR:-$(resolve_dependency "$BIN" libfrr.so.0)}
+[[ -r "$LIBFRR" ]] || {
+	echo "unable to resolve libfrr.so.0 for $BIN" >&2
+	exit 2
+}
+LIBUNWIND=${MIDRD_LIBUNWIND:-$(resolve_dependency "$LIBFRR" libunwind.so.8)}
+
 run_cluster() {
 	local name=$1 family=$2 base_port=$3 owner_runtime=$4 peer_runtime=$5
 	local expected_routes=$6
 	local node_a=$7 node_b=${8} node_c=${9}
 	local prefix_a=${10} prefix_b=${11} prefix_c=${12}
-	local run topo lab a_addr b_a_addr b_c_addr c_addr
+	local run topo lab runtime_lib a_addr b_a_addr b_c_addr c_addr
 	local a_listen b_listen c_listen a_peer b_peer b_to_c_peer c_peer
 	local n container all=0 i
 
 	run=$(mktemp -d "${TMPDIR:-/tmp}/midrd-r7-${name}.XXXXXX")
 	topo="$run/topology.clab.yaml"
 	lab="midr-r7-${name}"
+	runtime_lib="$run/lib"
+	mkdir -p "$runtime_lib"
+	cp -L "$LIBFRR" "$runtime_lib/libfrr.so.0"
+	if [[ -n "$LIBUNWIND" ]]; then
+		cp -L "$LIBUNWIND" "$runtime_lib/libunwind.so.8"
+	fi
 	if [[ "$family" == 4 ]]; then
 		a_addr=10.77.1.1/30
 		b_a_addr=10.77.1.2/30
@@ -65,11 +82,12 @@ topology:
       image: $IMAGE
       binds:
         - $BIN:/usr/local/bin/midrd:ro
+        - $runtime_lib:/opt/midrd:ro
       cmd: sleep infinity
       exec:
         - ip addr add $a_addr dev eth1
         - >-
-          sh -lc 'exec /usr/local/bin/midrd --node-id $node_a --listen $a_listen
+          sh -lc 'export LD_LIBRARY_PATH=/opt/midrd; exec /usr/local/bin/midrd --node-id $node_a --listen $a_listen
           --peer $a_peer --group 1 --prefix $prefix_a --link $node_b:5
           --takeover-delay 1500 --lifetime 3000
           --runtime $owner_runtime --pidfile /tmp/midrd.pid
@@ -79,12 +97,13 @@ topology:
       image: $IMAGE
       binds:
         - $BIN:/usr/local/bin/midrd:ro
+        - $runtime_lib:/opt/midrd:ro
       cmd: sleep infinity
       exec:
         - ip addr add $b_a_addr dev eth1
         - ip addr add $b_c_addr dev eth2
         - >-
-          sh -lc 'exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
+          sh -lc 'export LD_LIBRARY_PATH=/opt/midrd; exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
           --peer $b_peer --peer $b_to_c_peer --group 1 --prefix $prefix_b
           --link $node_a:5 --link $node_c:7 --takeover-delay 1500 --lifetime 3000
           --runtime $peer_runtime --pidfile /tmp/midrd.pid
@@ -94,11 +113,12 @@ topology:
       image: $IMAGE
       binds:
         - $BIN:/usr/local/bin/midrd:ro
+        - $runtime_lib:/opt/midrd:ro
       cmd: sleep infinity
       exec:
         - ip addr add $c_addr dev eth1
         - >-
-          sh -lc 'exec /usr/local/bin/midrd --node-id $node_c --listen $c_listen
+          sh -lc 'export LD_LIBRARY_PATH=/opt/midrd; exec /usr/local/bin/midrd --node-id $node_c --listen $c_listen
           --peer $c_peer --group 1 --prefix $prefix_c --link $node_b:7
           --takeover-delay 1500 --lifetime 3000
           --runtime $peer_runtime --pidfile /tmp/midrd.pid

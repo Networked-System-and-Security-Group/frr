@@ -52,7 +52,7 @@ $(BUILD_DIR)/midr-wire.o: midr-wire.c midr-wire.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-wire.c -o $@
 
 $(BUILD_DIR)/midr-transport.o: midr-transport.c midr-transport.h midr-wire.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-transport.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-transport.c -o $@
 
 $(BUILD_DIR)/midr-consumer.o: midr-consumer.c midr-consumer.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-consumer.c -o $@
@@ -109,13 +109,13 @@ $(BUILD_DIR)/midrd-transport-test.o: transport-test.c midr-transport.h | $(BUILD
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c transport-test.c -o $@
 
 $(BUILD_DIR)/midrd-transport-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midrd-transport-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-transport-budget-test.o: transport-budget-test.c midr-transport.c midr-transport.h midr-wire.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c transport-budget-test.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c transport-budget-test.c -o $@
 
 $(BUILD_DIR)/midrd-transport-budget-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midrd-transport-budget-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c consumer-test.c -o $@
@@ -206,7 +206,7 @@ $(BUILD_DIR)/midrd-engine-test.o: engine-test.c midr-engine.h midr-spf.h midr-te
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c engine-test.c -o $@
 
 $(BUILD_DIR)/midrd-engine-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-engine-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(BUILD_DIR)/midrd.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@

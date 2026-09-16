@@ -14,6 +14,8 @@
 
 #include "midr-core.h"
 
+struct event_loop;
+
 enum midr_transport_family {
 	MIDR_TRANSPORT_AF_IPV4 = MIDR_CORE_AF_IPV4,
 	MIDR_TRANSPORT_AF_IPV6 = MIDR_CORE_AF_IPV6,
@@ -81,6 +83,9 @@ struct midr_transport_callbacks {
 typedef uint64_t (*midr_transport_clock_cb)(void *arg);
 
 struct midr_transport_config {
+	/* The daemon event loop.  Tests may leave this NULL to use a private
+	 * transport loop driven by midr_transport_poll(). */
+	struct event_loop *master;
 	struct midr_transport_endpoint local;
 	uint32_t hello_interval_ms;
 	uint32_t hold_time_ms;

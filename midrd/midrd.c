@@ -2389,17 +2389,6 @@ static void periodic(struct midr_context *daemon, uint64_t now)
 		(void)rebuild_ted(daemon);
 		daemon->next_ted_retry = now + MIDRD_TED_RETRY_MS;
 	}
-	if (now >= daemon->next_hello) {
-		for (size_t i = 0; i < daemon->peer_count; i++)
-			(void)send_hello(daemon, &daemon->peers[i].endpoint);
-		daemon->next_hello = now + daemon->hello_ms;
-	}
-	if (now >= daemon->next_keepalive) {
-		for (size_t i = 0; i < daemon->peer_count; i++)
-			(void)send_frame(daemon, &daemon->peers[i].endpoint,
-					 MIDR_WIRE_KEEPALIVE, NULL, 0);
-		daemon->next_keepalive = now + daemon->hello_ms;
-	}
 	if (now >= daemon->next_refresh) {
 		refresh_owned(daemon);
 		daemon->next_refresh = now + daemon->lifetime_ms / 3U;
@@ -2421,6 +2410,33 @@ static void periodic(struct midr_context *daemon, uint64_t now)
 	    (!daemon->representative_committed && daemon->takeover_ready_at &&
 	     now >= daemon->takeover_ready_at))
 		(void)reconcile_group_prefixes(daemon, now);
+}
+
+static void midrd_hello_timer(struct event *event)
+{
+	struct midr_context *daemon = EVENT_ARG(event);
+
+	daemon->hello_event = NULL;
+	if (daemon->terminating)
+		return;
+	for (size_t i = 0; i < daemon->peer_count; i++)
+		(void)send_hello(daemon, &daemon->peers[i].endpoint);
+	event_add_timer_msec(daemon->master, midrd_hello_timer, daemon,
+			     daemon->hello_ms, &daemon->hello_event);
+}
+
+static void midrd_keepalive_timer(struct event *event)
+{
+	struct midr_context *daemon = EVENT_ARG(event);
+
+	daemon->keepalive_event = NULL;
+	if (daemon->terminating)
+		return;
+	for (size_t i = 0; i < daemon->peer_count; i++)
+		(void)send_frame(daemon, &daemon->peers[i].endpoint,
+				 MIDR_WIRE_KEEPALIVE, NULL, 0);
+	event_add_timer_msec(daemon->master, midrd_keepalive_timer, daemon,
+			     daemon->hello_ms, &daemon->keepalive_event);
 }
 
 enum midrd_shutdown_result {
@@ -2579,6 +2595,8 @@ static FRR_NORETURN void midrd_terminate(int status)
 	if (daemon && !daemon->terminating) {
 		daemon->terminating = true;
 		event_cancel(&daemon->poll_event);
+		event_cancel(&daemon->hello_event);
+		event_cancel(&daemon->keepalive_event);
 		shutdown_withdraw(daemon);
 		printf("midrd node=%" PRIu32 " final-objects=%zu\n",
 		       daemon->node_id, midr_engine_count(daemon->engine));
@@ -2601,7 +2619,6 @@ static void midrd_poll(struct event *event)
 		return;
 	(void)midr_local_ipc_server_poll(daemon->local_ipc, 0);
 	(void)midr_prefix_ipc_server_poll(daemon->prefix_ipc, 0);
-	(void)midr_transport_poll(daemon->transport, 0);
 	now = mono_ms();
 	periodic(daemon, now);
 	if (daemon->stop_at && now >= daemon->stop_at)
@@ -2724,6 +2741,7 @@ int main(int argc, char **argv, char **envp)
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
 	daemon.master = frr_init();
+	transport_config.master = daemon.master;
 	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
 		frr_fini();
@@ -2783,8 +2801,6 @@ int main(int argc, char **argv, char **envp)
 	{
 		uint64_t now = mono_ms();
 
-		daemon.next_hello = now + daemon.hello_ms;
-		daemon.next_keepalive = now + daemon.hello_ms / 2U;
 		daemon.next_refresh = now + daemon.lifetime_ms / 3U;
 		daemon.next_expire = now + 100U;
 		daemon.next_ted_retry = now + MIDRD_TED_RETRY_MS;
@@ -2798,6 +2814,11 @@ int main(int argc, char **argv, char **envp)
 	midrd_runtime = &daemon;
 	(void)fflush(NULL);
 	frr_config_fork();
+	event_add_timer_msec(daemon.master, midrd_hello_timer, &daemon,
+			     daemon.hello_ms, &daemon.hello_event);
+	event_add_timer_msec(daemon.master, midrd_keepalive_timer, &daemon,
+			     daemon.hello_ms / 2U ? daemon.hello_ms / 2U : 1U,
+			     &daemon.keepalive_event);
 	event_add_timer_msec(daemon.master, midrd_poll, &daemon, 0,
 			     &daemon.poll_event);
 	frr_run(daemon.master);

@@ -1,16 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 
+#include <zebra.h>
+
+#include "buffer.h"
+#include "frrevent.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
+#include "network.h"
+#include "sockunion.h"
+#include "stream.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,18 +24,18 @@
 
 struct midr_transport_tx {
 	struct midr_transport_tx *next;
-	uint8_t *data;
-	size_t length;
-	size_t offset;
+	struct buffer *buffer;
 	uint64_t encoded_ns;
 	uint64_t generation;
 	uint64_t sequence;
 };
 
+struct midr_transport;
+
 struct midr_transport_peer {
+	struct midr_transport *transport;
 	struct midr_transport_endpoint endpoint;
-	struct sockaddr_storage address;
-	socklen_t address_len;
+	union sockunion address;
 	int fd;
 	bool used;
 	bool desired;
@@ -40,12 +43,14 @@ struct midr_transport_peer {
 	bool established;
 	uint64_t generation;
 	uint64_t last_rx_ms;
-	uint64_t next_connect_ms;
-	uint8_t *rx_buffer;
-	size_t rx_length;
-	size_t rx_capacity;
+	struct stream *rx;
 	struct midr_transport_tx *tx_head;
 	struct midr_transport_tx *tx_tail;
+	struct event *read_event;
+	struct event *write_event;
+	struct event *reconnect_event;
+	struct event *hold_event;
+	struct event *tx_budget_event;
 };
 
 struct midr_transport {
@@ -53,8 +58,12 @@ struct midr_transport {
 	struct midr_transport_callbacks callbacks;
 	struct midr_transport_peer peers[MIDR_TRANSPORT_MAX_PEERS];
 	size_t peer_count;
+	struct event_loop *master;
+	struct event *accept_event;
 	int listen_fd;
 	uint64_t next_generation;
+	int last_error;
+	bool owns_master;
 	bool started;
 };
 
@@ -126,49 +135,38 @@ static int endpoint_compare(const struct midr_transport_endpoint *a,
 	return 0;
 }
 
-static int endpoint_to_sockaddr(const struct midr_transport_endpoint *endpoint,
-				struct sockaddr_storage *address,
-				socklen_t *length)
+static int endpoint_to_sockunion(const struct midr_transport_endpoint *endpoint,
+				 union sockunion *address)
 {
-	if (midr_transport_endpoint_validate(endpoint) || !address || !length)
+	if (midr_transport_endpoint_validate(endpoint) || !address)
 		return -EINVAL;
 	memset(address, 0, sizeof(*address));
 	if (endpoint->family == MIDR_TRANSPORT_AF_IPV4) {
-		struct sockaddr_in *sin = (struct sockaddr_in *)address;
-
-		sin->sin_family = AF_INET;
-		sin->sin_port = htons(endpoint->port);
-		memcpy(&sin->sin_addr, endpoint->address, 4);
-		*length = sizeof(*sin);
+		address->sin.sin_family = AF_INET;
+		address->sin.sin_port = htons(endpoint->port);
+		memcpy(&address->sin.sin_addr, endpoint->address, 4);
 	} else {
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)address;
-
-		sin6->sin6_family = AF_INET6;
-		sin6->sin6_port = htons(endpoint->port);
-		sin6->sin6_scope_id = endpoint->scope_id;
-		memcpy(&sin6->sin6_addr, endpoint->address, 16);
-		*length = sizeof(*sin6);
+		address->sin6.sin6_family = AF_INET6;
+		address->sin6.sin6_port = htons(endpoint->port);
+		address->sin6.sin6_scope_id = endpoint->scope_id;
+		memcpy(&address->sin6.sin6_addr, endpoint->address, 16);
 	}
 	return 0;
 }
 
-static void sockaddr_to_endpoint(const struct sockaddr_storage *address,
-				 struct midr_transport_endpoint *endpoint)
+static void sockunion_to_endpoint(const union sockunion *address,
+				  struct midr_transport_endpoint *endpoint)
 {
 	memset(endpoint, 0, sizeof(*endpoint));
-	if (address->ss_family == AF_INET) {
-		const struct sockaddr_in *sin = (const struct sockaddr_in *)address;
-
+	if (address->sa.sa_family == AF_INET) {
 		endpoint->family = MIDR_TRANSPORT_AF_IPV4;
-		endpoint->port = ntohs(sin->sin_port);
-		memcpy(endpoint->address, &sin->sin_addr, 4);
-	} else if (address->ss_family == AF_INET6) {
-		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)address;
-
+		endpoint->port = ntohs(address->sin.sin_port);
+		memcpy(endpoint->address, &address->sin.sin_addr, 4);
+	} else if (address->sa.sa_family == AF_INET6) {
 		endpoint->family = MIDR_TRANSPORT_AF_IPV6;
-		endpoint->port = ntohs(sin6->sin6_port);
-		endpoint->scope_id = sin6->sin6_scope_id;
-		memcpy(endpoint->address, &sin6->sin6_addr, 16);
+		endpoint->port = ntohs(address->sin6.sin6_port);
+		endpoint->scope_id = address->sin6.sin6_scope_id;
+		memcpy(endpoint->address, &address->sin6.sin6_addr, 16);
 	}
 }
 
@@ -176,7 +174,7 @@ static bool local_keeps_outbound(const struct midr_transport *transport,
 				 int accepted_fd,
 				 const struct midr_transport_peer *peer)
 {
-	struct sockaddr_storage address;
+	union sockunion address;
 	struct midr_transport_endpoint local = transport->config.local;
 	socklen_t address_len = sizeof(address);
 
@@ -186,7 +184,7 @@ static bool local_keeps_outbound(const struct midr_transport *transport,
 	 * endpoint keeps the matching inbound stream. */
 	if (getsockname(accepted_fd, (struct sockaddr *)&address,
 			&address_len) == 0)
-		sockaddr_to_endpoint(&address, &local);
+		sockunion_to_endpoint(&address, &local);
 	return endpoint_compare(&local, &peer->endpoint) <= 0;
 }
 
@@ -216,16 +214,13 @@ static struct midr_transport_peer *find_peer_by_address(
 static struct midr_transport_peer *ensure_peer(
 	struct midr_transport *transport,
 	const struct midr_transport_endpoint *endpoint,
-	const struct sockaddr_storage *address, socklen_t address_len,
-	bool desired)
+	const union sockunion *address, bool desired)
 {
 	struct midr_transport_peer *peer = find_peer(transport, endpoint);
 
 	if (peer) {
-		if (address) {
+		if (address)
 			peer->address = *address;
-			peer->address_len = address_len;
-		}
 		if (desired)
 			peer->desired = true;
 		return peer;
@@ -241,75 +236,194 @@ static struct midr_transport_peer *ensure_peer(
 	peer = &transport->peers[transport->peer_count++];
 initialize:
 	memset(peer, 0, sizeof(*peer));
+	peer->transport = transport;
 	peer->endpoint = *endpoint;
-	if (address) {
+	if (address)
 		peer->address = *address;
-		peer->address_len = address_len;
-	}
 	peer->fd = -1;
 	peer->desired = desired;
 	peer->used = true;
 	return peer;
 }
 
+static void peer_read_ready(struct event *event);
+static void peer_write_ready(struct event *event);
+static void peer_reconnect(struct event *event);
+static void peer_hold_expired(struct event *event);
+static void peer_tx_budget_expired(struct event *event);
+static void accept_ready(struct event *event);
+static void close_peer(struct midr_transport *transport,
+			       struct midr_transport_peer *peer, int reason);
+
+static void remember_error(struct midr_transport *transport, int error)
+{
+	if (error && !transport->last_error)
+		transport->last_error = error;
+}
+
+static void fail_tx_budget(struct midr_transport_peer *peer, int error)
+{
+	close_peer(peer->transport, peer, error);
+}
+
+static void schedule_read(struct midr_transport_peer *peer)
+{
+	if (peer->used && peer->established && peer->fd >= 0 &&
+	    !peer->read_event)
+		event_add_read(peer->transport->master, peer_read_ready, peer,
+			       peer->fd, &peer->read_event);
+}
+
+static void schedule_write(struct midr_transport_peer *peer)
+{
+	if (peer->used && peer->fd >= 0 &&
+	    (peer->connecting || peer->tx_head) && !peer->write_event)
+		event_add_write(peer->transport->master, peer_write_ready, peer,
+				peer->fd, &peer->write_event);
+}
+
+static void schedule_reconnect(struct midr_transport_peer *peer,
+			       uint32_t delay_ms)
+{
+	event_cancel(&peer->reconnect_event);
+	if (peer->used && peer->desired && peer->fd < 0 &&
+	    peer->transport->started)
+		event_add_timer_msec(peer->transport->master, peer_reconnect, peer,
+				     delay_ms, &peer->reconnect_event);
+}
+
+static void schedule_hold(struct midr_transport_peer *peer)
+{
+	struct midr_transport *transport = peer->transport;
+	uint64_t elapsed;
+	uint64_t now;
+	uint32_t delay;
+
+	event_cancel(&peer->hold_event);
+	if (!peer->used || !peer->established || !transport->config.hold_time_ms)
+		return;
+	now = transport_now_ms(transport);
+	elapsed = now >= peer->last_rx_ms ? now - peer->last_rx_ms : 0;
+	delay = elapsed >= transport->config.hold_time_ms
+			? 1U
+			: transport->config.hold_time_ms - (uint32_t)elapsed;
+	event_add_timer_msec(transport->master, peer_hold_expired, peer, delay,
+			     &peer->hold_event);
+}
+
+static int frame_budget_error(const struct midr_transport *transport,
+			      const struct midr_transport_tx *tx,
+			      uint64_t now_ns)
+{
+	uint64_t budget_ns;
+
+	if (!transport->config.tx_budget_ms)
+		return 0;
+	budget_ns = (uint64_t)transport->config.tx_budget_ms * 1000000U;
+	if (now_ns < tx->encoded_ns)
+		return -ERANGE;
+	if (now_ns - tx->encoded_ns > budget_ns)
+		return -ETIMEDOUT;
+	return 0;
+}
+
+static int schedule_tx_budget(struct midr_transport_peer *peer)
+{
+	struct midr_transport *transport = peer->transport;
+	struct midr_transport_tx *tx = peer->tx_head;
+	uint64_t budget_ns;
+	uint64_t elapsed_ns;
+	uint64_t now_ns;
+	uint64_t remaining_ns;
+	uint64_t delay_ms;
+
+	event_cancel(&peer->tx_budget_event);
+	if (!peer->used || !peer->established || !tx ||
+	    !transport->config.tx_budget_ms)
+		return 0;
+	now_ns = transport_now_ns(transport);
+	if (now_ns < tx->encoded_ns) {
+		fail_tx_budget(peer, -ERANGE);
+		return -ERANGE;
+	}
+	budget_ns = (uint64_t)transport->config.tx_budget_ms * 1000000U;
+	elapsed_ns = now_ns - tx->encoded_ns;
+	if (elapsed_ns > budget_ns) {
+		fail_tx_budget(peer, -ETIMEDOUT);
+		return -ETIMEDOUT;
+	}
+	remaining_ns = budget_ns - elapsed_ns;
+	delay_ms = remaining_ns / 1000000U + 1U;
+	if (delay_ms > UINT32_MAX)
+		delay_ms = UINT32_MAX;
+	event_add_timer_msec(transport->master, peer_tx_budget_expired, peer,
+			     (uint32_t)delay_ms, &peer->tx_budget_event);
+	return 0;
+}
+
 static void free_tx(struct midr_transport *transport,
 			struct midr_transport_peer *peer, int reason)
 {
-	struct midr_transport_tx *tx;
+	struct midr_transport_endpoint endpoint = peer->endpoint;
+	struct midr_transport_tx *tx = peer->tx_head;
 
-	while ((tx = peer->tx_head)) {
-		peer->tx_head = tx->next;
+	event_cancel(&peer->tx_budget_event);
+	peer->tx_head = NULL;
+	peer->tx_tail = NULL;
+	while (tx) {
+		struct midr_transport_tx *next = tx->next;
+
 		if (transport->callbacks.on_frame_dropped)
 			transport->callbacks.on_frame_dropped(
-				transport->callbacks.arg, &peer->endpoint,
+				transport->callbacks.arg, &endpoint,
 				tx->generation, tx->sequence, reason);
-		free(tx->data);
+		buffer_free(tx->buffer);
 		free(tx);
+		tx = next;
 	}
-	peer->tx_tail = NULL;
 }
 
 static void close_peer(struct midr_transport *transport,
 			       struct midr_transport_peer *peer, int reason)
 {
+	struct midr_transport_endpoint endpoint = peer->endpoint;
 	bool notify = peer->established || peer->connecting;
-	uint64_t now = transport_now_ms(transport);
 
+	event_cancel(&peer->read_event);
+	event_cancel(&peer->write_event);
+	event_cancel(&peer->hold_event);
+	event_cancel(&peer->tx_budget_event);
 	if (peer->fd >= 0)
 		close(peer->fd);
 	peer->fd = -1;
 	peer->connecting = false;
 	peer->established = false;
-	peer->rx_length = 0;
+	if (peer->rx)
+		stream_reset(peer->rx);
 	free_tx(transport, peer, reason);
+	if (!peer->desired) {
+		event_cancel(&peer->reconnect_event);
+		stream_free(peer->rx);
+		peer->rx = NULL;
+		peer->used = false;
+	}
 	if (notify && transport->callbacks.on_closed)
 		transport->callbacks.on_closed(transport->callbacks.arg,
-					       &peer->endpoint, reason);
-	if (peer->desired)
-		peer->next_connect_ms = now + MIDR_TRANSPORT_RECONNECT_MS;
-	else {
-		free(peer->rx_buffer);
-		peer->rx_buffer = NULL;
-		peer->rx_capacity = 0;
-		peer->used = false;
+					       &endpoint, reason);
+	if (peer->used && peer->desired && peer->fd < 0) {
+		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 	}
 }
 
-static int set_nonblocking(int fd)
+static int transport_set_nonblocking(int fd)
 {
-	int flags = fcntl(fd, F_GETFL, 0);
-
-	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+	if (set_nonblocking(fd) < 0)
 		return -errno;
 	return 0;
 }
 
-/* Frames may be queued while a non-blocking connect is still in progress.
- * Their connection generation is not known at enqueue time; bind those
- * frames to the generation assigned by establish_peer() before any bytes
- * are written.  Frames from a previous established stream are discarded by
- * close_peer(), so retagging here cannot let an old completion leak forward.
- */
+/* Frames queued while connect is in progress acquire the new stream's
+ * generation before any byte is written. */
 static void retag_queued_frames(struct midr_transport_peer *peer,
 				uint64_t generation)
 {
@@ -320,21 +434,23 @@ static void retag_queued_frames(struct midr_transport_peer *peer,
 static void establish_peer(struct midr_transport *transport,
 			   struct midr_transport_peer *peer)
 {
+	event_cancel(&peer->reconnect_event);
 	peer->connecting = false;
 	peer->established = true;
 	peer->generation = ++transport->next_generation;
 	retag_queued_frames(peer, peer->generation);
 	peer->last_rx_ms = transport_now_ms(transport);
-	peer->rx_length = 0;
-	if (!peer->rx_buffer) {
-		peer->rx_capacity = transport->config.max_frame_size;
-		peer->rx_buffer = malloc(peer->rx_capacity);
-		if (!peer->rx_buffer) {
-			peer->rx_capacity = 0;
-			close_peer(transport, peer, -ENOMEM);
-			return;
-		}
+	if (!peer->rx)
+		peer->rx = stream_new(transport->config.max_frame_size);
+	else
+		stream_reset(peer->rx);
+	if (!peer->rx) {
+		close_peer(transport, peer, -ENOMEM);
+		return;
 	}
+	schedule_read(peer);
+	schedule_hold(peer);
+	schedule_write(peer);
 	if (transport->callbacks.on_established)
 		transport->callbacks.on_established(transport->callbacks.arg,
 						    &peer->endpoint);
@@ -345,61 +461,45 @@ static int flush_peer(struct midr_transport *transport,
 {
 	while (peer->tx_head) {
 		struct midr_transport_tx *tx = peer->tx_head;
-		uint64_t now_ns;
-		ssize_t sent;
-		int flags = 0;
-		int ret;
+		uint64_t generation = peer->generation;
+		int fd = peer->fd;
+		int ret = frame_budget_error(transport, tx,
+					     transport_now_ns(transport));
+		buffer_status_t status;
 
-		now_ns = transport_now_ns(transport);
-		ret = 0;
-		if (transport->config.tx_budget_ms) {
-			uint64_t budget_ns =
-				(uint64_t)transport->config.tx_budget_ms * 1000000U;
-
-			if (now_ns < tx->encoded_ns)
-				ret = -ERANGE;
-			else if (now_ns - tx->encoded_ns > budget_ns)
-				ret = -ETIMEDOUT;
-		}
 		if (ret) {
 			close_peer(transport, peer, ret);
 			return ret;
 		}
-
-#ifdef MSG_NOSIGNAL
-		flags |= MSG_NOSIGNAL;
-#endif
-		sent = send(peer->fd, tx->data + tx->offset,
-			    tx->length - tx->offset, flags);
-		if (sent > 0) {
-			tx->offset += (size_t)sent;
-			if (tx->offset == tx->length) {
-				uint64_t generation = tx->generation;
-				uint64_t sequence = tx->sequence;
-
-				peer->tx_head = tx->next;
-				if (!peer->tx_head)
-					peer->tx_tail = NULL;
-				free(tx->data);
-				free(tx);
-				if (transport->callbacks.on_frame_written)
-					transport->callbacks.on_frame_written(
-						transport->callbacks.arg,
-						&peer->endpoint, generation, sequence);
-			}
-			continue;
+		status = buffer_flush_available(tx->buffer, peer->fd);
+		if (status == BUFFER_ERROR) {
+			ret = errno ? -errno : -EPIPE;
+			close_peer(transport, peer, ret);
+			return ret;
 		}
-		if (sent < 0 && errno == EINTR)
-			continue;
-		if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		if (status == BUFFER_PENDING) {
+			schedule_write(peer);
+			return schedule_tx_budget(peer);
+		}
+		peer->tx_head = tx->next;
+		if (!peer->tx_head)
+			peer->tx_tail = NULL;
+		generation = tx->generation;
+		uint64_t sequence = tx->sequence;
+
+		buffer_free(tx->buffer);
+		free(tx);
+		event_cancel(&peer->tx_budget_event);
+		if (transport->callbacks.on_frame_written)
+			transport->callbacks.on_frame_written(
+				transport->callbacks.arg, &peer->endpoint,
+				generation, sequence);
+		if (!peer->used || !peer->established || peer->fd != fd ||
+		    peer->generation != generation)
 			return 0;
-		{
-			int error = sent < 0 ? -errno : -EPIPE;
-
-			close_peer(transport, peer, error);
-			return error;
-		}
 	}
+	event_cancel(&peer->write_event);
+	event_cancel(&peer->tx_budget_event);
 	return 0;
 }
 
@@ -411,13 +511,12 @@ static int queue_frame_with_sequence(struct midr_transport_peer *peer,
 
 	if (!tx)
 		return -ENOMEM;
-	tx->data = malloc(length);
-	if (!tx->data) {
+	tx->buffer = buffer_new(length);
+	if (!tx->buffer) {
 		free(tx);
 		return -ENOMEM;
 	}
-	memcpy(tx->data, data, length);
-	tx->length = length;
+	buffer_put(tx->buffer, data, length);
 	tx->encoded_ns = encoded_ns;
 	tx->generation = peer->generation;
 	tx->sequence = sequence;
@@ -433,7 +532,9 @@ static int parse_rx(struct midr_transport *transport,
 			    struct midr_transport_peer *peer,
 			    uint64_t received_ns)
 {
-	while (peer->rx_length >= MIDR_WIRE_HEADER_LEN) {
+	while (STREAM_READABLE(peer->rx) >= MIDR_WIRE_HEADER_LEN) {
+		const uint8_t *data = STREAM_DATA(peer->rx) +
+				      stream_get_getp(peer->rx);
 		uint32_t magic, payload_length;
 		size_t frame_length;
 		struct midr_wire_frame wire_frame;
@@ -442,15 +543,13 @@ static int parse_rx(struct midr_transport *transport,
 		int fd;
 		int ret;
 
-		memcpy(&magic, peer->rx_buffer, sizeof(magic));
+		memcpy(&magic, data, sizeof(magic));
 		magic = ntohl(magic);
-		if (magic != MIDR_WIRE_MAGIC ||
-		    peer->rx_buffer[4] != MIDR_WIRE_VERSION) {
+		if (magic != MIDR_WIRE_MAGIC || data[4] != MIDR_WIRE_VERSION) {
 			close_peer(transport, peer, -EBADMSG);
 			return -EBADMSG;
 		}
-		memcpy(&payload_length, peer->rx_buffer + 16,
-		       sizeof(payload_length));
+		memcpy(&payload_length, data + 16, sizeof(payload_length));
 		payload_length = ntohl(payload_length);
 		if (payload_length > transport->config.max_frame_size -
 			    MIDR_WIRE_HEADER_LEN) {
@@ -458,10 +557,9 @@ static int parse_rx(struct midr_transport *transport,
 			return -EMSGSIZE;
 		}
 		frame_length = MIDR_WIRE_HEADER_LEN + (size_t)payload_length;
-		if (peer->rx_length < frame_length)
+		if (STREAM_READABLE(peer->rx) < frame_length)
 			return 0;
-		ret = midr_wire_decode_frame(peer->rx_buffer, frame_length,
-					     &wire_frame);
+		ret = midr_wire_decode_frame(data, frame_length, &wire_frame);
 		if (ret) {
 			close_peer(transport, peer, -EBADMSG);
 			return ret;
@@ -475,32 +573,22 @@ static int parse_rx(struct midr_transport *transport,
 		frame.payload = wire_frame.payload;
 		frame.payload_len = wire_frame.payload_len;
 		peer->last_rx_ms = received_ns / 1000000U;
+		schedule_hold(peer);
 		fd = peer->fd;
 		generation = peer->generation;
 		ret = transport->callbacks.on_frame(transport->callbacks.arg,
 						   &peer->endpoint, &frame);
 		if (ret) {
-			/* A frame callback error means the peer violated the MIDR
-			 * contract (or the local engine rejected the frame).  Drop the
-			 * connection before returning so the unconsumed frame cannot be
-			 * delivered again on the next poll.  The desired peer remains
-			 * registered and will follow the normal reconnect path. */
 			if (peer->used && peer->fd == fd &&
 			    peer->generation == generation)
 				close_peer(transport, peer, ret);
 			return ret;
 		}
-		/* Callbacks may synchronously close this stream, for example when a
-		 * response or reflood hits EPIPE.  close_peer() resets rx_length (and
-		 * may free the buffer), so never consume bytes from the old stream
-		 * after its fd or generation changed. */
 		if (!peer->used || !peer->established || peer->fd != fd ||
 		    peer->generation != generation)
 			return 0;
-		peer->rx_length -= frame_length;
-		if (peer->rx_length)
-			memmove(peer->rx_buffer, peer->rx_buffer + frame_length,
-				peer->rx_length);
+		stream_forward_getp(peer->rx, frame_length);
+		stream_pulldown(peer->rx);
 	}
 	return 0;
 }
@@ -508,42 +596,34 @@ static int parse_rx(struct midr_transport *transport,
 static int read_peer(struct midr_transport *transport,
 			     struct midr_transport_peer *peer)
 {
-	uint8_t buffer[4096];
-
 	for (;;) {
 		int fd = peer->fd;
-		ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+		ssize_t received;
 
+		if (!STREAM_WRITEABLE(peer->rx)) {
+			close_peer(transport, peer, -EMSGSIZE);
+			return -EMSGSIZE;
+		}
+		received = stream_read_try(peer->rx, fd,
+					   STREAM_WRITEABLE(peer->rx));
 		if (received > 0) {
-			uint64_t received_ns = transport_now_ns(transport);
+			int ret = parse_rx(transport, peer,
+					   transport_now_ns(transport));
 
-			if ((size_t)received > peer->rx_capacity - peer->rx_length) {
-				close_peer(transport, peer, -EMSGSIZE);
-				return -EMSGSIZE;
-			}
-			memcpy(peer->rx_buffer + peer->rx_length, buffer,
-			       (size_t)received);
-			peer->rx_length += (size_t)received;
-			{
-				int ret = parse_rx(transport, peer, received_ns);
-
-				if (ret)
-					return ret;
-			}
+			if (ret)
+				return ret;
 			if (!peer->used || !peer->established || peer->fd != fd)
 				return 0;
 			continue;
 		}
-		if (received < 0 && errno == EINTR)
-			continue;
-		if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		if (received == -2)
 			return 0;
 		if (received == 0) {
 			close_peer(transport, peer, -ECONNRESET);
 			return 0;
 		}
 		{
-			int error = -errno;
+			int error = errno ? -errno : -EIO;
 
 			close_peer(transport, peer, error);
 			return error;
@@ -554,64 +634,134 @@ static int read_peer(struct midr_transport *transport,
 static int connect_peer_now(struct midr_transport *transport,
 				struct midr_transport_peer *peer, uint64_t now)
 {
-	int family = peer->endpoint.family == MIDR_TRANSPORT_AF_IPV4 ?
-		AF_INET : AF_INET6;
+	enum connect_result result;
 	int fd;
 	int ret;
 
-	fd = socket(family, SOCK_STREAM, 0);
+	event_cancel(&peer->reconnect_event);
+	fd = sockunion_socket(&peer->address);
 	if (fd < 0) {
-		peer->next_connect_ms = now + MIDR_TRANSPORT_RECONNECT_MS;
+		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 		return -errno;
 	}
-	ret = set_nonblocking(fd);
+	ret = transport_set_nonblocking(fd);
 	if (ret) {
 		close(fd);
-		peer->next_connect_ms = now + MIDR_TRANSPORT_RECONNECT_MS;
+		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 		return ret;
 	}
-	if (connect(fd, (struct sockaddr *)&peer->address, peer->address_len) == 0) {
+	result = sockunion_connect(fd, &peer->address,
+				   htons(peer->endpoint.port));
+	if (result == connect_success) {
 		peer->fd = fd;
 		establish_peer(transport, peer);
 		return 0;
 	}
-	if (errno != EINPROGRESS) {
-		ret = -errno;
+	if (result == connect_error) {
 		close(fd);
-		peer->next_connect_ms = now + MIDR_TRANSPORT_RECONNECT_MS;
-		/* A refused/unreachable peer is a normal reconnect condition. */
+		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 		return 0;
 	}
 	peer->fd = fd;
 	peer->connecting = true;
 	peer->established = false;
+	schedule_write(peer);
 	return 0;
 }
 
-static void retry_connections(struct midr_transport *transport, uint64_t now)
+static void peer_reconnect(struct event *event)
 {
-	for (size_t i = 0; i < transport->peer_count; i++) {
-		struct midr_transport_peer *peer = &transport->peers[i];
+	struct midr_transport_peer *peer = EVENT_ARG(event);
 
-		if (!peer->used || !peer->desired || peer->fd >= 0 ||
-		    now < peer->next_connect_ms)
-			continue;
-		(void)connect_peer_now(transport, peer, now);
-	}
+	peer->reconnect_event = NULL;
+	if (!peer->used || !peer->desired || peer->fd >= 0)
+		return;
+	(void)connect_peer_now(peer->transport, peer,
+				   transport_now_ms(peer->transport));
 }
 
-static void expire_peers(struct midr_transport *transport, uint64_t now)
+static void peer_hold_expired(struct event *event)
 {
-	if (!transport->config.hold_time_ms)
-		return;
-	for (size_t i = 0; i < transport->peer_count; i++) {
-		struct midr_transport_peer *peer = &transport->peers[i];
+	struct midr_transport_peer *peer = EVENT_ARG(event);
+	struct midr_transport *transport = peer->transport;
+	uint64_t now;
 
-		if (peer->used && peer->established &&
-		    now >= peer->last_rx_ms &&
-		    now - peer->last_rx_ms >= transport->config.hold_time_ms)
-			close_peer(transport, peer, -ETIMEDOUT);
+	peer->hold_event = NULL;
+	if (!peer->used || !peer->established || !transport->config.hold_time_ms)
+		return;
+	now = transport_now_ms(transport);
+	if (now >= peer->last_rx_ms &&
+	    now - peer->last_rx_ms >= transport->config.hold_time_ms) {
+		close_peer(transport, peer, -ETIMEDOUT);
+		return;
 	}
+	schedule_hold(peer);
+}
+
+static void peer_tx_budget_expired(struct event *event)
+{
+	struct midr_transport_peer *peer = event ? EVENT_ARG(event) : NULL;
+	struct midr_transport *transport;
+	int ret;
+
+	if (!peer)
+		return;
+	peer->tx_budget_event = NULL;
+	transport = peer->transport;
+	if (!peer->used || !peer->established || !peer->tx_head)
+		return;
+	ret = frame_budget_error(transport, peer->tx_head,
+				 transport_now_ns(transport));
+	if (ret) {
+		fail_tx_budget(peer, ret);
+		remember_error(transport, ret);
+		return;
+	}
+	(void)schedule_tx_budget(peer);
+}
+
+static void peer_read_ready(struct event *event)
+{
+	struct midr_transport_peer *peer = EVENT_ARG(event);
+	struct midr_transport *transport = peer->transport;
+	int fd = EVENT_FD(event);
+	int ret;
+
+	peer->read_event = NULL;
+	if (!peer->used || !peer->established || peer->fd != fd)
+		return;
+	ret = read_peer(transport, peer);
+	remember_error(transport, ret);
+	if (peer->used && peer->established && peer->fd == fd)
+		schedule_read(peer);
+}
+
+static void peer_write_ready(struct event *event)
+{
+	struct midr_transport_peer *peer = EVENT_ARG(event);
+	struct midr_transport *transport = peer->transport;
+	int fd = EVENT_FD(event);
+
+	peer->write_event = NULL;
+	if (!peer->used || peer->fd != fd)
+		return;
+	if (peer->connecting) {
+		int error = 0;
+		socklen_t length = sizeof(error);
+
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
+			error = errno;
+		if (error) {
+			close_peer(transport, peer, -error);
+			return;
+		}
+		establish_peer(transport, peer);
+	}
+	if (peer->used && peer->established && peer->fd == fd)
+		(void)flush_peer(transport, peer);
+	if (peer->used && peer->fd == fd &&
+	    (peer->connecting || peer->tx_head))
+		schedule_write(peer);
 }
 
 int midr_transport_create(const struct midr_transport_config *config,
@@ -631,6 +781,11 @@ int midr_transport_create(const struct midr_transport_config *config,
 	transport->config = *config;
 	transport->callbacks = *callbacks;
 	transport->listen_fd = -1;
+	transport->master = config->master;
+	if (!transport->master) {
+		transport->master = event_master_create("midr-transport-test");
+		transport->owns_master = true;
+	}
 	*out = transport;
 	return 0;
 }
@@ -640,33 +795,32 @@ void midr_transport_destroy(struct midr_transport **transportp)
 	if (!transportp || !*transportp)
 		return;
 	(void)midr_transport_stop(*transportp);
+	if ((*transportp)->owns_master)
+		event_master_free((*transportp)->master);
 	free(*transportp);
 	*transportp = NULL;
 }
 
 int midr_transport_start(struct midr_transport *transport)
 {
-	struct sockaddr_storage address;
-	socklen_t address_len;
-	int family;
+	union sockunion address;
 	int one = 1;
+	int ret;
 
 	if (!transport || transport->started)
 		return -EINVAL;
-	if (endpoint_to_sockaddr(&transport->config.local, &address,
-					&address_len))
+	if (endpoint_to_sockunion(&transport->config.local, &address))
 		return -EINVAL;
-	family = transport->config.local.family == MIDR_TRANSPORT_AF_IPV4 ?
-		AF_INET : AF_INET6;
-	transport->listen_fd = socket(family, SOCK_STREAM, 0);
+	transport->listen_fd = sockunion_socket(&address);
 	if (transport->listen_fd < 0)
 		return -errno;
 	(void)setsockopt(transport->listen_fd, SOL_SOCKET, SO_REUSEADDR,
 				 &one, sizeof(one));
-	if (family == AF_INET6)
+	if (address.sa.sa_family == AF_INET6)
 		(void)setsockopt(transport->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY,
 				 &one, sizeof(one));
-	if (bind(transport->listen_fd, (struct sockaddr *)&address, address_len) < 0) {
+	if (sockunion_bind(transport->listen_fd, &address,
+			   transport->config.local.port, &address) < 0) {
 		int error = errno;
 
 		close(transport->listen_fd);
@@ -680,14 +834,16 @@ int midr_transport_start(struct midr_transport *transport)
 		transport->listen_fd = -1;
 		return -error;
 	}
-	if (set_nonblocking(transport->listen_fd)) {
-		int error = errno;
+	ret = transport_set_nonblocking(transport->listen_fd);
+	if (ret) {
 
 		close(transport->listen_fd);
 		transport->listen_fd = -1;
-		return -error;
+		return ret;
 	}
 	transport->started = true;
+	event_add_read(transport->master, accept_ready, transport,
+		       transport->listen_fd, &transport->accept_event);
 	return 0;
 }
 
@@ -695,6 +851,7 @@ int midr_transport_stop(struct midr_transport *transport)
 {
 	if (!transport)
 		return -EINVAL;
+	event_cancel(&transport->accept_event);
 	if (transport->listen_fd >= 0)
 		close(transport->listen_fd);
 	transport->listen_fd = -1;
@@ -705,10 +862,6 @@ int midr_transport_stop(struct midr_transport *transport)
 			continue;
 		peer->desired = false;
 		close_peer(transport, peer, 0);
-		free(peer->rx_buffer);
-		peer->rx_buffer = NULL;
-		peer->rx_capacity = 0;
-		peer->used = false;
 	}
 	transport->peer_count = 0;
 	transport->started = false;
@@ -718,22 +871,20 @@ int midr_transport_stop(struct midr_transport *transport)
 int midr_transport_connect(struct midr_transport *transport,
 			   const struct midr_transport_endpoint *endpoint)
 {
-	struct sockaddr_storage address;
-	socklen_t address_len;
+	union sockunion address;
 	struct midr_transport_peer *peer;
 	uint64_t now;
 
 	if (!transport || !transport->started ||
-	    endpoint_to_sockaddr(endpoint, &address, &address_len))
+	    endpoint_to_sockunion(endpoint, &address))
 		return -EINVAL;
-	peer = ensure_peer(transport, endpoint, &address, address_len, true);
+	peer = ensure_peer(transport, endpoint, &address, true);
 	if (!peer)
 		return -ENOSPC;
 	peer->desired = true;
 	if (peer->fd >= 0)
 		return 0;
 	now = transport_now_ms(transport);
-	peer->next_connect_ms = now;
 	return connect_peer_now(transport, peer, now);
 }
 
@@ -784,12 +935,10 @@ int midr_transport_send(struct midr_transport *transport,
 static int accept_peers(struct midr_transport *transport)
 {
 	for (;;) {
-		struct sockaddr_storage address;
-		socklen_t address_len = sizeof(address);
+		union sockunion address;
 		struct midr_transport_endpoint source, endpoint;
 		struct midr_transport_peer *peer;
-		int fd = accept(transport->listen_fd, (struct sockaddr *)&address,
-					&address_len);
+		int fd = sockunion_accept(transport->listen_fd, &address);
 
 		if (fd < 0) {
 			if (errno == EINTR)
@@ -798,11 +947,11 @@ static int accept_peers(struct midr_transport *transport)
 				return 0;
 			return -errno;
 		}
-		if (set_nonblocking(fd)) {
+		if (transport_set_nonblocking(fd)) {
 			close(fd);
 			continue;
 		}
-		sockaddr_to_endpoint(&address, &source);
+		sockunion_to_endpoint(&address, &source);
 		if (midr_transport_endpoint_validate(&source)) {
 			close(fd);
 			continue;
@@ -827,15 +976,13 @@ static int accept_peers(struct midr_transport *transport)
 			 * ephemeral source port, which must not replace that address. */
 			if (!peer->desired) {
 				peer->address = address;
-				peer->address_len = address_len;
 			}
 			peer->fd = fd;
 			establish_peer(transport, peer);
 			continue;
 		}
 		endpoint = source;
-		peer = ensure_peer(transport, &endpoint, &address, address_len,
-					false);
+		peer = ensure_peer(transport, &endpoint, &address, false);
 		if (!peer) {
 			close(fd);
 			continue;
@@ -845,77 +992,44 @@ static int accept_peers(struct midr_transport *transport)
 	}
 }
 
+static void accept_ready(struct event *event)
+{
+	struct midr_transport *transport = EVENT_ARG(event);
+	int fd = EVENT_FD(event);
+	int ret;
+
+	transport->accept_event = NULL;
+	if (!transport->started || transport->listen_fd != fd)
+		return;
+	ret = accept_peers(transport);
+	remember_error(transport, ret);
+	if (transport->started && transport->listen_fd == fd)
+		event_add_read(transport->master, accept_ready, transport, fd,
+			       &transport->accept_event);
+}
+
+static void poll_timeout(struct event *event)
+{
+	(void)event;
+}
+
 int midr_transport_poll(struct midr_transport *transport, int timeout_ms)
 {
-	fd_set readfds, writefds;
-	struct timeval timeout;
-	uint64_t now;
-	int max_fd;
-	int ret;
+	struct event *timeout_event = NULL;
+	struct event ready;
+	int ret = 0;
 
 	if (!transport || !transport->started || timeout_ms < 0)
 		return -EINVAL;
-	now = transport_now_ms(transport);
-	expire_peers(transport, now);
-	retry_connections(transport, now);
-	FD_ZERO(&readfds);
-	FD_ZERO(&writefds);
-	FD_SET(transport->listen_fd, &readfds);
-	max_fd = transport->listen_fd;
-	for (size_t i = 0; i < transport->peer_count; i++) {
-		struct midr_transport_peer *peer = &transport->peers[i];
-
-		if (!peer->used || peer->fd < 0)
-			continue;
-		if (peer->established)
-			FD_SET(peer->fd, &readfds);
-		if (peer->connecting || peer->tx_head)
-			FD_SET(peer->fd, &writefds);
-		if (peer->fd > max_fd)
-			max_fd = peer->fd;
+	event_add_timer_msec(transport->master, poll_timeout, transport,
+			     timeout_ms, &timeout_event);
+	if (event_fetch(transport->master, &ready))
+		event_call(&ready);
+	event_cancel(&timeout_event);
+	if (transport->last_error) {
+		ret = transport->last_error;
+		transport->last_error = 0;
 	}
-	timeout.tv_sec = timeout_ms / 1000;
-	timeout.tv_usec = (timeout_ms % 1000) * 1000;
-	ret = select(max_fd + 1, &readfds, &writefds, NULL, &timeout);
-	if (ret < 0)
-		return errno == EINTR ? 0 : -errno;
-	if (FD_ISSET(transport->listen_fd, &readfds)) {
-		ret = accept_peers(transport);
-		if (ret)
-			return ret;
-	}
-	for (size_t i = 0; i < transport->peer_count; i++) {
-		struct midr_transport_peer *peer = &transport->peers[i];
-		int fd;
-
-		if (!peer->used || peer->fd < 0)
-			continue;
-		fd = peer->fd;
-		if (peer->connecting && FD_ISSET(fd, &writefds)) {
-			int error = 0;
-			socklen_t length = sizeof(error);
-
-			if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
-				error = errno;
-			if (error) {
-				close_peer(transport, peer, -error);
-				continue;
-			}
-			establish_peer(transport, peer);
-		}
-		if (peer->used && peer->fd == fd && peer->established &&
-		    FD_ISSET(fd, &readfds)) {
-			ret = read_peer(transport, peer);
-			if (ret)
-				return ret;
-		}
-		if (peer->used && peer->fd == fd && peer->established &&
-		    FD_ISSET(fd, &writefds))
-			(void)flush_peer(transport, peer);
-	}
-	now = transport_now_ms(transport);
-	expire_peers(transport, now);
-	retry_connections(transport, now);
 	return ret;
 }
 

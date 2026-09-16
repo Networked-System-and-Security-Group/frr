@@ -40,7 +40,8 @@ static void on_established(void *arg,
 {
 	struct callback_state *state = arg;
 
-	assert(peer && peer->family == MIDR_TRANSPORT_AF_IPV4);
+	assert(peer && (peer->family == MIDR_TRANSPORT_AF_IPV4 ||
+			peer->family == MIDR_TRANSPORT_AF_IPV6));
 	state->established++;
 }
 
@@ -58,7 +59,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 {
 	struct callback_state *state = arg;
 
-	assert(peer && peer->family == MIDR_TRANSPORT_AF_IPV4);
+	assert(peer && (peer->family == MIDR_TRANSPORT_AF_IPV4 ||
+			peer->family == MIDR_TRANSPORT_AF_IPV6));
 	assert(frame && frame->type == MIDR_FRAME_KEEPALIVE);
 	state->frames++;
 	state->payload_bytes += frame->payload_len;
@@ -78,7 +80,8 @@ static void on_frame_written(void *arg,
 {
 	struct callback_state *state = arg;
 
-	assert(peer && peer->family == MIDR_TRANSPORT_AF_IPV4);
+	assert(peer && (peer->family == MIDR_TRANSPORT_AF_IPV4 ||
+			peer->family == MIDR_TRANSPORT_AF_IPV6));
 	state->written++;
 	state->last_written_generation = generation;
 	state->last_written_sequence = sequence;
@@ -227,6 +230,104 @@ static void test_callback_disconnect(void)
 	midr_transport_destroy(&right);
 }
 
+static void test_ipv6(void)
+{
+	struct callback_state left_state = {0}, right_state = {0};
+	struct midr_transport *left = NULL, *right = NULL;
+	struct midr_transport_endpoint left_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV6,
+		.port = 38997,
+		.address = {[15] = 1},
+	};
+	struct midr_transport_endpoint right_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV6,
+		.port = 38998,
+		.address = {[15] = 1},
+	};
+	struct midr_transport_config left_config = {
+		.local = left_endpoint,
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_config right_config = {
+		.local = right_endpoint,
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_frame frame = {
+		.version = MIDR_WIRE_VERSION,
+		.type = MIDR_FRAME_KEEPALIVE,
+		.sequence = 11,
+	};
+	struct midr_transport_callbacks left_callbacks = callbacks(&left_state);
+	struct midr_transport_callbacks right_callbacks = callbacks(&right_state);
+
+	assert(midr_transport_create(&left_config, &left_callbacks, &left) == 0);
+	assert(midr_transport_create(&right_config, &right_callbacks, &right) == 0);
+	assert(midr_transport_start(left) == 0);
+	assert(midr_transport_start(right) == 0);
+	assert(midr_transport_connect(left, &right_endpoint) == 0);
+	for (unsigned int i = 0;
+	     i < 100 && (!left_state.established || !right_state.established);
+	     i++)
+		poll_pair(left, right);
+	assert(left_state.established == 1 && right_state.established == 1);
+	assert(midr_transport_send(left, &right_endpoint, &frame) == 0);
+	for (unsigned int i = 0; i < 100 && !right_state.frames; i++)
+		poll_pair(left, right);
+	assert(right_state.frames == 1 && left_state.written == 1);
+	midr_transport_destroy(&left);
+	midr_transport_destroy(&right);
+}
+
+static void test_hold_timer(void)
+{
+	struct callback_state left_state = {0}, right_state = {0};
+	struct midr_transport *left = NULL, *right = NULL;
+	struct midr_transport_endpoint right_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39000,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_config left_config = {
+		.local = {
+			.family = MIDR_TRANSPORT_AF_IPV4,
+			.port = 38999,
+			.address = {127, 0, 0, 1},
+		},
+		.hold_time_ms = 40,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_config right_config = {
+		.local = right_endpoint,
+		.hold_time_ms = 40,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_callbacks left_callbacks = callbacks(&left_state);
+	struct midr_transport_callbacks right_callbacks = callbacks(&right_state);
+
+	assert(midr_transport_create(&left_config, &left_callbacks, &left) == 0);
+	assert(midr_transport_create(&right_config, &right_callbacks, &right) == 0);
+	assert(midr_transport_start(left) == 0);
+	assert(midr_transport_start(right) == 0);
+	assert(midr_transport_connect(left, &right_endpoint) == 0);
+	for (unsigned int i = 0;
+	     i < 100 && (!left_state.established || !right_state.established);
+	     i++)
+		poll_pair(left, right);
+	assert(left_state.established && right_state.established);
+	for (unsigned int i = 0;
+	     i < 100 && (!left_state.closed || !right_state.closed); i++)
+		poll_pair(left, right);
+	assert(left_state.closed && right_state.closed);
+	midr_transport_destroy(&left);
+	midr_transport_destroy(&right);
+}
+
 int main(void)
 {
 	struct callback_state left_state = {0}, right_state = {0};
@@ -270,6 +371,7 @@ int main(void)
 	struct midr_transport_callbacks left_callbacks = callbacks(&left_state);
 	struct midr_transport_callbacks right_callbacks = callbacks(&right_state);
 	uint8_t payload[3000];
+	uint64_t old_generation;
 
 	memset(payload, 0xa5, sizeof(payload));
 	frame.payload = payload;
@@ -310,6 +412,7 @@ int main(void)
 		poll_pair(left, right);
 	assert(right_state.frames == 18);
 	assert(left_state.written == 18);
+	old_generation = left_state.last_written_generation;
 	assert(midr_transport_disconnect(left, &right_endpoint) == 0);
 	assert(left_state.closed == 1);
 	/* A configured peer must reconnect to its destination port after an
@@ -326,7 +429,7 @@ int main(void)
 	frame.sequence = 2;
 	assert(midr_transport_send(left, &right_endpoint, &frame) == 0);
 	assert(left_state.written == 19 &&
-	       left_state.last_written_generation != 1);
+	       left_state.last_written_generation != old_generation);
 	left_clock.advance_after_read_ns = 1000000001U;
 	frame.sequence = 3;
 	assert(midr_transport_send(left, &right_endpoint, &frame) == -ETIMEDOUT);
@@ -343,6 +446,8 @@ int main(void)
 	midr_transport_destroy(&right);
 	test_simultaneous_connect();
 	test_callback_disconnect();
+	test_ipv6();
+	test_hold_timer();
 	puts("midrd-transport-test: PASS");
 	return 0;
 }

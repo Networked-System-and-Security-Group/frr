@@ -103,6 +103,8 @@ struct midrd_local_stage {
 struct midr_context {
 	struct event_loop *master;
 	struct event *poll_event;
+	struct event *hello_event;
+	struct event *keepalive_event;
 	uint32_t node_id;
 	uint32_t group_id;
 	uint32_t lifetime_ms;
@@ -144,8 +146,6 @@ struct midr_context {
 	struct midr_core_identity local_identity;
 	bool have_local_identity;
 	const char *sequence_file;
-	uint64_t next_hello;
-	uint64_t next_keepalive;
 	uint64_t next_refresh;
 	uint64_t next_expire;
 	uint64_t next_ted_retry;
