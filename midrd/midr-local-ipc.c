@@ -1,15 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 
+#include <zebra.h>
+
+#include "buffer.h"
+#include "frrevent.h"
 #include "midr-local-ipc.h"
+#include "network.h"
+#include "stream.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -23,13 +27,35 @@ struct midr_local_ipc {
 	bool started;
 	int listener_fd;
 	int fd;
+	struct event_loop *master;
+	struct event *accept_event;
+	struct event *read_event;
+	struct stream *rx_stream;
+	uint64_t connection_generation;
+	int last_error;
+	bool owns_master;
 	char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	midr_local_ipc_event_cb on_event;
 	midr_local_ipc_disconnect_cb on_disconnect;
 	void *arg;
-	uint8_t rx[MIDR_LOCAL_IPC_RX_CAP];
-	size_t rx_len;
 };
+
+static void local_accept_ready(struct event *event);
+static void local_read_ready(struct event *event);
+
+static int set_no_sigpipe(int fd)
+{
+#ifdef SO_NOSIGPIPE
+	int enabled = 1;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+		       sizeof(enabled)) < 0)
+		return -errno;
+#else
+	(void)fd;
+#endif
+	return 0;
+}
 
 static uint64_t host_to_be64(uint64_t value)
 {
@@ -173,26 +199,19 @@ static int decode(const uint8_t frame[MIDR_LOCAL_IPC_FRAME_LEN],
 	return midr_local_event_validate(event) ? -EBADMSG : 0;
 }
 
-static int set_nonblocking(int fd)
-{
-	int flags = fcntl(fd, F_GETFL, 0);
-
-	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
-		return -errno;
-	return 0;
-}
-
 static void close_client(struct midr_local_ipc *ipc, int reason)
 {
 	bool was_open;
 
 	if (!ipc)
 		return;
+	event_cancel(&ipc->read_event);
 	was_open = ipc->fd >= 0;
 	if (was_open)
 		(void)close(ipc->fd);
 	ipc->fd = -1;
-	ipc->rx_len = 0;
+	if (ipc->rx_stream)
+		stream_reset(ipc->rx_stream);
 	if (was_open && ipc->on_disconnect)
 		ipc->on_disconnect(ipc->arg, reason);
 }
@@ -211,6 +230,18 @@ int midr_local_ipc_server_create(const struct midr_local_ipc_config *config,
 	ipc->server = true;
 	ipc->listener_fd = -1;
 	ipc->fd = -1;
+	ipc->master = config->master;
+	if (!ipc->master) {
+		ipc->master = event_master_create("midr-local-ipc-test");
+		ipc->owns_master = true;
+	}
+	ipc->rx_stream = stream_new(MIDR_LOCAL_IPC_RX_CAP);
+	if (!ipc->rx_stream) {
+		if (ipc->owns_master)
+			event_master_free(ipc->master);
+		free(ipc);
+		return -ENOMEM;
+	}
 	strcpy(ipc->path, config->path);
 	ipc->on_event = config->on_event;
 	ipc->on_disconnect = config->on_disconnect;
@@ -237,10 +268,13 @@ int midr_local_ipc_server_start(struct midr_local_ipc *ipc)
 		ret = -errno;
 		goto failed;
 	}
-	ret = set_nonblocking(ipc->listener_fd);
-	if (ret)
+	if (set_nonblocking(ipc->listener_fd) < 0) {
+		ret = -errno;
 		goto failed;
+	}
 	ipc->started = true;
+	event_add_read(ipc->master, local_accept_ready, ipc,
+		       ipc->listener_fd, &ipc->accept_event);
 	return 0;
 failed:
 	(void)close(ipc->listener_fd);
@@ -254,30 +288,30 @@ static int read_events(struct midr_local_ipc *ipc)
 	for (;;) {
 		ssize_t length;
 
-		if (ipc->rx_len == sizeof(ipc->rx)) {
+		if (!STREAM_WRITEABLE(ipc->rx_stream)) {
 			close_client(ipc, -EMSGSIZE);
 			return -EMSGSIZE;
 		}
-		length = recv(ipc->fd, ipc->rx + ipc->rx_len,
-			      sizeof(ipc->rx) - ipc->rx_len, 0);
+		length = stream_read_try(ipc->rx_stream, ipc->fd,
+					 STREAM_WRITEABLE(ipc->rx_stream));
 		if (!length) {
 			close_client(ipc, -ECONNRESET);
 			return -ECONNRESET;
 		}
 		if (length < 0) {
-			int error = errno;
+			int error;
 
-			if (error == EINTR)
-				continue;
-			if (error == EAGAIN || error == EWOULDBLOCK)
+			if (length == -2)
 				return 0;
-			close_client(ipc, -error);
-			return -error;
+			error = errno ? -errno : -EIO;
+			close_client(ipc, error);
+			return error;
 		}
-		ipc->rx_len += (size_t)length;
-		while (ipc->rx_len >= MIDR_LOCAL_IPC_FRAME_LEN) {
+		while (STREAM_READABLE(ipc->rx_stream) >= MIDR_LOCAL_IPC_FRAME_LEN) {
 			struct midr_local_event event;
-			int ret = decode(ipc->rx, &event);
+			const uint8_t *data = STREAM_DATA(ipc->rx_stream) +
+				stream_get_getp(ipc->rx_stream);
+			int ret = decode(data, &event);
 
 			if (ret) {
 				close_client(ipc, ret);
@@ -288,63 +322,90 @@ static int read_events(struct midr_local_ipc *ipc)
 				close_client(ipc, ret);
 				return ret;
 			}
-			ipc->rx_len -= MIDR_LOCAL_IPC_FRAME_LEN;
-			memmove(ipc->rx, ipc->rx + MIDR_LOCAL_IPC_FRAME_LEN,
-				ipc->rx_len);
+			stream_forward_getp(ipc->rx_stream, MIDR_LOCAL_IPC_FRAME_LEN);
+			stream_pulldown(ipc->rx_stream);
 		}
 	}
 }
 
+static void local_read_ready(struct event *event)
+{
+	struct midr_local_ipc *ipc = EVENT_ARG(event);
+	int fd = EVENT_FD(event);
+	uint64_t generation = ipc->connection_generation;
+	int ret;
+
+	ipc->read_event = NULL;
+	if (!ipc->started || ipc->fd != fd || generation != ipc->connection_generation)
+		return;
+	ret = read_events(ipc);
+	if (ret && !ipc->last_error)
+		ipc->last_error = ret;
+	if (ipc->started && ipc->fd == fd &&
+	    generation == ipc->connection_generation)
+		event_add_read(ipc->master, local_read_ready, ipc, fd,
+			       &ipc->read_event);
+}
+
+static void local_accept_ready(struct event *event)
+{
+	struct midr_local_ipc *ipc = EVENT_ARG(event);
+	int listener = EVENT_FD(event);
+
+	ipc->accept_event = NULL;
+	if (!ipc->started || ipc->listener_fd != listener)
+		return;
+	for (;;) {
+		int fd = accept(listener, NULL, NULL);
+
+		if (fd < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno != EAGAIN && errno != EWOULDBLOCK &&
+			    !ipc->last_error)
+				ipc->last_error = -errno;
+			break;
+		}
+		if (set_nonblocking(fd) < 0) {
+			close(fd);
+			continue;
+		}
+		if (ipc->fd >= 0)
+			close_client(ipc, -ECONNABORTED);
+		ipc->fd = fd;
+		ipc->connection_generation++;
+		stream_reset(ipc->rx_stream);
+		event_add_read(ipc->master, local_read_ready, ipc, fd,
+			       &ipc->read_event);
+	}
+	if (ipc->started && ipc->listener_fd == listener)
+		event_add_read(ipc->master, local_accept_ready, ipc, listener,
+			       &ipc->accept_event);
+}
+
+static void ipc_poll_timeout(struct event *event)
+{
+	(void)event;
+}
+
 int midr_local_ipc_server_poll(struct midr_local_ipc *ipc, int timeout_ms)
 {
-	fd_set readfds;
-	struct timeval timeout;
-	int maxfd;
-	int ret;
+	struct event *timeout_event = NULL;
+	struct event ready;
 
 	if (!ipc || !ipc->server || !ipc->started || timeout_ms < 0)
 		return -EINVAL;
-	for (;;) {
-		FD_ZERO(&readfds);
-		FD_SET(ipc->listener_fd, &readfds);
-		maxfd = ipc->listener_fd;
-		if (ipc->fd >= 0) {
-			FD_SET(ipc->fd, &readfds);
-			if (ipc->fd > maxfd)
-				maxfd = ipc->fd;
-		}
-		timeout.tv_sec = timeout_ms / 1000;
-		timeout.tv_usec = (timeout_ms % 1000) * 1000;
-		ret = select(maxfd + 1, &readfds, NULL, NULL, &timeout);
-		if (ret >= 0 || errno != EINTR)
-			break;
-	}
-	if (ret < 0)
-		return -errno;
-	if (!ret)
-		return 0;
-	if (FD_ISSET(ipc->listener_fd, &readfds)) {
-		int fd;
+	event_add_timer_msec(ipc->master, ipc_poll_timeout, ipc, timeout_ms,
+			     &timeout_event);
+	if (event_fetch(ipc->master, &ready))
+		event_call(&ready);
+	event_cancel(&timeout_event);
+	if (ipc->last_error) {
+		int ret = ipc->last_error;
 
-		do {
-			fd = accept(ipc->listener_fd, NULL, NULL);
-		} while (fd < 0 && errno == EINTR);
-		if (fd < 0) {
-			if (errno != EAGAIN && errno != EWOULDBLOCK)
-				return -errno;
-		} else {
-			if (ipc->fd >= 0)
-				close_client(ipc, -ECONNABORTED);
-			ipc->fd = fd;
-			ret = set_nonblocking(ipc->fd);
-			if (ret) {
-				close_client(ipc, ret);
-				return ret;
-			}
-		}
+		ipc->last_error = 0;
+		return ret;
 	}
-	if (ipc->fd >= 0 && FD_ISSET(ipc->fd, &readfds))
-		return read_events(ipc);
 	return 0;
 }
 
@@ -352,6 +413,7 @@ int midr_local_ipc_server_stop(struct midr_local_ipc *ipc)
 {
 	if (!ipc || !ipc->server)
 		return -EINVAL;
+	event_cancel(&ipc->accept_event);
 	close_client(ipc, 0);
 	if (ipc->listener_fd >= 0)
 		(void)close(ipc->listener_fd);
@@ -367,6 +429,9 @@ void midr_local_ipc_server_destroy(struct midr_local_ipc **ipcp)
 	if (!ipcp || !*ipcp)
 		return;
 	(void)midr_local_ipc_server_stop(*ipcp);
+	stream_free((*ipcp)->rx_stream);
+	if ((*ipcp)->owns_master)
+		event_master_free((*ipcp)->master);
 	free(*ipcp);
 	*ipcp = NULL;
 }
@@ -390,9 +455,23 @@ int midr_local_ipc_client_connect(const char *path,
 		free(ipc);
 		return -error;
 	}
+	if (set_no_sigpipe(ipc->fd)) {
+		int error = errno;
+
+		(void)close(ipc->fd);
+		free(ipc);
+		return -error;
+	}
 	address.sun_family = AF_UNIX;
 	strcpy(address.sun_path, path);
 	if (connect(ipc->fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+		int error = errno;
+
+		(void)close(ipc->fd);
+		free(ipc);
+		return -error;
+	}
+	if (set_nonblocking(ipc->fd) < 0) {
 		int error = errno;
 
 		(void)close(ipc->fd);
@@ -408,7 +487,8 @@ int midr_local_ipc_client_send(struct midr_local_ipc *ipc,
 			       const struct midr_local_event *event)
 {
 	uint8_t frame[MIDR_LOCAL_IPC_FRAME_LEN];
-	size_t offset = 0;
+	struct buffer *buffer;
+	buffer_status_t status;
 	int ret;
 
 	if (!ipc || ipc->server || !ipc->started)
@@ -416,30 +496,17 @@ int midr_local_ipc_client_send(struct midr_local_ipc *ipc,
 	ret = encode(event, frame);
 	if (ret)
 		return ret;
-	while (offset < sizeof(frame)) {
-		ssize_t sent;
-		int flags = 0;
-
-#ifdef MSG_NOSIGNAL
-		flags = MSG_NOSIGNAL;
-#endif
-		sent = send(ipc->fd, frame + offset, sizeof(frame) - offset,
-			    flags);
-		if (sent < 0) {
-			int error = errno;
-
-			if (error == EINTR)
-				continue;
-			(void)midr_local_ipc_client_close(ipc);
-			return -error;
-		}
-		if (!sent) {
-			(void)midr_local_ipc_client_close(ipc);
-			return -EPIPE;
-		}
-		offset += (size_t)sent;
-	}
-	return 0;
+	buffer = buffer_new(sizeof(frame));
+	if (!buffer)
+		return -ENOMEM;
+	buffer_put(buffer, frame, sizeof(frame));
+	status = buffer_flush_all(buffer, ipc->fd);
+	buffer_free(buffer);
+	if (status == BUFFER_EMPTY)
+		return 0;
+	ret = errno ? -errno : -EAGAIN;
+	(void)midr_local_ipc_client_close(ipc);
+	return ret;
 }
 
 int midr_local_ipc_client_close(struct midr_local_ipc *ipc)

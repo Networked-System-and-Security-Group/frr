@@ -2617,8 +2617,6 @@ static void midrd_poll(struct event *event)
 	daemon->poll_event = NULL;
 	if (daemon->terminating)
 		return;
-	(void)midr_local_ipc_server_poll(daemon->local_ipc, 0);
-	(void)midr_prefix_ipc_server_poll(daemon->prefix_ipc, 0);
 	now = mono_ms();
 	periodic(daemon, now);
 	if (daemon->stop_at && now >= daemon->stop_at)
@@ -2749,6 +2747,7 @@ int main(int argc, char **argv, char **envp)
 	}
 	if (prefix_socket) {
 		struct midr_prefix_ipc_config ipc_config = {
+			.master = daemon.master,
 			.path = prefix_socket,
 			.on_event = prefix_ipc_event,
 			.on_disconnect = prefix_ipc_disconnect,
@@ -2763,6 +2762,7 @@ int main(int argc, char **argv, char **envp)
 	}
 	if (local_socket) {
 		struct midr_local_ipc_config ipc_config = {
+			.master = daemon.master,
 			.path = local_socket,
 			.on_event = local_event,
 			.on_disconnect = local_ipc_disconnect,

@@ -73,7 +73,7 @@ $(BUILD_DIR)/midr-local-provider.o: midr-local-provider.c midr-local-provider.h 
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-local-provider.c -o $@
 
 $(BUILD_DIR)/midr-local-ipc.o: midr-local-ipc.c midr-local-ipc.h midr-local-provider.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-local-ipc.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-local-ipc.c -o $@
 
 $(BUILD_DIR)/midr-ted.o: midr-ted.c midr-ted.h midr-consumer.h midr-lsdb.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-ted.c -o $@
@@ -133,13 +133,13 @@ $(BUILD_DIR)/midr-spf.o: midr-spf.c midr-spf.h midr-consumer.h midr-ted.h | $(BU
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-spf.c -o $@
 
 $(BUILD_DIR)/midr-prefix-ipc.o: midr-prefix-ipc.c midr-prefix-ipc.h midr-prefix-provider.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-prefix-ipc.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-prefix-ipc.c -o $@
 
 $(BUILD_DIR)/midrd-prefix-ipc-test.o: prefix-ipc-test.c midr-prefix-ipc.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c prefix-ipc-test.c -o $@
 
 $(BUILD_DIR)/midrd-prefix-ipc-test: $(BUILD_DIR)/midr-prefix-ipc.o $(BUILD_DIR)/midrd-prefix-ipc-test.o $(BUILD_DIR)/midr-prefix-provider.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-cost-test.o: cost-test.c midr-cost.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c cost-test.c -o $@
@@ -151,7 +151,7 @@ $(BUILD_DIR)/midrd-local-ipc-test.o: local-ipc-test.c midr-local-ipc.h midr-loca
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c local-ipc-test.c -o $@
 
 $(BUILD_DIR)/midrd-local-ipc-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-local-provider.o $(BUILD_DIR)/midr-local-ipc.o $(BUILD_DIR)/midrd-local-ipc-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c local-transaction-test.c -o $@

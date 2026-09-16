@@ -7,6 +7,8 @@
 
 #include "midr-prefix-provider.h"
 
+struct event_loop;
+
 #define MIDR_PREFIX_IPC_FRAME_LEN 48U
 
 typedef int (*midr_prefix_ipc_event_cb)(
@@ -14,6 +16,7 @@ typedef int (*midr_prefix_ipc_event_cb)(
 typedef void (*midr_prefix_ipc_disconnect_cb)(void *arg, int reason);
 
 struct midr_prefix_ipc_config {
+	struct event_loop *master;
 	const char *path;
 	midr_prefix_ipc_event_cb on_event;
 	midr_prefix_ipc_disconnect_cb on_disconnect;
@@ -29,6 +32,7 @@ int midr_prefix_ipc_server_poll(struct midr_prefix_ipc *ipc, int timeout_ms);
 int midr_prefix_ipc_server_stop(struct midr_prefix_ipc *ipc);
 void midr_prefix_ipc_server_destroy(struct midr_prefix_ipc **ipc);
 
+/* Client calls are synchronous.  The provider adapter owns reconnect policy. */
 int midr_prefix_ipc_client_connect(const char *path,
 				   struct midr_prefix_ipc **out);
 int midr_prefix_ipc_client_send(struct midr_prefix_ipc *ipc,
