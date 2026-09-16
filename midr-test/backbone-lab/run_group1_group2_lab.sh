@@ -16,6 +16,7 @@ TOPOLOGY="$RUN_ROOT/midr-backbone.clab.yaml"
 ACCEPTANCE="$REPO_ROOT/midr-test/backbone-group2/run_group1_group2_demo_check.sh"
 CAPTURE="$REPO_ROOT/midr-test/backbone-group2/capture_group1_group2_state.sh"
 VERIFY="$REPO_ROOT/midr-test/backbone-group2/verify_group1_group2_evidence.py"
+TIER1_CHECK="$SCRIPT_DIR/check_tier1_admission.sh"
 MODE=${1:-all}
 
 die()
@@ -31,8 +32,9 @@ require_command()
 
 ensure_root()
 {
-	[ "$(id -u)" -eq 0 ] ||
-		die "this mode needs root; run: sudo -E $0 $MODE"
+	# containerlab also runs without sudo for members of clab_admins.
+	[ "$(id -u)" -eq 0 ] || id -nG | tr ' ' '\n' | grep -qx clab_admins ||
+		die "this mode needs root or clab_admins; run: sudo -E $0 $MODE"
 }
 
 check_lab_name()
@@ -71,6 +73,10 @@ preflight()
 	"${GIT[@]}" diff --check
 	bash -n "$ACCEPTANCE"
 	bash -n "$CAPTURE"
+	bash -n "$TIER1_CHECK"
+	[ -f "$SCRIPT_DIR/configs-backbone/z1/midr-policy/prefix2as.txt" ] &&
+		[ -f "$SCRIPT_DIR/configs-backbone/z1/midr-policy/tier1_asns.txt" ] ||
+		die "z1 Tier1 admission policy files are missing"
 	python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$VERIFY"
 	[ -f "$SCRIPT_DIR/midr-backbone.clab.yaml" ] || die "15-node topology is missing"
 	[ "$(grep -c 'image: frr-ubuntu20:latest' "$SCRIPT_DIR/midr-backbone.clab.yaml")" -eq 15 ] ||
@@ -161,7 +167,7 @@ deploy_lab()
 
 run_acceptance()
 {
-	local acceptance_status capture_status
+	local acceptance_status tier1_status capture_status
 
 	set +e
 	MIDR_LAB_PREFIX="$LAB_PREFIX" \
@@ -169,10 +175,24 @@ run_acceptance()
 		MIDR_DEMO_POLL_SECONDS="${MIDR_DEMO_POLL_SECONDS:-10}" \
 		"$ACCEPTANCE" 2>&1 | tee "$RUN_ROOT/acceptance.log"
 	acceptance_status=${PIPESTATUS[0]}
+	run_tier1_check
+	tier1_status=$?
 	run_capture post-convergence
 	capture_status=$?
 	set -e
-	[ "$acceptance_status" -eq 0 ] && [ "$capture_status" -eq 0 ]
+	printf 'acceptance=%s tier1-admission=%s capture=%s\n' \
+		"$acceptance_status" "$tier1_status" "$capture_status" |
+		tee "$RUN_ROOT/result.txt"
+	[ "$acceptance_status" -eq 0 ] && [ "$tier1_status" -eq 0 ] &&
+		[ "$capture_status" -eq 0 ]
+}
+
+run_tier1_check()
+{
+	MIDR_LAB_PREFIX="$LAB_PREFIX" \
+		MIDR_LAB_LOG_ROOT="$RUN_ROOT/logs-backbone" \
+		"$TIER1_CHECK" 2>&1 | tee "$RUN_ROOT/tier1-admission.log"
+	return "${PIPESTATUS[0]}"
 }
 
 run_capture()
@@ -215,11 +235,20 @@ case "$MODE" in
 		[ -f "$TOPOLOGY" ] || die "prepared topology is missing: $TOPOLOGY"
 		run_acceptance
 		;;
+	tier1-check)
+		[ -f "$TOPOLOGY" ] || die "prepared topology is missing: $TOPOLOGY"
+		run_tier1_check
+		;;
 	capture)
 		preflight
 		run_capture manual
 		;;
+	destroy)
+		ensure_root
+		[ -f "$TOPOLOGY" ] || die "prepared topology is missing: $TOPOLOGY"
+		containerlab destroy --topo "$TOPOLOGY" 2>&1 | tee "$RUN_ROOT/destroy.log"
+		;;
 	*)
-		die "usage: $0 [preflight|build|deploy|all|check|capture]"
+		die "usage: $0 [preflight|build|deploy|all|check|tier1-check|capture|destroy]"
 		;;
 esac

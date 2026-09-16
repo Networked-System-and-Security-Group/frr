@@ -1,0 +1,4 @@
+MIDR-TIER1-ASNS 1
+LIST-ID backbone-lab-avoid-t1
+# Lab-only list: AS 64500 is the fictional transit that z1 must avoid.
+64500

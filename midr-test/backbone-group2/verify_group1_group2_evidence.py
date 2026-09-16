@@ -11,15 +11,21 @@ from pathlib import Path
 
 
 MEMBERS = ("r1", "r2", "m1a", "m1b", "m2a", "z1", "z2")
+# z1 avoids t1 (Tier1 admission scenario, see backbone-lab/configs-backbone/z1)
+# and therefore joins group 2 instead of the faster group 1.
 EXPECTED_GROUP_SIZE = {
     "r1": 4,
     "m1a": 4,
     "m1b": 4,
-    "z1": 1,
-    "r2": 2,
-    "m2a": 2,
+    "z1": 3,
+    "r2": 3,
+    "m2a": 3,
     "z2": 4,
 }
+# r2 peers directly with every node that originates objects it selects
+# (group 1 anchors m1a/m1b/z2, the manual r1 edge, and group 2 members), so
+# multi-hop propagation cannot be observed there.
+NO_MULTIHOP_NODES = {"r2"}
 
 
 class Checks:
@@ -264,7 +270,9 @@ def main() -> int:
         ted_summary = read_output(root, node, "ted-summary")
         ted_text = read_output(root, node, "ted-detail")
 
-        router_id = text_field(self_text, "Router-ID")
+        router_id = text_field(self_text, "BGP Identifier") or text_field(
+            self_text, "Router-ID"
+        )
         group_id = int_field(self_text, "Group-ID")
         expected_size = EXPECTED_GROUP_SIZE[node]
 
@@ -413,8 +421,10 @@ def main() -> int:
             f"{node} RIB selects one conflict-free path per identity",
         )
         checks.check(
-            len(remote_selected) > 0 and len(multihop_selected) > 0,
-            f"{node} contains selected remote objects with multi-hop propagation paths",
+            len(remote_selected) > 0
+            and (len(multihop_selected) > 0 or node in NO_MULTIHOP_NODES),
+            f"{node} contains selected remote objects"
+            + ("" if node in NO_MULTIHOP_NODES else " with multi-hop propagation paths"),
         )
         checks.check(
             lsdb_objects_count == selected
