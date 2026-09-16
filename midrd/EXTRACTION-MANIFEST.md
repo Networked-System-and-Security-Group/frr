@@ -1,8 +1,10 @@
 # R7 extraction manifest (EXT-0 through EXT-3)
 
 This manifest is the source-of-truth for the standalone MIDR extraction.  The
-`midrd` core must build without FRR or BGP headers.  The existing `bgpd`
-implementation remains a differential oracle until the R5-full-B parity gate.
+`midrd` process may use common libfrr facilities, but it must build and run
+without `bgpd` and without BGP protocol types or behavior.  The existing
+`bgpd` implementation remains a differential oracle; it is not a runtime
+dependency.
 
 ## Runtime ownership
 
@@ -10,11 +12,11 @@ implementation remains a differential oracle until the R5-full-B parity gate.
 |---|---|---|
 | identity, canonical admission, ACTIVE/WITHDRAWN, sequence, lifetime | `midr-core.[ch]` | value-only object and identity types |
 | wire framing and object codec | `midr-wire.[ch]` | versioned MIDR frame, no BGP UPDATE |
-| native IPv4/IPv6 sockets and session callbacks | `midr-transport.[ch]` | endpoint/frame callback contract |
+| native IPv4/IPv6 sockets and session callbacks | `midr-transport.[ch]` | MIDR endpoint/frame callback contract over FRR event/stream/buffer |
 | source snapshot/events | `midr-prefix-provider.[ch]` | neutral IPv4/IPv6 Prefix events |
 | Prefix Feed IPC | `midr-prefix-ipc.[ch]` | local stream, generation and EoR |
 | LSDB/TED event publication | `midr-consumer.[ch]` | neutral committed snapshot events |
-| orchestration and diagnostics | `midrd.[ch]` / `midr-engine.[ch]` | daemon lifecycle only |
+| orchestration and diagnostics | `midr-context*` / `midrd.c` / `midr-engine.[ch]` | FRR daemon lifecycle and protocol-neutral context |
 | optional BGP integration | external adapter | RIB -> Prefix Feed IPC; never included in core |
 
 ## Explicitly excluded from `midrd`
@@ -22,7 +24,9 @@ implementation remains a differential oracle until the R5-full-B parity gate.
 `struct bgp`, `struct peer`, `struct bgp_path_info`, BGP attributes,
 MP_REACH/MP_UNREACH, AFI/SAFI, TCP/179, update-groups, Adj-RIB-Out, selected
 path, BGP Route Refresh, BGP GR/LLGR and the BGP session FSM are not allowed in
-the standalone build.  A source scan is part of the EXT-0 gate.
+the standalone build.  Common libfrr headers and services are allowed.  Zebra
+is reached through the public zclient/ZAPI interface; zebra daemon-private
+headers and state are not allowed.  A source scan is part of the boundary gate.
 
 ## Migration parity gates
 
@@ -53,3 +57,9 @@ The original 18 R5-full-A cases map to the following standalone targets:
 The old `bgpd` implementation remains a differential oracle.  This manifest
 does not authorize its removal before hardening, R5-full-B, R6-B-B and the
 parity gate.
+
+## FRR-native migration
+
+The post-extraction migration is tracked in `FRR-MIGRATION-MANIFEST.md`.
+During that migration, the allowed dependency boundary changes from libc-only
+to common libfrr, while every BGP exclusion above remains mandatory.
