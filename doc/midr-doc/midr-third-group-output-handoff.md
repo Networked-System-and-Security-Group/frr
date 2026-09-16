@@ -2,7 +2,7 @@
 
 ## 1. 交接结论
 
-第二组独立 `midrd` 已收口，代码提交为 `6bf1f9c524de2f8828c8c05942b0e72390d5c1d2`。第三组后续只需消费 committed TED/SPF route result，在自己的 adapter 中完成 Zebra/ZAPI/Linux FIB、ECMP/UCMP/SRv6 等下游安装策略。
+第二组独立 `midrd` 已收口，主体提交为 `6bf1f9c524de2f8828c8c05942b0e72390d5c1d2`，当前收口后审查提交为 `5eab85832a`。第三组后续只需消费 committed TED/SPF route result，在自己的 adapter 中完成 Zebra/ZAPI/Linux FIB、ECMP/UCMP/SRv6 等下游安装策略。
 
 第三组不修改 MIDR canonical、洪泛、sequence、lifetime、scope 或 LSDB/TED 内部状态；第二组不将 Zebra、ZAPI、Linux FIB 或 BGP 类型引入 `midrd` 核心。
 

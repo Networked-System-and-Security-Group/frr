@@ -2,7 +2,7 @@
 
 ## 1. 交接结论
 
-第二组独立 `midrd` 已收口，代码提交为 `6bf1f9c524de2f8828c8c05942b0e72390d5c1d2`。第一组后续只需负责真实 Prefix、Membership、Link/NDS 数据的采集和转换，通过本文冻结的 Prefix/Local Fact Provider IPC 向 `midrd` 供数。
+第二组独立 `midrd` 已收口，主体提交为 `6bf1f9c524de2f8828c8c05942b0e72390d5c1d2`，当前收口后审查提交为 `5eab85832a`。第一组后续只需负责真实 Prefix、Membership、Link/NDS 数据的采集和转换，通过本文冻结的 Prefix/Local Fact Provider IPC 向 `midrd` 供数。
 
 `midrd` 与 `bgpd` 是互相独立的协议进程。BGP 如需提供 Prefix，只能作为 Prefix IPC 的外部发布端；`midrd` 不依赖 BGP OPEN/UPDATE、BGP FSM、BGP capability、BGP RIB、selected path 或 TCP/179。
 
