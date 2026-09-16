@@ -6,6 +6,8 @@
 #include "bgpd/midr_trace_types.h"
 
 #define MIDR_TRACE_MAX_TTL 30U
+/* Total successful sends per unresponsive TTL, including the first probe. */
+#define MIDR_TRACE_PROBES_PER_HOP 3U
 #define MIDR_TRACE_PROBE_WAIT_MSEC 1000U
 #define MIDR_TRACE_SEND_INTERVAL_MSEC 10U
 
@@ -20,7 +22,8 @@ bool midr_trace_engine_target_valid(const struct prefix *target);
  * defer owner finalization to an event. No list/database pointers are kept.
  */
 int midr_trace_engine_start(struct event_loop *master,
-	const struct prefix *target, midr_trace_engine_done_cb done, void *arg,
+	const struct prefix *target, const struct midr_trace_net_context *context,
+	midr_trace_engine_done_cb done, void *arg,
 	struct midr_trace_engine **out);
 void midr_trace_engine_snapshot(const struct midr_trace_engine *engine,
 			       struct midr_trace_job_result *out);

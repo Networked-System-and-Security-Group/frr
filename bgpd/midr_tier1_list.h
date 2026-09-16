@@ -3,6 +3,10 @@
 #define _FRR_MIDR_TIER1_LIST_H
 
 #include "bgpd/midr_tier1.h"
+#include "hook.h"
+
+/* Main-loop notification after a successful policy/map publication. */
+DECLARE_HOOK(midr_policy_changed, (void), ());
 
 #define MIDR_TIER1_LIST_MAX 4096U
 #define MIDR_TIER1_LIST_FILE_MAX (128U * 1024U)

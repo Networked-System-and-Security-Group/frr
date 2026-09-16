@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include "bgpd/midr_tier1.h"
 
-#define MIDR_TRACE_PROFILE_VERSION 2U
+#define MIDR_TRACE_PROFILE_VERSION 3U
 #define MIDR_TRACE_CONCURRENCY_HARD_MAX 32U
 
 enum midr_trace_status {
@@ -44,6 +44,15 @@ enum midr_trace_stop_reason {
 	MIDR_TRACE_STOP_MAX_HOPS,
 	MIDR_TRACE_STOP_UNREACHABLE,
 	MIDR_TRACE_STOP_ERROR,
+};
+
+/* Zero initialization selects the diagnostic CLI's default context.  MIDR
+ * admission supplies an explicit source and an instance lifetime cookie.
+ * Non-default VRFs are rejected until all MIDR channels support them. */
+struct midr_trace_net_context {
+	struct prefix source;
+	uint64_t instance_cookie;
+	uint32_t vrf_id;
 };
 
 struct midr_trace_raw_hop {

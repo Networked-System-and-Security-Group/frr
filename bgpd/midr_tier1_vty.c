@@ -1350,6 +1350,7 @@ DEFUN(show_midr_traceroute_scheduler,
 		json_object_boolean_add(json, "ipv6Supported", midr_trace_engine_supported(AF_INET6));
 		json_object_int_add(json, "maxTtl", MIDR_TRACE_MAX_TTL);
 		json_object_int_add(json, "probeWaitMsec", MIDR_TRACE_PROBE_WAIT_MSEC);
+		json_object_int_add(json, "probesPerHop", MIDR_TRACE_PROBES_PER_HOP);
 		json_object_boolean_add(json, "ready",
 					midr_trace_scheduler_is_ready());
 		json_object_boolean_add(json, "accepting", stats.accepting);
@@ -1400,8 +1401,8 @@ DEFUN(show_midr_traceroute_scheduler,
 	vty_out(vty, "  Backend: linux-udp, compiled IPv4/IPv6 support: %s/%s\n",
 		midr_trace_engine_supported(AF_INET) ? "yes" : "no",
 		midr_trace_engine_supported(AF_INET6) ? "yes" : "no");
-	vty_out(vty, "  Profile: %u, max TTL %u, probe wait %u ms, send interval %u ms\n",
-		MIDR_TRACE_PROFILE_VERSION, MIDR_TRACE_MAX_TTL,
+	vty_out(vty, "  Profile: %u, max TTL %u, probes/hop %u, probe wait %u ms, send interval %u ms\n",
+		MIDR_TRACE_PROFILE_VERSION, MIDR_TRACE_MAX_TTL, MIDR_TRACE_PROBES_PER_HOP,
 		MIDR_TRACE_PROBE_WAIT_MSEC, MIDR_TRACE_SEND_INTERVAL_MSEC);
 	vty_out(vty, "  Ready/accepting: %s/%s\n",
 		midr_trace_scheduler_is_ready() ? "yes" : "no",

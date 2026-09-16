@@ -48,7 +48,8 @@ static socklen_t midr_trace_sockaddr(const struct prefix *target,
 	return 0;
 }
 
-int midr_trace_udp_open(int family, int *fd)
+int midr_trace_udp_open(int family,
+			const struct midr_trace_net_context *context, int *fd)
 {
 	struct prefix local = {.family = family};
 	struct sockaddr_storage ss;
@@ -61,6 +62,13 @@ int midr_trace_udp_open(int family, int *fd)
 	if (!fd)
 		return EINVAL;
 	*fd = -1;
+	if (context && context->vrf_id != VRF_DEFAULT)
+		return EOPNOTSUPP;
+	if (context && context->source.family) {
+		if (context->source.family != family)
+			return EINVAL;
+		local = context->source;
+	}
 	if (!midr_trace_udp_supported(family))
 		return EAFNOSUPPORT;
 	sock = vrf_socket(family, SOCK_DGRAM, IPPROTO_UDP, VRF_DEFAULT, NULL);

@@ -33,6 +33,7 @@ struct midr_trace_delivery {
 
 struct midr_trace_request_options {
 	bool force_refresh;
+	struct midr_trace_net_context context;
 };
 
 enum midr_trace_submit_rc {

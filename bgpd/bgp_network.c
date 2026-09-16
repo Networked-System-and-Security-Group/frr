@@ -24,6 +24,7 @@
 #include "nexthop.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_open.h"
 #include "bgpd/bgp_fsm.h"
 #include "bgpd/bgp_attr.h"
@@ -592,6 +593,24 @@ static void bgp_accept(struct event *event)
 	/* bgp pointer may be null, but since we have a peer data structure we know we have it */
 	bgp = peer->bgp;
 	connection = peer->connection;
+	if (!midr_admission_peer_ready(peer)) {
+		close(bgp_sock);
+		return;
+	}
+	if (midr_nds_peer_is_overlay(peer) && bgp->midr_nds_info->avoid_tier1) {
+		union sockunion *accepted_local = sockunion_getsockname(bgp_sock);
+		struct ipaddr local, configured;
+		bool matches = accepted_local &&
+			midr_sockunion_to_ipaddr(accepted_local, &local) &&
+			midr_nds_local_transport_get(bgp, &configured) &&
+			midr_ipaddr_same(&local, &configured);
+
+		sockunion_free(accepted_local);
+		if (!matches) {
+			close(bgp_sock);
+			return;
+		}
+	}
 	if (CHECK_FLAG(peer->flags, PEER_FLAG_SHUTDOWN) ||
 	    CHECK_FLAG(peer->bgp->flags, BGP_FLAG_SHUTDOWN)) {
 		if (bgp_debug_neighbor_events(peer))
@@ -682,6 +701,12 @@ static void bgp_accept(struct event *event)
 	incoming = doppelganger->connection;
 
 	peer_xfer_config(doppelganger, peer);
+	/* The accepted connection owns its own attempt permit. */
+	if (!midr_admission_begin(incoming)) {
+		close(bgp_sock);
+		peer_delete(doppelganger);
+		return;
+	}
 	bgp_peer_gr_flags_update(doppelganger);
 
 	BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer);
@@ -838,6 +863,9 @@ static int bgp_update_source(struct peer_connection *connection)
 enum connect_result bgp_connect(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
+
+	if (!midr_admission_begin(connection))
+		return connect_error;
 
 	assert(!CHECK_FLAG(connection->thread_flags, PEER_THREAD_WRITES_ON));
 	assert(!CHECK_FLAG(connection->thread_flags, PEER_THREAD_READS_ON));

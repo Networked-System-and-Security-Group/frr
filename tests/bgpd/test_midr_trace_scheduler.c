@@ -17,9 +17,11 @@ struct midr_trace_engine {
 static struct midr_trace_engine fake;
 static unsigned int starts, destroys, deliveries, canceled;
 static bool finish_in_callback;
+static struct midr_trace_net_context captured_context;
 
 bool __wrap_midr_trace_engine_supported(int family);
 int __wrap_midr_trace_engine_start(struct event_loop *loop, const struct prefix *target,
+	const struct midr_trace_net_context *context,
 	midr_trace_engine_done_cb done, void *arg, struct midr_trace_engine **out);
 void __wrap_midr_trace_engine_destroy(struct midr_trace_engine **engine);
 void __wrap_midr_trace_engine_snapshot(const struct midr_trace_engine *engine,
@@ -31,9 +33,11 @@ bool __wrap_midr_trace_engine_supported(int family)
 }
 
 int __wrap_midr_trace_engine_start(struct event_loop *loop, const struct prefix *target,
+	const struct midr_trace_net_context *context,
 	midr_trace_engine_done_cb done, void *arg, struct midr_trace_engine **out)
 {
 	(void)loop;
+	captured_context = *context;
 	memset(&fake, 0, sizeof(fake));
 	fake.done = done;
 	fake.arg = arg;
@@ -136,6 +140,30 @@ int main(void)
 	assert(midr_trace_job_lookup(job, &snapshot) == MIDR_TRACE_QUERY_COMPLETED);
 	assert(midr_trace_cache_lookup(&target, &options, &view, NULL) == MIDR_TRACE_LOOKUP_HIT);
 	assert(view.observation.observed_asns[0] == 174);
+	/* Identical destination, different source or instance: never reuse the
+	 * diagnostic cache. Unsupported VRFs fail closed at submission. */
+	{
+		struct midr_trace_request_options scoped = {};
+		assert(str2prefix("192.0.2.1", &scoped.context.source));
+		assert(midr_trace_cache_lookup(&target, &scoped, &view, NULL) == MIDR_TRACE_LOOKUP_MISS);
+		assert(midr_trace_request_async(&target, &scoped, received, NULL, &a) == MIDR_TRACE_SUBMIT_ACCEPTED);
+		while (starts < 2)
+			tick();
+		assert(prefix_same(&captured_context.source, &scoped.context.source));
+		expected = deliveries + 1;
+		fake.result.status = MIDR_TRACE_OK;
+		fake.done(&fake.result, fake.arg);
+		while (deliveries < expected)
+			tick();
+		assert(midr_trace_cache_lookup(&target, &scoped, &view, NULL) == MIDR_TRACE_LOOKUP_HIT);
+		scoped.context.instance_cookie = 123;
+		assert(midr_trace_cache_lookup(&target, &scoped, &view, NULL) == MIDR_TRACE_LOOKUP_MISS);
+		scoped.context.vrf_id = 1;
+		assert(midr_trace_request_async(&target, &scoped, received, NULL, &a) == MIDR_TRACE_SUBMIT_UNSUPPORTED);
+		scoped.context.vrf_id = 0;
+		assert(str2prefix("2001:db8::1", &scoped.context.source));
+		assert(midr_trace_request_async(&target, &scoped, received, NULL, &a) == MIDR_TRACE_SUBMIT_INVALID);
+	}
 	/* Cache delivery remains deferred, even when teardown is reentered. */
 	expected = deliveries + 1;
 	finish_in_callback = true;

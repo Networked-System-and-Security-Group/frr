@@ -5,6 +5,7 @@
 #include <linux/errqueue.h>
 #endif
 #include "privs.h"
+#include "vrf.h"
 #include "bgpd/midr_trace_udp.h"
 
 struct zebra_privs_t bgpd_privs = {};
@@ -74,6 +75,12 @@ ssize_t __wrap_recvmsg(int fd, struct msghdr *msg, int flags)
 
 int main(void)
 {
+	struct midr_trace_net_context context = {.vrf_id = 1};
+	int fd = 100;
+	assert(midr_trace_udp_open(AF_INET, &context, &fd) == EOPNOTSUPP && fd == -1);
+	context.vrf_id = VRF_DEFAULT;
+	context.source.family = AF_INET6;
+	assert(midr_trace_udp_open(AF_INET, &context, &fd) == EINVAL && fd == -1);
 #if defined(HAVE_LINUX_ERRQUEUE_H) && defined(IP_RECVERR) \
 	&& defined(IPV6_RECVERR) && defined(MSG_ERRQUEUE)
 	struct midr_trace_udp_reply reply;

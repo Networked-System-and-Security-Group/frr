@@ -8,6 +8,8 @@
 #include "bgpd/bgp_memory.h"
 #include "bgpd/midr_tier1_list.h"
 
+DEFINE_HOOK(midr_policy_changed, (void), ());
+
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TIER1_LIST, "MIDR Tier-1 list");
 
 struct midr_tier1_snapshot {
@@ -220,6 +222,7 @@ int midr_tier1_list_load_file(const char *path, bool validate_only,
 	active = candidate;
 	generation++;
 	midr_tier1_snapshot_free(old);
+	hook_call(midr_policy_changed);
 	return 0;
 fail:
 	if (file)
@@ -243,6 +246,7 @@ int midr_tier1_list_clear(char *errmsg, size_t errmsg_len)
 	midr_tier1_snapshot_free(active);
 	active = NULL;
 	generation++;
+	hook_call(midr_policy_changed);
 	return 0;
 }
 

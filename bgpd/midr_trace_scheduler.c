@@ -22,13 +22,14 @@
 #include "bgpd/midr_trace_engine.h"
 #include "bgpd/midr_trace_observer.h"
 #include "bgpd/midr_trace_scheduler.h"
+#include "vrf.h"
 
 #define MIDR_TRACE_DEFAULT_CONCURRENCY 4U
 #define MIDR_TRACE_DEFAULT_QUEUE_LIMIT 128U
 #define MIDR_TRACE_DEFAULT_REQUESTS_PER_JOB 64U
 #define MIDR_TRACE_DEFAULT_PENDING_REQUESTS 4096U
 #define MIDR_TRACE_DEFAULT_QUEUE_TIMEOUT_MSEC 5000U
-#define MIDR_TRACE_DEFAULT_EXEC_TIMEOUT_MSEC 35000U
+#define MIDR_TRACE_DEFAULT_EXEC_TIMEOUT_MSEC 95000U
 #define MIDR_TRACE_DEFAULT_CACHE_TTL_MSEC (300U * 1000U)
 #define MIDR_TRACE_DEFAULT_NEGATIVE_TTL_MSEC (15U * 1000U)
 #define MIDR_TRACE_DEFAULT_CACHE_CAPACITY 1024U
@@ -58,6 +59,7 @@ enum midr_trace_request_state {
 struct midr_trace_key {
 	struct prefix target;
 	uint32_t profile_version;
+	struct midr_trace_net_context context;
 };
 
 struct midr_trace_delivery_seed {
@@ -215,13 +217,24 @@ static bool midr_trace_key_same(const struct midr_trace_key *a,
 				const struct midr_trace_key *b)
 {
 	return a->profile_version == b->profile_version
+	       && a->context.instance_cookie == b->context.instance_cookie
+	       && a->context.vrf_id == b->context.vrf_id
+	       && a->context.source.family == b->context.source.family
+	       && (!a->context.source.family ||
+		   prefix_same(&a->context.source, &b->context.source))
 	       && prefix_same(&a->target, &b->target);
 }
 
 static unsigned int midr_trace_key_hash(const struct midr_trace_key *key)
 {
-	return jhash_1word(key->profile_version,
-			   prefix_hash_key(&key->target));
+	unsigned int hash = jhash_3words(key->profile_version,
+		(uint32_t)key->context.instance_cookie,
+		(uint32_t)(key->context.instance_cookie >> 32),
+		prefix_hash_key(&key->target));
+
+	return jhash_2words(key->context.vrf_id,
+		key->context.source.family ? prefix_hash_key(&key->context.source) : 0,
+		hash);
 }
 
 static unsigned int midr_trace_job_key_hash(const void *data)
@@ -795,14 +808,27 @@ static void midr_trace_scheduler_cleanup(struct event *event)
 
 static enum midr_trace_submit_rc
 midr_trace_submit_precheck(const struct prefix *target,
+			   const struct midr_trace_request_options *options,
 			   struct midr_trace_key *key)
 {
 	struct midr_trace_scheduler *scheduler = midr_trace_scheduler;
 
+	if (key) {
+		memset(key, 0, sizeof(*key));
+		if (options)
+			key->context = options->context;
+	}
 	if (!target || !key
 	    || !midr_trace_target_normalize(target, &key->target))
 		return MIDR_TRACE_SUBMIT_INVALID;
 	key->profile_version = MIDR_TRACE_PROFILE_VERSION;
+	if (key->context.vrf_id != VRF_DEFAULT)
+		return MIDR_TRACE_SUBMIT_UNSUPPORTED;
+	if (key->context.source.family &&
+	    (key->context.source.family != target->family ||
+	     !midr_trace_target_normalize(&key->context.source,
+					 &key->context.source)))
+		return MIDR_TRACE_SUBMIT_INVALID;
 	if (!scheduler)
 		return midr_trace_engine_supported(target->family)
 			       ? MIDR_TRACE_SUBMIT_NOT_READY
@@ -837,7 +863,7 @@ enum midr_trace_submit_rc midr_trace_request_async(
 		*request_id = 0;
 	if (!done || !request_id)
 		return MIDR_TRACE_SUBMIT_INVALID;
-	rc = midr_trace_submit_precheck(target, &key);
+	rc = midr_trace_submit_precheck(target, options, &key);
 	if (rc != MIDR_TRACE_SUBMIT_ACCEPTED)
 		return rc;
 
@@ -954,10 +980,10 @@ enum midr_trace_cache_lookup_rc midr_trace_cache_lookup(
 		*cache_age_msec = 0;
 	if (!midr_ip2asn_is_loaded())
 		return MIDR_TRACE_LOOKUP_NO_SNAPSHOT;
-	if (!scheduler || !target || !view
-	    || !midr_trace_target_normalize(target, &key.target))
+	if (!scheduler || !view ||
+	    midr_trace_submit_precheck(target, options, &key) !=
+		MIDR_TRACE_SUBMIT_ACCEPTED)
 		return MIDR_TRACE_LOOKUP_MISS;
-	key.profile_version = MIDR_TRACE_PROFILE_VERSION;
 	if (options && options->force_refresh)
 		return MIDR_TRACE_LOOKUP_MISS;
 
@@ -992,7 +1018,7 @@ enum midr_trace_submit_rc midr_trace_ensure_job(
 		*job_id = 0;
 	if (!job_id || !state)
 		return MIDR_TRACE_SUBMIT_INVALID;
-	rc = midr_trace_submit_precheck(target, &key);
+	rc = midr_trace_submit_precheck(target, options, &key);
 	if (rc != MIDR_TRACE_SUBMIT_ACCEPTED)
 		return rc;
 
@@ -1267,15 +1293,11 @@ unsigned int midr_trace_cache_clear(const struct prefix *target)
 	if (target) {
 		if (!midr_trace_target_normalize(target, &key.target))
 			return 0;
-		key.profile_version = MIDR_TRACE_PROFILE_VERSION;
-		entry = midr_trace_cache_find(scheduler, &key);
-		if (!entry)
-			return 0;
-		midr_trace_cache_remove(scheduler, entry);
-		return 1;
 	}
 
 	for (ALL_LIST_ELEMENTS(scheduler->cache_lru, node, next, entry)) {
+		if (target && !prefix_same(&entry->key.target, &key.target))
+			continue;
 		midr_trace_cache_remove(scheduler, entry);
 		removed++;
 	}
@@ -1589,6 +1611,7 @@ static void midr_trace_job_start_event(struct event *event)
 	job->start_attempted = true;
 	monotime(&job->started_at);
 	rc = midr_trace_engine_start(scheduler->master, &job->key.target,
+				     &job->key.context,
 				     midr_trace_job_engine_done, job,
 				     &job->engine);
 	if (rc) {

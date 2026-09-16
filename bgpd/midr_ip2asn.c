@@ -32,6 +32,7 @@
 
 #include "bgpd/bgp_memory.h"
 #include "bgpd/midr_ip2asn.h"
+#include "bgpd/midr_tier1_list.h"
 
 #define MIDR_IP2ASN_UPDATE_MAX_OPERATIONS 10000U
 #define MIDR_IP2ASN_UPDATE_MAX_FILE_SIZE (8U * 1024U * 1024U)
@@ -608,6 +609,7 @@ int midr_ip2asn_load_file_ex(const char *path, unsigned int flags,
 
 	midr_ip2asn_snapshot_destroy(&candidate);
 	midr_ip2asn_assert_invariants();
+	hook_call(midr_policy_changed);
 	return 0;
 }
 
@@ -666,6 +668,7 @@ int midr_ip2asn_clear_ex(unsigned int flags, char *errmsg,
 
 	midr_ip2asn_snapshot_destroy(&old_snapshot);
 	midr_ip2asn_assert_invariants();
+	hook_call(midr_policy_changed);
 	return 0;
 }
 
@@ -1617,6 +1620,7 @@ midr_ip2asn_update_commit(const char *path,
 	}
 
 	midr_ip2asn_assert_invariants();
+	hook_call(midr_policy_changed);
 	return 0;
 }
 

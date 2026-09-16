@@ -26,6 +26,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_nds_facts.h"
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_cl.h"
@@ -432,6 +433,7 @@ void midr_nds_ledger_drop(struct bgp *bgp, struct ipaddr transport)
 	if (!bgp || !bgp->midr_nds_info || !bgp->midr_nds_info->session_ledger)
 		return;
 	mi = bgp->midr_nds_info;
+	midr_admission_forget(bgp, transport);
 
 	for (ALL_LIST_ELEMENTS(mi->session_ledger, node, nnode, e)) {
 		if (!midr_ipaddr_same(&e->transport, &transport))
@@ -1522,6 +1524,11 @@ void midr_nds_anchor_ctx_clear(struct bgp *bgp)
 		return;
 	mi = bgp->midr_nds_info;
 
+	/* ANCHOR consumes the probe context before asynchronous admission
+	 * completes. Cancel its retained owners even when the slots are already
+	 * empty, so an abandoned join round cannot establish a late edge. */
+	midr_admission_forget_reason(bgp, MIDR_SESSION_CL_ANCHOR);
+
 	if (!mi->anchor_group_id[0] && !mi->anchor_group_id[1] &&
 	    !mi->t_anchor_probe_done)
 		return; /* 没有残留，静默 */
@@ -2078,6 +2085,9 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 {
 	if (!bgp || !bgp->midr_nds_info)
 		return;
+
+	if (new_group_id != old_group_id)
+		midr_admission_forget_reason(bgp, MIDR_SESSION_SAME_GROUP);
 
 	/* A group-0 node has no publishable topology membership.  Retire all
 	 * previously active Link facts before refreshing/withdrawing its Node fact. */
@@ -2662,10 +2672,11 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 				 * should_peer 推不出来，清理时全靠账认。
 				 * 【我方改动，需知会 zhc】本行原为两参调用，
 				 * 现为四参（末参 = 发 nudge，发起类传 true）。 */
-				midr_ctrl_connect(bgp, entry,
+				enum midr_admission_result admission = midr_ctrl_connect(bgp, entry,
 						  MIDR_SESSION_CL_ANCHOR,
 						  true);
-				connected++;
+				if (admission == MIDR_ADMISSION_READY || admission == MIDR_ADMISSION_PENDING)
+					connected++; /* Accepted intents, not Established peers. */
 			}
 		zlog_info("MIDR I-7：ANCHOR 处理 %u 个锚点候选，尝试建连 %u 个",
 			  decision->evidence
@@ -3072,6 +3083,7 @@ bool midr_nds_manual_session_del(struct bgp *bgp, struct ipaddr transport)
 	if (!bgp || !bgp->midr_nds_info)
 		return false;
 	mi = bgp->midr_nds_info;
+	midr_admission_forget(bgp, transport);
 	if (!mi->manual_sessions)
 		return false;
 
@@ -3102,6 +3114,18 @@ void midr_nds_manual_sessions_restore(struct bgp *bgp)
 	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session)) {
 		struct midr_node_entry target = {};
 		struct in_addr resolved_rid;
+		union sockunion su;
+		struct peer *peer;
+
+		/* Admission owns retries for retained intent. Existing peers use the
+		 * guarded FSM; this also makes periodic capacity recovery idempotent. */
+		if (midr_admission_has_intent(bgp, session->transport))
+			continue;
+		if (midr_ipaddr_to_sockunion(&session->transport, &su)) {
+			peer = peer_lookup(bgp, &su);
+			if (peer && peer->connection && peer->connection->status == Established)
+				continue;
+		}
 
 		if (!midr_ipaddr_valid_locator(&session->transport) ||
 		    ipaddr_family(&session->transport) != ipaddr_family(&local))
@@ -3779,6 +3803,7 @@ unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
 	 * NODE_CHANGE、拆会话会引来重建。
 	 */
 	mi->shutdown = true;
+	midr_admission_reset(bgp);
 
 	/*
 	 * ② 撤自身通告。LEAVE 分支在 midr_nds_report_node() 里排在 shutdown 抑制
@@ -4122,7 +4147,7 @@ static void midr_nds_attach_ensure(struct bgp *bgp, const char *why)
 	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP))
 		return;
 
-	live = midr_nds_attach_count(bgp);
+	live = midr_nds_attach_count(bgp) + midr_admission_attach_pending(bgp);
 	if (live >= MIDR_ATTACH_K)
 		return;
 
@@ -4190,7 +4215,7 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		 * （第二批）第一次仍会被撞一次——只是死心只花 6s。名单报了它活着
 		 * 却连不上，才是真该慢慢试的（第一批 15s）。
 		 */
-		if (cand->attach_failed)
+		if (cand->attach_failed || midr_admission_unavailable(bgp, cand->transport))
 			continue;
 
 		led = midr_nds_ledger_lookup(bgp, cand->transport);
@@ -4213,7 +4238,8 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		 * `midr session` 对称配上，要么在本机 `no midr session` 让它回到
 		 * 普通候选）。
 		 */
-		if (led && led->reason == MIDR_SESSION_MANUAL) {
+		if ((led && led->reason == MIDR_SESSION_MANUAL) ||
+		    midr_admission_is_manual(bgp, cand->transport)) {
 			zlog_info("MIDR 挂靠：跳过引导 %pIA（rid %pI4）——该地址上已有运维手配的会话（台账 MANUAL），挂靠不占用运维的边；要让它参与挂靠请在本机 no midr session %pIA",
 				  &cand->transport, &cand->rid,
 				  &cand->transport);
@@ -4236,7 +4262,10 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 			  second ? "第二批：不在最新活引导名单里"
 				 : "第一批：在最新活引导名单里",
 			  (start + i) % n, n, start);
-		midr_ctrl_connect(bgp, &e, MIDR_SESSION_ATTACH, true);
+		enum midr_admission_result admission =
+			midr_ctrl_connect(bgp, &e, MIDR_SESSION_ATTACH, true);
+		if (admission == MIDR_ADMISSION_BLOCKED || admission == MIDR_ADMISSION_INVALID)
+			continue;
 		/*
 		 * 第二批压重传预算（批 6 的 A-2）。放在 connect **之后**：预算改的是
 		 * connect 刚入队的那条 pending；若 connect 因去重没入队（不该发生
@@ -4274,7 +4303,7 @@ void midr_nds_attach_pick_from(struct bgp *bgp, enum midr_attach_batch from)
 	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP))
 		return;
 
-	live = midr_nds_attach_count(bgp);
+	live = midr_nds_attach_count(bgp) + midr_admission_attach_pending(bgp);
 	if (live >= MIDR_ATTACH_K)
 		return; /* 已够 K 台，不必再挑 */
 	want = MIDR_ATTACH_K - live;
@@ -5669,6 +5698,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	restart_join = mi->join_intent || mi->join_in_progress ||
 		       mi->join_phase != MIDR_JOIN_IDLE;
 	mi->transport_reconfiguring = true;
+	midr_admission_reset(bgp);
 
 	/* Withdraw endpoints while the old active locator is still available. */
 	midr_nds_facts_withdraw_all_links(bgp);
@@ -5860,6 +5890,7 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	SET_IPADDR_NONE(&mi->active_transport_addr);
 
 	bgp->midr_nds_info = mi;
+	midr_admission_init(bgp);
 
 	/* 对接第二组 topology 接口：取一次 context 句柄存下（Q7 透传约定），
 	 * 再建本地事实表（轮 1 起由 midr_nds_report_node 写入并上报）。 */
@@ -5904,6 +5935,7 @@ void bgp_midr_nds_finish(struct bgp *bgp)
 		return;
 
 	mi = bgp->midr_nds_info;
+	midr_admission_finish(bgp);
 
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);

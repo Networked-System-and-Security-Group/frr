@@ -29,10 +29,13 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_pm.h" /* midr_pm_add_target（connect_group 启探测） */
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_PENDING, "MIDR ctrl pending peer-request");
+
+#define MIDR_CTRL_ADMISSION_GRACE_MS 120000
 
 /*
  * PEER_REQUEST retransmit: UDP is lossy, so resend until the session is up.
@@ -455,6 +458,8 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct ipaddr dst,
 		if (midr_ipaddr_same(&p->target_transport, &dst) &&
 		    p->type == type) {
 			p->target_group = target_group;
+			if (midr_ctrl_is_peer_req_like(type))
+				return; /* Repeated discovery must not reset the deadline. */
 			p->params = *rp;
 			p->retries_left = rp->count;
 			p->due_ms = rp->interval_ms;
@@ -468,6 +473,7 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct ipaddr dst,
 	p->params = *rp;
 	p->retries_left = rp->count;
 	p->due_ms = rp->interval_ms;
+	p->admission_grace_ms = midr_ctrl_is_peer_req_like(type) ? MIDR_CTRL_ADMISSION_GRACE_MS : 0;
 	listnode_add(mi->ctrl_pending, p);
 
 	/*
@@ -493,6 +499,8 @@ void midr_ctrl_set_retx_budget(struct bgp *bgp, struct ipaddr dst,
 	    !bgp->midr_nds_info->ctrl_pending || retries <= 0)
 		return;
 	mi = bgp->midr_nds_info;
+	if (type == MIDR_CTRL_ATTACH_REQUEST)
+		midr_admission_retx_budget(bgp, dst, retries);
 
 	for (ALL_LIST_ELEMENTS_RO(mi->ctrl_pending, node, p))
 		if (midr_ipaddr_same(&p->target_transport, &dst) &&
@@ -637,6 +645,11 @@ static void midr_ctrl_send_peer_request(struct bgp *bgp,
 
 	midr_ctrl_enqueue_request(bgp, entry->transport_addr, type,
 				  mi->local_group_id, &midr_ctrl_retx_default);
+	if (reason == MIDR_SESSION_ATTACH) {
+		int budget = midr_admission_get_retx_budget(bgp, entry->transport_addr);
+		if (budget > 0)
+			midr_ctrl_set_retx_budget(bgp, entry->transport_addr, type, budget);
+	}
 	MIDR_FLOW_LOG("MIDR ctrl: sent %s to %pIA (group %u)",
 		  midr_ctrl_msg_type_str(type), &entry->transport_addr,
 		  mi->local_group_id);
@@ -733,6 +746,7 @@ static void midr_ctrl_retx_timer(struct event *t)
 			      : midr_ctrl_retx_default.interval_ms;
 
 	for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, p)) {
+		p->admission_grace_ms = MAX(0, p->admission_grace_ms - tick_ms);
 		/*
 		 * 各条按自己的 interval 走：没到点的这一跳一概不动（不查信号、
 		 * 不烧次数、不重发）。所有条目 interval 相同时每跳人人到点，
@@ -765,7 +779,7 @@ static void midr_ctrl_retx_timer(struct event *t)
 						  p->type))
 			continue;
 
-		if (--p->retries_left <= 0) {
+		if (!p->admission_grace_ms && --p->retries_left <= 0) {
 			/*
 			 * 不等完成信号的消息（stop_on_signal=false）：发满 count 次
 			 * 就是干完了，不算失败——不报 warn、不拆半边、不 failover。
@@ -1995,12 +2009,12 @@ static void midr_ctrl_udp_recv(struct event *t)
 				 : MIDR_SESSION_PEER_REQ_REPLY;
 
 		/* send_nudge=false：我是被请求方，再发一次 PEER_REQUEST 就是回声。 */
-		midr_ctrl_connect(bgp, &req, reason, false);
+		midr_admission_remote_seen(bgp, req.transport_addr);
+		if (midr_ctrl_connect_received(bgp, &req, reason, is_attach) == MIDR_ADMISSION_BLOCKED)
+			midr_ctrl_send_peer_reject(bgp, req.transport_addr);
 
 		/* SAME_GROUP 时 connect 内已把对端纳入本群邻居（置位 + 起探），
 		 * 视图变了要告知 CL；本路一次一个节点，就地发一条。 */
-		if (reason == MIDR_SESSION_SAME_GROUP)
-			midr_nds_notify_cl(bgp, MIDR_TRIGGER_NODE_CHANGE);
 		break;
 	}
 	case MIDR_CTRL_PEER_REJECT: {
@@ -2123,6 +2137,7 @@ void midr_ctrl_forget_target(struct bgp *bgp, struct ipaddr transport)
 	    !midr_ipaddr_valid_locator(&transport))
 		return;
 	mi = bgp->midr_nds_info;
+	midr_admission_forget(bgp, transport);
 
 	if (mi->ctrl_pending)
 		for (ALL_LIST_ELEMENTS(mi->ctrl_pending, node, nnode, pending)) {
@@ -2290,8 +2305,8 @@ bool midr_nds_peer_is_overlay(struct peer *peer)
 	return CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY);
 }
 
-void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
-		       enum midr_session_reason reason, bool send_nudge)
+static enum midr_admission_result midr_ctrl_connect_internal(struct bgp *bgp, const struct midr_node_entry *entry,
+		       enum midr_session_reason reason, bool send_nudge, bool received, bool attach_request)
 {
 	struct bgp_midr_nds *mi;
 	struct midr_node_entry key = {};
@@ -2305,14 +2320,14 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	int ret;
 
 	if (!bgp || !bgp->midr_nds_info || !entry)
-		return;
+		return MIDR_ADMISSION_INVALID;
 	mi = bgp->midr_nds_info;
 	asn = entry->asn;
 	if (entry->node_id.family != AF_INET ||
 	    entry->node_id.prefixlen != IPV4_MAX_BITLEN) {
 		zlog_warn("MIDR ctrl: invalid remote router-id %pFX; refusing session",
 			  &entry->node_id);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 	remote_rid = entry->node_id.u.prefix4;
 	has_remote_rid = remote_rid.s_addr != INADDR_ANY;
@@ -2324,7 +2339,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	if (!has_remote_rid && reason != MIDR_SESSION_MANUAL) {
 		zlog_warn("MIDR ctrl: missing remote router-id for automatic session to %pIA; refusing session",
 			  &entry->transport_addr);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	/* 轮 4 放宽：不再要求 asn 非 0。建连走 AS_EXTERNAL，只校验"对端 AS ≠ 本机
@@ -2344,22 +2359,25 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	    !midr_ipaddr_valid_locator(&entry->transport_addr)) {
 		zlog_warn("MIDR ctrl: %pFX 没有 transport 地址，不建连——该节点多半漏配了 midr transport-address（router-id 只是身份、未必可路由，不作回落）",
 			  &entry->node_id);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	if (!mi || mi->transport_reconfiguring || mi->shutdown ||
 	    !midr_nds_local_transport_get(bgp, &local))
-		return;
+		return MIDR_ADMISSION_INVALID;
 	if (ipaddr_family(&local) != ipaddr_family(&entry->transport_addr)) {
 		zlog_warn("MIDR ctrl: local %pIA and remote %pIA transport families differ; refusing session",
 			  &local, &entry->transport_addr);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 	known = NULL;
 	if (has_remote_rid) {
 		key.node_id = entry->node_id;
 		known = midr_node_hash_find(&mi->global_view->nodes, &key);
 	}
+	if (received && !attach_request && (mi->local_capabilities & MIDR_CAP_BOOTSTRAP) &&
+	    known && !(known->capabilities & (MIDR_CAP_BOOTSTRAP | MIDR_CAP_GROUP_REP)))
+		return MIDR_ADMISSION_INVALID;
 	if (known && known != entry && known->has_transport_addr &&
 	    midr_ipaddr_valid_locator(&known->transport_addr) &&
 	    !midr_ipaddr_same(&known->transport_addr,
@@ -2367,13 +2385,13 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 		zlog_warn("MIDR ctrl: router-id %pI4 is already bound to locator %pIA; refusing transient rewrite to %pIA",
 			  &remote_rid, &known->transport_addr,
 			  &entry->transport_addr);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 	if (!midr_nds_locator_unique(bgp, &entry->node_id,
 				      &entry->transport_addr)) {
 		zlog_warn("MIDR ctrl: locator %pIA is claimed by multiple node identities; refusing session",
 			  &entry->transport_addr);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	/*
@@ -2390,7 +2408,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 			       &mi->active_transport_addr))) {
 		zlog_warn("MIDR ctrl: 拒绝与本机自身建会话（%pFX）——请检查 bootstrap / session 配置是否把本机填成了对端",
 			  &entry->node_id);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	/*
@@ -2405,11 +2423,23 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	    midr_nds_is_session_excluded(bgp, entry->node_id.u.prefix4)) {
 		MIDR_LOG("MIDR ctrl: %pFX 在会话排除名单中，跳过自动建连",
 			 &entry->node_id);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	if (!midr_ipaddr_to_sockunion(&entry->transport_addr, &su))
-		return;
+		return MIDR_ADMISSION_INVALID;
+
+	peer = peer_lookup(bgp, &su);
+	if (peer && !midr_nds_peer_is_overlay(peer))
+		return MIDR_ADMISSION_INVALID;
+	/* Existing Established sessions are grandfathered; new TCP attempts
+	 * still pass the network/FSM guards. */
+	if (!peer || !peer->connection || peer->connection->status != Established) {
+		enum midr_admission_result admission = midr_admission_gate(
+			bgp, entry, reason, send_nudge, received, attach_request);
+		if (admission != MIDR_ADMISSION_READY)
+			return admission;
+	}
 
 	/*
 	 * 台账家规①：登记放在下面两道去重检查【之前】。"MIDR 需要这条边"和
@@ -2433,12 +2463,15 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	 */
 	if (reason == MIDR_SESSION_SAME_GROUP) {
 		struct ipaddr transport = midr_ipaddr_none();
+		bool adjacency_changed = !known || !known->is_adjacent;
 
 		if (entry->has_transport_addr)
 			transport = entry->transport_addr;
 		midr_nds_adopt_group_peer(bgp, remote_rid, asn, transport,
 					  entry->group_id);
 		midr_mark_topology(bgp, entry);
+		if (adjacency_changed)
+			midr_admission_committed(bgp);
 	}
 	/* Locator replacement retires the old PM context.  Cross-group anchors
 	 * are deliberately not is_adjacent, so the PM neighbor sweep cannot
@@ -2478,7 +2511,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 				zlog_warn("MIDR ctrl: %pFX 的 transport 地址上有一条运维会话，MIDR 不整形运维配置、这条边建不起来；请检查该静态邻居是否误用了 transport（loopback）地址——静态会话只应配链路地址",
 					  &entry->node_id);
 			}
-			return;
+			return MIDR_ADMISSION_READY;
 		}
 	}
 
@@ -2492,7 +2525,7 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	if (ret != 0) {
 		zlog_warn("MIDR ctrl: peer_remote_as(%pFX AS %u) failed: %d",
 			  &entry->node_id, asn, ret);
-		return;
+		return MIDR_ADMISSION_INVALID;
 	}
 
 	MIDR_FLOW_LOG("MIDR ctrl: peering initiated with %pFX AS %u",
@@ -2503,6 +2536,26 @@ void midr_ctrl_connect(struct bgp *bgp, const struct midr_node_entry *entry,
 	peer = peer_lookup(bgp, &su);
 	if (peer)
 		midr_nds_ctrl_setup_overlay_peer(bgp, peer);
+	return peer ? MIDR_ADMISSION_READY : MIDR_ADMISSION_INVALID;
+}
+
+enum midr_admission_result midr_ctrl_connect(struct bgp *bgp,
+	const struct midr_node_entry *entry, enum midr_session_reason reason,
+	bool send_nudge)
+{
+	return midr_ctrl_connect_internal(bgp, entry, reason, send_nudge, false, false);
+}
+
+enum midr_admission_result midr_ctrl_connect_received(struct bgp *bgp,
+	const struct midr_node_entry *entry, enum midr_session_reason reason,
+	bool attach_request)
+{
+	return midr_ctrl_connect_internal(bgp, entry, reason, false, true, attach_request);
+}
+
+void midr_ctrl_reject_admission(struct bgp *bgp, struct ipaddr transport)
+{
+	midr_ctrl_send_peer_reject(bgp, transport);
 }
 
 static void midr_try_disconnect(struct bgp *bgp,
@@ -2551,7 +2604,8 @@ static void midr_try_disconnect(struct bgp *bgp,
 		const struct midr_session_ledger_entry *led =
 			midr_nds_ledger_lookup(bgp, transport);
 
-		if (led && led->reason == MIDR_SESSION_MANUAL) {
+		if ((led && led->reason == MIDR_SESSION_MANUAL) ||
+		    midr_admission_is_manual(bgp, transport)) {
 			zlog_warn("MIDR ctrl: %pFX（%pIA）的会话是运维手配（台账 MANUAL），跳过自动拆除——要拆请用 no midr session",
 				  &entry->node_id, &transport);
 			return;
@@ -2673,8 +2727,10 @@ int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id,
 		 * midr_ctrl_connect() 的 SAME_GROUP 分支——回配路要做同样的事。
 		 * ⚠ 故本函数的 reason 必须是 SAME_GROUP，换别的值三件套就不生效。
 		 */
-		midr_ctrl_connect(bgp, entry, reason, true);
-		count++;
+		enum midr_admission_result admission =
+			midr_ctrl_connect(bgp, entry, reason, true);
+		if (admission == MIDR_ADMISSION_READY || admission == MIDR_ADMISSION_PENDING)
+			count++; /* accepted intents, never an Established count */
 	}
 
 	return count;

@@ -24,6 +24,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_vty.h" /* bgp_config_inprocess()：引导角色收尾的时机判断 */
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_nds_facts.h" /* midr_nds_report_node（轮 1 node 上报线） */
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_pm.h"
@@ -331,7 +332,13 @@ accepted:
 	target.transport_addr = transport;
 	target.has_transport_addr = true;
 	target.asn = asn;
-	midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+	enum midr_admission_result admission =
+		midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+	if (admission == MIDR_ADMISSION_PENDING || admission == MIDR_ADMISSION_BLOCKED) {
+		vty_out(vty, "MIDR session %s configured; Tier1 admission %s (show midr admission)\n",
+			argv[2]->arg, admission == MIDR_ADMISSION_BLOCKED ? "blocked" : "pending");
+		return CMD_SUCCESS;
+	}
 
 	peer = peer_lookup(bgp, &su);
 	if (!peer || !midr_nds_peer_is_overlay(peer)) {
@@ -393,7 +400,8 @@ DEFUN(no_midr_session,
 	ledger = midr_nds_ledger_lookup(bgp, transport);
 	peer = peer_lookup(bgp, &su);
 	operator_peer = peer && !midr_nds_peer_is_overlay(peer);
-	if (!manual && !ledger && (!peer || operator_peer)) {
+	if (!manual && !ledger && (!peer || operator_peer) &&
+	    !midr_admission_has_intent(bgp, transport)) {
 		vty_out(vty, "%% MIDR session %s is not configured\n",
 			argv[3]->arg);
 		return CMD_WARNING;
@@ -2104,6 +2112,40 @@ DEFUN(midr_help,
 
 /* Persist only explicit operator intent.  Runtime ledger entries, learned
  * seeds and dynamically derived roles/groups must never leak into frr.conf. */
+DEFUN(midr_avoid_tier1,
+      midr_avoid_tier1_cmd,
+      "[no] midr avoid-tier1",
+      NO_STR
+      "MIDR configuration\n"
+      "Reject new MIDR sessions when traceroute observes Tier1\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	if (!bgp->midr_nds_info)
+		return CMD_WARNING_CONFIG_FAILED;
+	midr_admission_set(bgp, !strmatch(argv[0]->text, "no"));
+	vty_out(vty, "MIDR Tier1 admission %s; existing Established sessions retained\n",
+		bgp->midr_nds_info->avoid_tier1 ? "enabled" : "disabled");
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_admission,
+      show_midr_admission_cmd,
+      "show midr admission",
+      SHOW_STR
+      "MIDR information\n"
+      "Show Tier1 admission for all BGP instances\n")
+{
+	struct bgp *bgp;
+	struct listnode *node;
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		if (!bgp->midr_nds_info)
+			continue;
+		vty_out(vty, "BGP %s AS %u\n", bgp->name_pretty, bgp->as);
+		midr_admission_show(bgp, vty);
+	}
+	return CMD_SUCCESS;
+}
+
 static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 {
 	struct bgp_midr_nds *mi;
@@ -2115,6 +2157,8 @@ static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 		return 0;
 	mi = bgp->midr_nds_info;
 
+	if (mi->avoid_tier1)
+		vty_out(vty, " midr avoid-tier1\n");
 	if (mi->config_group_id)
 		vty_out(vty, " midr group-id %u\n", mi->config_group_id);
 	if (mi->transport_addr_set &&
@@ -2149,6 +2193,8 @@ static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 void bgp_midr_nds_vty_init(void)
 {
 	hook_register(bgp_inst_config_write, midr_nds_config_write);
+	install_element(BGP_NODE, &midr_avoid_tier1_cmd);
+	install_element(VIEW_NODE, &show_midr_admission_cmd);
 	install_element(BGP_NODE, &midr_group_id_cmd);
 	install_element(BGP_NODE, &midr_session_cmd);
 	install_element(BGP_NODE, &no_midr_session_cmd);

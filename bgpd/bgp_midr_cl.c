@@ -31,6 +31,7 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_cl.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
@@ -227,6 +228,10 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 				continue;
 
 			cl_identity_from_rep(&identity, r);
+			struct ipaddr locator;
+			if (midr_nds_node_transport_get(bgp, &identity.node_id, &locator) &&
+			    midr_admission_candidate_blocked(bgp, locator))
+				continue;
 			link = cl_find_link_by_prefix(gv, &identity.node_id);
 			if (!cl_link_has_data(link))
 				continue;
@@ -330,7 +335,9 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 
 		total++;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
-		if (cl_link_is_good_for_join(link)) {
+		if (cl_link_is_good_for_join(link) &&
+		    (!entry->has_transport_addr ||
+		     !midr_admission_candidate_blocked(bgp, entry->transport_addr))) {
 			good++;
 		} else {
 			/* 收集未达标链路数据用于调试日志 */
@@ -441,7 +448,7 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
  * 不看 is_adjacent：锚点候选是 NDS 为评估而临时探测的非本群节点（只探不
  * 连），不是本群邻居，语义上正相反于 cl_count_good_member_links 的过滤条件。
  */
-static void cl_select_anchor_candidates(const struct midr_global_view *gv,
+static void cl_select_anchor_candidates(struct bgp *bgp, const struct midr_global_view *gv,
 					uint32_t target_group_id,
 					struct list *out)
 {
@@ -459,7 +466,8 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry)) {
 		struct midr_link_entry *link;
 
-		if (entry->is_self || entry->group_id != target_group_id)
+		if (entry->is_self || entry->group_id != target_group_id ||
+		    midr_admission_candidate_blocked(bgp, entry->transport_addr))
 			continue;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
 		MIDR_LOG("MIDR CL: 锚点候选 %pFX group=%u link=%s status=%d rtt=%u loss=%.4f",
@@ -523,8 +531,8 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
 	d.new_group_id = mi->local_group_id;
 	d.evidence = list_new();
 
-	cl_select_anchor_candidates(gv, mi->anchor_group_id[0], d.evidence);
-	cl_select_anchor_candidates(gv, mi->anchor_group_id[1], d.evidence);
+	cl_select_anchor_candidates(bgp, gv, mi->anchor_group_id[0], d.evidence);
+	cl_select_anchor_candidates(bgp, gv, mi->anchor_group_id[1], d.evidence);
 	{
 		struct listnode *log_node;
 		struct midr_node_evidence *log_ev;
@@ -711,6 +719,32 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		 */
 		MIDR_LOG("MIDR CL: CAPABILITY_UPDATE — 稳态能力重评估（stub）");
 		break;
+
+	case MIDR_TRIGGER_ADMISSION_CHANGE: {
+		uint32_t groups[2];
+		size_t count = midr_admission_anchor_groups(bgp, groups, array_size(groups));
+		struct midr_cluster_decision d = {};
+		struct listnode *node, *next;
+		struct midr_node_evidence *ev;
+		d.decision_type = MIDR_DECISION_ANCHOR;
+		d.old_group_id = d.new_group_id = mi->local_group_id;
+		d.evidence = list_new();
+		for (size_t i = 0; i < count; i++)
+			cl_select_anchor_candidates(bgp, gv, groups[i], d.evidence);
+		if (listcount(d.evidence))
+			midr_nds_on_cluster_decision(bgp, &d);
+		for (ALL_LIST_ELEMENTS(d.evidence, node, next, ev))
+			XFREE(MTYPE_MIDR_NODE_EVIDENCE, ev);
+		list_delete(&d.evidence);
+		/* A cached admission result may arrive before PM's warm-up window.
+		 * Only reconsider a phase whose original probe timer has completed. */
+		if (mi->join_phase == MIDR_JOIN_PROBING_REPS && mi->rep_dir &&
+		    !mi->t_rep_probe_done)
+			cl_handle_rep_probe_done(bgp, gv);
+		else if (mi->join_phase == MIDR_JOIN_PROBING_MEMBERS && !mi->t_member_probe_done)
+			cl_handle_member_probe_done(bgp, gv);
+		break;
+	}
 
 	case MIDR_TRIGGER_PERIODIC_SYNC:
 		/*

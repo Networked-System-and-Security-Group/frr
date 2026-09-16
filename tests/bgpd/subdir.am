@@ -335,3 +335,17 @@ EXTRA_DIST += tests/bgpd/test_midr_native_trace.py
 tests_bgpd_test_midr_trace_engine_LDFLAGS = -Wl,--wrap=midr_trace_udp_open -Wl,--wrap=midr_trace_udp_send -Wl,--wrap=midr_trace_udp_receive -Wl,--wrap=midr_trace_udp_supported
 tests_bgpd_test_midr_trace_scheduler_LDFLAGS = -Wl,--wrap=midr_trace_engine_start -Wl,--wrap=midr_trace_engine_destroy -Wl,--wrap=midr_trace_engine_snapshot -Wl,--wrap=midr_trace_engine_supported
 tests_bgpd_test_midr_trace_udp_LDFLAGS = -Wl,--wrap=recvmsg
+
+if BGPD
+check_PROGRAMS += tests/bgpd/test_midr_admission
+endif
+tests_bgpd_test_midr_admission_CFLAGS = $(TESTS_CFLAGS)
+tests_bgpd_test_midr_admission_CPPFLAGS = $(TESTS_CPPFLAGS)
+tests_bgpd_test_midr_admission_LDADD = $(BGP_TEST_LDADD)
+tests_bgpd_test_midr_admission_SOURCES = tests/bgpd/test_midr_admission.c
+tests_bgpd_test_midr_admission_LDFLAGS = \
+	-Wl,--wrap=midr_trace_request_async -Wl,--wrap=midr_trace_cancel \
+	-Wl,--wrap=midr_trace_cache_lookup -Wl,--wrap=peer_lookup \
+	-Wl,--wrap=midr_nds_local_transport_get -Wl,--wrap=midr_ctrl_connect
+
+tests_bgpd_test_midr_admission_LDFLAGS += -Wl,--wrap=clock_gettime

@@ -18,6 +18,7 @@
 /* enum midr_session_reason（会话台账原因）按值出现在 midr_ctrl_connect 的
  * 签名里，必须见到定义；顺带让本头自洽（原先靠各 .c 先包含 nds.h 才编得过）。 */
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 
 struct bgp;
 struct bgp_midr_nds;
@@ -169,6 +170,7 @@ struct midr_ctrl_pending {
 	 * 参数化之前的"单节拍、每跳全队各减一次"。
 	 */
 	int due_ms;
+	int admission_grace_ms; /* Fixed from initial nudge; never extended. */
 };
 
 /* Human-readable name of an enum midr_ctrl_msg_type value (for logs/show). */
@@ -176,6 +178,10 @@ extern const char *midr_ctrl_msg_type_str(uint8_t type);
 
 /* Initialise/free containers.  Socket binding is driven by transport reconcile. */
 extern void midr_ctrl_init(struct bgp *bgp);
+extern enum midr_admission_result midr_ctrl_connect_received(struct bgp *bgp,
+	const struct midr_node_entry *entry, enum midr_session_reason reason,
+	bool attach_request);
+extern void midr_ctrl_reject_admission(struct bgp *bgp, struct ipaddr transport);
 extern void midr_ctrl_finish(struct bgp *bgp);
 /* Atomically open/close UDP and TCP channels on one exact local locator. */
 extern bool midr_ctrl_open(struct bgp *bgp, const struct ipaddr *local);
@@ -199,7 +205,7 @@ extern void midr_ctrl_forget_target(struct bgp *bgp,
  * 方，再发就是回声），发起类三处传 true。不做默认值：默认发会把"回配忘了关
  * nudge"这类错误静默化。
  */
-extern void midr_ctrl_connect(struct bgp *bgp,
+extern enum midr_admission_result midr_ctrl_connect(struct bgp *bgp,
 			      const struct midr_node_entry *entry,
 			      enum midr_session_reason reason, bool send_nudge);
 

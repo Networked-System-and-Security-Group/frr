@@ -25,6 +25,7 @@ struct midr_trace_engine {
 	struct event_loop *master;
 	int fd;
 	uint8_t ttl;
+	unsigned int probes;
 	uint16_t port;
 	bool waiting;
 	bool finished;
@@ -115,6 +116,7 @@ static void midr_trace_engine_next(struct midr_trace_engine *engine)
 		return;
 	}
 	engine->ttl++;
+	engine->probes = 0;
 	event_add_timer_msec(engine->master, midr_trace_engine_send, engine,
 			     MIDR_TRACE_SEND_INTERVAL_MSEC, &engine->timer);
 }
@@ -129,6 +131,14 @@ static void midr_trace_engine_hop_timeout(struct event *event)
 	hop = &engine->result.raw_path.hops[engine->ttl - 1];
 	hop->ttl = engine->ttl;
 	engine->result.raw_path.hop_count = engine->ttl;
+	if (engine->probes < MIDR_TRACE_PROBES_PER_HOP) {
+		engine->waiting = false;
+		/* A retry has a new port/token so late replies cannot match it. */
+		engine->port = 0;
+		event_add_timer_msec(engine->master, midr_trace_engine_send, engine,
+				     MIDR_TRACE_SEND_INTERVAL_MSEC, &engine->timer);
+		return;
+	}
 	midr_trace_engine_next(engine);
 }
 
@@ -189,6 +199,7 @@ static void midr_trace_engine_send(struct event *event)
 					 MIDR_TRACE_STOP_ERROR, rc);
 		return;
 	}
+	engine->probes++;
 	engine->sent_usec = midr_trace_now();
 	engine->waiting = true;
 	event_add_timer_msec(engine->master, midr_trace_engine_hop_timeout, engine,
@@ -226,6 +237,10 @@ static void midr_trace_engine_read(struct event *event)
 						 MIDR_TRACE_STOP_ERROR, reply.local_errno);
 			return;
 		}
+		/* An unidentifiable non-terminal reply still represents a '*' hop.
+		 * Leave the current timeout armed so the bounded retry path handles it. */
+		if (!reply.visible && !reply.terminal)
+			continue;
 		hop = &engine->result.raw_path.hops[engine->ttl - 1];
 		hop->ttl = engine->ttl;
 		hop->visible = reply.visible;
@@ -257,6 +272,7 @@ static void midr_trace_engine_read(struct event *event)
 }
 
 int midr_trace_engine_start(struct event_loop *master, const struct prefix *target,
+			   const struct midr_trace_net_context *context,
 			   midr_trace_engine_done_cb done, void *arg,
 			   struct midr_trace_engine **out)
 {
@@ -268,7 +284,11 @@ int midr_trace_engine_start(struct event_loop *master, const struct prefix *targ
 	*out = NULL;
 	if (!master || !done || !midr_trace_engine_target_valid(target))
 		return EINVAL;
-	rc = midr_trace_udp_open(target->family, &fd);
+	if (context && context->source.family &&
+	    (!midr_trace_engine_target_valid(&context->source) ||
+	     context->source.family != target->family))
+		return EINVAL;
+	rc = midr_trace_udp_open(target->family, context, &fd);
 	if (rc)
 		return rc;
 	engine = XCALLOC(MTYPE_MIDR_TRACE_ENGINE, sizeof(*engine));

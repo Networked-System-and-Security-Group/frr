@@ -382,6 +382,7 @@ enum midr_trigger_type {
 	 * MIDR_DECISION_RECONNECT.
 	 */
 	MIDR_TRIGGER_ISOLATED = 7,
+	MIDR_TRIGGER_ADMISSION_CHANGE = 8,
 };
 
 /* §2.6 I-7 clustering decision */
@@ -517,6 +518,8 @@ struct midr_manual_session {
 
 /* §2.7 MIDR instance state, hung off bgp->midr_nds_info */
 struct bgp_midr_nds {
+	bool avoid_tier1;
+	struct midr_admission *admission;
 	struct bgp *bgp; /* back-pointer */
 
 	/* === NDS === */

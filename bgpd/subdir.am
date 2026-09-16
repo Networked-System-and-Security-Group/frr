@@ -77,6 +77,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_pm.c \
 	bgpd/bgp_midr_cl.c \
 	bgpd/bgp_midr_ctrl.c \
+	bgpd/bgp_midr_admission.c \
 	bgpd/bgp_midr_ctrl_tcp.c \
 	bgpd/bgp_midr_store.c \
 	bgpd/bgp_midr_nds_vty.c \
@@ -201,6 +202,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_pm.h \
 	bgpd/bgp_midr_cl.h \
 	bgpd/bgp_midr_ctrl.h \
+	bgpd/bgp_midr_admission.h \
 	bgpd/bgp_midr_store.h \
 	bgpd/bgp_midr_nds_vty.h \
 	bgpd/bgp_mac.h \

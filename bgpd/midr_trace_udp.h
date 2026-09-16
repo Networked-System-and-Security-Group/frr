@@ -16,7 +16,8 @@ struct midr_trace_udp_reply {
 };
 
 bool midr_trace_udp_supported(int family);
-int midr_trace_udp_open(int family, int *fd);
+int midr_trace_udp_open(int family,
+			const struct midr_trace_net_context *context, int *fd);
 int midr_trace_udp_send(int fd, const struct prefix *target, uint16_t port,
 			uint8_t ttl, const void *payload, size_t len);
 /* 1 matched reply, 0 unrelated/malformed, -1 syscall error (errno set).

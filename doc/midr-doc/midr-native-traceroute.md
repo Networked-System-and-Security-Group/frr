@@ -5,11 +5,12 @@
 ## 功能与边界
 
 - Linux IPv4/IPv6 UDP traceroute 在 bgpd 内执行，使用 FRR 的 VRF socket 封装、TTL/Hop Limit 设置、非阻塞读事件和定时器。
-- 每 job 顺序探测 TTL 1–30，每跳一个 UDP probe，等待 1000 ms；多个 job 沿用原 scheduler 的并发、队列、single-flight 和轮询/回调。
-- 全进程发送尝试之间至少 10 ms，无突发额度；探测期间仍受默认 35 秒整体 timeout 限制。排队 timeout 独立计算。
+- 每 job 顺序探测 TTL 1–30，每跳最多发送 3 次 UDP probe（含首次，即最多补发 2 次），每次等待 1000 ms。收到可识别响应即继续下一跳；3 次均无响应则该跳保留 `*`，不再重试该跳并继续后续 TTL。多个 job 沿用原 scheduler 的并发、队列、single-flight 和轮询/回调。
+- 全进程发送尝试之间至少 10 ms，无突发额度；默认整体 timeout 调整为 95 秒，覆盖低负载下 30 跳全部无响应约 90 秒的等待。排队 timeout 独立计算；显式配置的更短 timeout 或高并发调度可能提前结束任务，不保证每跳都能用完 3 次。
+- 每次补发使用新的目的端口及 probe token，旧探测的迟到响应不会冒充新探测。profile 升至 3；`show midr traceroute scheduler [json]` 显示每跳探测上限（JSON 字段 `probesPerHop`）。
 - 每 probe 使用不同高目的端口，原目标/端口和可用 payload 必须匹配；迟到、重复及无法关联的数据不修改已结算 hop。
 - 端口按地址族分配，范围 33434–65535。每个端口预留 240 秒，覆盖配置允许的最长 120 秒 job 和额外 120 秒冷却；无可用端口形成 `resource-error`。该上界与整体 timeout 校验必须一起维护。
-- 仅默认网络上下文，不支持 VRF 参数、源接口、源地址选择、带 zone 的 IPv6 link-local、TCP/ICMP Echo 或 Paris traceroute。不会复用 BGP TCP 连接或 PM echo socket。
+- 仅默认 VRF；诊断 CLI 仍使用自动源地址。邻居准入调用支持显式绑定本实例 transport 源地址，并按源地址、实例标识隔离 job/cache；见 [Tier1 邻居准入实现](midr-tier1-admission.md)。不支持源接口选择、带 zone 的 IPv6 link-local、TCP/ICMP Echo 或 Paris traceroute。不会复用 BGP TCP 连接或 PM echo socket。
 - 移除了外部 executor、SIGCHLD、管道解析和 `--with-midr-traceroute`。Linux 错误队列不可用时不回退外部命令。
 
 `ipv4Supported/ipv6Supported` 表示编译期接口可用。内核、权限或网络策略导致的运行期 socket/发送错误会作为具体 job 结果报告；这些字段不表示已进行联网自检。
@@ -48,6 +49,63 @@ midr tier1 validate file /var/lib/midr/next-tier1-asns.txt
 `write memory` 保存文件路径，不保存文件内容。重启时文件必须存在且 bgpd 可读；文件内容由部署流程维护。generation 为进程内激活序号，不跨重启保持。
 
 ## 查询
+
+### 安装新版本后出现 Unknown command
+
+`make install` 更新磁盘文件，不会替换已经运行的 bgpd 进程。启动
+`vtysh` 也不会启动或重启 bgpd，它只连接现有守护进程。因此更新后的
+vtysh 可以识别并转发新命令，而旧 bgpd 返回：
+
+```text
+% [BGP] Unknown command: show midr tier1 list
+% [BGP] Unknown command: midr tier1 file /var/lib/frr/ip2asn/tier1_asns.txt
+```
+
+该错误来自 bgpd 的命令匹配阶段，尚未读取 ASN 文件。vtysh 的
+`show version` 显示新版本不能单独证明后台 bgpd 也已更新。源码中的
+`bgp_init()` → `bgp_vty_init()` → `midr_tier1_vty_init()` 会注册这两条命令；
+show 注册于 VIEW_NODE（FRR 自动同步到 ENABLE_NODE），file 注册于全局
+CONFIG_NODE。无需重复注册或把全局清单改成 BGP 实例配置。
+
+完成安装后，退出 vtysh，通过本机实际使用的服务管理方式重启 FRR。
+重启会中断现有路由会话，并重新加载已保存的配置；未保存的运行配置不会自动保留。
+下面两种服务命令按环境选择一种：
+
+```sh
+# 使用 systemd 的环境
+sudo systemctl restart frr
+
+# 未启用 systemd、但已安装 FRR init 服务的环境（如部分 WSL）
+sudo service frr restart
+```
+
+若 bgpd 是手工启动，应通过原启动方式停止并重新启动该进程，保留原来的
+配置文件、实例和路径参数，不要额外启动第二个 bgpd。重新打开 vtysh 后验证：
+
+```text
+frr# show midr tier1 list
+frr# configure terminal
+frr(config)# midr tier1 file /var/lib/frr/ip2asn/tier1_asns.txt
+frr(config)# end
+frr# show midr tier1 list
+```
+
+首次 show 即使没有加载清单，也应显示 `not loaded`，而不是 Unknown command。
+若重启后仍报错，在 Linux 侧检查实际进程及其运行文件（每个 bgpd PID 分别检查）：
+
+```sh
+pgrep -a -x bgpd
+sudo readlink /proc/<PID>/exe
+sudo /proc/<PID>/exe --version
+/usr/lib/frr/bgpd --version
+```
+
+`/usr/lib/frr/bgpd` 适用于本次 `--sbindir=/usr/lib/frr` 安装；其它构建使用自己的安装路径。
+运行文件显示 `(deleted)` 通常意味着安装已替换文件但旧进程尚未退出。
+若安装路径与实际启动路径不同，应修正服务启动路径或安装目标，再重启对应服务。
+这些检查须在运行 bgpd 的同一 WSL/容器/命名空间内执行。
+
+### 路径探测与 Tier1 查询示例
 
 ```text
 show midr traceroute 8.8.8.8 json
