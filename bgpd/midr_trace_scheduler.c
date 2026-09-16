@@ -1476,7 +1476,26 @@ static void midr_trace_job_record_result_stats(
 	case MIDR_TRACE_ERR_RESOURCE:
 		scheduler->stats.resource_errors++;
 		break;
-	default:
+	case MIDR_TRACE_OK:
+		/* Published jobs, including successes, are counted by finalize. */
+		break;
+	case MIDR_TRACE_ERR_INVALID:
+	case MIDR_TRACE_ERR_NO_SNAPSHOT:
+	case MIDR_TRACE_ERR_UNSUPPORTED:
+	case MIDR_TRACE_ERR_QUEUE_FULL:
+	case MIDR_TRACE_ERR_REQUEST_LIMIT:
+		/* Submission failures have no job-result error counter here. */
+		break;
+	case MIDR_TRACE_ERR_SPAWN:
+	case MIDR_TRACE_ERR_OUTPUT_LIMIT:
+	case MIDR_TRACE_ERR_PARSE:
+	case MIDR_TRACE_ERR_EXIT_STATUS:
+		/* Reserved statuses from the removed external-process backend. */
+		break;
+	case MIDR_TRACE_ERR_CANCELED:
+	case MIDR_TRACE_ERR_SHUTDOWN:
+		/* Lifecycle termination is not a probe failure. Cancellation is
+		 * counted per request by midr_trace_cancel(), not per job here. */
 		break;
 	}
 }
