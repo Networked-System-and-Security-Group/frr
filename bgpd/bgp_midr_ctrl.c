@@ -30,6 +30,7 @@
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_admission.h"
+#include "bgpd/bgp_midr_nds_facts.h" /* midr_nds_group2_ctx */
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_pm.h" /* midr_pm_add_target（connect_group 启探测） */
 #include "bgpd/midr_trace_scheduler.h"
@@ -2356,9 +2357,10 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct bgp *bgp, co
 		return MIDR_ADMISSION_INVALID;
 	}
 
-	/* 轮 4 放宽：不再要求 asn 非 0。建连走 AS_EXTERNAL，只校验"对端 AS ≠ 本机
-	 * AS"、随后用对端 OPEN 的真实 AS 覆盖（bgp_packet.c:2037），传什么都不参与
-	 * 校验；而第二组的 membership 对象不含 ASN，换源后这道守卫会永远挡住建连。
+	/* 轮 4 放宽：不再要求 asn 非 0。asn 已知时经 midr_peer_session_request()
+	 * 按该 AS 建连（对端 OPEN 须一致）；为 0 时退回 AS_EXTERNAL，只校验"对端
+	 * AS ≠ 本机 AS"、随后用对端 OPEN 的真实 AS 覆盖（bgp_packet.c:2037）——
+	 * 第二组的 membership 对象不含 ASN，换源后要求非 0 会永远挡住建连。
 	 * 真必需的是 transport（建连目标地址）。 */
 
 	/*
@@ -2535,11 +2537,40 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct bgp *bgp, co
 	 * containerlab/部署手册.md。〕
 	 */
 
-	ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
-	if (ret != 0) {
-		zlog_warn("MIDR ctrl: peer_remote_as(%pFX AS %u) failed: %d",
-			  &entry->node_id, asn, ret);
-		return MIDR_ADMISSION_INVALID;
+	/*
+	 * Create the session through the shared MIDR session API.  It only
+	 * accepts an explicit remote AS; members learned from a Membership
+	 * object carry no ASN, so those keep the AS_EXTERNAL fallback.  The
+	 * API does not take multihop/update-source; the overlay shaping below
+	 * applies them.
+	 */
+	if (asn) {
+		struct midr_peer_session_request_info req = {
+			.remote_address = su,
+			.remote_as = asn,
+			.afi = AFI_BGP_LS,
+			.safi = SAFI_MIDR_LS,
+		};
+
+		ret = midr_peer_session_request(midr_nds_group2_ctx(bgp), &req);
+		if (ret != 0) {
+			zlog_warn("MIDR ctrl: midr_peer_session_request(%pFX %pIA AS %u) failed: %d",
+				  &entry->node_id, &entry->transport_addr, asn,
+				  ret);
+			return MIDR_ADMISSION_INVALID;
+		}
+		zlog_info("MIDR ctrl: session requested via midr_peer_session_request for %pFX %pIA AS %u (%s)",
+			  &entry->node_id, &entry->transport_addr, asn,
+			  midr_session_reason_str(reason));
+	} else {
+		ret = peer_remote_as(bgp, &su, NULL, &asn, AS_EXTERNAL, NULL);
+		if (ret != 0) {
+			zlog_warn("MIDR ctrl: peer_remote_as(%pFX AS external) failed: %d",
+				  &entry->node_id, ret);
+			return MIDR_ADMISSION_INVALID;
+		}
+		zlog_info("MIDR ctrl: remote AS unknown for %pFX %pIA; session created as AS external",
+			  &entry->node_id, &entry->transport_addr);
 	}
 
 	MIDR_FLOW_LOG("MIDR ctrl: peering initiated with %pFX AS %u",
