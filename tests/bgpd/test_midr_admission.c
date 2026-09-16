@@ -159,6 +159,7 @@ int main(void)
 	struct prefix source;
 	struct peer peer = {};
 	struct peer_connection connection = {};
+	struct midr_manual_session manual = {};
 	union sockunion local_su;
 	struct midr_global_view view = {};
 	struct midr_node_entry known = {};
@@ -358,11 +359,55 @@ int main(void)
 	deliver(8, &clean);
 	assert(midr_admission_begin(&connection));
 	midr_admission_finish(&bgp);
+	/* A reply-only ledger must not become a permanent local owner after an
+	 * Established entry is reclaimed. Its active lease also expires at the
+	 * connection guard, without waiting for the one-second manager tick. */
+	mi.session_ledger = list_new();
+	midr_nds_ledger_note(&bgp, target.transport_addr,
+			     MIDR_SESSION_PEER_REQ_REPLY,
+			     target.node_id.u.prefix4, target.asn, target.group_id);
+	midr_admission_init(&bgp);
+	assert(!midr_admission_peer_ready(&peer) && submitted == 9);
+	midr_nds_ledger_drop(&bgp, target.transport_addr);
+	assert(midr_admission_gate(&bgp, &target,
+				   MIDR_SESSION_PEER_REQ_REPLY, false, true, false)
+	       == MIDR_ADMISSION_PENDING && submitted == 10);
+	deliver(9, &clean);
+	connection.status = OpenConfirm;
+	assert(midr_admission_begin(&connection));
+	clock_offset = 11;
+	assert(!midr_admission_check(&connection));
+	assert(!midr_admission_peer_ready(&peer) && submitted == 10);
+	clock_offset = 0;
+	midr_admission_finish(&bgp);
+	/* A manual command replayed during configuration must join an existing
+	 * automatic observation even when its peer is already Established. */
+	mi.manual_sessions = list_new();
+	manual.transport = target.transport_addr;
+	manual.remote_asn = 65002;
+	listnode_add(mi.manual_sessions, &manual);
+	midr_nds_ledger_note(&bgp, target.transport_addr,
+			     MIDR_SESSION_PEER_REQ_REPLY,
+			     target.node_id.u.prefix4, target.asn, target.group_id);
+	midr_admission_init(&bgp);
+	connection.status = Idle;
+	assert(midr_admission_gate(&bgp, &target,
+				   MIDR_SESSION_PEER_REQ_REPLY, false, true, false)
+	       == MIDR_ADMISSION_PENDING && submitted == 11);
+	deliver(10, &clean);
+	connection.status = Established;
+	midr_nds_manual_sessions_restore(&bgp);
+	assert(midr_admission_is_manual(&bgp, target.transport_addr));
+	assert(connected == 2);
+	midr_admission_finish(&bgp);
+	midr_nds_ledger_drop(&bgp, target.transport_addr);
+	list_delete(&mi.manual_sessions);
+	list_delete(&mi.session_ledger);
 	midr_node_hash_del(&view.nodes, &known);
 	midr_node_hash_fini(&view.nodes);
 	mi.global_view = NULL;
 	lookup_peer = NULL;
-	assert(connected == 1);
+	assert(connected == 2);
 	event_cancel(&watchdog);
 	list_delete(&bgp.peer);
 	midr_tier1_list_fini();

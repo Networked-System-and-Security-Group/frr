@@ -32,10 +32,23 @@
 #include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_pm.h" /* midr_pm_add_target（connect_group 启探测） */
+#include "bgpd/midr_trace_scheduler.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_CTRL_PENDING, "MIDR ctrl pending peer-request");
 
 #define MIDR_CTRL_ADMISSION_GRACE_MS 120000
+
+static int midr_ctrl_admission_grace_ms(void)
+{
+	struct midr_trace_scheduler_config config;
+	uint64_t trace_budget;
+
+	midr_trace_scheduler_config_get(&config);
+	trace_budget = (uint64_t)config.queue_timeout_msec +
+		       config.execution_timeout_msec + 5000U;
+	return (int)MAX((uint64_t)MIDR_CTRL_ADMISSION_GRACE_MS,
+			trace_budget);
+}
 
 /*
  * PEER_REQUEST retransmit: UDP is lossy, so resend until the session is up.
@@ -473,7 +486,8 @@ static void midr_ctrl_enqueue_request(struct bgp *bgp, struct ipaddr dst,
 	p->params = *rp;
 	p->retries_left = rp->count;
 	p->due_ms = rp->interval_ms;
-	p->admission_grace_ms = midr_ctrl_is_peer_req_like(type) ? MIDR_CTRL_ADMISSION_GRACE_MS : 0;
+	p->admission_grace_ms = midr_ctrl_is_peer_req_like(type)
+				 ? midr_ctrl_admission_grace_ms() : 0;
 	listnode_add(mi->ctrl_pending, p);
 
 	/*

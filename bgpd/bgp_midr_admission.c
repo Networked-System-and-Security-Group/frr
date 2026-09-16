@@ -102,9 +102,11 @@ static struct admission_entry *find_entry(const struct bgp *bgp, struct ipaddr t
 static struct peer *entry_peer(struct admission_entry *e)
 {
 	union sockunion su;
+	struct peer *peer;
 	if (!midr_ipaddr_to_sockunion(&e->target.transport_addr, &su))
 		return NULL;
-	return peer_lookup(e->manager->bgp, &su);
+	peer = peer_lookup(e->manager->bgp, &su);
+	return midr_nds_peer_is_overlay(peer) ? peer : NULL;
 }
 
 bool midr_admission_has_intent(struct bgp *bgp, struct ipaddr target)
@@ -159,6 +161,7 @@ static bool valid_owners(struct admission_entry *e)
 {
 	struct bgp *bgp = e->manager->bgp;
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct peer *peer = entry_peer(e);
 	struct midr_node_entry *known = mi->global_view ?
 		midr_node_hash_find(&mi->global_view->nodes, &e->target) : NULL;
 	struct listnode *n;
@@ -189,6 +192,11 @@ static bool valid_owners(struct admission_entry *e)
 		e->local_reasons &= 1U << MIDR_SESSION_MANUAL;
 		e->remote_reasons = 0;
 	}
+	/* A remote-only request is a lease, including between timer ticks.  An
+	 * existing Established session is retained until its next reconnect. */
+	if (!(peer && peer->connection && peer->connection->status == Established) &&
+	    now_ms() - e->remote_seen > ADMISSION_REMOTE_LIFETIME_MS)
+		e->remote_reasons = 0;
 	return e->local_reasons || e->remote_reasons;
 }
 
@@ -429,9 +437,11 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 static void start_trace(struct admission_entry *e)
 {
 	struct midr_trace_request_options options = {};
+	struct midr_trace_scheduler_config trace_config;
 	struct midr_trace_query_view cached;
 	struct prefix target;
 	uint32_t age = 0;
+	uint64_t deadline_ms;
 	enum midr_trace_submit_rc rc;
 	/* A new attempt may need fresher evidence, but must not revoke the
 	 * permit of a handshake already in progress (including passive clones).
@@ -463,7 +473,13 @@ static void start_trace(struct admission_entry *e)
 	e->ip_generation = midr_ip2asn_generation();
 	e->list_generation = midr_tier1_list_generation();
 	e->permit = 0;
-	e->deadline = now_ms() + ADMISSION_DEADLINE_MS;
+	/* Scheduler timeouts are configurable. Let its bounded queue and execution
+	 * finish before the admission watchdog can cancel their partial result. */
+	midr_trace_scheduler_config_get(&trace_config);
+	deadline_ms = (uint64_t)trace_config.queue_timeout_msec +
+		      trace_config.execution_timeout_msec + 5000U;
+	e->deadline = now_ms() + MAX((uint64_t)ADMISSION_DEADLINE_MS,
+				      deadline_ms);
 	e->token = XCALLOC(MTYPE_MIDR_ADMISSION_TOKEN, sizeof(*e->token));
 	e->token->owner = e;
 	rc = midr_trace_request_async(&target, &options, trace_done, e->token,
@@ -765,6 +781,10 @@ bool midr_admission_peer_ready(struct peer *peer)
 	if (!mi->avoid_tier1)
 		return true;
 	e = peer_entry(peer);
+	if (e && !valid_owners(e)) {
+		queue_resume(e);
+		return false;
+	}
 	if (fresh_permit(e) && peer_source_matches(peer, e))
 		return true;
 	if (e) {
@@ -775,7 +795,9 @@ bool midr_admission_peer_ready(struct peer *peer)
 	if (!midr_sockunion_to_ipaddr(&peer->connection->su, &target.transport_addr))
 		return false;
 	ledger = midr_nds_ledger_lookup(peer->bgp, target.transport_addr);
-	if (!ledger)
+	/* A received-only ledger is evidence of a past request, not a durable
+	 * local demand. Wait for the requester to renew it. */
+	if (!ledger || ledger->reason == MIDR_SESSION_PEER_REQ_REPLY)
 		return false;
 	target.node_id.family = AF_INET;
 	target.node_id.prefixlen = 32;

@@ -3116,14 +3116,17 @@ void midr_nds_manual_sessions_restore(struct bgp *bgp)
 		struct in_addr resolved_rid;
 		union sockunion su;
 		struct peer *peer;
+		const struct midr_session_ledger_entry *ledger;
 
-		/* Admission owns retries for retained intent. Existing peers use the
-		 * guarded FSM; this also makes periodic capacity recovery idempotent. */
-		if (midr_admission_has_intent(bgp, session->transport))
+		/* Another owner at this locator does not yet own the persisted manual
+		 * demand. Merge MANUAL into its admission entry before skipping it. */
+		if (midr_admission_is_manual(bgp, session->transport))
 			continue;
 		if (midr_ipaddr_to_sockunion(&session->transport, &su)) {
 			peer = peer_lookup(bgp, &su);
-			if (peer && peer->connection && peer->connection->status == Established)
+			ledger = midr_nds_ledger_lookup(bgp, session->transport);
+			if (peer && peer->connection && peer->connection->status == Established &&
+			    ledger && ledger->reason == MIDR_SESSION_MANUAL)
 				continue;
 		}
 
@@ -5253,6 +5256,7 @@ static void midr_nds_remote_restore_intent(
 	bool send_nudge;
 
 	if (!intent->present || intent->reason == MIDR_SESSION_MANUAL ||
+	    intent->reason == MIDR_SESSION_PEER_REQ_REPLY ||
 	    !entry->has_transport_addr ||
 	    !midr_ipaddr_valid_locator(&entry->transport_addr) ||
 	    !midr_nds_locator_unique(bgp, &entry->node_id,
@@ -5661,8 +5665,8 @@ static void midr_nds_transport_clear_measurements(struct bgp_midr_nds *mi)
 }
 
 /* Reconcile configured transport with runtime state as one fail-closed
- * transaction.  Ledger/config intent survives; old sockets, async requests,
- * probes, measurements and NDS-owned peers do not. */
+ * transaction. Local ledger/config intent survives; remote-only request
+ * leases and old sockets, probes, measurements and peers do not. */
 int midr_nds_transport_reconcile(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi;
@@ -5670,7 +5674,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	struct peer **doomed = NULL;
 	struct peer *peer;
 	struct midr_node_entry *view_entry;
-	struct listnode *node;
+	struct listnode *node, *nnode;
 	struct midr_session_ledger_entry *ledger;
 	struct ipaddr desired = midr_ipaddr_none();
 	bool want_transport, desired_unique = true, restart_join;
@@ -5763,10 +5767,16 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	if (mi->transport_active) {
 		/* Restore durable edge intent without carrying old peer objects or
 		 * measurements across the locator generation. */
-		for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, ledger)) {
+		for (ALL_LIST_ELEMENTS(mi->session_ledger, node, nnode, ledger)) {
 			struct midr_node_entry target = {};
 			bool send_nudge;
 
+			/* A reply-only ledger is a past remote request. The requester
+			 * must renew it after our transport generation changes. */
+			if (ledger->reason == MIDR_SESSION_PEER_REQ_REPLY) {
+				midr_nds_ledger_drop(bgp, ledger->transport);
+				continue;
+			}
 			if (!midr_ipaddr_valid_locator(&ledger->transport) ||
 			    ipaddr_family(&ledger->transport) !=
 				    ipaddr_family(&mi->active_transport_addr))
@@ -5779,8 +5789,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 			target.asn = ledger->remote_asn;
 			target.group_id = ledger->remote_group;
 			ledger->down_since = 0;
-			send_nudge = ledger->reason != MIDR_SESSION_MANUAL &&
-				      ledger->reason != MIDR_SESSION_PEER_REQ_REPLY;
+			send_nudge = ledger->reason != MIDR_SESSION_MANUAL;
 			midr_ctrl_connect(bgp, &target, ledger->reason,
 					  send_nudge);
 		}
