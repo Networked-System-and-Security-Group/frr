@@ -156,6 +156,7 @@ midrd_midrd_SOURCES = \
 	midrd/midr-transport.c midrd/midr-transport.h \
 	midrd/midr-wire.c midrd/midr-wire.h
 midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd
+midrd_midrd_LDADD = lib/libfrr.la $(LIBCAP)
 sbin_SCRIPTS =
 noinst_PROGRAMS =
 noinst_HEADERS =

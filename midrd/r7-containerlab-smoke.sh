@@ -72,7 +72,8 @@ topology:
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_a --listen $a_listen
           --peer $a_peer --group 1 --prefix $prefix_a --link $node_b:5
           --takeover-delay 1500 --lifetime 3000
-          --runtime $owner_runtime >/tmp/midrd.log 2>&1 &'
+          --runtime $owner_runtime --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
       image: $IMAGE
@@ -86,7 +87,8 @@ topology:
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_b --listen $b_listen
           --peer $b_peer --peer $b_to_c_peer --group 1 --prefix $prefix_b
           --link $node_a:5 --link $node_c:7 --takeover-delay 1500 --lifetime 3000
-          --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
+          --runtime $peer_runtime --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -99,7 +101,8 @@ topology:
           sh -lc 'exec /usr/local/bin/midrd --node-id $node_c --listen $c_listen
           --peer $c_peer --group 1 --prefix $prefix_c --link $node_b:7
           --takeover-delay 1500 --lifetime 3000
-          --runtime $peer_runtime >/tmp/midrd.log 2>&1 &'
+          --runtime $peer_runtime --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
     - endpoints: ["b:eth2", "c:eth1"]

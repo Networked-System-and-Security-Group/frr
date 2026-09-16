@@ -1,6 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _POSIX_C_SOURCE 200809L
 
+#include <zebra.h>
+
+#include "frrevent.h"
+#include "getopt.h"
+#include "libfrr.h"
+#include "log.h"
+#include "sigevent.h"
+#include <lib/version.h>
+
 #include "midr-cost.h"
 #include "midr-context-private.h"
 #include "midr-engine.h"
@@ -27,13 +36,111 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t stop_requested;
+static struct midr_context *midrd_runtime;
 
-static void on_signal(int signal_number)
+static FRR_NORETURN void midrd_terminate(int status);
+
+static void midrd_sighup(void)
 {
-	(void)signal_number;
-	stop_requested = 1;
+	zlog_info("SIGHUP received and ignored");
 }
+
+static void midrd_sigusr1(void)
+{
+	zlog_rotate();
+}
+
+static FRR_NORETURN void midrd_sigint(void)
+{
+	zlog_notice("Terminating on signal");
+	midrd_terminate(0);
+}
+
+static struct frr_signal_t midrd_signals[] = {
+	{
+		.signal = SIGHUP,
+		.handler = &midrd_sighup,
+	},
+	{
+		.signal = SIGUSR1,
+		.handler = &midrd_sigusr1,
+	},
+	{
+		.signal = SIGINT,
+		.handler = &midrd_sigint,
+	},
+	{
+		.signal = SIGTERM,
+		.handler = &midrd_sigint,
+	},
+};
+
+static struct zebra_privs_t midrd_privs;
+
+static const char midrd_help[] =
+	"  --node-id N              Stable MIDR node identifier\n"
+	"  --listen HOST:PORT       Native MIDR listener\n"
+	"  --peer HOST:PORT         Native MIDR peer (repeatable)\n"
+	"  --group ID               Development-time local group\n"
+	"  --prefix ADDRESS/LEN     Development-time local Prefix\n"
+	"  --link NODE:COST         Development-time local Link\n"
+	"  --local-fact-socket PATH External Local Fact Provider\n"
+	"  --prefix-socket PATH     External Prefix Provider\n"
+	"  --sequence-file PATH     Persistent owner sequence file\n"
+	"  --lifetime MS            Object lifetime\n"
+	"  --hold-time MS           Native session Hold Timer\n"
+	"  --runtime SEC            Stop after a bounded runtime\n"
+	"  --takeover-delay MS      Representative takeover delay\n"
+	"  --pidfile PATH           Compatibility alias for --pid_file\n";
+
+/* clang-format off */
+FRR_DAEMON_INFO(midrd, MIDR,
+	.vty_port = 0,
+	.proghelp = "Standalone MIDR link-state daemon.",
+	.signals = midrd_signals,
+	.n_signals = array_size(midrd_signals),
+	.privs = &midrd_privs,
+	.flags = FRR_NO_PRIVSEP | FRR_NO_TCPVTY | FRR_NO_SPLIT_CONFIG |
+		 FRR_NO_ZCLIENT,
+);
+/* clang-format on */
+
+enum midrd_option {
+	/* libfrr reserves 1000-1009 for its own long-only options. */
+	MIDRD_OPT_NODE_ID = 2000,
+	MIDRD_OPT_LISTEN,
+	MIDRD_OPT_PEER,
+	MIDRD_OPT_GROUP,
+	MIDRD_OPT_PREFIX,
+	MIDRD_OPT_LINK,
+	MIDRD_OPT_LOCAL_FACT_SOCKET,
+	MIDRD_OPT_PREFIX_SOCKET,
+	MIDRD_OPT_SEQUENCE_FILE,
+	MIDRD_OPT_LIFETIME,
+	MIDRD_OPT_HOLD_TIME,
+	MIDRD_OPT_RUNTIME,
+	MIDRD_OPT_TAKEOVER_DELAY,
+	MIDRD_OPT_PIDFILE,
+};
+
+static const struct option midrd_longopts[] = {
+	{"node-id", required_argument, NULL, MIDRD_OPT_NODE_ID},
+	{"listen", required_argument, NULL, MIDRD_OPT_LISTEN},
+	{"peer", required_argument, NULL, MIDRD_OPT_PEER},
+	{"group", required_argument, NULL, MIDRD_OPT_GROUP},
+	{"prefix", required_argument, NULL, MIDRD_OPT_PREFIX},
+	{"link", required_argument, NULL, MIDRD_OPT_LINK},
+	{"local-fact-socket", required_argument, NULL,
+	 MIDRD_OPT_LOCAL_FACT_SOCKET},
+	{"prefix-socket", required_argument, NULL, MIDRD_OPT_PREFIX_SOCKET},
+	{"sequence-file", required_argument, NULL, MIDRD_OPT_SEQUENCE_FILE},
+	{"lifetime", required_argument, NULL, MIDRD_OPT_LIFETIME},
+	{"hold-time", required_argument, NULL, MIDRD_OPT_HOLD_TIME},
+	{"runtime", required_argument, NULL, MIDRD_OPT_RUNTIME},
+	{"takeover-delay", required_argument, NULL, MIDRD_OPT_TAKEOVER_DELAY},
+	{"pidfile", required_argument, NULL, MIDRD_OPT_PIDFILE},
+	{0},
+};
 
 static int reconcile_group_prefixes(struct midr_context *daemon, uint64_t now_ms);
 
@@ -2465,19 +2572,45 @@ static int midr_context_initialize(
 	return 0;
 }
 
-static void usage(const char *program)
+static FRR_NORETURN void midrd_terminate(int status)
 {
-	fprintf(stderr,
-		"usage: %s --node-id N --listen HOST:PORT [--peer HOST:PORT]... "
-		"[--group ID] [--prefix ADDRESS/LEN] [--link NODE:COST]... "
-		"[--local-fact-socket PATH] [--prefix-socket PATH] "
-		"[--sequence-file PATH] [--lifetime MS] [--hold-time MS] "
-		"[--runtime SEC] "
-		"[--takeover-delay MS] [--pidfile PATH]\n",
-		program);
+	struct midr_context *daemon = midrd_runtime;
+
+	if (daemon && !daemon->terminating) {
+		daemon->terminating = true;
+		event_cancel(&daemon->poll_event);
+		shutdown_withdraw(daemon);
+		printf("midrd node=%" PRIu32 " final-objects=%zu\n",
+		       daemon->node_id, midr_engine_count(daemon->engine));
+		midr_context_finish(daemon);
+	}
+	if (midrd_di.pid_file)
+		(void)unlink(midrd_di.pid_file);
+	midrd_runtime = NULL;
+	frr_fini();
+	exit(status);
 }
 
-int main(int argc, char **argv)
+static void midrd_poll(struct event *event)
+{
+	struct midr_context *daemon = EVENT_ARG(event);
+	uint64_t now;
+
+	daemon->poll_event = NULL;
+	if (daemon->terminating)
+		return;
+	(void)midr_local_ipc_server_poll(daemon->local_ipc, 0);
+	(void)midr_prefix_ipc_server_poll(daemon->prefix_ipc, 0);
+	(void)midr_transport_poll(daemon->transport, 0);
+	now = mono_ms();
+	periodic(daemon, now);
+	if (daemon->stop_at && now >= daemon->stop_at)
+		midrd_terminate(0);
+	event_add_timer_msec(daemon->master, midrd_poll, daemon,
+			     MIDRD_POLL_INTERVAL_MS, &daemon->poll_event);
+}
+
+int main(int argc, char **argv, char **envp)
 {
 	struct midr_context daemon = {
 		.lifetime_ms = MIDRD_DEFAULT_LIFETIME,
@@ -2487,58 +2620,70 @@ int main(int argc, char **argv)
 	struct midr_transport_config transport_config = {0};
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
-	const char *pidfile = NULL;
-	FILE *pid_stream = NULL;
 	int runtime_sec = 0;
+	int exit_status = 1;
 	int opt;
 
-	for (opt = 1; opt < argc; opt++) {
-		if (!strcmp(argv[opt], "--node-id") && opt + 1 < argc)
-			daemon.node_id = (uint32_t)strtoul(argv[++opt], NULL, 10);
-		else if (!strcmp(argv[opt], "--listen") && opt + 1 < argc)
-			listen_text = argv[++opt];
-		else if (!strcmp(argv[opt], "--peer") && opt + 1 < argc) {
+	(void)envp;
+	frr_preinit(&midrd_di, argc, argv);
+	frr_opt_add("", midrd_longopts, midrd_help);
+	while ((opt = frr_getopt(argc, argv, NULL)) != EOF) {
+		switch (opt) {
+		case MIDRD_OPT_NODE_ID:
+			daemon.node_id = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_LISTEN:
+			listen_text = optarg;
+			break;
+		case MIDRD_OPT_PEER:
 			if (daemon.peer_count == MIDRD_MAX_PEERS ||
-			    parse_endpoint(argv[++opt],
+			    parse_endpoint(optarg,
 					   &daemon.peers[daemon.peer_count].endpoint)) {
-				usage(argv[0]);
-				return 2;
+				frr_help_exit(2);
 			}
 			daemon.peer_count++;
-		} else if (!strcmp(argv[opt], "--prefix") && opt + 1 < argc)
-			prefix_text = argv[++opt];
-		else if (!strcmp(argv[opt], "--link") && opt + 1 < argc) {
+			break;
+		case MIDRD_OPT_PREFIX:
+			prefix_text = optarg;
+			break;
+		case MIDRD_OPT_LINK:
 			if (daemon.link_count == MIDRD_MAX_LINKS ||
-			    parse_link(argv[++opt], &daemon.links[daemon.link_count])) {
-				usage(argv[0]);
-				return 2;
+			    parse_link(optarg, &daemon.links[daemon.link_count])) {
+				frr_help_exit(2);
 			}
 			daemon.link_count++;
-		}
-		else if (!strcmp(argv[opt], "--group") && opt + 1 < argc)
-			daemon.group_id = (uint32_t)strtoul(argv[++opt], NULL, 10);
-		else if (!strcmp(argv[opt], "--local-fact-socket") &&
-			 opt + 1 < argc)
-			local_socket = argv[++opt];
-		else if (!strcmp(argv[opt], "--prefix-socket") && opt + 1 < argc)
-			prefix_socket = argv[++opt];
-		else if (!strcmp(argv[opt], "--sequence-file") && opt + 1 < argc)
-			daemon.sequence_file = argv[++opt];
-		else if (!strcmp(argv[opt], "--lifetime") && opt + 1 < argc)
-			daemon.lifetime_ms = (uint32_t)strtoul(argv[++opt], NULL, 10);
-		else if (!strcmp(argv[opt], "--hold-time") && opt + 1 < argc)
-			daemon.hold_time_ms =
-				(uint32_t)strtoul(argv[++opt], NULL, 10);
-		else if (!strcmp(argv[opt], "--takeover-delay") && opt + 1 < argc)
-			daemon.takeover_delay_ms =
-				(uint32_t)strtoul(argv[++opt], NULL, 10);
-		else if (!strcmp(argv[opt], "--runtime") && opt + 1 < argc)
-			runtime_sec = atoi(argv[++opt]);
-		else if (!strcmp(argv[opt], "--pidfile") && opt + 1 < argc)
-			pidfile = argv[++opt];
-		else {
-			usage(argv[0]);
-			return 2;
+			break;
+		case MIDRD_OPT_GROUP:
+			daemon.group_id = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_LOCAL_FACT_SOCKET:
+			local_socket = optarg;
+			break;
+		case MIDRD_OPT_PREFIX_SOCKET:
+			prefix_socket = optarg;
+			break;
+		case MIDRD_OPT_SEQUENCE_FILE:
+			daemon.sequence_file = optarg;
+			break;
+		case MIDRD_OPT_LIFETIME:
+			daemon.lifetime_ms = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_HOLD_TIME:
+			daemon.hold_time_ms = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_TAKEOVER_DELAY:
+			daemon.takeover_delay_ms = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_RUNTIME:
+			runtime_sec = atoi(optarg);
+			break;
+		case MIDRD_OPT_PIDFILE:
+			midrd_di.pid_file = optarg;
+			break;
+		case 0:
+			break;
+		default:
+			frr_help_exit(2);
 		}
 	}
 	if (!daemon.hold_time_ms)
@@ -2578,8 +2723,10 @@ int main(int argc, char **argv)
 	transport_config.hold_time_ms = daemon.hold_time_ms;
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
+	daemon.master = frr_init();
 	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
+		frr_fini();
 		return 1;
 	}
 	if (prefix_socket) {
@@ -2593,8 +2740,7 @@ int main(int argc, char **argv)
 		if (midr_prefix_ipc_server_create(&ipc_config, &daemon.prefix_ipc) ||
 		    midr_prefix_ipc_server_start(daemon.prefix_ipc)) {
 			fprintf(stderr, "prefix IPC initialization failed\n");
-			midr_context_finish(&daemon);
-			return 1;
+			goto fail;
 		}
 	}
 	if (local_socket) {
@@ -2608,54 +2754,32 @@ int main(int argc, char **argv)
 		if (midr_local_ipc_server_create(&ipc_config, &daemon.local_ipc) ||
 		    midr_local_ipc_server_start(daemon.local_ipc)) {
 			fprintf(stderr, "local fact IPC initialization failed\n");
-			midr_context_finish(&daemon);
-			return 1;
+			goto fail;
 		}
 	}
 	for (size_t i = 0; i < daemon.peer_count; i++)
 		if (midr_transport_connect(daemon.transport,
 					    &daemon.peers[i].endpoint)) {
 			fprintf(stderr, "peer connection setup failed\n");
-			midr_context_finish(&daemon);
-			return 1;
+			goto fail;
 		}
 	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
 		fprintf(stderr, "invalid prefix\n");
-		midr_context_finish(&daemon);
-		return 2;
+		exit_status = 2;
+		goto fail;
 	}
 	if (daemon.group_id && install_local_membership(&daemon, daemon.group_id)) {
 		fprintf(stderr, "invalid group\n");
-		midr_context_finish(&daemon);
-		return 2;
+		exit_status = 2;
+		goto fail;
 	}
 	for (size_t i = 0; i < daemon.link_count; i++)
 		if (install_local_link(&daemon, &daemon.links[i])) {
 			fprintf(stderr, "invalid link\n");
-			midr_context_finish(&daemon);
-			return 2;
+			exit_status = 2;
+			goto fail;
 		}
 	(void)reconcile_group_prefixes(&daemon, mono_ms());
-	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR) {
-		midr_context_finish(&daemon);
-		return 1;
-	}
-	if (pidfile) {
-		pid_stream = fopen(pidfile, "w");
-		if (!pid_stream || fprintf(pid_stream, "%ld\n", (long)getpid()) < 0) {
-			if (pid_stream)
-				(void)fclose(pid_stream);
-			(void)unlink(pidfile);
-			midr_context_finish(&daemon);
-			return 1;
-		}
-		if (fclose(pid_stream) != 0) {
-			(void)unlink(pidfile);
-			midr_context_finish(&daemon);
-			return 1;
-		}
-		pid_stream = NULL;
-	}
 	{
 		uint64_t now = mono_ms();
 
@@ -2671,21 +2795,16 @@ int main(int argc, char **argv)
 	       daemon.node_id, transport_config.local.family,
 	       transport_config.local.port);
 	drain_events(&daemon, NULL);
-	for (;;) {
-		uint64_t now = mono_ms();
+	midrd_runtime = &daemon;
+	(void)fflush(NULL);
+	frr_config_fork();
+	event_add_timer_msec(daemon.master, midrd_poll, &daemon, 0,
+			     &daemon.poll_event);
+	frr_run(daemon.master);
+	midrd_terminate(0);
 
-		if (stop_requested || (daemon.stop_at && now >= daemon.stop_at))
-			break;
-		(void)midr_local_ipc_server_poll(daemon.local_ipc, 0);
-		(void)midr_prefix_ipc_server_poll(daemon.prefix_ipc, 0);
-		(void)midr_transport_poll(daemon.transport, 100);
-		periodic(&daemon, mono_ms());
-	}
-	shutdown_withdraw(&daemon);
-	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
-	       midr_engine_count(daemon.engine));
+fail:
 	midr_context_finish(&daemon);
-	if (pidfile)
-		(void)unlink(pidfile);
-	return 0;
+	frr_fini();
+	return exit_status;
 }

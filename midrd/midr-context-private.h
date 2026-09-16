@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "frrevent.h"
 #include "midr-context.h"
 #include "midr-consumer.h"
 #include "midr-core.h"
@@ -29,6 +30,7 @@
 #define MIDRD_FORWARD_BUDGET_MS 1000U
 #define MIDRD_TED_RETRY_MS 1000U
 #define MIDRD_SHUTDOWN_WAIT_MS 1000U
+#define MIDRD_POLL_INTERVAL_MS 10U
 
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
@@ -99,6 +101,8 @@ struct midrd_local_stage {
 };
 
 struct midr_context {
+	struct event_loop *master;
+	struct event *poll_event;
 	uint32_t node_id;
 	uint32_t group_id;
 	uint32_t lifetime_ms;
@@ -153,6 +157,7 @@ struct midr_context {
 	uint64_t shutdown_generation_failures;
 	bool shutdown_active;
 	uint64_t shutdown_write_failures;
+	bool terminating;
 };
 
 #endif /* MIDRD_CONTEXT_PRIVATE_H */

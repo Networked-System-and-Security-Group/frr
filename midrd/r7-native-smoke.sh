@@ -52,16 +52,19 @@ run_cluster() {
 	"$BIN" --node-id 101 --listen "$a_listen" --peer "$a_peer" \
 		--group 1 --prefix "$prefix_a" --link 102:5 \
 		--takeover-delay 500 --lifetime 3000 --runtime "$RUNTIME" \
+		--pidfile "$run/a.pid" \
 		>"$run/a.log" 2>&1 &
 	a=$!
 	"$BIN" --node-id 102 --listen "$b_listen" --peer "$b_peer" \
 		--peer "$b_to_c" --group 1 --prefix "$prefix_b" \
 		--link 101:5 --link 103:7 --takeover-delay 500 --lifetime 3000 \
-		--runtime "$RUNTIME" >"$run/b.log" 2>&1 &
+		--runtime "$RUNTIME" --pidfile "$run/b.pid" \
+		>"$run/b.log" 2>&1 &
 	b=$!
 	"$BIN" --node-id 103 --listen "$c_listen" --peer "$c_peer" \
 		--group 1 --prefix "$prefix_c" --link 102:7 \
 		--takeover-delay 500 --lifetime 3000 --runtime "$RUNTIME" \
+		--pidfile "$run/c.pid" \
 		>"$run/c.log" 2>&1 &
 	c=$!
 	PIDS="$a $b $c"

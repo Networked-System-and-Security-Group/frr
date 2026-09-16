@@ -4,6 +4,12 @@ CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic
 BUILD_DIR ?= build
 PREFIX ?= /usr/local
 SBINDIR ?= $(PREFIX)/sbin
+FRR_CPPFLAGS ?= -DHAVE_CONFIG_H -I.. -I../lib
+FRR_CFLAGS ?= -std=gnu11 -Wno-pedantic -Wno-missing-field-initializers \
+	-Wno-unused-parameter
+FRR_LIBDIR ?= $(abspath ../lib/.libs)
+FRR_LIB ?= $(FRR_LIBDIR)/libfrr.so
+FRR_LDFLAGS ?= -Wl,-rpath,$(FRR_LIBDIR)
 
 .PHONY: all test clean boundary install native-smoke hardening-smoke
 
@@ -118,7 +124,7 @@ $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-con
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-prefix-provider.c -o $@
@@ -148,10 +154,10 @@ $(BUILD_DIR)/midrd-local-ipc-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-lo
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c local-transaction-test.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c local-transaction-test.c -o $@
 
 $(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-ted-test.o: ted-test.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c ted-test.c -o $@
@@ -166,10 +172,10 @@ $(BUILD_DIR)/midrd-lsdb-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consume
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-context.h midr-context-private.h midr-transport.h midr-engine.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c sync-test.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c sync-test.c -o $@
 
 $(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c owned-test.c -o $@
@@ -178,10 +184,10 @@ $(BUILD_DIR)/midrd-owned-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-owned.
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd-prefix-transaction-test.o: prefix-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c prefix-transaction-test.c -o $@
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c prefix-transaction-test.c -o $@
 
 $(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-scope-test.o: scope-test.c midr-scope.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c scope-test.c -o $@
@@ -203,7 +209,7 @@ $(BUILD_DIR)/midrd-engine-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-engine-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
 $(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(BUILD_DIR)/midrd.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 test: all
 	$(BUILD_DIR)/midrd-contract-test

@@ -25,12 +25,14 @@ trap cleanup EXIT
 "$BIN" --node-id 902 --listen "127.0.0.1:$((BASE_PORT + 2))" \
 	--peer "127.0.0.1:$((BASE_PORT + 1))" --group 1 \
 	--prefix 192.0.2.2/32 --sequence-file "$RUN/peer.seq" \
-	--lifetime 3000 --runtime 8 >"$PEER_LOG" 2>&1 &
+	--lifetime 3000 --runtime 8 --pidfile "$RUN/peer.pid" \
+	>"$PEER_LOG" 2>&1 &
 peer_pid=$!
 "$BIN" --node-id 901 --listen "127.0.0.1:$((BASE_PORT + 1))" \
 	--peer "127.0.0.1:$((BASE_PORT + 2))" --group 1 \
 	--prefix 192.0.2.1/32 --sequence-file "$SEQ_FILE" \
-	--lifetime 3000 --runtime 20 >"$OWNER_LOG" 2>&1 &
+	--lifetime 3000 --runtime 20 --pidfile "$RUN/owner.pid" \
+	>"$OWNER_LOG" 2>&1 &
 owner_pid=$!
 
 sleep 1
@@ -41,7 +43,8 @@ sleep 0.3
 "$BIN" --node-id 901 --listen "127.0.0.1:$((BASE_PORT + 1))" \
 	--peer "127.0.0.1:$((BASE_PORT + 2))" --group 1 \
 	--prefix 192.0.2.1/32 --sequence-file "$SEQ_FILE" \
-	--lifetime 3000 --runtime 4 >"$OWNER_RESTART_LOG" 2>&1 &
+	--lifetime 3000 --runtime 4 --pidfile "$RUN/owner.pid" \
+	>"$OWNER_RESTART_LOG" 2>&1 &
 owner_restart_pid=$!
 
 wait "$owner_restart_pid"

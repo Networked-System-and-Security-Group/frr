@@ -111,7 +111,8 @@ topology:
           --listen 0.0.0.0:33101 --peer 10.78.1.2:33102
           --peer 10.78.3.2:33103 --group 1 --prefix 10.20.1.1/32
           --link 202:5 --link 203:20 --takeover-delay 1500
-          --lifetime 6000 --runtime 8 >/tmp/midrd.log 2>&1 &'
+          --lifetime 6000 --runtime 8 --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
       image: $IMAGE
@@ -126,7 +127,8 @@ topology:
           --listen 0.0.0.0:33102 --peer 10.78.1.1:33101
           --peer 10.78.2.2:33103 --group 1 --prefix 10.20.2.2/32
           --link 201:5 --link 203:7 --takeover-delay 1500
-          --lifetime 6000 --runtime 8 >/tmp/midrd.log 2>&1 &'
+          --lifetime 6000 --runtime 8 --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -141,7 +143,8 @@ topology:
           --listen 0.0.0.0:33103 --peer 10.78.2.1:33102
           --peer 10.78.3.1:33101 --group 1 --prefix 10.20.3.3/32
           --link 202:7 --link 201:20 --takeover-delay 1500
-          --lifetime 6000 --runtime 8 >/tmp/midrd.log 2>&1 &'
+          --lifetime 6000 --runtime 8 --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
     - endpoints: ["b:eth2", "c:eth1"]
@@ -189,7 +192,7 @@ topology:
           --listen 10.79.1.1:33201 --peer 10.79.1.2:33202
           --group 1 --prefix 10.21.1.1/32 --link 212:5
           --takeover-delay 1000 --lifetime 10000 --hold-time 2000
-          --runtime 14 >/tmp/midrd.log 2>&1 &'
+          --runtime 14 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
       image: $IMAGE
@@ -205,6 +208,7 @@ topology:
           --peer 10.79.2.2:33203 --group 1 --prefix 10.21.2.2/32
           --link 211:5 --link 213:7 --takeover-delay 1000
           --lifetime 10000 --hold-time 2000 --runtime 14
+          --pidfile /tmp/midrd.pid
           >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
@@ -219,7 +223,7 @@ topology:
           --listen 10.79.2.2:33203 --peer 10.79.2.1:33202
           --group 1 --prefix 10.21.3.3/32 --link 212:7
           --takeover-delay 1000 --lifetime 10000 --hold-time 2000
-          --runtime 14 >/tmp/midrd.log 2>&1 &'
+          --runtime 14 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
     - endpoints: ["b:eth2", "c:eth1"]
@@ -309,7 +313,7 @@ topology:
           --peer [2001:db8:79:1::2]:33502 --group 1
           --prefix 2001:db8:21::1/128 --link 232:5
           --takeover-delay 1000 --lifetime 10000 --hold-time 2000
-          --runtime 14 >/tmp/midrd.log 2>&1 &'
+          --runtime 14 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
       image: $IMAGE
@@ -325,7 +329,7 @@ topology:
           --peer [2001:db8:79:2::2]:33503 --group 1
           --prefix 2001:db8:22::2/128 --link 231:5 --link 233:7
           --takeover-delay 1000 --lifetime 10000 --hold-time 2000
-          --runtime 14 >/tmp/midrd.log 2>&1 &'
+          --runtime 14 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -340,7 +344,7 @@ topology:
           --peer [2001:db8:79:2::1]:33502 --group 1
           --prefix 2001:db8:23::3/128 --link 232:7
           --takeover-delay 1000 --lifetime 10000 --hold-time 2000
-          --runtime 14 >/tmp/midrd.log 2>&1 &'
+          --runtime 14 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
     - endpoints: ["b:eth2", "c:eth1"]
@@ -431,6 +435,7 @@ topology:
           --listen 10.81.1.1:33601 --peer 10.81.1.2:33602
           --group 1 --prefix 10.23.1.1/32 --link 302:5
           --takeover-delay 1000 --lifetime 6000 --runtime 18
+          --pidfile /tmp/midrd.pid
           >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
@@ -446,7 +451,8 @@ topology:
           --listen 0.0.0.0:33602 --peer 10.81.1.1:33601
           --peer 10.81.2.2:33603 --group 1 --prefix 10.23.2.2/32
           --link 301:5 --link 303:7 --takeover-delay 1000
-          --lifetime 6000 --runtime 18 >/tmp/midrd.log 2>&1 &'
+          --lifetime 6000 --runtime 18 --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -460,6 +466,7 @@ topology:
           --listen 10.81.2.2:33603 --peer 10.81.2.1:33602
           --group 1 --prefix 10.23.3.3/32 --link 302:7
           --takeover-delay 1000 --lifetime 6000 --runtime 18
+          --pidfile /tmp/midrd.pid
           >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
@@ -662,7 +669,8 @@ topology:
           --listen 0.0.0.0:33302 --peer 10.80.1.1:33301
           --peer 10.80.2.2:33303 --group 1 --prefix 10.22.2.2/32
           --link 221:5 --link 223:7 --takeover-delay 1000
-          --lifetime 3000 --runtime 9 >/tmp/midrd.log 2>&1 &'
+          --lifetime 3000 --runtime 9 --pidfile /tmp/midrd.pid
+          >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -676,6 +684,7 @@ topology:
           --listen 10.80.2.2:33303 --peer 10.80.2.1:33302
           --group 1 --prefix 10.22.3.3/32 --link 222:7
           --takeover-delay 1000 --lifetime 3000 --runtime 9
+          --pidfile /tmp/midrd.pid
           >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
