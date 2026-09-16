@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "midr-cost.h"
+#include "midr-context-private.h"
 #include "midr-engine.h"
 #include "midr-local-ipc.h"
 #include "midr-local-provider.h"
@@ -26,17 +27,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MIDRD_MAX_PEERS 32U
-#define MIDRD_MAX_LINKS 64U
-#define MIDRD_MAX_SNAPSHOT 4096U
-#define MIDRD_MAX_FRAME 4096U
-#define MIDRD_DEFAULT_LIFETIME 6000U
-#define MIDRD_DEFAULT_HELLO 1000U
-#define MIDRD_DEFAULT_TAKEOVER_DELAY 3000U
-#define MIDRD_FORWARD_BUDGET_MS 1000U
-#define MIDRD_TED_RETRY_MS 1000U
-#define MIDRD_SHUTDOWN_WAIT_MS 1000U
-
 static volatile sig_atomic_t stop_requested;
 
 static void on_signal(int signal_number)
@@ -45,137 +35,9 @@ static void on_signal(int signal_number)
 	stop_requested = 1;
 }
 
-struct midrd_peer_config {
-	struct midr_transport_endpoint endpoint;
-	uint32_t node_id;
-};
+static int reconcile_group_prefixes(struct midr_context *daemon, uint64_t now_ms);
 
-/* Development-time static Link input.  The daemon is the owner of the
- * resulting object; the remote node and metric are the only wire-facing
- * parameters needed for a single link between two nodes. */
-struct midrd_link_config {
-	uint32_t remote;
-	uint32_t local_ifindex;
-	uint32_t metric;
-	uint32_t candidate_metric;
-	uint64_t link_id;
-	uint8_t address_family;
-	uint8_t local_address[MIDR_CORE_ADDR_BYTES];
-	uint8_t remote_address[MIDR_CORE_ADDR_BYTES];
-	struct midr_cost_metrics latest_metrics;
-	uint64_t input_version;
-	uint64_t measurement_sequence;
-	uint64_t measurement_timestamp_ms;
-	uint64_t last_cost_advertised_ms;
-	bool cost_pending;
-};
-
-struct midrd_snapshot_stage {
-	struct midr_transport_endpoint peer;
-	struct midr_core_object *objects;
-	uint64_t *received_ns;
-	struct midr_core_object *updates;
-	uint64_t *update_received_ns;
-	size_t count;
-	size_t update_count;
-	size_t capacity;
-	bool active;
-	bool ended;
-	uint64_t generation;
-};
-
-struct midrd_prefix_stage {
-	struct midr_prefix prefixes[MIDRD_MAX_SNAPSHOT];
-	size_t count;
-	uint64_t generation;
-	uint32_t originator;
-	bool active;
-	bool ended;
-	bool discard;
-};
-
-struct midrd_local_link_version {
-	uint32_t remote;
-	uint64_t link_id;
-	uint64_t version;
-};
-
-struct midrd_local_stage {
-	struct midr_local_membership membership;
-	struct midr_local_link links[MIDRD_MAX_LINKS];
-	struct midrd_local_link_version link_versions[MIDRD_MAX_SNAPSHOT];
-	size_t link_count;
-	size_t link_version_count;
-	uint64_t membership_floor;
-	uint64_t generation;
-	uint32_t originator;
-	bool membership_present;
-	bool active;
-	bool ended;
-	bool discard;
-};
-
-struct midrd {
-	uint32_t node_id;
-	uint32_t group_id;
-	uint32_t lifetime_ms;
-	uint32_t hello_ms;
-	uint32_t hold_time_ms;
-	uint32_t takeover_delay_ms;
-	uint64_t frame_sequence;
-	struct midr_engine *engine;
-	struct midr_owned *owned;
-	struct midr_consumer *consumer;
-	struct midr_ted *ted;
-	struct midr_prefix_provider *prefix_provider;
-	struct midr_prefix_ipc *prefix_ipc;
-	struct midr_local_ipc *local_ipc;
-	struct midr_transport *transport;
-	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
-	struct midrd_link_config links[MIDRD_MAX_LINKS];
-	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];
-	struct midr_prefix ipc_prefixes[MIDRD_MAX_SNAPSHOT];
-	struct midrd_prefix_stage prefix_stage;
-	struct midrd_local_stage local_stage;
-	struct midrd_local_link_version local_link_versions[MIDRD_MAX_SNAPSHOT];
-	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
-	size_t peer_count;
-	size_t link_count;
-	size_t group_prefix_count;
-	size_t ipc_prefix_count;
-	size_t local_link_version_count;
-	uint64_t prefix_generation;
-	uint64_t local_generation;
-	uint64_t membership_version;
-	uint32_t representative_group;
-	uint32_t representative_node;
-	uint64_t takeover_ready_at;
-	bool representative_committed;
-	bool group_reconcile_pending;
-	bool owned_commit_active;
-	uint64_t owned_commit_now_ms;
-	struct midr_core_identity local_identity;
-	bool have_local_identity;
-	const char *sequence_file;
-	uint64_t next_hello;
-	uint64_t next_keepalive;
-	uint64_t next_refresh;
-	uint64_t next_expire;
-	uint64_t next_ted_retry;
-	uint64_t last_spf_generation;
-	uint64_t stop_at;
-	bool ted_rebuild_pending;
-	/* Keep the previous consistent TED view while an inbound EoR batch is
-	 * being committed; publish a new derived view only after the barrier. */
-	bool sync_derivation_wait;
-	uint64_t shutdown_generation_failures;
-	bool shutdown_active;
-	uint64_t shutdown_write_failures;
-};
-
-static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms);
-
-static uint32_t peer_node_id(const struct midrd *daemon,
+static uint32_t peer_node_id(const struct midr_context *daemon,
 			     const struct midr_transport_endpoint *peer)
 {
 	if (!daemon || !peer)
@@ -186,7 +48,7 @@ static uint32_t peer_node_id(const struct midrd *daemon,
 	return 0;
 }
 
-static struct midrd_snapshot_stage *stage_for(struct midrd *daemon,
+static struct midrd_snapshot_stage *stage_for(struct midr_context *daemon,
 					      const struct midr_transport_endpoint *peer,
 					      bool create)
 {
@@ -250,7 +112,7 @@ static uint64_t mono_ms(void)
 	return mono_ns() / 1000000U;
 }
 
-static int age_object_lifetime(const struct midrd *daemon,
+static int age_object_lifetime(const struct midr_context *daemon,
 			       struct midr_core_object *object,
 			       uint64_t received_ns, uint64_t now_ns,
 			       uint32_t budget_ms)
@@ -377,7 +239,7 @@ static int parse_link(const char *text, struct midrd_link_config *link)
 	return 0;
 }
 
-static int send_frame_at(struct midrd *daemon,
+static int send_frame_at(struct midr_context *daemon,
 			 const struct midr_transport_endpoint *peer,
 			 uint8_t type, const uint8_t *payload,
 			 size_t payload_len, uint64_t encoded_ns)
@@ -394,14 +256,14 @@ static int send_frame_at(struct midrd *daemon,
 	return midr_transport_send(daemon->transport, peer, &frame);
 }
 
-static int send_frame(struct midrd *daemon,
+static int send_frame(struct midr_context *daemon,
 		      const struct midr_transport_endpoint *peer,
 		      uint8_t type, const uint8_t *payload, size_t payload_len)
 {
 	return send_frame_at(daemon, peer, type, payload, payload_len, 0);
 }
 
-static int send_hello(struct midrd *daemon,
+static int send_hello(struct midr_context *daemon,
 			      const struct midr_transport_endpoint *peer)
 {
 	uint8_t payload[28] = {0};
@@ -418,7 +280,7 @@ static int send_hello(struct midrd *daemon,
 	return send_frame(daemon, peer, MIDR_WIRE_HELLO, payload, sizeof(payload));
 }
 
-static int send_object(struct midrd *daemon,
+static int send_object(struct midr_context *daemon,
 			       const struct midr_transport_endpoint *peer,
 			       const struct midr_core_object *object,
 			       uint64_t observed_ns)
@@ -442,7 +304,7 @@ static int send_object(struct midrd *daemon,
 	return send_frame_at(daemon, peer, type, payload, length, encoded_ns);
 }
 
-static int send_snapshot_object(struct midrd *daemon,
+static int send_snapshot_object(struct midr_context *daemon,
 				const struct midr_transport_endpoint *peer,
 				const struct midr_core_object *object,
 				uint64_t observed_ns)
@@ -465,7 +327,7 @@ static int send_snapshot_object(struct midrd *daemon,
 			     length, encoded_ns);
 }
 
-static void flood_object(struct midrd *daemon,
+static void flood_object(struct midr_context *daemon,
 			 const struct midr_core_object *object,
 			 uint64_t observed_ns,
 			 const struct midr_transport_endpoint *except)
@@ -482,7 +344,7 @@ static void flood_object(struct midrd *daemon,
 	}
 }
 
-static void reflood_scope(struct midrd *daemon,
+static void reflood_scope(struct midr_context *daemon,
 			  const struct midr_transport_endpoint *except)
 {
 	struct midr_core_object *objects;
@@ -502,7 +364,7 @@ static void reflood_scope(struct midrd *daemon,
 	free(objects);
 }
 
-static void note_engine_publication(struct midrd *daemon)
+static void note_engine_publication(struct midr_context *daemon)
 {
 	int error;
 	enum midr_ted_state previous_state;
@@ -524,7 +386,7 @@ static void note_engine_publication(struct midrd *daemon)
 			daemon->node_id, error);
 }
 
-static int apply_update(struct midrd *daemon,
+static int apply_update(struct midr_context *daemon,
 			const struct midr_core_object *object,
 			uint64_t now_ms, enum midr_core_result *result,
 			bool *scope_changed)
@@ -543,7 +405,7 @@ static int apply_update(struct midrd *daemon,
 	return ret;
 }
 
-static int rebuild_ted(struct midrd *daemon)
+static int rebuild_ted(struct midr_context *daemon)
 {
 	struct midr_consumer_snapshot snapshot = {0};
 	enum midr_ted_state previous_state;
@@ -583,7 +445,7 @@ static int rebuild_ted(struct midrd *daemon)
 	return 0;
 }
 
-static void drain_consumer(struct midrd *daemon)
+static void drain_consumer(struct midr_context *daemon)
 {
 	struct midr_consumer_event event;
 	struct midr_ted_view view = {0};
@@ -651,7 +513,7 @@ static void drain_consumer(struct midrd *daemon)
 	}
 }
 
-static void drain_events(struct midrd *daemon,
+static void drain_events(struct midr_context *daemon,
 			 const struct midr_transport_endpoint *except)
 {
 	struct midr_core_object event_object;
@@ -675,7 +537,7 @@ static void drain_events(struct midrd *daemon,
 	drain_consumer(daemon);
 }
 
-static void send_snapshot(struct midrd *daemon,
+static void send_snapshot(struct midr_context *daemon,
 			  const struct midr_transport_endpoint *peer)
 {
 	struct midr_core_object *objects;
@@ -702,7 +564,7 @@ static void send_snapshot(struct midrd *daemon,
 static void on_consumer_event(void *arg,
 			      const struct midr_consumer_event *event)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	if (!daemon || !event || event->kind != MIDR_CONSUMER_SNAPSHOT_END)
 		return;
@@ -719,7 +581,7 @@ static void on_consumer_event(void *arg,
 static void on_established(void *arg,
 			   const struct midr_transport_endpoint *peer)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	printf("node=%" PRIu32 " established family=%u port=%u\n",
 	       daemon->node_id, peer->family, peer->port);
@@ -749,7 +611,7 @@ static int stage_generation_check(const struct midrd_snapshot_stage *stage,
 static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
 			      int reason)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	struct midrd_snapshot_stage *stage = stage_for(daemon, peer, false);
 
 	stage_release(stage);
@@ -761,7 +623,7 @@ static void on_frame_written(void *arg,
 			     const struct midr_transport_endpoint *peer,
 			     uint64_t generation, uint64_t sequence)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	if (!daemon || !peer)
 		return;
@@ -774,7 +636,7 @@ static void on_frame_dropped(void *arg,
 			     const struct midr_transport_endpoint *peer,
 			     uint64_t generation, uint64_t sequence, int reason)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	if (!daemon || !peer)
 		return;
@@ -789,7 +651,7 @@ static void on_frame_dropped(void *arg,
 static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			const struct midr_transport_frame *frame)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	struct midr_core_object object;
 	enum midr_core_result result;
 	int ret;
@@ -1009,7 +871,7 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 
 static int publish_owned(void *arg, const struct midr_core_object *object)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	enum midr_core_result result;
 	uint64_t now_ms;
 	int ret;
@@ -1023,7 +885,7 @@ static int publish_owned(void *arg, const struct midr_core_object *object)
 	return result == MIDR_CORE_ACCEPTED ? 0 : -EAGAIN;
 }
 
-static void set_local_identity(struct midrd *daemon,
+static void set_local_identity(struct midr_context *daemon,
 			       const struct midr_core_identity *identity)
 {
 	daemon->local_identity = *identity;
@@ -1033,7 +895,7 @@ static void set_local_identity(struct midrd *daemon,
 static int local_provider_event(void *arg,
 				const struct midr_prefix_event *event)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	struct midr_core_object object = {0};
 	int ret;
 
@@ -1082,7 +944,7 @@ static int prefix_find(const struct midr_prefix *prefixes, size_t count,
 	return -1;
 }
 
-static void prefix_identity(struct midrd *daemon,
+static void prefix_identity(struct midr_context *daemon,
 			    const struct midr_prefix *prefix,
 			    struct midr_core_identity *identity)
 {
@@ -1094,7 +956,7 @@ static void prefix_identity(struct midrd *daemon,
 	memcpy(identity->prefix, prefix->address, sizeof(identity->prefix));
 }
 
-static int preserve_staged_sequence(struct midrd *daemon,
+static int preserve_staged_sequence(struct midr_context *daemon,
 				    const struct midr_owned *staged,
 				    int operation_error)
 {
@@ -1104,7 +966,7 @@ static int preserve_staged_sequence(struct midrd *daemon,
 	return operation_error ? operation_error : ret;
 }
 
-static int commit_prefixes(struct midrd *daemon,
+static int commit_prefixes(struct midr_context *daemon,
 			   const struct midr_prefix *prefixes, size_t count)
 {
 	struct midr_owned *staged = NULL, *old_owned = NULL;
@@ -1249,7 +1111,7 @@ static void prefix_stage_reset(struct midrd_prefix_stage *stage)
 
 static int prefix_event(void *arg, const struct midr_prefix_event *event)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	struct midrd_prefix_stage *stage;
 	int ret;
 
@@ -1322,7 +1184,7 @@ static int prefix_ipc_event(void *arg, const struct midr_prefix_event *event)
 
 static void prefix_ipc_disconnect(void *arg, int reason)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	(void)reason;
 	prefix_stage_reset(&daemon->prefix_stage);
@@ -1350,7 +1212,7 @@ static int local_link_find(const struct midr_local_link *links, size_t count,
 }
 
 static const struct midrd_link_config *local_link_lookup(
-	const struct midrd *daemon, const struct midr_local_link *link)
+	const struct midr_context *daemon, const struct midr_local_link *link)
 {
 	for (size_t i = 0; i < daemon->link_count; i++)
 		if (local_link_key_equal(&daemon->links[i], link))
@@ -1493,7 +1355,7 @@ static int local_link_config_at(const struct midr_local_link *input,
 	return 0;
 }
 
-static void link_identity(struct midrd *daemon,
+static void link_identity(struct midr_context *daemon,
 			  const struct midrd_link_config *link,
 			  struct midr_core_identity *identity)
 {
@@ -1504,7 +1366,7 @@ static void link_identity(struct midrd *daemon,
 	identity->link_id = link->link_id;
 }
 
-static void link_object(struct midrd *daemon,
+static void link_object(struct midr_context *daemon,
 			const struct midrd_link_config *link,
 			struct midr_core_object *object)
 {
@@ -1523,7 +1385,7 @@ static uint32_t local_ifindex_lookup(void *arg, uint32_t local_node_id,
 				     uint32_t remote_node_id,
 				     uint64_t link_id)
 {
-	const struct midrd *daemon = arg;
+	const struct midr_context *daemon = arg;
 
 	if (!daemon || local_node_id != daemon->node_id)
 		return 0;
@@ -1560,7 +1422,7 @@ static bool local_ifindices_equal(const struct midrd_link_config *left,
 }
 
 static int commit_local_facts_at(
-	struct midrd *daemon, const struct midr_local_membership *membership,
+	struct midr_context *daemon, const struct midr_local_membership *membership,
 	bool membership_present, const struct midr_local_link *links,
 	size_t link_count, uint64_t membership_floor,
 	const struct midrd_local_link_version *version_floors,
@@ -1912,7 +1774,7 @@ static int local_stage_delta_apply(struct midrd_local_stage *stage,
 	return 0;
 }
 
-static int local_delta_at(struct midrd *daemon,
+static int local_delta_at(struct midr_context *daemon,
 			  const struct midr_local_event *event, uint64_t now_ms)
 {
 	struct midrd_local_stage stage = {0};
@@ -1968,7 +1830,7 @@ static int local_delta_at(struct midrd *daemon,
 static int local_event_at(void *arg, const struct midr_local_event *event,
 			  uint64_t now_ms)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 	struct midrd_local_stage *stage;
 	int ret;
 
@@ -2058,7 +1920,7 @@ static int local_event(void *arg, const struct midr_local_event *event)
 
 static void local_ipc_disconnect(void *arg, int reason)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	(void)reason;
 	local_stage_reset(&daemon->local_stage);
@@ -2068,7 +1930,7 @@ static void local_ipc_disconnect(void *arg, int reason)
 	daemon->local_generation = 0;
 }
 
-static int publish_pending_link_costs_at(struct midrd *daemon,
+static int publish_pending_link_costs_at(struct midr_context *daemon,
 					 uint64_t now_ms)
 {
 	struct midrd_link_config desired[MIDRD_MAX_LINKS];
@@ -2143,7 +2005,7 @@ failed:
 	return ret;
 }
 
-static int install_local_prefix(struct midrd *daemon, const char *text)
+static int install_local_prefix(struct midr_context *daemon, const char *text)
 {
 	char copy[128], *slash, *end;
 	struct midr_prefix prefix = {.metric = 10};
@@ -2183,7 +2045,7 @@ static int install_local_prefix(struct midrd *daemon, const char *text)
 	return midr_prefix_provider_upsert(daemon->prefix_provider, &prefix);
 }
 
-static int install_local_membership(struct midrd *daemon, uint32_t group_id)
+static int install_local_membership(struct midr_context *daemon, uint32_t group_id)
 {
 	struct midr_core_object object = {0};
 	int ret;
@@ -2202,7 +2064,7 @@ static int install_local_membership(struct midrd *daemon, uint32_t group_id)
 	return 0;
 }
 
-static int install_local_link(struct midrd *daemon,
+static int install_local_link(struct midr_context *daemon,
 			      const struct midrd_link_config *link)
 {
 	struct midr_core_object object;
@@ -2231,7 +2093,7 @@ static bool identity_present(const struct midr_core_identity *identities,
 	return false;
 }
 
-static int withdraw_group_prefixes(struct midrd *daemon)
+static int withdraw_group_prefixes(struct midr_context *daemon)
 {
 	size_t index = 0;
 	bool changed = false;
@@ -2256,7 +2118,7 @@ static int withdraw_group_prefixes(struct midrd *daemon)
 	return result;
 }
 
-static int reconcile_group_prefixes(struct midrd *daemon, uint64_t now_ms)
+static int reconcile_group_prefixes(struct midr_context *daemon, uint64_t now_ms)
 {
 	struct midr_core_object *objects = NULL;
 	struct midr_core_identity *desired = NULL;
@@ -2384,7 +2246,7 @@ done:
 	return ret ? ret : result;
 }
 
-static void refresh_owned(struct midrd *daemon)
+static void refresh_owned(struct midr_context *daemon)
 {
 	struct midr_core_identity identity = {0};
 
@@ -2413,7 +2275,7 @@ static void refresh_owned(struct midrd *daemon)
 	drain_events(daemon, NULL);
 }
 
-static void periodic(struct midrd *daemon, uint64_t now)
+static void periodic(struct midr_context *daemon, uint64_t now)
 {
 	(void)publish_pending_link_costs_at(daemon, now);
 	if (daemon->ted_rebuild_pending && now >= daemon->next_ted_retry) {
@@ -2471,7 +2333,7 @@ static enum midrd_shutdown_result shutdown_result(size_t remaining,
 	return MIDRD_SHUTDOWN_COMPLETE;
 }
 
-static void shutdown_withdraw(struct midrd *daemon)
+static void shutdown_withdraw(struct midr_context *daemon)
 {
 	uint64_t deadline;
 	bool generation_failed = false;
@@ -2535,6 +2397,74 @@ static void shutdown_withdraw(struct midrd *daemon)
 	daemon->shutdown_active = false;
 }
 
+static void midr_context_finish(struct midr_context *daemon)
+{
+	if (!daemon)
+		return;
+	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
+		stage_release(&daemon->stages[i]);
+	midr_local_ipc_server_destroy(&daemon->local_ipc);
+	midr_prefix_ipc_server_destroy(&daemon->prefix_ipc);
+	midr_transport_destroy(&daemon->transport);
+	midr_prefix_provider_destroy(&daemon->prefix_provider);
+	midr_owned_destroy(&daemon->owned);
+	midr_ted_destroy(&daemon->ted);
+	midr_consumer_destroy(&daemon->consumer);
+	midr_engine_destroy(&daemon->engine);
+}
+
+static int midr_context_initialize(
+	struct midr_context *daemon,
+	const struct midr_transport_config *transport_config)
+{
+	if (!daemon || !transport_config)
+		return -EINVAL;
+
+	struct midr_engine_config engine_config = {
+		.node_id = daemon->node_id,
+		.max_objects = MIDRD_MAX_SNAPSHOT,
+		.lifetime_ms = daemon->lifetime_ms,
+	};
+	struct midr_owned_config owned_config = {
+		.originator = daemon->node_id,
+		.max_objects = MIDRD_MAX_SNAPSHOT,
+		.lifetime_ms = daemon->lifetime_ms,
+		.sequence_file = daemon->sequence_file,
+	};
+	struct midr_ted_config ted_config = {
+		.max_events = MIDRD_MAX_SNAPSHOT,
+		.local_ifindex_lookup = local_ifindex_lookup,
+		.local_ifindex_arg = daemon,
+	};
+	struct midr_consumer_config consumer_config = {
+		.on_event = on_consumer_event,
+		.arg = daemon,
+	};
+	struct midr_transport_callbacks transport_callbacks = {
+		.on_frame = on_frame,
+		.on_established = on_established,
+		.on_closed = on_closed,
+		.on_frame_written = on_frame_written,
+		.on_frame_dropped = on_frame_dropped,
+		.arg = daemon,
+	};
+
+	if (midr_engine_create(&engine_config, &daemon->engine) ||
+	    midr_ted_create(&ted_config, &daemon->ted) ||
+	    midr_consumer_create(&consumer_config, &daemon->consumer) ||
+	    midr_engine_attach_ted(daemon->engine, daemon->ted) ||
+	    midr_engine_attach_consumer(daemon->engine, daemon->consumer) ||
+	    midr_owned_create(&owned_config, publish_owned, daemon,
+			      &daemon->owned) ||
+	    midr_transport_create(transport_config, &transport_callbacks,
+				  &daemon->transport) ||
+	    midr_transport_start(daemon->transport)) {
+		midr_context_finish(daemon);
+		return -1;
+	}
+	return 0;
+}
+
 static void usage(const char *program)
 {
 	fprintf(stderr,
@@ -2549,29 +2479,12 @@ static void usage(const char *program)
 
 int main(int argc, char **argv)
 {
-	struct midrd daemon = {
+	struct midr_context daemon = {
 		.lifetime_ms = MIDRD_DEFAULT_LIFETIME,
 		.hello_ms = MIDRD_DEFAULT_HELLO,
 		.takeover_delay_ms = MIDRD_DEFAULT_TAKEOVER_DELAY,
 	};
-	struct midr_engine_config engine_config;
-	struct midr_owned_config owned_config;
-	struct midr_ted_config ted_config = {
-		.max_events = MIDRD_MAX_SNAPSHOT,
-		.local_ifindex_lookup = local_ifindex_lookup,
-		.local_ifindex_arg = &daemon,
-	};
-	struct midr_consumer_config consumer_config = {
-		.on_event = on_consumer_event,
-	};
 	struct midr_transport_config transport_config = {0};
-	struct midr_transport_callbacks transport_callbacks = {
-		.on_frame = on_frame,
-		.on_established = on_established,
-		.on_closed = on_closed,
-		.on_frame_written = on_frame_written,
-		.on_frame_dropped = on_frame_dropped,
-	};
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
 	const char *pidfile = NULL;
@@ -2665,25 +2578,7 @@ int main(int argc, char **argv)
 	transport_config.hold_time_ms = daemon.hold_time_ms;
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
-	transport_callbacks.arg = &daemon;
-	consumer_config.arg = &daemon;
-	engine_config.node_id = daemon.node_id;
-	engine_config.max_objects = MIDRD_MAX_SNAPSHOT;
-	engine_config.lifetime_ms = daemon.lifetime_ms;
-	owned_config.originator = daemon.node_id;
-	owned_config.max_objects = MIDRD_MAX_SNAPSHOT;
-	owned_config.lifetime_ms = daemon.lifetime_ms;
-	owned_config.sequence_file = daemon.sequence_file;
-	if (midr_engine_create(&engine_config, &daemon.engine) ||
-	    midr_ted_create(&ted_config, &daemon.ted) ||
-	    midr_consumer_create(&consumer_config, &daemon.consumer) ||
-	    midr_engine_attach_ted(daemon.engine, daemon.ted) ||
-	    midr_engine_attach_consumer(daemon.engine, daemon.consumer) ||
-	    midr_owned_create(&owned_config, publish_owned, &daemon,
-			       &daemon.owned) ||
-	    midr_transport_create(&transport_config, &transport_callbacks,
-				   &daemon.transport) ||
-	    midr_transport_start(daemon.transport)) {
+	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
 		return 1;
 	}
@@ -2698,6 +2593,7 @@ int main(int argc, char **argv)
 		if (midr_prefix_ipc_server_create(&ipc_config, &daemon.prefix_ipc) ||
 		    midr_prefix_ipc_server_start(daemon.prefix_ipc)) {
 			fprintf(stderr, "prefix IPC initialization failed\n");
+			midr_context_finish(&daemon);
 			return 1;
 		}
 	}
@@ -2712,6 +2608,7 @@ int main(int argc, char **argv)
 		if (midr_local_ipc_server_create(&ipc_config, &daemon.local_ipc) ||
 		    midr_local_ipc_server_start(daemon.local_ipc)) {
 			fprintf(stderr, "local fact IPC initialization failed\n");
+			midr_context_finish(&daemon);
 			return 1;
 		}
 	}
@@ -2719,34 +2616,42 @@ int main(int argc, char **argv)
 		if (midr_transport_connect(daemon.transport,
 					    &daemon.peers[i].endpoint)) {
 			fprintf(stderr, "peer connection setup failed\n");
+			midr_context_finish(&daemon);
 			return 1;
 		}
 	if (prefix_text && install_local_prefix(&daemon, prefix_text)) {
 		fprintf(stderr, "invalid prefix\n");
+		midr_context_finish(&daemon);
 		return 2;
 	}
 	if (daemon.group_id && install_local_membership(&daemon, daemon.group_id)) {
 		fprintf(stderr, "invalid group\n");
+		midr_context_finish(&daemon);
 		return 2;
 	}
 	for (size_t i = 0; i < daemon.link_count; i++)
 		if (install_local_link(&daemon, &daemon.links[i])) {
 			fprintf(stderr, "invalid link\n");
+			midr_context_finish(&daemon);
 			return 2;
 		}
 	(void)reconcile_group_prefixes(&daemon, mono_ms());
-	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR)
+	if (signal(SIGINT, on_signal) == SIG_ERR || signal(SIGTERM, on_signal) == SIG_ERR) {
+		midr_context_finish(&daemon);
 		return 1;
+	}
 	if (pidfile) {
 		pid_stream = fopen(pidfile, "w");
 		if (!pid_stream || fprintf(pid_stream, "%ld\n", (long)getpid()) < 0) {
 			if (pid_stream)
 				(void)fclose(pid_stream);
 			(void)unlink(pidfile);
+			midr_context_finish(&daemon);
 			return 1;
 		}
 		if (fclose(pid_stream) != 0) {
 			(void)unlink(pidfile);
+			midr_context_finish(&daemon);
 			return 1;
 		}
 		pid_stream = NULL;
@@ -2779,16 +2684,7 @@ int main(int argc, char **argv)
 	shutdown_withdraw(&daemon);
 	printf("midrd node=%" PRIu32 " final-objects=%zu\n", daemon.node_id,
 	       midr_engine_count(daemon.engine));
-	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
-		stage_release(&daemon.stages[i]);
-	midr_local_ipc_server_destroy(&daemon.local_ipc);
-	midr_prefix_ipc_server_destroy(&daemon.prefix_ipc);
-	midr_transport_destroy(&daemon.transport);
-	midr_prefix_provider_destroy(&daemon.prefix_provider);
-	midr_owned_destroy(&daemon.owned);
-	midr_ted_destroy(&daemon.ted);
-	midr_consumer_destroy(&daemon.consumer);
-	midr_engine_destroy(&daemon.engine);
+	midr_context_finish(&daemon);
 	if (pidfile)
 		(void)unlink(pidfile);
 	return 0;

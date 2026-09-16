@@ -117,7 +117,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -147,7 +147,7 @@ $(BUILD_DIR)/midrd-local-ipc-test.o: local-ipc-test.c midr-local-ipc.h midr-loca
 $(BUILD_DIR)/midrd-local-ipc-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-local-provider.o $(BUILD_DIR)/midr-local-ipc.o $(BUILD_DIR)/midrd-local-ipc-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c local-transaction-test.c -o $@
 
 $(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
@@ -165,7 +165,7 @@ $(BUILD_DIR)/midrd-lsdb-test.o: lsdb-test.c midr-lsdb.h midr-scope.h midr-core.h
 $(BUILD_DIR)/midrd-lsdb-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midr-lsdb.o $(BUILD_DIR)/midrd-lsdb-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-transport.h midr-engine.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-context.h midr-context-private.h midr-transport.h midr-engine.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c sync-test.c -o $@
 
 $(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
@@ -177,7 +177,7 @@ $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD
 $(BUILD_DIR)/midrd-owned-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-owned.o $(BUILD_DIR)/midrd-owned-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd-prefix-transaction-test.o: prefix-transaction-test.c midrd.c midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd-prefix-transaction-test.o: prefix-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c prefix-transaction-test.c -o $@
 
 $(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o

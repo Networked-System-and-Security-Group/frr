@@ -37,7 +37,7 @@ static struct midr_core_object prefix(uint32_t originator, uint64_t sequence,
 	return object;
 }
 
-static void setup(struct midrd *daemon)
+static void setup(struct midr_context *daemon)
 {
 	struct midr_engine_config engine_config = {
 		.node_id = 1,
@@ -61,7 +61,7 @@ static void setup(struct midrd *daemon)
 					   daemon->consumer) == 0);
 }
 
-static void teardown(struct midrd *daemon)
+static void teardown(struct midr_context *daemon)
 {
 	midr_ted_destroy(&daemon->ted);
 	midr_consumer_destroy(&daemon->consumer);
@@ -92,7 +92,7 @@ static void drain_consumer_queue(struct midr_consumer *consumer)
 		;
 }
 
-static int frame_generation(struct midrd *daemon,
+static int frame_generation(struct midr_context *daemon,
 			    const struct midr_transport_endpoint *peer,
 			    uint8_t type, uint64_t generation, uint64_t sequence,
 			    uint64_t received_ns, const uint8_t *payload,
@@ -111,7 +111,7 @@ static int frame_generation(struct midrd *daemon,
 	return on_frame(daemon, peer, &input);
 }
 
-static int frame(struct midrd *daemon, const struct midr_transport_endpoint *peer,
+static int frame(struct midr_context *daemon, const struct midr_transport_endpoint *peer,
 		 uint8_t type, uint64_t sequence, uint64_t received_ns,
 		 const uint8_t *payload, size_t payload_len)
 {
@@ -121,7 +121,7 @@ static int frame(struct midrd *daemon, const struct midr_transport_endpoint *pee
 
 static void test_snapshot_barrier_and_atomic_eor(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct midr_transport_endpoint peer = {
 		.family = MIDR_TRANSPORT_AF_IPV4,
 		.address = {127, 0, 0, 1},
@@ -212,7 +212,7 @@ static void test_snapshot_barrier_and_atomic_eor(void)
 
 static void test_reconnect_generation_isolation(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct midr_transport_endpoint peer = {
 		.family = MIDR_TRANSPORT_AF_IPV4,
 		.address = {127, 0, 0, 1},
@@ -288,7 +288,7 @@ static void test_shutdown_result_classification(void)
 
 static void test_publication_failure_gates_ted_and_recovers(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct midr_core_object local = membership(1, 7, 1);
 	struct midr_core_object remote_membership = membership(2, 7, 1);
 	struct midr_core_object remote_prefix = prefix(2, 1, 10);

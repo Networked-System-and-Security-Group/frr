@@ -8,7 +8,7 @@ static size_t consumer_snapshots;
 
 static void test_lifetime_accounting(void)
 {
-	struct midrd daemon = {.lifetime_ms = 10000};
+	struct midr_context daemon = {.lifetime_ms = 10000};
 	struct midr_core_object object = {.lifetime_ms = 8000};
 	struct midr_core_object before;
 
@@ -50,7 +50,7 @@ static void test_lifetime_accounting(void)
 static void record_consumer_event(void *arg,
 				  const struct midr_consumer_event *event)
 {
-	struct midrd *daemon = arg;
+	struct midr_context *daemon = arg;
 
 	assert(event);
 	on_consumer_event(daemon, event);
@@ -96,7 +96,7 @@ static struct midr_prefix_event prefix_event_value(
 	return event;
 }
 
-static void initialize_daemon(struct midrd *daemon, size_t capacity)
+static void initialize_daemon(struct midr_context *daemon, size_t capacity)
 {
 	struct midr_engine_config engine_config = {
 		.node_id = 77,
@@ -146,7 +146,7 @@ static void initialize_daemon(struct midrd *daemon, size_t capacity)
 				 &daemon->owned) == 0);
 }
 
-static void destroy_daemon(struct midrd *daemon)
+static void destroy_daemon(struct midr_context *daemon)
 {
 	midr_owned_destroy(&daemon->owned);
 	midr_ted_destroy(&daemon->ted);
@@ -154,12 +154,12 @@ static void destroy_daemon(struct midrd *daemon)
 	midr_engine_destroy(&daemon->engine);
 }
 
-static int deliver(struct midrd *daemon, struct midr_prefix_event event)
+static int deliver(struct midr_context *daemon, struct midr_prefix_event event)
 {
 	return prefix_event(daemon, &event);
 }
 
-static bool owned_contains(struct midrd *daemon,
+static bool owned_contains(struct midr_context *daemon,
 			   const struct midr_prefix_event *event,
 			   uint32_t metric)
 {
@@ -171,7 +171,7 @@ static bool owned_contains(struct midrd *daemon,
 	       object.state == MIDR_CORE_ACTIVE && object.metric == metric;
 }
 
-static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
+static uint64_t consumer_generation(struct midr_context *daemon, size_t *count)
 {
 	struct midr_consumer_snapshot snapshot = {0};
 	uint64_t generation;
@@ -186,7 +186,7 @@ static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
 
 int main(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct midr_prefix_event ipv4 = prefix_event_value(
 		MIDR_PREFIX_UPSERT, 1, 77, MIDR_CORE_AF_IPV4, 1, 10);
 	struct midr_prefix_event ipv6 = prefix_event_value(

@@ -5,7 +5,7 @@
 #include <assert.h>
 
 struct consumer_probe {
-	struct midrd *daemon;
+	struct midr_context *daemon;
 	size_t snapshots;
 };
 
@@ -111,7 +111,7 @@ static struct midr_local_event link_withdraw_event(uint64_t generation,
 	return event;
 }
 
-static void initialize_daemon(struct midrd *daemon,
+static void initialize_daemon(struct midr_context *daemon,
 			      struct consumer_probe *probe, size_t capacity)
 {
 	struct midr_engine_config engine_config = {
@@ -148,7 +148,7 @@ static void initialize_daemon(struct midrd *daemon,
 				 &daemon->owned) == 0);
 }
 
-static void destroy_daemon(struct midrd *daemon)
+static void destroy_daemon(struct midr_context *daemon)
 {
 	midr_owned_destroy(&daemon->owned);
 	midr_ted_destroy(&daemon->ted);
@@ -156,7 +156,7 @@ static void destroy_daemon(struct midrd *daemon)
 	midr_engine_destroy(&daemon->engine);
 }
 
-static uint64_t consumer_view_generation(struct midrd *daemon, size_t *count)
+static uint64_t consumer_view_generation(struct midr_context *daemon, size_t *count)
 {
 	struct midr_consumer_snapshot snapshot = {0};
 	uint64_t generation;
@@ -169,7 +169,7 @@ static uint64_t consumer_view_generation(struct midrd *daemon, size_t *count)
 	return generation;
 }
 
-static uint64_t consumer_generation(struct midrd *daemon, size_t *count)
+static uint64_t consumer_generation(struct midr_context *daemon, size_t *count)
 {
 	uint64_t generation = consumer_view_generation(daemon, count);
 
@@ -204,14 +204,14 @@ static size_t fill_consumer(struct midr_consumer *consumer)
 	return count;
 }
 
-static void assert_no_engine_events(struct midrd *daemon)
+static void assert_no_engine_events(struct midr_context *daemon)
 {
 	struct midr_core_object event;
 
 	assert(midr_engine_event_next(daemon->engine, &event) == -ENOENT);
 }
 
-static void link_identity_for(struct midrd *daemon,
+static void link_identity_for(struct midr_context *daemon,
 			      const struct midr_local_event *event,
 			      struct midr_core_identity *identity)
 {
@@ -224,7 +224,7 @@ static void link_identity_for(struct midrd *daemon,
 }
 
 static struct midr_core_object owned_link(
-	struct midrd *daemon, const struct midr_local_event *event)
+	struct midr_context *daemon, const struct midr_local_event *event)
 {
 	struct midr_core_identity identity;
 	struct midr_core_object object;
@@ -234,7 +234,7 @@ static struct midr_core_object owned_link(
 	return object;
 }
 
-static int deliver_snapshot(struct midrd *daemon, uint64_t now_ms,
+static int deliver_snapshot(struct midr_context *daemon, uint64_t now_ms,
 			    uint64_t generation,
 			    const struct midr_local_event *membership,
 			    const struct midr_local_event *links, size_t link_count)
@@ -271,7 +271,7 @@ static int deliver_snapshot(struct midrd *daemon, uint64_t now_ms,
 static void test_atomic_and_cost(void)
 {
 	const uint64_t start = 1000;
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct consumer_probe probe;
 	struct midr_local_event membership = membership_event(1, 1, 9);
 	struct midr_local_event links[2];
@@ -444,7 +444,7 @@ static void test_atomic_and_cost(void)
 
 static void test_failed_commits_and_version_floors(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct consumer_probe probe;
 	struct midr_local_event membership = membership_event(1, 1, 9);
 	struct midr_local_event links[2];
@@ -545,7 +545,7 @@ static void test_failed_commits_and_version_floors(void)
 
 static void test_snapshot_generation_guards(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct consumer_probe probe;
 	struct midr_local_event membership = membership_event(1, 1, 9);
 	struct midr_local_event link =
@@ -608,7 +608,7 @@ static void test_snapshot_generation_guards(void)
 
 static void test_incremental_withdraw_and_barrier(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct consumer_probe probe;
 	struct midr_local_event membership = membership_event(1, 1, 9);
 	struct midr_local_event link =
@@ -673,7 +673,7 @@ static void test_incremental_withdraw_and_barrier(void)
 
 static void test_local_ifindex_metadata(void)
 {
-	struct midrd daemon;
+	struct midr_context daemon;
 	struct consumer_probe probe;
 	struct midr_local_event membership = membership_event(1, 1, 9);
 	struct midr_local_event link =
