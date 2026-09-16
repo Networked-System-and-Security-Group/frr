@@ -26,6 +26,11 @@
 #define ADMISSION_RETRY_MAX_MS 60000U
 #define ADMISSION_REASON_COUNT (MIDR_SESSION_PEER_REQ_REPLY + 1)
 #define ADMISSION_ANCHORS_PER_GROUP 2U
+/* Candidate screening owns an intent without asking for a session, so CL can
+ * rank join/anchor candidates on a path verdict before any connect. */
+#define ADMISSION_SCREEN_BIT (1U << ADMISSION_REASON_COUNT)
+#define ADMISSION_SESSION_MASK (ADMISSION_SCREEN_BIT - 1U)
+#define ADMISSION_SCREEN_LIFETIME_MS 600000U
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ADMISSION, "MIDR admission manager");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_ADMISSION_ENTRY, "MIDR admission intent");
@@ -54,9 +59,12 @@ struct admission_entry {
 	uint32_t local_group;
 	uint64_t remote_seen, deadline, retry_at, measured_at;
 	uint64_t ip_generation, list_generation, permit;
+	uint64_t screen_until;
 	unsigned int backoff;
 	int retx_budget;
 	enum admission_state state;
+	/* Last completed trace hit Tier1; kept while a re-measurement runs. */
+	bool last_blocked;
 	const char *detail;
 	struct midr_tier1_result result;
 	struct admission_token *token;
@@ -131,12 +139,13 @@ static bool room_for(struct admission_entry *e)
 	struct admission_entry *other;
 	enum midr_session_reason reason;
 	unsigned int used = 0, limit;
+	unsigned int local = e->local_reasons & ADMISSION_SESSION_MASK;
 	if (e->remote_reasons || entry_peer(e))
 		return true;
-	if (e->local_reasons == (1U << MIDR_SESSION_ATTACH)) {
+	if (local == (1U << MIDR_SESSION_ATTACH)) {
 		reason = MIDR_SESSION_ATTACH;
 		limit = MIDR_ATTACH_K;
-	} else if (e->local_reasons == (1U << MIDR_SESSION_CL_ANCHOR)) {
+	} else if (local == (1U << MIDR_SESSION_CL_ANCHOR)) {
 		reason = MIDR_SESSION_CL_ANCHOR;
 		limit = ADMISSION_ANCHORS_PER_GROUP;
 	} else
@@ -167,6 +176,8 @@ static bool valid_owners(struct admission_entry *e)
 	struct listnode *n;
 	struct midr_bootstrap_entry *candidate;
 	bool has_candidate = false;
+	if ((e->local_reasons & ADMISSION_SCREEN_BIT) && now_ms() >= e->screen_until)
+		e->local_reasons &= ~ADMISSION_SCREEN_BIT;
 	if (!known || !known->has_transport_addr ||
 	    !midr_ipaddr_same(&known->transport_addr, &e->target.transport_addr))
 		e->local_reasons &= ~((1U << MIDR_SESSION_SAME_GROUP) |
@@ -341,6 +352,9 @@ static void resume_connect(struct event *event)
 					      MIDR_STOP_KEEPALIVE_TIMEOUT);
 		return;
 	}
+	/* A screening verdict alone never starts a session. */
+	if (!(local & ADMISSION_SESSION_MASK) && !remote)
+		return;
 	if (bgp_config_inprocess() || !current_path(e))
 		return;
 	if (!room_for(e))
@@ -412,6 +426,7 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 	if (result == MIDR_ADMISSION_READY) {
 		e->state = ADMISSION_ALLOWED;
 		e->detail = "no-tier1-observed";
+		e->last_blocked = false;
 		e->permit = next_serial();
 		e->measured_at = now_ms() - (delivery->has_cache_metadata ?
 			delivery->cache_age_msec : 0);
@@ -420,6 +435,7 @@ static void trace_done(const struct midr_trace_delivery *delivery, void *arg)
 	} else if (result == MIDR_ADMISSION_BLOCKED) {
 		e->state = ADMISSION_BLOCKED;
 		e->detail = "tier1-observed";
+		e->last_blocked = true;
 		e->permit = 0;
 		e->retry_at = now_ms() + ADMISSION_RETRY_MAX_MS;
 		if (e->remote_reasons)
@@ -515,6 +531,14 @@ static void tick(struct event *event)
 			queue_resume(e);
 			continue;
 		}
+		/* Screening re-measures only when NDS evaluates the candidate again. */
+		if (!(e->local_reasons & ADMISSION_SESSION_MASK) && !e->remote_reasons) {
+			if (e->token && now >= e->deadline) {
+				cancel_trace(e);
+				retry_later(e, "admission-timeout");
+			}
+			continue;
+		}
 		if (established || bgp_config_inprocess() || !current_path(e))
 			continue;
 		if (!m->bgp->midr_nds_info->avoid_tier1) {
@@ -568,6 +592,7 @@ static void invalidate(struct midr_admission *m)
 		e->permit = 0;
 		e->retry_at = 0;
 		e->state = ADMISSION_WAIT_DATA;
+		e->last_blocked = false;
 		e->detail = "policy-or-data-changed";
 	}
 	/* Queue stop, never delete peers while traversing the instance list. */
@@ -679,23 +704,19 @@ void midr_admission_remote_seen(struct bgp *bgp, struct ipaddr target)
 		e->remote_seen = now_ms();
 }
 
-enum midr_admission_result midr_admission_gate(struct bgp *bgp,
-	const struct midr_node_entry *target, enum midr_session_reason reason,
-	bool send_nudge, bool received, bool attach_request)
+/* Find or create the intent for target from the current local transport.
+ * Returns NULL on identity conflict or when capacity is exhausted. */
+static struct admission_entry *intent_get(struct bgp *bgp,
+					  const struct midr_node_entry *target,
+					  struct ipaddr source)
 {
-	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	struct midr_admission *m = mi->admission;
+	struct midr_admission *m = bgp->midr_nds_info->admission;
 	struct admission_entry *e;
-	struct ipaddr source;
-	if (!mi->avoid_tier1)
-		return MIDR_ADMISSION_READY;
-	if (!m || !m->cookie || (unsigned int)reason >= ADMISSION_REASON_COUNT ||
-	    !midr_nds_local_transport_get(bgp, &source))
-		return MIDR_ADMISSION_INVALID;
+
 	e = find_entry(bgp, target->transport_addr);
 	if (e && e->target.node_id.u.prefix4.s_addr && target->node_id.u.prefix4.s_addr &&
 	    !prefix_same(&e->target.node_id, &target->node_id))
-		return MIDR_ADMISSION_INVALID;
+		return NULL;
 	if (e && !midr_ipaddr_same(&e->source, &source)) {
 		free_entry(e);
 		e = NULL;
@@ -716,7 +737,7 @@ enum midr_admission_result midr_admission_gate(struct bgp *bgp,
 			}
 		}
 		if (listcount(m->entries) >= ADMISSION_LIMIT)
-			return MIDR_ADMISSION_INVALID; /* No retained intent: never report pending. */
+			return NULL; /* No retained intent: never report pending. */
 		e = XCALLOC(MTYPE_MIDR_ADMISSION_ENTRY, sizeof(*e));
 		e->manager = m;
 		e->source = source;
@@ -732,6 +753,25 @@ enum midr_admission_result midr_admission_gate(struct bgp *bgp,
 	e->target.capabilities = target->capabilities;
 	e->target.has_transport_addr = true;
 	e->target.transport_addr = target->transport_addr;
+	return e;
+}
+
+enum midr_admission_result midr_admission_gate(struct bgp *bgp,
+	const struct midr_node_entry *target, enum midr_session_reason reason,
+	bool send_nudge, bool received, bool attach_request)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct midr_admission *m = mi->admission;
+	struct admission_entry *e;
+	struct ipaddr source;
+	if (!mi->avoid_tier1)
+		return MIDR_ADMISSION_READY;
+	if (!m || !m->cookie || (unsigned int)reason >= ADMISSION_REASON_COUNT ||
+	    !midr_nds_local_transport_get(bgp, &source))
+		return MIDR_ADMISSION_INVALID;
+	e = intent_get(bgp, target, source);
+	if (!e)
+		return MIDR_ADMISSION_INVALID;
 	if (received) {
 		e->remote_reasons |= 1U << reason;
 		e->remote_attach = attach_request;
@@ -749,6 +789,31 @@ enum midr_admission_result midr_admission_gate(struct bgp *bgp,
 	if (!e->token && now_ms() >= e->retry_at)
 		start_trace(e);
 	return MIDR_ADMISSION_PENDING;
+}
+
+void midr_admission_screen(struct bgp *bgp, const struct midr_node_entry *target)
+{
+	struct bgp_midr_nds *mi = bgp ? bgp->midr_nds_info : NULL;
+	struct admission_entry *e;
+	struct ipaddr source;
+	uint64_t now = now_ms();
+
+	if (!mi || !mi->avoid_tier1 || !mi->admission || !target ||
+	    !target->has_transport_addr ||
+	    !midr_ipaddr_valid_locator(&target->transport_addr) ||
+	    !midr_nds_local_transport_get(bgp, &source))
+		return;
+	e = intent_get(bgp, target, source);
+	if (!e)
+		return;
+	e->local_reasons |= ADMISSION_SCREEN_BIT;
+	e->screen_until = now + ADMISSION_SCREEN_LIFETIME_MS;
+	if (e->token || now < e->retry_at)
+		return;
+	if (e->state == ADMISSION_ALLOWED && current_data(e) &&
+	    now - e->measured_at <= ADMISSION_MAX_AGE_MS)
+		return;
+	start_trace(e);
 }
 
 static struct admission_entry *peer_entry(struct peer *peer)
@@ -784,6 +849,12 @@ bool midr_admission_peer_ready(struct peer *peer)
 	if (e && !valid_owners(e)) {
 		queue_resume(e);
 		return false;
+	}
+	/* A screening verdict is not session demand; derive it from the ledger. */
+	if (e && !(e->local_reasons & ADMISSION_SESSION_MASK) && !e->remote_reasons) {
+		if (!midr_nds_ledger_lookup(peer->bgp, e->target.transport_addr))
+			return false;
+		e = NULL;
 	}
 	if (fresh_permit(e) && peer_source_matches(peer, e))
 		return true;
@@ -858,9 +929,13 @@ bool midr_admission_candidate_blocked(const struct bgp *bgp, struct ipaddr targe
 	struct peer *peer = e ? entry_peer(e) : NULL;
 	if (peer && peer->connection && peer->connection->status == Established)
 		return false;
-	return bgp->midr_nds_info->avoid_tier1 && e &&
-	       (e->state == ADMISSION_BLOCKED || e->state == ADMISSION_UNKNOWN) &&
-	       current_data(e) && now_ms() < e->retry_at;
+	if (!bgp->midr_nds_info->avoid_tier1 || !e || !current_data(e))
+		return false;
+	if (e->state == ADMISSION_UNKNOWN && now_ms() < e->retry_at)
+		return true;
+	/* A Tier1 verdict stands until a completed re-measurement clears it. */
+	return e->last_blocked &&
+	       (e->state == ADMISSION_BLOCKED || e->state == ADMISSION_WAIT_TRACE);
 }
 
 size_t midr_admission_anchor_groups(struct bgp *bgp, uint32_t *groups, size_t size)
@@ -929,10 +1004,12 @@ void midr_admission_show(struct bgp *bgp, struct vty *vty)
 	for (ALL_LIST_ELEMENTS_RO(m->entries, n, e)) {
 		struct peer *peer = entry_peer(e);
 		vty_out(vty, "  %pIA -> %pIA: %s (%s), IP2ASN %" PRIu64
-			" Tier1 %" PRIu64 ", request %" PRIu64 ", owners local=0x%x remote=0x%x%s\n",
+			" Tier1 %" PRIu64 ", request %" PRIu64 ", owners local=0x%x remote=0x%x%s%s\n",
 			&e->source, &e->target.transport_addr, names[e->state], e->detail,
 			e->ip_generation, e->list_generation,
-			e->token ? e->token->request_id : 0, e->local_reasons, e->remote_reasons,
+			e->token ? e->token->request_id : 0,
+			e->local_reasons & ADMISSION_SESSION_MASK, e->remote_reasons,
+			(e->local_reasons & ADMISSION_SCREEN_BIT) ? " (candidate screening)" : "",
 			peer && peer->connection && peer->connection->status == Established ?
 				" (Established retained)" : "");
 	}

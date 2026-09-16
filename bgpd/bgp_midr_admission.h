@@ -29,6 +29,9 @@ bool midr_admission_is_manual(struct bgp *bgp, struct ipaddr target);
 enum midr_admission_result midr_admission_gate(struct bgp *bgp,
 	const struct midr_node_entry *entry, enum midr_session_reason reason,
 	bool send_nudge, bool received, bool attach_request);
+/* Trace a join/anchor candidate ahead of any session so that CL can skip
+ * candidates whose path crosses a Tier1 AS. No-op unless avoid-tier1 is on. */
+void midr_admission_screen(struct bgp *bgp, const struct midr_node_entry *target);
 bool midr_admission_peer_ready(struct peer *peer);
 bool midr_admission_begin(struct peer_connection *connection);
 bool midr_admission_check(struct peer_connection *connection);

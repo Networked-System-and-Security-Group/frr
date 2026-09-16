@@ -903,6 +903,7 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
 	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
+	midr_admission_screen(bgp, entry);
 }
 
 /*
@@ -950,6 +951,7 @@ void midr_nds_learn_anchor_candidate(struct bgp *bgp, struct in_addr rid,
 	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
 	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
+	midr_admission_screen(bgp, entry);
 }
 
 /*
@@ -4676,6 +4678,7 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		midr_ctrl_send_announce(bgp, r->rep_transport);
 
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
+		midr_admission_screen(bgp, entry);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pIA（群 %u）",
 			      &r->rep_transport, r->group_id);
 	}

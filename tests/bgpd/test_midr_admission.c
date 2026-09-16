@@ -146,6 +146,11 @@ static void timeout(struct event *event)
 	assert(!"admission test timed out");
 }
 
+static void screening_stop(struct event *event)
+{
+	*(bool *)EVENT_ARG(event) = true;
+}
+
 int main(void)
 {
 	struct bgp_master state = {};
@@ -283,7 +288,7 @@ int main(void)
 	deliver(4, &clean);
 	assert(midr_admission_begin(&connection) && connection.midr_admission_permit);
 	assert(midr_admission_check(&connection));
-	peer.update_if = "unexpected-interface";
+	peer.update_if = (char *)"unexpected-interface";
 	assert(!midr_admission_check(&connection));
 	peer.update_if = NULL;
 	connection.su_local = &connection.su;
@@ -396,6 +401,9 @@ int main(void)
 	       == MIDR_ADMISSION_PENDING && submitted == 11);
 	deliver(10, &clean);
 	connection.status = Established;
+	/* restore lives next to midr_nds_local_transport_get(), so the link-time
+	 * wrap does not apply there; the real getter needs an active transport. */
+	mi.transport_active = true;
 	midr_nds_manual_sessions_restore(&bgp);
 	assert(midr_admission_is_manual(&bgp, target.transport_addr));
 	assert(connected == 2);
@@ -408,6 +416,45 @@ int main(void)
 	mi.global_view = NULL;
 	lookup_peer = NULL;
 	assert(connected == 2);
+
+	/* Candidate screening: CL keeps a Tier1 verdict after the session owners
+	 * are gone, and an allowed screening verdict never connects by itself. */
+	load_file("MIDR-TIER1-ASNS 1\nLIST-ID screening\n174\n", true);
+	midr_admission_init(&bgp);
+	assert(midr_ipaddr_from_prefix(&hit.target, &target.transport_addr));
+	midr_admission_screen(&bgp, &target);
+	assert(submitted == 12);
+	assert(!midr_admission_candidate_blocked(&bgp, target.transport_addr));
+	midr_admission_screen(&bgp, &target);
+	assert(submitted == 12); /* one trace per candidate at a time */
+	deliver(11, &hit);
+	assert(midr_admission_candidate_blocked(&bgp, target.transport_addr));
+	assert(midr_admission_gate(&bgp, &target, MIDR_SESSION_SAME_GROUP,
+				   false, false, false) == MIDR_ADMISSION_BLOCKED);
+	midr_admission_forget_reason(&bgp, MIDR_SESSION_SAME_GROUP);
+	assert(midr_admission_has_intent(&bgp, target.transport_addr));
+	assert(midr_admission_candidate_blocked(&bgp, target.transport_addr));
+	/* After the cooldown a new screening re-measures; the verdict stands
+	 * until that measurement completes. */
+	clock_offset = 61;
+	midr_admission_screen(&bgp, &target);
+	assert(submitted == 13);
+	assert(midr_admission_candidate_blocked(&bgp, target.transport_addr));
+	deliver(12, &clean);
+	assert(!midr_admission_candidate_blocked(&bgp, target.transport_addr));
+	clock_offset = 0;
+	{
+		bool stop = false;
+		struct event *t_stop = NULL;
+
+		event_add_timer_msec(master, screening_stop, &stop, 50, &t_stop);
+		while (!stop) {
+			assert(event_fetch(master, &event));
+			event_call(&event);
+		}
+	}
+	assert(connected == 2 && submitted == 13);
+	midr_admission_finish(&bgp);
 	event_cancel(&watchdog);
 	list_delete(&bgp.peer);
 	midr_tier1_list_fini();
