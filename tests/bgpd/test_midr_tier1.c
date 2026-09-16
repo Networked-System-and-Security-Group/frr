@@ -124,8 +124,8 @@ static void test_private_asns_are_ignored(void)
 		    "private ASNs are counted as ignored");
 	expect_true(!!(result.flags & MIDR_TIER1_FLAG_PRIVATE_ASNS_IGNORED),
 		    "private flag is set");
-	expect_true(!(result.flags & MIDR_TIER1_FLAG_SEMANTICS_DEGRADED),
-		    "private filtering alone is outside the degradation mask");
+	expect_true(!!(result.flags & MIDR_TIER1_FLAG_SEMANTICS_DEGRADED),
+		    "private filtering is part of the degradation mask");
 
 	aspath_free(path);
 
