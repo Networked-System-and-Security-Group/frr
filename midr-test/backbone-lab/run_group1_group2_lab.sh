@@ -42,6 +42,9 @@ case "$STACK:$FAMILY" in
 esac
 LAB_NAME=${MIDR_LAB_NAME:-$DEFAULT_LAB_NAME}
 LAB_PREFIX="clab-$LAB_NAME"
+# Match only this lab's nodes: the IPv4 prefix is also a prefix of the IPv6
+# lab's container names.
+LAB_NODE_RE='(b[1-5]|t[1-3]|r[12]|m1[ab]|m2a|z[12])'
 IMAGE=${MIDR_LAB_IMAGE:-frr-midr-g12:$REV}
 UBUNTU_VERSION=${MIDR_UBUNTU_VERSION:-22.04}
 RUN_ROOT=${MIDR_LAB_RUN_ROOT:-"$(dirname "$REPO_ROOT")/midr-lab-runs/$LAB_NAME"}
@@ -88,7 +91,7 @@ check_existing_lab()
 	local existing
 
 	existing=$(docker ps -a --format '{{.Names}}' |
-		grep -E "^${LAB_PREFIX}-" || true)
+		grep -E "^${LAB_PREFIX}-${LAB_NODE_RE}\$" || true)
 	[ -z "$existing" ] || {
 		printf 'An existing lab uses prefix %s:\n%s\n' "$LAB_PREFIX" "$existing" >&2
 		die "refusing to replace or destroy an existing lab"
@@ -218,7 +221,8 @@ deploy_lab()
 	check_existing_lab
 	containerlab deploy --topo "$TOPOLOGY" 2>&1 | tee "$RUN_ROOT/deploy.log"
 	local running
-	running=$(docker ps --format '{{.Names}}' | grep -cE "^${LAB_PREFIX}-" || true)
+	running=$(docker ps --format '{{.Names}}' |
+		grep -cE "^${LAB_PREFIX}-${LAB_NODE_RE}\$" || true)
 	[ "$running" -eq 15 ] || die "expected 15 running containers, found $running"
 	containerlab inspect --topo "$TOPOLOGY" | tee "$RUN_ROOT/inspect.log"
 }

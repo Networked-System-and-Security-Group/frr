@@ -1300,6 +1300,8 @@ static int midr_show_neighbors(struct vty *vty, bool uj)
 					    peer->established_count);
 			json_object_int_add(jp, "connectionsDropped",
 					    peer->dropped_count);
+			json_object_int_add(jp, "lastResetReason",
+					    peer->last_reset);
 			json_object_int_add(jp, "remoteAs", peer->as);
 			json_object_string_add(jp, "origin", origin);
 			if (ne) {

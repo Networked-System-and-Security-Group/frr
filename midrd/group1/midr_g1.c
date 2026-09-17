@@ -282,6 +282,10 @@ static void midr_g1_session_down_cb(struct midr_context *ctx,
 {
 	struct midr_g1_peer *peer = midr_g1_peer_lookup(arg, remote);
 
+	/* midrd's reason: 0 = closed by the remote, negative errno otherwise
+	 * (e.g. hold timer or write budget expiry). */
+	zlog_info("MIDR: session %pIA closed by midrd, reason %d", remote,
+		  reason);
 	if (peer)
 		peer->last_reset = reason;
 	midr_g1_session_queue(remote, 0, false);
