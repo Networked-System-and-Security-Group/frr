@@ -255,10 +255,11 @@ void midr_nodedir_receive(struct midr_g1 *g1, const struct ipaddr *from,
 	if (!lifetime)
 		lifetime = NODEDIR_LIFETIME_SECS;
 
-	/* Our own advertisement came back.  A newer copy means a previous run
-	 * of this node is still remembered: jump past it and re-advertise. */
+	/* Our own advertisement came back.  Only a strictly newer copy means a
+	 * previous run of this node is still remembered: jump past it and
+	 * re-advertise.  Our current copy returning is normal flooding. */
 	if (adv.node_id.s_addr == g1->router_id.s_addr) {
-		if (nodedir.self_valid && adv.sequence >= nodedir.self.sequence) {
+		if (nodedir.self_valid && adv.sequence > nodedir.self.sequence) {
 			nodedir.self.sequence = adv.sequence;
 			nodedir.self.sequence =
 				nodedir_next_sequence(nodedir.self.sequence);

@@ -156,6 +156,7 @@ void midr_g1_peer_stop(struct midr_g1_peer *peer)
 {
 	if (!peer || !peer->requested || peer->established || g1_terminating)
 		return;
+	MIDR_G1_LOG("MIDR: stop pending session %pIA", &peer->transport);
 	(void)midr_session_release(peer->g1->ctx, &peer->transport);
 	peer->requested = false;
 }
@@ -176,8 +177,11 @@ void midr_g1_peer_delete(struct midr_g1_peer *peer)
 		return;
 	g1 = peer->g1;
 	/* On daemon exit midrd still needs the sessions to flood withdrawals. */
-	if (peer->requested && !g1_terminating)
+	if (peer->requested && !g1_terminating) {
+		MIDR_G1_LOG("MIDR: release session %pIA (%s)", &peer->transport,
+			    midr_g1_peer_state_str(peer));
 		(void)midr_session_release(g1->ctx, &peer->transport);
+	}
 	listnode_delete(g1->peer, peer);
 	XFREE(MTYPE_MIDR_G1_PEER, peer);
 }
@@ -466,6 +470,9 @@ void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	g1->peer = list_new();
 	g1_instance = g1;
 
+	/* The traceroute backend opens sockets with vrf_socket(), which needs
+	 * the default VRF/netns set up; bgpd did this for group 1. */
+	vrf_init(NULL, NULL, NULL, NULL);
 	cmd_init_config_callbacks(midr_g1_config_start, midr_g1_config_stop);
 	midr_g1_debug_init();
 	if (midr_trace_scheduler_init(master) != 0)
@@ -496,6 +503,7 @@ void midr_group1_terminate(void)
 	list_delete(&g1->peer);
 	midr_trace_scheduler_fini();
 	midr_tier1_list_fini();
+	vrf_terminate();
 	g1_instance = NULL;
 	XFREE(MTYPE_MIDR_G1, g1);
 }

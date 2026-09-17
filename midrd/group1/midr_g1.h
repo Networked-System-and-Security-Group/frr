@@ -73,6 +73,12 @@ extern unsigned long midr_g1_debug;
 #define MIDR_G1_DEBUG_FLOW                                                     \
 	(MIDR_G1_DEBUG_ON(GENERAL) || MIDR_G1_DEBUG_ON(DISCOVERY))
 
+#define MIDR_G1_LOG(...)                                                       \
+	do {                                                                   \
+		if (MIDR_G1_DEBUG_ON(GENERAL))                                 \
+			zlog_debug(__VA_ARGS__);                               \
+	} while (0)
+
 /* Configuration commands act on the single group-1 instance. */
 #define MIDR_G1_DECLVAR(vty, g1)                                               \
 	struct midr_g1 *g1 = midr_g1_get();                                    \
