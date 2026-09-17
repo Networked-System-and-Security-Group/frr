@@ -115,6 +115,7 @@ midr_g1_peer_lookup_su(struct midr_g1 *g1, const union sockunion *su)
  * 1-0.95^20 ≈ 0.641 at the old 20s — a wider safety margin between the good-
  * and bad-link RTTs before CL evaluates. */
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
+#define MIDR_JOIN_REP_REFRESH_SECS  20 /* 探测代表期间重拉一次目录 */
 
 /*
  * 退网延时拆会话（秒）：`midr shutdown` 先发撤销、隔这么久再拆会话——拆了会话
@@ -607,6 +608,10 @@ struct midr_nds {
 	struct event *t_probe_timeout;	  /* PM probe timeout */
 	struct event *t_pm_probe;	  /* periodic PM probe of connected nodes */
 	struct event *t_rep_probe_done;	  /* deferred REP_PROBE_DONE after EWMA warm-up */
+	/* midrd: re-ask the bootstrap once during rep probing, so reps that
+	 * attached after our first request are still evaluated. */
+	struct event *t_rep_refresh;
+	struct ipaddr join_bootstrap;
 	struct event *t_member_probe_done; /* deferred MEMBER_PROBE_DONE after EWMA warm-up */
 	struct event *t_anchor_probe_done; /* deferred ANCHOR_PROBE_DONE，见 anchor_group_id */
 	struct event *t_bootstrap_boot;	  /* §8.31 一次性种子自举定时器 */

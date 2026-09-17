@@ -1653,9 +1653,24 @@ const char *midr_origin_reason_str(enum midr_origin_reason reason)
 
 /* Deferred join-phase triggers: fire after MIDR_JOIN_PROBE_WAIT_SECS to give
  * the PM long-term EWMA time to warm up before CL evaluates link quality. */
+static void midr_join_rep_refresh_cb(struct event *t)
+{
+	struct midr_g1 *g1 = EVENT_ARG(t);
+	struct midr_nds *mi = g1->midr_nds_info;
+
+	if (mi->join_phase != MIDR_JOIN_PROBING_REPS ||
+	    !midr_ipaddr_valid_locator(&mi->join_bootstrap))
+		return;
+	MIDR_FLOW_LOG("MIDR 加入：探测代表期间向引导 %pIA 重拉一次群代表目录",
+		      &mi->join_bootstrap);
+	midr_ctrl_send_rep_request(g1, mi->join_bootstrap);
+}
+
 static void midr_join_rep_probe_done_cb(struct event *t)
 {
 	struct midr_g1 *g1 = EVENT_ARG(t);
+
+	event_cancel(&g1->midr_nds_info->t_rep_refresh);
 	MIDR_FLOW_LOG("MIDR 加入：REP_PROBE_DONE 定时器触发，通知 CL");
 	midr_nds_notify_cl(g1, MIDR_TRIGGER_REP_PROBE_DONE);
 }
@@ -4638,6 +4653,7 @@ void midr_join_on_rep_list(struct midr_g1 *g1)
 	struct midr_nds *mi;
 	struct listnode *node;
 	struct midr_rep_entry *r;
+	bool refresh;
 
 	if (!g1 || !g1->midr_nds_info)
 		return;
@@ -4664,6 +4680,9 @@ void midr_join_on_rep_list(struct midr_g1 *g1)
 	 * midr_nds_on_cluster_decision 发 MEMBER_LIST_REQ 取成员列表。
 	 * NDS 不再自己"取首条"选群——选群职责归 CL。
 	 */
+	/* A second REP_LIST_RESP during probing only adds reps; the warm-up
+	 * timer keeps running. */
+	refresh = mi->join_phase == MIDR_JOIN_PROBING_REPS;
 	mi->join_in_progress = true;
 	mi->join_phase = MIDR_JOIN_PROBING_REPS;
 	/* §8.32：第一跳完成，收起 failover 游标；候选清单保留（供展示与
@@ -4707,6 +4726,10 @@ void midr_join_on_rep_list(struct midr_g1 *g1)
 		midr_prefix_from_in_addr(&locator, r->rep_rid);
 		key.node_id = locator;
 		entry = midr_node_hash_find(&mi->global_view->nodes, &key);
+		/* On a refresh only reps not seen before start probing. */
+		if (refresh && entry &&
+		    midr_global_view_find_link(mi->global_view, &locator))
+			continue;
 		if (!midr_nds_control_locator_usable(
 			    g1, &key.node_id, entry, &r->rep_transport,
 			    "群代表目录"))
@@ -4742,8 +4765,14 @@ void midr_join_on_rep_list(struct midr_g1 *g1)
 			      &r->rep_transport, r->group_id);
 	}
 
+	if (refresh)
+		return;
+
 	/* 延迟 MIDR_JOIN_PROBE_WAIT_SECS 秒再发 REP_PROBE_DONE，让 PM 的
 	 * 长期 EWMA（α=0.05）先积累足够样本，使 CL 能区分好/坏链路。 */
+	event_cancel(&mi->t_rep_refresh);
+	event_add_timer(midr_g1_master(), midr_join_rep_refresh_cb, g1,
+			MIDR_JOIN_REP_REFRESH_SECS, &mi->t_rep_refresh);
 	event_cancel(&mi->t_rep_probe_done);
 	event_add_timer(midr_g1_master(), midr_join_rep_probe_done_cb, g1,
 			MIDR_JOIN_PROBE_WAIT_SECS, &mi->t_rep_probe_done);
@@ -5706,6 +5735,7 @@ int midr_nds_transport_reconcile(struct midr_g1 *g1)
 	midr_ctrl_close(g1);
 	midr_nds_transport_clear_deferred(mi);
 	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_rep_refresh);
 	event_cancel(&mi->t_member_probe_done);
 	midr_nds_anchor_ctx_clear(g1);
 	midr_rep_dir_clear(g1);
@@ -5943,6 +5973,7 @@ void midr_nds_finish(struct midr_g1 *g1)
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);
 	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_rep_refresh);
 	event_cancel(&mi->t_member_probe_done);
 	event_cancel(&mi->t_anchor_probe_done);
 	event_cancel(&mi->t_shutdown_teardown);

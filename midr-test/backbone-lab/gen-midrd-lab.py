@@ -58,6 +58,10 @@ def split_config(text):
         if line.startswith("router bgp "):
             in_bgp = True
         elif in_bgp and line == "!":
+            # vtysh stays in the router node across "!": without an explicit
+            # exit, top-level `midr` lines that also exist under `router bgp`
+            # would be sent to bgpd.
+            out.append("exit")
             out.append(line)
             if midr:
                 out.append("! MIDR（midrd 第一组）：原先写在 router bgp 下的配置")

@@ -1502,7 +1502,11 @@ static void midr_ctrl_recv_rep_list(struct midr_g1 *g1, const uint8_t *buf,
 	if (!midr_ctrl_list_identities_unique(identities, count))
 		goto invalid;
 
-	midr_rep_dir_clear(g1);
+	/* A refresh during rep probing extends the directory; a new join
+	 * replaces it. */
+	if (mi->join_phase != MIDR_JOIN_PROBING_REPS)
+		midr_rep_dir_clear(g1);
+	mi->join_bootstrap = src;
 	for (i = 0; i < count; i++)
 		midr_rep_dir_add(g1, items[i].group_id, items[i].transport,
 				 items[i].asn, items[i].rid);
