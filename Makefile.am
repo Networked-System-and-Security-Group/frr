@@ -158,6 +158,8 @@ midrd_midrd_SOURCES = \
 	midrd/midr-wire.c midrd/midr-wire.h
 midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd
 midrd_midrd_LDADD = lib/libfrr.la $(LIBCAP)
+# 第一组新增：第一组（发现/测量/选群）编进 midrd，源文件清单放在自己的目录里。
+include midrd/group1/subdir.am
 sbin_SCRIPTS =
 noinst_PROGRAMS =
 noinst_HEADERS =

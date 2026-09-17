@@ -1,0 +1,48 @@
+#
+# MIDR group 1 (discovery, measurement, clustering, Tier1 admission)
+# running inside midrd.
+#
+
+midrd_midrd_SOURCES += \
+	midrd/midr-session.h \
+	midrd/group1/midr_g1.c \
+	midrd/group1/midr_g1.h \
+	midrd/group1/midr_nodedir.c \
+	midrd/group1/midr_nds.c \
+	midrd/group1/midr_nds.h \
+	midrd/group1/midr_nds_vty.c \
+	midrd/group1/midr_nds_vty.h \
+	midrd/group1/midr_nds_facts.c \
+	midrd/group1/midr_nds_facts.h \
+	midrd/group1/midr_ctrl.c \
+	midrd/group1/midr_ctrl.h \
+	midrd/group1/midr_ctrl_tcp.c \
+	midrd/group1/midr_pm.c \
+	midrd/group1/midr_pm.h \
+	midrd/group1/midr_pm_net.h \
+	midrd/group1/midr_cl.c \
+	midrd/group1/midr_cl.h \
+	midrd/group1/midr_admission.c \
+	midrd/group1/midr_admission.h \
+	midrd/group1/midr_addr.h \
+	midrd/group1/midr_store.c \
+	midrd/group1/midr_store.h \
+	midrd/group1/midr_ip2asn.c \
+	midrd/group1/midr_ip2asn.h \
+	midrd/group1/midr_tier1.c \
+	midrd/group1/midr_tier1.h \
+	midrd/group1/midr_tier1_list.c \
+	midrd/group1/midr_tier1_list.h \
+	midrd/group1/midr_tier1_vty.c \
+	midrd/group1/midr_tier1_vty.h \
+	midrd/group1/midr_trace_engine.c \
+	midrd/group1/midr_trace_engine.h \
+	midrd/group1/midr_trace_observer.c \
+	midrd/group1/midr_trace_observer.h \
+	midrd/group1/midr_trace_scheduler.c \
+	midrd/group1/midr_trace_scheduler.h \
+	midrd/group1/midr_trace_types.h \
+	midrd/group1/midr_trace_udp.c \
+	midrd/group1/midr_trace_udp.h \
+	# end
+midrd_midrd_LDADD += -lm
