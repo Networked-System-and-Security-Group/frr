@@ -123,22 +123,22 @@ static struct midr_link_update link_update(uint64_t version, uint32_t rtt_us)
 static uint64_t selected_sequence(const struct midr_ls_object_key *key,
 				  struct midr_ls_object *selected)
 {
-	const struct midr_propagation_path *path;
+	struct midr_instance instance;
+	uint32_t age;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, key, selected, &path, &peer) == 0);
+	assert(midr_rib_selected_instance_get(ctx, key, &instance, &age, &peer) == 0);
 	assert(peer == bgp->peer_self);
-	assert(path->node_count == 1);
-	return selected->ls_sequence;
+	*selected = instance.object;
+	return instance.object.ls_sequence;
 }
 
 static void assert_selected_missing(const struct midr_ls_object_key *key)
 {
-	const struct midr_propagation_path *path;
-	struct midr_ls_object selected;
+	struct midr_instance selected;
 	struct peer *peer;
 
-	assert(midr_rib_selected_get(ctx, key, &selected, &path, &peer) == -ENOENT);
+	assert(midr_rib_selected_instance_get(ctx, key, &selected, NULL, &peer) == -ENOENT);
 }
 
 static void test_origination_suppression_and_withdraw(void)
@@ -275,7 +275,65 @@ static void test_persistence_failure_and_fightback(void)
 	node = node_update(10, 10);
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
-	(void)selected_sequence(&membership_key, &selected);
+	observed = selected_sequence(&membership_key, &selected);
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	assert(selected_sequence(&membership_key, &selected) == observed);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(summary.fightbacks == 0);
+
+	/* Re-publish the local fact after the fight-back tombstone so the
+	 * following blocked update exercises a real withdrawal operation. */
+	midr_owned_identity_withdraw(ctx);
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	node = node_update(11, 10);
+	assert(midr_topology_node_upsert(ctx, &node) == 0);
+	midr_topology_process_pending(ctx);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+	assert(selected.payload.membership.group_id == 10);
+
+	/* A real canonical event allocation failure must count as an operation
+	 * failure without erasing the previously advertised instance. */
+	{
+		uint64_t previous_sequence = selected.ls_sequence;
+		uint64_t withdraw_failures = summary.withdraw_failures;
+		uint64_t refresh_failures = summary.refresh_failures;
+
+		assert(midr_rib_test_set_event_limit(ctx, 0) == 0);
+		/* Exercise the public identity withdrawal path directly.  The input
+		 * queue may coalesce a blocked topology update before reconciliation,
+		 * whereas this path must always attempt the advertised instance. */
+		midr_owned_identity_withdraw(ctx);
+		assert(selected_sequence(&membership_key, &selected) ==
+		       previous_sequence);
+		assert(selected.payload.membership.group_id == 10);
+		assert(midr_owned_summary_get(ctx, &summary) == 0);
+		/* Both the local Membership and Link are advertised at this point;
+		 * count failures per object, as required by the diagnostics contract. */
+		assert(summary.withdraw_failures == withdraw_failures + 2);
+
+		assert(midr_rib_test_set_event_limit(
+			       ctx, MIDR_RIB_MAX_IDENTITIES * 2U) == 0);
+		midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+		node = node_update(13, 20);
+		assert(midr_topology_node_upsert(ctx, &node) == 0);
+		midr_topology_process_pending(ctx);
+		assert(selected_sequence(&membership_key, &selected) >
+		       previous_sequence);
+		assert(selected.payload.membership.group_id == 20);
+
+		previous_sequence = selected.ls_sequence;
+		assert(midr_rib_test_set_event_limit(ctx, 0) == 0);
+		midr_owned_test_fire_refresh(ctx);
+		assert(selected_sequence(&membership_key, &selected) ==
+		       previous_sequence);
+		assert(midr_owned_summary_get(ctx, &summary) == 0);
+		assert(summary.refresh_failures == refresh_failures + 2);
+		assert(midr_rib_test_set_event_limit(
+			       ctx, MIDR_RIB_MAX_IDENTITIES * 2U) == 0);
+		midr_owned_test_fire_refresh(ctx);
+		assert(selected_sequence(&membership_key, &selected) >
+		       previous_sequence);
+	}
 
 	sequence_store.fail_save = true;
 	selected.ls_sequence = (((selected.ls_sequence >> 32) + 1) << 32);
@@ -283,20 +341,22 @@ static void test_persistence_failure_and_fightback(void)
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(!summary.ready);
 	assert(summary.sequence_failures == 1);
-	assert_selected_missing(&membership_key);
+	assert(selected_sequence(&membership_key, &selected) > 0);
+	assert(selected.payload.membership.group_id == 20);
 	assert(midr_owned_test_set_sequence_store(ctx, &sequence_ops, &sequence_store) == -EBUSY);
 
-	node.version = 11;
-	node.group_id = 20;
+	node.version = 14;
+	node.group_id = 30;
 	assert(midr_topology_node_upsert(ctx, &node) == 0);
 	midr_topology_process_pending(ctx);
-	assert_selected_missing(&membership_key);
+	assert(selected_sequence(&membership_key, &selected) > 0);
+	assert(selected.payload.membership.group_id == 20);
 
 	sequence_store.fail_save = false;
 	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
 	midr_owned_reconcile(ctx);
 	observed = selected_sequence(&membership_key, &selected);
-	assert(selected.payload.membership.group_id == 20);
+	assert(selected.payload.membership.group_id == 30);
 
 	selected.ls_sequence += (UINT64_C(1) << 32);
 	observed = selected.ls_sequence;
@@ -304,6 +364,63 @@ static void test_persistence_failure_and_fightback(void)
 	assert(selected_sequence(&membership_key, &selected) > observed);
 	assert(midr_owned_summary_get(ctx, &summary) == 0);
 	assert(summary.fightbacks == 1);
+}
+
+static void test_restart_observes_self_instance_before_allocator_ready(void)
+{
+	struct midr_ls_object_key membership_key = {
+		.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+		.originator_node_id = bgp->router_id.s_addr,
+	};
+	struct midr_owned_summary summary;
+	struct midr_ls_object selected;
+	uint64_t observed = (UINT64_C(99) << 32) | 7;
+
+	sequence_store.fail_save = true;
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	assert(midr_owned_summary_get(ctx, &summary) == 0);
+	assert(!summary.ready);
+
+	/* A valid self-originated old instance is accepted as version evidence,
+	 * but its payload is never installed as a local fact. */
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	sequence_store.fail_save = false;
+	midr_owned_identity_start(ctx, bgp->router_id.s_addr);
+	midr_owned_reconcile(ctx);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+}
+
+static void test_instance_fightback_is_targeted(void)
+{
+	struct midr_ls_object_key membership_key = {
+		.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+		.originator_node_id = bgp->router_id.s_addr,
+	};
+	struct midr_ls_object_key link_key = {
+		.type = MIDR_NLRI_TYPE_LINK,
+		.originator_node_id = bgp->router_id.s_addr,
+		.u.link = {
+			.remote_node_id = router_id("10.0.0.2"),
+			.link_id = 100,
+		},
+	};
+	struct midr_owned_summary before;
+	struct midr_owned_summary after;
+	struct midr_ls_object selected;
+	uint64_t membership_sequence;
+	uint64_t link_sequence;
+	uint64_t observed;
+
+	membership_sequence = selected_sequence(&membership_key, &selected);
+	link_sequence = selected_sequence(&link_key, &selected);
+	assert(midr_owned_summary_get(ctx, &before) == 0);
+
+	observed = membership_sequence + (UINT64_C(1) << 32);
+	assert(midr_owned_observe_self_instance(ctx, &membership_key, observed) == 0);
+	assert(selected_sequence(&membership_key, &selected) > observed);
+	assert(selected_sequence(&link_key, &selected) == link_sequence);
+	assert(midr_owned_summary_get(ctx, &after) == 0);
+	assert(after.fightbacks == before.fightbacks + 1);
 }
 
 static void test_owned_lifecycle_and_validation(void)
@@ -388,6 +505,10 @@ static void test_owned_lifecycle_and_validation(void)
 	assert(selected.payload.membership.group_id == 30);
 	assert(midr_owned_link_metadata_get(ctx, &link_key, &ifindex) == 0);
 	assert(ifindex == 7);
+	sequence = selected_sequence(&membership_key, &selected);
+	midr_owned_test_fire_refresh(ctx);
+	assert(selected_sequence(&membership_key, &selected) > sequence);
+	assert(selected.payload.membership.group_id == 30);
 
 	node.version = 21;
 	node.policy_tags++;
@@ -496,6 +617,8 @@ int main(void)
 
 	test_origination_suppression_and_withdraw();
 	test_persistence_failure_and_fightback();
+	test_restart_observes_self_instance_before_allocator_ready();
+	test_instance_fightback_is_targeted();
 	test_owned_lifecycle_and_validation();
 	assert(midr_owned_init(ctx) == -EALREADY);
 	midr_owned_finish(ctx);

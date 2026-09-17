@@ -85,6 +85,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
 #include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_vty.h"
 #include "bgpd/midr_trace_scheduler.h"
 #include "bgpd/midr_tier1_list.h"
@@ -1319,6 +1320,10 @@ enum bgp_peer_sort peer_sort_lookup(struct peer *peer)
  */
 void bgp_peer_connection_buffers_free(struct peer_connection *connection)
 {
+	if (connection && connection->peer && connection->peer->bgp &&
+	    connection->peer->bgp->midr_info)
+		midr_sync_connection_down(&connection->peer->bgp->midr_info->ctx,
+					  connection);
 	frr_with_mutex (&connection->io_mtx) {
 		if (connection->ibuf) {
 			stream_fifo_free(connection->ibuf);

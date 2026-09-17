@@ -185,6 +185,8 @@ static void test_add_flush_diff(void)
 	TV(g_last_api.instance == MIDR_INSTANCE_SPF, "zapi instance=SPF(0)");
 	TV(g_last_api.distance == ZEBRA_BGP_MIDR_DISTANCE_DEFAULT, "zapi distance=115");
 	TV(g_last_api.type == ZEBRA_ROUTE_BGP_MIDR, "zapi type=MIDR");
+	TV(CHECK_FLAG(g_last_api.flags, ZEBRA_FLAG_ALLOW_RECURSION),
+	   "zapi allows recursive transport nexthops");
 	TV(CHECK_FLAG(g_last_api.message, ZAPI_MESSAGE_METRIC), "zapi has METRIC flag");
 
 	/* no-op reinstall */

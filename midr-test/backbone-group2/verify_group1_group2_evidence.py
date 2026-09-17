@@ -11,21 +11,6 @@ from pathlib import Path
 
 
 MEMBERS = ("r1", "r2", "m1a", "m1b", "m2a", "z1", "z2")
-# z1 avoids t1 (Tier1 admission scenario, see backbone-lab/configs-backbone/z1)
-# and therefore joins group 2 instead of the faster group 1.
-EXPECTED_GROUP_SIZE = {
-    "r1": 4,
-    "m1a": 4,
-    "m1b": 4,
-    "z1": 3,
-    "r2": 3,
-    "m2a": 3,
-    "z2": 4,
-}
-# r2 peers directly with every node that originates objects it selects
-# (group 1 anchors m1a/m1b/z2, the manual r1 edge, and group 2 members), so
-# multi-hop propagation cannot be observed there.
-NO_MULTIHOP_NODES = {"r2"}
 
 
 class Checks:
@@ -274,7 +259,6 @@ def main() -> int:
             self_text, "Router-ID"
         )
         group_id = int_field(self_text, "Group-ID")
-        expected_size = EXPECTED_GROUP_SIZE[node]
 
         node_report = re.search(
             r"node\s*: valid=(\d+) reported=(\d+) pending=(\d+) version=(\d+)",
@@ -321,10 +305,11 @@ def main() -> int:
             if line.lstrip().startswith("path ") and "selected=yes" in line
         ]
         remote_selected = [line for line in selected_lines if "peer=self" not in line]
-        multihop_selected = [
+        active_selected = [line for line in selected_lines if "state=ACTIVE" in line]
+        legacy_path_selected = [
             line
             for line in remote_selected
-            if re.search(r"propagation=\[[^]]*,[^]]*\]", line)
+            if "propagation=" in line
         ]
 
         lsdb_objects_count = int_field(lsdb_summary, "objects")
@@ -352,6 +337,7 @@ def main() -> int:
 
         memberships = lsdb_memberships(objects)
         local_memberships = lsdb_local_memberships(objects, group_id or -1)
+        expected_size = len(local_memberships)
         local_nodes = {row[0] for row in local_memberships}
         links = lsdb_links(objects, local_nodes)
         node_prefixes = lsdb_node_prefixes(objects)
@@ -421,13 +407,11 @@ def main() -> int:
             f"{node} RIB selects one conflict-free path per identity",
         )
         checks.check(
-            len(remote_selected) > 0
-            and (len(multihop_selected) > 0 or node in NO_MULTIHOP_NODES),
-            f"{node} contains selected remote objects"
-            + ("" if node in NO_MULTIHOP_NODES else " with multi-hop propagation paths"),
+            len(remote_selected) > 0 and not legacy_path_selected,
+            f"{node} selects remote canonical objects without Propagation Path",
         )
         checks.check(
-            lsdb_objects_count == selected
+            lsdb_objects_count == len(active_selected)
             and lsdb_usable == lsdb_objects_count
             and lsdb_pending == 0
             and lsdb_dirty == 0
@@ -485,7 +469,7 @@ def main() -> int:
                 "rib_paths": rib_path_count if rib_path_count is not None else -1,
                 "rib_selected": selected if selected is not None else -1,
                 "remote_selected": len(remote_selected),
-                "multihop_selected": len(multihop_selected),
+                "legacy_path_selected": len(legacy_path_selected),
                 "lsdb_objects": lsdb_objects_count if lsdb_objects_count is not None else -1,
                 "lsdb_usable": lsdb_usable if lsdb_usable is not None else -1,
                 "ted_generation": ted_generation if ted_generation is not None else -1,
@@ -548,7 +532,7 @@ def main() -> int:
         stream.write(f"Verification: {checks.passed} passed, {checks.failed} failed.\n\n")
         stream.write(
             "| Node | Router ID | Group | Provider/Owned Links | "
-            "RIB Selected/Paths | Remote/Multi-hop | LSDB Usable | "
+            "RIB Selected/Paths | Remote/Legacy-path | LSDB Usable | "
             "TED Gen | TED Nodes/Links | Node/Group Prefixes |\n"
         )
         stream.write(
@@ -559,7 +543,7 @@ def main() -> int:
                 f"| {row['node']} | {row['router_id']} | {row['group_id']} | "
                 f"{row['reported_links']}/{row['owned_links']} | "
                 f"{row['rib_selected']}/{row['rib_paths']} | "
-                f"{row['remote_selected']}/{row['multihop_selected']} | "
+                f"{row['remote_selected']}/{row['legacy_path_selected']} | "
                 f"{row['lsdb_usable']} | {row['ted_generation']} | "
                 f"{row['ted_nodes']}/"
                 f"{int(row['ted_intra_links']) + int(row['ted_egress_links'])} | "

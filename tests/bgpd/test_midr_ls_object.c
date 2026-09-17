@@ -260,6 +260,12 @@ static void test_defensive_arguments(void)
 	link.key.type = MIDR_NLRI_TYPE_RESERVED;
 	invalid_copy = link;
 	assert(!midr_ls_object_same(&link, &invalid_copy));
+	link = link_object();
+	invalid_copy = link;
+	invalid_copy.ls_sequence++;
+	assert(midr_ls_object_semantic_same(&link, &invalid_copy));
+	invalid_copy.payload.link.canonical_cost++;
+	assert(!midr_ls_object_semantic_same(&link, &invalid_copy));
 }
 
 int main(void)

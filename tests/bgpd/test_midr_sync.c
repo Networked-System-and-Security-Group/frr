@@ -8,14 +8,20 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #include "command.h"
 #include "privs.h"
 #include "qobj.h"
+#include "stream.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_lsdb.h"
+#include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted.h"
 #include "bgpd/bgp_network.h"
@@ -26,6 +32,15 @@ struct event_loop *master;
 
 static struct bgp *bgp;
 static struct midr_context *ctx;
+
+static void process_until_no_pending_update(void)
+{
+	struct midr_sync_status status;
+
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.pending_update_count == 0);
+}
 
 static uint32_t router_id(const char *text)
 {
@@ -64,15 +79,84 @@ static void test_no_peer_and_configuration(void)
 	assert(!midr_sync_view_ready(ctx, false, &reasons));
 }
 
+static void test_bootstrap_empty_snapshot_can_send_eor(void)
+{
+	struct peer *peer = established_peer("10.0.0.9");
+	struct peer_connection *connection = peer->connection;
+	struct midr_sync_status before;
+	struct midr_sync_status after;
+	uint64_t reasons = 0;
+
+	assert(bgp->midr_nds_info);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	bgp->midr_nds_info->local_capabilities |= MIDR_CAP_BOOTSTRAP;
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(!midr_sync_can_send_eor(ctx, connection));
+	assert(midr_sync_local_ready(ctx));
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	assert(midr_sync_can_send_eor(ctx, connection));
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.waiting_peer_count == 0);
+	assert(after.receive_drained_count == 1);
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(midr_sync_local_ready(ctx));
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.barrier_count == before.barrier_count);
+
+	bgp->midr_nds_info->local_capabilities &= ~MIDR_CAP_BOOTSTRAP;
+	connection->status = Idle;
+	midr_sync_test_session_down(ctx, connection);
+	event_cancel(&connection->t_generate_updgrp_packets);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(!midr_sync_local_ready(ctx));
+}
+
+static void test_late_peer_does_not_reopen_initial_barrier(void)
+{
+	struct midr_sync_status before;
+	struct midr_sync_status after;
+	struct peer *peer;
+	uint64_t reasons = 0;
+
+	assert(midr_sync_view_ready(ctx, true, &reasons));
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(before.state == MIDR_SYNC_READY);
+	assert(before.initial_peer_count == 0);
+	peer = established_peer("10.0.0.8");
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.initial_peer_count == 0);
+	assert(after.waiting_peer_count == 0);
+	assert(after.active_session_count == 1);
+	assert(after.barrier_count == before.barrier_count);
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.state == MIDR_SYNC_READY);
+	assert(after.receive_drained_count == 1);
+
+	peer->connection->status = Idle;
+	midr_sync_peer_status_changed(ctx, peer);
+	event_cancel(&peer->connection->t_generate_updgrp_packets);
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+}
+
 static void test_eor_peer_down_timeout_and_late_eor(void)
 {
 	struct peer *peer = established_peer("10.0.0.2");
 	struct midr_sync_status status;
 	uint64_t reasons = 0;
 
+	/* Peer establishment can precede local input readiness. */
+	midr_sync_peer_status_changed(ctx, peer);
 	assert(!midr_sync_view_ready(ctx, true, &reasons));
 	assert(midr_sync_status_get(ctx, &status) == 0);
 	assert(status.state == MIDR_SYNC_REMOTE_WAIT);
+	assert(status.initial_peer_count == 1);
 	assert(status.waiting_peer_count == 1);
 	midr_sync_peer_eor(ctx, peer);
 	assert(midr_sync_status_get(ctx, &status) == 0);
@@ -80,6 +164,7 @@ static void test_eor_peer_down_timeout_and_late_eor(void)
 
 	assert(!midr_sync_view_ready(ctx, false, &reasons));
 	UNSET_FLAG(peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS], PEER_STATUS_EOR_RECEIVED);
+	midr_sync_test_session_down(ctx, peer->connection);
 	assert(!midr_sync_view_ready(ctx, true, &reasons));
 	midr_sync_test_timeout(ctx);
 	reasons = 0;
@@ -95,6 +180,7 @@ static void test_eor_peer_down_timeout_and_late_eor(void)
 	assert(!midr_sync_view_ready(ctx, false, &reasons));
 	peer->connection->status = Established;
 	UNSET_FLAG(peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS], PEER_STATUS_EOR_RECEIVED);
+	midr_sync_test_session_down(ctx, peer->connection);
 	assert(!midr_sync_view_ready(ctx, true, &reasons));
 	midr_sync_test_timeout(ctx);
 	reasons = 0;
@@ -108,6 +194,398 @@ static void test_eor_peer_down_timeout_and_late_eor(void)
 	reasons = 0;
 	assert(midr_sync_view_ready(ctx, true, &reasons));
 	assert(!(reasons & MIDR_TED_SYNC_REASON_EOR_TIMEOUT));
+}
+
+static void test_session_generation_and_packet_lifecycle(void)
+{
+	struct peer *peer = established_peer("10.0.0.3");
+	struct peer_connection *old_connection = peer->connection;
+	struct peer_connection *new_connection;
+	struct midr_sync_status status;
+	struct stream *stream;
+	uint64_t reasons = 0;
+	uint64_t first_generation;
+	uint64_t reconnects;
+
+	assert(midr_sync_view_ready(ctx, false, &reasons) == false);
+	assert(midr_sync_view_ready(ctx, true, &reasons) == false);
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.active_session_count == 1);
+	first_generation = status.next_session_generation;
+	reconnects = status.reconnect_count;
+	assert(first_generation != 0);
+
+	stream = stream_new(64);
+	midr_sync_snapshot_begin(old_connection);
+	midr_sync_snapshot_end(old_connection);
+	midr_sync_packet_queued(old_connection, stream, false);
+	assert(!midr_sync_can_send_eor(ctx, old_connection));
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.pending_update_count == 1);
+	midr_sync_packet_written(old_connection, stream);
+	process_until_no_pending_update();
+	stream_free(stream);
+	assert(midr_sync_can_send_eor(ctx, old_connection));
+
+	old_connection->status = Idle;
+	midr_sync_peer_status_changed(ctx, peer);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.active_session_count == 0);
+
+	new_connection = bgp_peer_connection_new(peer, NULL, CONNECTION_OUTGOING);
+	assert(new_connection);
+	new_connection->status = Established;
+	peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] = 1;
+	midr_sync_test_session_start(ctx, peer, new_connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.active_session_count == 1);
+	assert(status.next_session_generation == first_generation + 1);
+	assert(status.reconnect_count == reconnects + 1);
+
+	midr_sync_snapshot_begin(new_connection);
+	midr_sync_snapshot_end(new_connection);
+	midr_sync_peer_eor_connection(ctx, new_connection);
+	assert(midr_sync_can_send_eor(ctx, new_connection));
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.eor_received_count == 1);
+	assert(status.syncing_session_count == 1);
+
+	stream = stream_new(64);
+	midr_sync_packet_queued(new_connection, stream, true);
+	assert(!midr_sync_can_send_eor(ctx, new_connection));
+	midr_sync_packet_written(new_connection, stream);
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.syncing_session_count == 0);
+	assert(status.eor_written_count == 1);
+	stream_free(stream);
+	midr_sync_test_session_down(ctx, new_connection);
+	new_connection->status = Idle;
+	event_cancel(&new_connection->t_generate_updgrp_packets);
+	bgp_peer_connection_free(&new_connection);
+	event_cancel(&old_connection->t_generate_updgrp_packets);
+
+}
+
+static void test_delayed_completion_reuse_and_destroy(void)
+{
+	struct peer *peer = established_peer("10.0.0.4");
+	struct peer_connection *connection = peer->connection;
+	struct midr_sync_status status;
+	struct stream *stream = stream_new(64);
+	uint64_t reasons = 0;
+	uint64_t generation;
+
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(!midr_sync_view_ready(ctx, true, &reasons));
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	generation = status.next_session_generation;
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	midr_sync_packet_queued(connection, stream, false);
+	midr_sync_packet_written(connection, stream);
+	/* Reuse both addresses before the old completion reaches the main loop. */
+	midr_sync_test_session_down(ctx, connection);
+	SET_FLAG(peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS], PEER_STATUS_EOR_RECEIVED);
+	midr_sync_test_session_start(ctx, peer, connection);
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	midr_sync_packet_queued(connection, stream, false);
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.next_session_generation == generation + 1);
+	assert(status.pending_update_count == 1);
+	assert(status.eor_received_count == 0);
+	midr_sync_packet_dropped(connection, stream);
+	process_until_no_pending_update();
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.resync_required_count == 1);
+	assert(!midr_sync_can_send_eor(ctx, connection));
+
+	midr_sync_test_session_down(ctx, connection);
+	midr_sync_test_session_start(ctx, peer, connection);
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	midr_sync_packet_queued(connection, stream, false);
+	midr_sync_packet_written(connection, stream);
+	midr_sync_finish(ctx);
+	/* Completion and cancellation must not dereference the destroyed store. */
+	midr_sync_packet_dropped(connection, stream);
+	assert(midr_sync_init(ctx) == 0);
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.active_session_count == 0);
+	assert(status.pending_update_count == 0);
+	event_cancel(&connection->t_generate_updgrp_packets);
+	stream_free(stream);
+
+}
+
+static void test_encoded_packet_budget_timeout(void)
+{
+	struct peer *peer = established_peer("10.0.0.11");
+	struct peer_connection *connection = peer->connection;
+	struct midr_sync_status before, after;
+	struct stream *stream = stream_new(64);
+	struct stream *untracked = stream_new(64);
+	const uint64_t encoded_ns = 3000000000000ULL;
+	const uint64_t budget_ns =
+		(uint64_t)MIDR_CANONICAL_FORWARD_BUDGET_MS * 1000000ULL;
+
+	midr_sync_test_session_start(ctx, peer, connection);
+	midr_sync_snapshot_begin(connection);
+	midr_sync_snapshot_end(connection);
+	stream_putw(stream, 0x1234);
+	stream_set_monotime_ns(stream, encoded_ns);
+	midr_sync_packet_queued(connection, stream, false);
+	assert(midr_sync_status_get(ctx, &before) == 0);
+	assert(before.pending_update_count == 1);
+
+	/* Exactly B is still covered by the encoded compensation. */
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, stream, encoded_ns + budget_ns));
+	/* A partial write does not grant a fresh deadline.  Once B is exceeded,
+	 * the remaining bytes are failed and the session is forced to resync;
+	 * bgp_io also raises TCP_fatal_error so the old byte stream is discarded. */
+	stream_forward_getp(stream, 1);
+	assert(midr_sync_test_packet_timed_out_at(
+		connection, stream, encoded_ns + budget_ns + 1));
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &after) == 0);
+	assert(after.pending_update_count == 0);
+	assert(after.resync_required_count == 1);
+	assert(after.output_timeout_count == before.output_timeout_count + 1);
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+
+	/* The wire deadline is enforced from the stream metadata even if packet
+	 * tracking could not attach to a session.  Resetting a reusable stream
+	 * clears that metadata before it carries unrelated new contents. */
+	stream_putw(untracked, 0x5678);
+	stream_set_monotime_ns(untracked, encoded_ns);
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns));
+	assert(midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns + 1));
+	stream_reset(untracked);
+	assert(stream_get_monotime_ns(untracked) == 0);
+	assert(!midr_sync_test_packet_timed_out_at(
+		connection, untracked, encoded_ns + budget_ns + 1));
+
+	midr_sync_test_session_down(ctx, connection);
+	connection->status = Idle;
+	event_cancel(&connection->t_generate_updgrp_packets);
+	stream_free(untracked);
+	stream_free(stream);
+}
+
+static void test_eor_waits_for_admission_and_derivation(void)
+{
+	struct peer *peer;
+	struct listnode *node;
+	struct midr_sync_status status;
+	struct midr_lsdb_summary lsdb;
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = {
+			.key.type = MIDR_NLRI_TYPE_MEMBERSHIP,
+			.ls_sequence = 1,
+			.payload.membership.group_id = 1,
+		},
+	};
+	uint64_t reasons = 0;
+
+	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer)) {
+		midr_sync_test_session_down(ctx, peer->connection);
+		peer->connection->status = Idle;
+	}
+	peer = established_peer("10.0.0.5");
+	instance.object.key.originator_node_id = peer->remote_id.s_addr;
+	assert(!midr_sync_view_ready(ctx, false, &reasons));
+	assert(!midr_sync_view_ready(ctx, true, &reasons));
+	midr_sync_input_begin(ctx, peer->connection);
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.waiting_peer_count == 1);
+	assert(midr_rib_instance_upsert(ctx, peer, &instance, 0) == 0);
+	midr_sync_input_end(ctx, peer->connection, true);
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.dirty_count > 0);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.waiting_peer_count == 1);
+	midr_lsdb_test_fail_next_prepare(ctx);
+	assert(midr_lsdb_test_process(ctx) == -ENOMEM);
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.waiting_peer_count == 1);
+	assert(midr_lsdb_test_process(ctx) == 0);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(status.waiting_peer_count == 1);
+	assert(status.receive_drained_count == 0);
+	assert(!lsdb.ready);
+	assert(!lsdb.derivation_pending);
+
+	midr_sync_test_session_down(ctx, peer->connection);
+	midr_sync_test_session_start(ctx, peer, peer->connection);
+	midr_sync_input_begin(ctx, peer->connection);
+	midr_sync_input_end(ctx, peer->connection, false);
+	midr_sync_peer_eor(ctx, peer);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.resync_required_count == 1);
+	assert(status.receive_drained_count == 0);
+	assert(!midr_sync_can_send_eor(ctx, peer->connection));
+}
+
+struct writer_completion {
+	struct peer_connection *connection;
+	struct stream *stream;
+};
+
+static void *writer_complete(void *arg)
+{
+	struct writer_completion *completion = arg;
+
+	midr_sync_packet_written(completion->connection, completion->stream);
+	return NULL;
+}
+
+static void test_writer_teardown_race(void)
+{
+	struct peer *peer = established_peer("10.0.0.6");
+	struct writer_completion completion = {.connection = peer->connection};
+	struct midr_sync_status status;
+	pthread_t writer;
+
+	for (unsigned int i = 0; i < 32; i++) {
+		midr_sync_test_session_start(ctx, peer, peer->connection);
+		midr_sync_snapshot_begin(peer->connection);
+		midr_sync_snapshot_end(peer->connection);
+		completion.stream = stream_new(64);
+		midr_sync_packet_queued(peer->connection, completion.stream, false);
+		assert(pthread_create(&writer, NULL, writer_complete, &completion) == 0);
+		midr_sync_connection_down(ctx, peer->connection);
+		assert(pthread_join(writer, NULL) == 0);
+		midr_sync_test_drain_completions(ctx);
+		assert(midr_sync_status_get(ctx, &status) == 0);
+		assert(status.pending_update_count == 0);
+		stream_free(completion.stream);
+	}
+}
+
+static void test_shutdown_result_is_bounded_and_retained(void)
+{
+	struct peer *peer = established_peer("10.0.0.7");
+	struct midr_sync_status status;
+	struct stream *stream;
+
+	midr_sync_test_session_start(ctx, peer, peer->connection);
+	midr_sync_snapshot_begin(peer->connection);
+	midr_sync_snapshot_end(peer->connection);
+	stream = stream_new(64);
+	midr_sync_packet_queued(peer->connection, stream, false);
+
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_announce_complete(ctx);
+	assert(!midr_sync_shutdown_ready(ctx));
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_WAITING);
+	midr_sync_shutdown_expired(ctx);
+	assert(midr_sync_shutdown_ready(ctx));
+	midr_sync_packet_dropped(peer->connection, stream);
+	midr_sync_test_drain_completions(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_DEGRADED);
+	midr_sync_shutdown_finish(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(!status.shutdown_active);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_DEGRADED);
+
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_announce_complete(ctx);
+	assert(midr_sync_shutdown_ready(ctx));
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_COMPLETE);
+	midr_sync_shutdown_finish(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_COMPLETE);
+	midr_sync_shutdown_cancel(ctx);
+	stream_free(stream);
+}
+
+static void test_shutdown_generation_failure_is_counted_once(void)
+{
+	struct midr_sync_status status;
+	uint64_t before;
+
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	before = status.shutdown_generation_failures;
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_GENERATION_FAILED);
+	assert(status.shutdown_generation_failures == before + 1);
+	midr_sync_shutdown_finish(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(!status.shutdown_active);
+	assert(status.shutdown_state == MIDR_SYNC_SHUTDOWN_GENERATION_FAILED);
+
+	/* The next teardown cycle gets its own single increment. */
+	midr_sync_shutdown_begin(ctx);
+	midr_sync_shutdown_generation_failed(ctx);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.shutdown_generation_failures == before + 2);
+	midr_sync_shutdown_finish(ctx);
+}
+
+static void test_input_rejection_backoff_and_recovery(void)
+{
+	struct midr_sync_status status;
+	struct peer *peer;
+
+	peer = established_peer("10.0.0.10");
+	midr_sync_test_session_start(ctx, peer, peer->connection);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 60000) == 0);
+
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 1);
+	assert(status.resync_required_count == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+
+	/* A repeated rejection while a resync is already pending adds no work. */
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 2);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+
+	/* After the resync fires, the backoff window suppresses an immediate
+	 * reschedule; with the backoff disabled a new one is admitted. */
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 3);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 0) == 0);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 4);
+	assert(midr_sync_test_resync_pending(ctx) == 1);
+	assert(midr_sync_test_fire_resync(ctx) == 1);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+
+	/* A rejection without a live session only bumps the counter. */
+	peer->connection->status = Idle;
+	midr_sync_test_session_down(ctx, peer->connection);
+	event_cancel(&peer->connection->t_generate_updgrp_packets);
+	midr_sync_input_rejected(ctx, peer->connection);
+	assert(midr_sync_status_get(ctx, &status) == 0);
+	assert(status.input_rejected_count == 5);
+	assert(midr_sync_test_resync_pending(ctx) == 0);
+	assert(midr_sync_test_set_input_reject_backoff(ctx, 1000) == 0);
 }
 
 int main(void)
@@ -127,9 +605,27 @@ int main(void)
 	ctx = &bgp->midr_info->ctx;
 
 	test_no_peer_and_configuration();
+	test_bootstrap_empty_snapshot_can_send_eor();
+	/* The following cases exercise the sync state machine without the
+	 * LSDB/TED readiness gate. Full integration coverage follows below. */
+	midr_lsdb_finish(ctx);
+	test_late_peer_does_not_reopen_initial_barrier();
 	test_eor_peer_down_timeout_and_late_eor();
+	test_session_generation_and_packet_lifecycle();
+	test_delayed_completion_reuse_and_destroy();
+	test_encoded_packet_budget_timeout();
+	test_input_rejection_backoff_and_recovery();
+	assert(midr_lsdb_init(ctx) == 0);
+	test_eor_waits_for_admission_and_derivation();
+	test_writer_teardown_race();
+	test_shutdown_result_is_bounded_and_retained();
+	test_shutdown_generation_failure_is_counted_once();
 	assert(midr_sync_status_get(NULL, &(struct midr_sync_status){}) == -ENOENT);
 	assert(midr_sync_status_get(ctx, NULL) == -EINVAL);
+	/* Release sessions and any completion that has already reached the
+	 * test-owned event queue before LeakSanitizer inspects the fixture. */
+	midr_sync_test_drain_completions(ctx);
+	midr_sync_finish(ctx);
 	puts("MIDR sync tests passed");
 	return 0;
 }

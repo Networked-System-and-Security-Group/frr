@@ -6,39 +6,475 @@
 #include <zebra.h>
 
 #include <errno.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "linklist.h"
 #include "memory.h"
+#include "monotime.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_midr_canonical.h"
 #include "bgpd/bgp_midr_lsdb.h"
+#include "bgpd/bgp_midr_nds.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted.h"
+#include "bgpd/bgp_packet.h"
+#include "bgpd/bgp_route.h"
+#include "bgpd/bgp_updgrp.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_STORE, "MIDR sync store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_PEER, "MIDR sync peer");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_SESSION, "MIDR sync session");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_PACKET, "MIDR sync packet");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_TOKEN, "MIDR sync session token");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_SYNC_SHUTDOWN_TARGET,
+			   "MIDR shutdown sync target");
+
+/* Minimum spacing between resync attempts scheduled by resource-rejected
+ * MIDR input, so sustained overload degrades to a bounded retry rate
+ * instead of a resync storm. */
+#define MIDR_SYNC_INPUT_REJECT_BACKOFF_MSEC 1000U
 
 struct midr_sync_peer {
 	struct peer *peer;
+	uint64_t generation;
 	bool waiting;
 	bool timed_out;
+};
+
+struct midr_sync_token {
+	struct midr_sync_session *session;
+	size_t references;
+};
+
+struct midr_sync_session_packet {
+	struct stream *stream;
+	struct peer_connection *connection;
+	struct midr_sync_token *token;
+	struct event *completion;
+	struct midr_sync_session_packet *next;
+	struct midr_sync_session_packet *completion_next;
+	size_t references;
+	uint64_t generation;
+	uint64_t encoded_ns;
+	bool eor;
+	bool written;
+	bool timed_out;
+};
+
+struct midr_sync_shutdown_target {
+	struct peer_connection *connection;
+	uint64_t generation;
+	bool failed;
+};
+
+/* The writer only accesses this registry under the mutex, never the LS store. */
+static pthread_mutex_t midr_sync_packets_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct midr_sync_session_packet *midr_sync_packets;
+static struct midr_sync_session_packet *midr_sync_completions;
+
+struct midr_sync_session {
+	struct midr_sync_store *store;
+	struct peer *peer;
+	struct peer_connection *connection;
+	uint64_t generation;
+	enum midr_sync_session_state state;
+	bool remote_eor;
+	bool local_eor_queued;
+	bool local_eor_written;
+	bool needs_resync;
+	bool snapshot_requested;
+	bool snapshot_active;
+	bool snapshot_completed;
+	struct event *resync_event;
+	uint64_t snapshot_generation;
+	size_t pending_updates;
+	size_t pending_input;
+	int64_t last_input_reject_ms;
+	struct list *packets;
+	struct midr_sync_token *token;
 };
 
 struct midr_sync_store {
 	struct midr_context *ctx;
 	struct list *peers;
+	struct list *sessions;
 	struct event *t_timeout;
 	enum midr_sync_state state;
 	uint32_t timeout_seconds;
 	bool local_ready;
 	uint64_t barrier_count;
 	uint64_t timeout_count;
+	uint64_t next_session_generation;
+	uint64_t reconnect_count;
+	uint64_t stale_event_count;
+	uint64_t input_rejected_count;
+	uint64_t output_timeout_count;
+	uint64_t shutdown_generation_failures;
+	uint64_t gr_tuple_ignored;
+	uint64_t llgr_tuple_ignored;
+	uint32_t input_reject_backoff_msec;
+	bool shutdown_active;
+	bool shutdown_announce_complete;
+	bool shutdown_generation_failure_recorded;
+	enum midr_sync_shutdown_state shutdown_state;
+	struct list *shutdown_targets;
 };
+
+static struct midr_sync_session *midr_sync_session_lookup_generation(
+	struct midr_sync_store *store, struct peer_connection *connection,
+	uint64_t generation);
+
+static uint64_t midr_sync_now_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static struct midr_sync_shutdown_target *midr_sync_shutdown_target_lookup(
+	struct midr_sync_store *store, struct peer_connection *connection,
+	uint64_t generation)
+{
+	struct listnode *node;
+	struct midr_sync_shutdown_target *target;
+
+	for (ALL_LIST_ELEMENTS_RO(store->shutdown_targets, node, target))
+		if (target->connection == connection &&
+		    target->generation == generation)
+			return target;
+	return NULL;
+}
 
 static void midr_sync_peer_free(void *arg)
 {
 	XFREE(MTYPE_MIDR_SYNC_PEER, arg);
+}
+
+static void midr_sync_shutdown_target_free(void *arg)
+{
+	XFREE(MTYPE_MIDR_SYNC_SHUTDOWN_TARGET, arg);
+}
+
+static void midr_sync_token_release(struct midr_sync_token *token)
+{
+	if (!token || !token->references)
+		return;
+	if (!--token->references)
+		XFREE(MTYPE_MIDR_SYNC_TOKEN, token);
+}
+
+static void midr_sync_packet_ref(struct midr_sync_session_packet *packet)
+{
+	if (packet)
+		packet->references++;
+}
+
+static void midr_sync_packet_unref(struct midr_sync_session_packet *packet)
+{
+	struct midr_sync_session_packet **link;
+
+	if (!packet || !packet->references)
+		return;
+	if (--packet->references)
+		return;
+
+	/* An unclaimed packet can still be present in the writer registry when
+	 * its session is torn down.  Remove that registry reference before the
+	 * object is released.  Claimed completions have their own reference and
+	 * therefore cannot reach this path until their event has run. */
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (link = &midr_sync_packets; *link; link = &(*link)->next)
+		if (*link == packet) {
+			*link = packet->next;
+			break;
+		}
+	for (struct midr_sync_session_packet **completion =
+		     &midr_sync_completions;
+	     *completion; completion = &(*completion)->completion_next)
+		if (*completion == packet) {
+			*completion = packet->completion_next;
+			break;
+		}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	event_cancel(&packet->completion);
+	midr_sync_token_release(packet->token);
+	XFREE(MTYPE_MIDR_SYNC_PACKET, packet);
+}
+
+static bool midr_sync_receive_drained(struct midr_sync_session *session)
+{
+	struct midr_lsdb_summary summary;
+
+	/* A dedicated bootstrap has no local Membership and therefore never has
+	 * a READY derived LSDB/TED.  Its receive side is nevertheless drained
+	 * once the peer snapshot reached EoR and no input or resync work remains. */
+	if (midr_nds_is_bootstrap(session->store->ctx->bgp))
+		return session->remote_eor && !session->pending_input &&
+		       !session->needs_resync;
+	if (!session->store->ctx->lsdb_store)
+		return session->remote_eor && !session->pending_input &&
+		       !session->needs_resync;
+	if (midr_lsdb_summary_get(session->store->ctx, &summary) != 0)
+		return false;
+
+	return session->remote_eor && !session->pending_input &&
+	       !session->needs_resync &&
+	       summary.ready && !summary.dirty_count &&
+	       !summary.derivation_pending && !summary.last_error;
+}
+
+static void midr_sync_start(struct midr_sync_store *store);
+
+static void midr_sync_session_packet_free(void *arg)
+{
+	struct midr_sync_session_packet *packet = arg;
+
+	/* The session list owns one reference.  A completion claimed by the
+	 * writer owns a second reference and is deliberately not cancelled here;
+	 * its event may run after the session has gone away. */
+	midr_sync_packet_unref(packet);
+}
+
+static void midr_sync_packet_event(struct event *event)
+{
+	struct midr_sync_session_packet *packet = EVENT_ARG(event);
+	struct midr_sync_session *session = packet->token ? packet->token->session : NULL;
+	bool in_session = session && session->connection == packet->connection &&
+			  session->generation == packet->generation &&
+			  session->state != MIDR_SYNC_SESSION_DOWN &&
+			  listnode_lookup(session->packets, packet);
+	/* The event owns the completion reference.  Remove the packet from the
+	 * test/diagnostic completion registry before applying its result so a
+	 * direct test drain cannot invoke it twice. */
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (struct midr_sync_session_packet **completion =
+		     &midr_sync_completions;
+	     *completion; completion = &(*completion)->completion_next)
+		if (*completion == packet) {
+			*completion = packet->completion_next;
+			break;
+		}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+
+	packet->completion = NULL;
+	if (session && in_session) {
+		if (packet->timed_out)
+			session->store->output_timeout_count++;
+		if (packet->eor)
+			session->local_eor_written = packet->written;
+		else if (session->pending_updates)
+			session->pending_updates--;
+		if (!packet->written) {
+			session->needs_resync = true;
+			session->state = MIDR_SYNC_SESSION_RESYNC;
+			if (session->store->shutdown_active) {
+				struct midr_sync_shutdown_target *target =
+					midr_sync_shutdown_target_lookup(
+						session->store, session->connection,
+						session->generation);
+
+				if (target) {
+					target->failed = true;
+					session->store->shutdown_state =
+						MIDR_SYNC_SHUTDOWN_DEGRADED;
+				}
+			}
+			midr_sync_request_resync(session->connection);
+		}
+		if (session->local_eor_written && midr_sync_receive_drained(session))
+			session->state = MIDR_SYNC_SESSION_READY;
+		if (peer_established(session->connection))
+			event_add_event(bm->master, bgp_generate_updgrp_packets,
+					session->connection, 0,
+					&session->connection->t_generate_updgrp_packets);
+		listnode_delete(session->packets, packet);
+		midr_sync_packet_unref(packet); /* session reference */
+		midr_sync_packet_unref(packet); /* completion reference */
+		return;
+	}
+	midr_sync_packet_unref(packet); /* completion reference */
+}
+
+static void midr_sync_session_free(void *arg)
+{
+	struct midr_sync_session *session = arg;
+	struct midr_sync_token *token = session->token;
+	bool resync_pending = session->resync_event != NULL;
+
+	token->session = NULL;
+	event_cancel(&session->resync_event);
+	list_delete(&session->packets);
+	if (resync_pending)
+		midr_sync_token_release(token);
+	midr_sync_token_release(token);
+	XFREE(MTYPE_MIDR_SYNC_SESSION, session);
+}
+
+static void midr_sync_resync_event(struct event *event)
+{
+	struct midr_sync_token *token = EVENT_ARG(event);
+	struct midr_sync_session *session = token ? token->session : NULL;
+
+	if (session) {
+		session->resync_event = NULL;
+		if (peer_established(session->connection) && !session->snapshot_active)
+			bgp_announce_route(session->peer, AFI_BGP_LS,
+					   SAFI_MIDR_LS, true);
+	}
+	midr_sync_token_release(token);
+}
+
+static void midr_sync_schedule_resync_delay(
+	struct midr_sync_session *session, uint32_t delay_ms)
+{
+	if (!session || session->resync_event || !bm || !bm->master ||
+	    !peer_established(session->connection))
+		return;
+	session->snapshot_requested = true;
+	session->snapshot_completed = false;
+	session->local_eor_queued = false;
+	session->local_eor_written = false;
+	UNSET_FLAG(session->peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS],
+		   PEER_STATUS_EOR_SEND);
+	session->token->references++;
+	event_add_timer_msec(bm->master, midr_sync_resync_event, session->token,
+			     delay_ms, &session->resync_event);
+}
+
+static void midr_sync_schedule_resync(struct midr_sync_session *session)
+{
+	midr_sync_schedule_resync_delay(session, 0);
+}
+
+static struct midr_sync_session *midr_sync_session_lookup(
+	struct midr_sync_store *store, const struct peer_connection *connection)
+{
+	struct listnode *node;
+	struct midr_sync_session *session;
+
+	if (!connection)
+		return NULL;
+	for (ALL_LIST_ELEMENTS_RO(store->sessions, node, session))
+		if (session->connection == connection &&
+		    session->state != MIDR_SYNC_SESSION_DOWN)
+			return session;
+	return NULL;
+}
+
+/*
+ * A well-formed MIDR UPDATE that cannot be admitted for resource reasons
+ * must not reset the session.  Record the rejection, keep the session out
+ * of the drained/READY state, and schedule a resync at a bounded rate.
+ */
+void midr_sync_input_rejected(struct midr_context *ctx,
+			      struct peer_connection *connection)
+{
+	struct midr_sync_store *store;
+	struct midr_sync_session *session;
+	uint64_t now_ns;
+	int64_t now_ms;
+
+	if (!ctx || !ctx->sync_store || !connection)
+		return;
+	store = ctx->sync_store;
+	store->input_rejected_count++;
+	session = midr_sync_session_lookup(store, connection);
+	if (!session || session->state == MIDR_SYNC_SESSION_DOWN)
+		return;
+	session->needs_resync = true;
+	session->state = MIDR_SYNC_SESSION_RESYNC;
+	if (session->resync_event)
+		return;
+	now_ns = midr_sync_now_ns();
+	now_ms = (int64_t)(now_ns / 1000000ULL);
+	if (now_ms < session->last_input_reject_ms +
+			     (int64_t)store->input_reject_backoff_msec)
+		return;
+	session->last_input_reject_ms = now_ms;
+	midr_sync_schedule_resync_delay(session,
+					store->input_reject_backoff_msec);
+}
+
+static struct midr_sync_peer *midr_sync_peer_lookup(struct midr_sync_store *store,
+						    const struct peer *peer);
+
+static struct midr_sync_peer *midr_sync_peer_ensure(
+	struct midr_sync_store *store, struct peer *peer, uint64_t generation)
+{
+	struct midr_sync_peer *entry;
+
+	entry = midr_sync_peer_lookup(store, peer);
+	if (entry)
+		return entry;
+
+	entry = XCALLOC(MTYPE_MIDR_SYNC_PEER, sizeof(*entry));
+	entry->peer = peer;
+	entry->generation = generation;
+	entry->waiting = true;
+	listnode_add(store->peers, entry);
+	return entry;
+}
+
+static struct midr_sync_session *midr_sync_session_create(
+	struct midr_sync_store *store, struct peer *peer,
+	struct peer_connection *connection)
+{
+	struct midr_sync_session *session;
+	struct listnode *node;
+	struct listnode *next;
+	struct midr_sync_session *old;
+
+	if (!peer || !connection || !peer_established(connection) ||
+	    !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS])
+		return NULL;
+	if (midr_sync_session_lookup(store, connection))
+		return midr_sync_session_lookup(store, connection);
+
+	session = XCALLOC(MTYPE_MIDR_SYNC_SESSION, sizeof(*session));
+	session->store = store;
+	session->peer = peer;
+	session->connection = connection;
+	session->generation = ++store->next_session_generation;
+	session->state = MIDR_SYNC_SESSION_SYNCING;
+	session->snapshot_requested = true;
+	session->packets = list_new();
+	session->packets->del = midr_sync_session_packet_free;
+	session->token = XCALLOC(MTYPE_MIDR_SYNC_TOKEN, sizeof(*session->token));
+	session->token->session = session;
+	session->token->references = 1;
+	for (ALL_LIST_ELEMENTS(store->sessions, node, next, old))
+		if (old->peer == peer && old->state == MIDR_SYNC_SESSION_DOWN) {
+			store->reconnect_count++;
+			list_delete_node(store->sessions, node);
+			midr_sync_session_free(old);
+		}
+	listnode_add(store->sessions, session);
+	return session;
+}
+
+static void midr_sync_session_mark_down(struct midr_sync_store *store,
+						struct peer_connection *connection)
+{
+	struct midr_sync_session *session;
+
+	if (!connection)
+		return;
+	for (struct listnode *node = listhead(store->sessions); node;
+	     node = listnextnode(node)) {
+		session = listgetdata(node);
+		if (session->connection != connection ||
+		    session->state == MIDR_SYNC_SESSION_DOWN)
+			continue;
+		session->state = MIDR_SYNC_SESSION_DOWN;
+		list_delete_all_node(session->packets);
+		session->pending_updates = 0;
+		session->pending_input = 0;
+	}
 }
 
 static struct midr_sync_peer *midr_sync_peer_lookup(struct midr_sync_store *store,
@@ -65,10 +501,60 @@ static size_t midr_sync_waiting_count(const struct midr_sync_store *store)
 	return count;
 }
 
+bool midr_sync_view_can_derive(struct midr_context *ctx,
+				       uint64_t *reason_flags)
+{
+	struct midr_sync_store *store;
+	struct listnode *node;
+	struct midr_sync_peer *entry;
+	struct midr_sync_session *session;
+
+	if (!ctx || !(store = ctx->sync_store))
+		return false;
+	if (!store->local_ready) {
+		store->local_ready = true;
+		midr_sync_start(store);
+	}
+	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {
+		if (entry->timed_out) {
+			if (reason_flags)
+				*reason_flags |= MIDR_TED_SYNC_REASON_EOR_TIMEOUT;
+			continue;
+		}
+		if (!entry->waiting)
+			continue;
+		session = NULL;
+		for (struct listnode *session_node = listhead(store->sessions);
+		     session_node; session_node = listnextnode(session_node)) {
+			struct midr_sync_session *candidate = listgetdata(session_node);
+
+			if (candidate->peer == entry->peer &&
+			    candidate->generation == entry->generation &&
+			    candidate->state != MIDR_SYNC_SESSION_DOWN) {
+				session = candidate;
+				break;
+			}
+		}
+		if (!session || !session->remote_eor || session->pending_input ||
+		    session->needs_resync)
+			return false;
+	}
+	return true;
+}
+
 static void midr_sync_complete_if_ready(struct midr_sync_store *store)
 {
 	if (store->state != MIDR_SYNC_REMOTE_WAIT || midr_sync_waiting_count(store))
 		return;
+	if (store->ctx->lsdb_store && !midr_nds_is_bootstrap(store->ctx->bgp)) {
+		struct midr_lsdb_summary summary;
+
+		if (midr_lsdb_summary_get(store->ctx, &summary) != 0 ||
+		    !summary.ready ||
+		    summary.dirty_count || summary.derivation_pending ||
+		    summary.last_error)
+			return;
+	}
 	store->state = MIDR_SYNC_READY;
 	event_cancel(&store->t_timeout);
 	midr_lsdb_sync_changed(store->ctx);
@@ -90,6 +576,10 @@ static void midr_sync_timeout_event(struct event *event)
 		entry->timed_out = true;
 	}
 	store->timeout_count++;
+	/* A timeout is a usable initial-sync outcome.  Wake derivation even
+	 * when no prior READY TED exists; otherwise the first candidate can
+	 * remain NOT_READY indefinitely. */
+	midr_lsdb_sync_changed(store->ctx);
 	midr_sync_complete_if_ready(store);
 }
 
@@ -110,15 +600,18 @@ static void midr_sync_start(struct midr_sync_store *store)
 	store->barrier_count++;
 	for (ALL_LIST_ELEMENTS_RO(store->ctx->bgp->peer, node, peer)) {
 		struct midr_sync_peer *entry;
+		struct midr_sync_session *session;
 
 		if (!peer->connection || !peer_established(peer->connection) ||
 		    !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS])
 			continue;
-		entry = XCALLOC(MTYPE_MIDR_SYNC_PEER, sizeof(*entry));
-		entry->peer = peer;
-		entry->waiting = !CHECK_FLAG(peer->af_sflags[AFI_BGP_LS][SAFI_MIDR_LS],
-					     PEER_STATUS_EOR_RECEIVED);
-		listnode_add(store->peers, entry);
+		session = midr_sync_session_create(store, peer, peer->connection);
+		entry = midr_sync_peer_ensure(store, peer, session->generation);
+		if (!entry)
+			continue;
+		entry->generation = session->generation;
+		entry->waiting = !midr_sync_receive_drained(session);
+		entry->timed_out = false;
 	}
 	if (!midr_sync_waiting_count(store)) {
 		store->state = MIDR_SYNC_READY;
@@ -143,6 +636,11 @@ int midr_sync_init(struct midr_context *ctx)
 	store->timeout_seconds = MIDR_EOR_TIMEOUT_DEFAULT;
 	store->peers = list_new();
 	store->peers->del = midr_sync_peer_free;
+	store->sessions = list_new();
+	store->sessions->del = midr_sync_session_free;
+	store->shutdown_targets = list_new();
+	store->shutdown_targets->del = midr_sync_shutdown_target_free;
+	store->input_reject_backoff_msec = MIDR_SYNC_INPUT_REJECT_BACKOFF_MSEC;
 	ctx->sync_store = store;
 	return 0;
 }
@@ -157,6 +655,8 @@ void midr_sync_finish(struct midr_context *ctx)
 	ctx->sync_store = NULL;
 	event_cancel(&store->t_timeout);
 	list_delete(&store->peers);
+	list_delete(&store->shutdown_targets);
+	list_delete(&store->sessions);
 	XFREE(MTYPE_MIDR_SYNC_STORE, store);
 }
 
@@ -170,6 +670,11 @@ bool midr_sync_view_ready(struct midr_context *ctx, bool local_ready, uint64_t *
 		return false;
 	store = ctx->sync_store;
 	if (!local_ready) {
+		/* Bootstrap nodes intentionally have no local Membership.  Once their
+		 * empty snapshot is active, LSDB's NOT_READY state must not tear down
+		 * EoR synchronization and start the same snapshot again. */
+		if (midr_nds_is_bootstrap(ctx->bgp))
+			return false;
 		if (store->local_ready)
 			midr_sync_reset(store);
 		return false;
@@ -195,14 +700,50 @@ bool midr_sync_local_ready(const struct midr_context *ctx)
 void midr_sync_peer_status_changed(struct midr_context *ctx, struct peer *peer)
 {
 	struct midr_sync_store *store;
+	struct peer_connection *connection;
 	struct midr_sync_peer *entry;
 	bool clear_timeout = false;
 
 	if (!ctx || !ctx->sync_store || !peer)
 		return;
 	store = ctx->sync_store;
+	connection = peer->connection;
+	if (connection && peer_established(connection) &&
+	    peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS]) {
+		struct midr_sync_session *session =
+			midr_sync_session_create(store, peer, connection);
+
+		if (!session)
+			return;
+		/* The store-wide barrier is an initial-view barrier.  Sessions that
+		 * establish after it completed retain their own snapshot/EoR state,
+		 * but must not repopulate the completed barrier's peer set. */
+		if (store->state == MIDR_SYNC_READY) {
+			entry = midr_sync_peer_lookup(store, peer);
+			if (entry && entry->generation != session->generation) {
+				bool timed_out = entry->timed_out;
+
+				entry->generation = session->generation;
+				entry->waiting = false;
+				entry->timed_out = false;
+				if (timed_out)
+					midr_lsdb_sync_changed(ctx);
+			}
+			return;
+		}
+		entry = midr_sync_peer_ensure(store, peer, session->generation);
+		if (entry && session && entry->generation != session->generation) {
+			entry->generation = session->generation;
+			entry->waiting = true;
+			entry->timed_out = false;
+		}
+		return;
+	}
+	if (connection)
+		midr_sync_session_mark_down(store, connection);
+
 	entry = midr_sync_peer_lookup(store, peer);
-	if (!entry || (peer->connection && peer_established(peer->connection)))
+	if (!entry)
 		return;
 	if (entry->waiting)
 		entry->waiting = false;
@@ -217,21 +758,595 @@ void midr_sync_peer_status_changed(struct midr_context *ctx, struct peer *peer)
 
 void midr_sync_peer_eor(struct midr_context *ctx, struct peer *peer)
 {
+	if (peer)
+		midr_sync_peer_eor_connection(ctx, peer->connection);
+}
+
+void midr_sync_peer_eor_connection(struct midr_context *ctx,
+					   struct peer_connection *connection)
+{
 	struct midr_sync_store *store;
 	struct midr_sync_peer *entry;
+	struct midr_sync_session *session;
+	bool first_eor;
 
-	if (!ctx || !ctx->sync_store || !peer)
+	if (!ctx || !ctx->sync_store || !connection)
 		return;
 	store = ctx->sync_store;
-	entry = midr_sync_peer_lookup(store, peer);
-	if (!entry)
-		return;
-	entry->waiting = false;
-	if (entry->timed_out) {
-		entry->timed_out = false;
-		midr_lsdb_sync_changed(ctx);
+	session = midr_sync_session_lookup(store, connection);
+	if (!session) {
+		if (!peer_established(connection) ||
+		    !connection->peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS]) {
+			store->stale_event_count++;
+			return;
+		}
+		session = midr_sync_session_create(store, connection->peer,
+						   connection);
+		if (!session) {
+			store->stale_event_count++;
+			return;
+		}
+	}
+	if (session) {
+		first_eor = !session->remote_eor;
+		if (first_eor)
+			session->remote_eor = true;
+		if (first_eor)
+			/* An empty snapshot has no route hook to wake LSDB. */
+			midr_lsdb_sync_changed(ctx);
+		if (session->local_eor_written && midr_sync_receive_drained(session))
+			session->state = MIDR_SYNC_SESSION_READY;
+	}
+	entry = midr_sync_peer_lookup(store, connection->peer);
+	if (!entry && store->state != MIDR_SYNC_READY)
+		entry = midr_sync_peer_ensure(store, connection->peer,
+					      session->generation);
+	if (entry && entry->generation == session->generation &&
+	    midr_sync_receive_drained(session)) {
+		entry->waiting = false;
+		if (entry->timed_out) {
+			entry->timed_out = false;
+			midr_lsdb_sync_changed(ctx);
+		}
 	}
 	midr_sync_complete_if_ready(store);
+}
+
+bool midr_sync_can_send_eor(struct midr_context *ctx,
+					struct peer_connection *connection)
+{
+	struct midr_sync_store *store;
+	struct midr_sync_session *session;
+	bool bootstrap;
+
+	if (!ctx || !ctx->sync_store || !connection ||
+	    !peer_established(connection) ||
+	    !connection->peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS])
+		return false;
+	store = ctx->sync_store;
+	bootstrap = midr_nds_is_bootstrap(ctx->bgp);
+	/* A dedicated bootstrap originates no LS objects, so its empty local
+	 * snapshot is ready without a local Membership.  Start its per-session
+	 * snapshots here; otherwise both sides can wait forever for its EoR. */
+	if (!store->local_ready && bootstrap) {
+		store->local_ready = true;
+		midr_sync_start(store);
+	}
+	if (!store->local_ready)
+		return false;
+	session = midr_sync_session_lookup(store, connection);
+	if (!session)
+		session = midr_sync_session_create(store, connection->peer, connection);
+	if (session && bootstrap && !session->snapshot_active &&
+	    !session->snapshot_completed)
+		midr_sync_schedule_resync(session);
+	return session && session->snapshot_completed && !session->snapshot_active &&
+	       !session->needs_resync && !session->pending_updates &&
+	       !session->local_eor_queued;
+}
+
+void midr_sync_packet_queued(struct peer_connection *connection,
+					     struct stream *stream, bool eor)
+{
+	struct midr_context *ctx;
+	struct midr_sync_store *store;
+	struct midr_sync_session *session;
+	struct midr_sync_session_packet *packet;
+
+	if (!connection || !stream || !connection->peer || !connection->peer->bgp)
+		return;
+	if (!connection->peer->bgp->midr_info)
+		return;
+	ctx = &connection->peer->bgp->midr_info->ctx;
+	if (!ctx || !ctx->sync_store)
+		return;
+	store = ctx->sync_store;
+	session = midr_sync_session_lookup(store, connection);
+	if (!session)
+		return;
+	packet = XCALLOC(MTYPE_MIDR_SYNC_PACKET, sizeof(*packet));
+	packet->references = 1; /* session packet list */
+	packet->stream = stream;
+	packet->connection = connection;
+	packet->token = session->token;
+	packet->token->references++;
+	packet->generation = session->generation;
+	packet->eor = eor;
+	packet->encoded_ns = stream_get_monotime_ns(stream);
+	if (!packet->encoded_ns)
+		packet->encoded_ns = midr_sync_now_ns();
+	listnode_add(session->packets, packet);
+	if (eor)
+		session->local_eor_queued = true;
+	else
+		session->pending_updates++;
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	packet->next = midr_sync_packets;
+	midr_sync_packets = packet;
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+}
+
+static void midr_sync_packet_complete(struct peer_connection *connection,
+				     struct stream *stream, bool written)
+{
+	struct midr_sync_session_packet **link;
+	struct midr_sync_session_packet *packet;
+	bool claimed = false;
+
+	if (!connection || !stream || !bm || !bm->master)
+		return;
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (link = &midr_sync_packets; *link; link = &(*link)->next) {
+		packet = *link;
+		if (packet->connection != connection || packet->stream != stream)
+			continue;
+		*link = packet->next;
+		packet->stream = NULL;
+		packet->written = written;
+		/* Keep the packet alive while the completion is handed to the event
+		 * loop.  The session may be torn down as soon as this mutex is
+		 * released. */
+		midr_sync_packet_ref(packet);
+		packet->completion_next = midr_sync_completions;
+		midr_sync_completions = packet;
+		claimed = true;
+		break;
+	}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	if (claimed)
+		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
+				&packet->completion);
+}
+
+void midr_sync_packet_written(struct peer_connection *connection,
+			      struct stream *stream)
+{
+	midr_sync_packet_complete(connection, stream, true);
+}
+
+void midr_sync_packet_dropped(struct peer_connection *connection,
+			      struct stream *stream)
+{
+	midr_sync_packet_complete(connection, stream, false);
+}
+
+static bool midr_sync_packet_timed_out_at(
+	struct peer_connection *connection, struct stream *stream,
+	uint64_t now_ns)
+{
+	struct midr_sync_session_packet **link;
+	struct midr_sync_session_packet *packet = NULL;
+	const uint64_t budget_ns =
+		(uint64_t)MIDR_CANONICAL_FORWARD_BUDGET_MS * 1000000ULL;
+	uint64_t encoded_ns;
+
+	if (!connection || !stream || !bm || !bm->master)
+		return false;
+	pthread_mutex_lock(&midr_sync_packets_mutex);
+	for (link = &midr_sync_packets; *link; link = &(*link)->next) {
+		packet = *link;
+		if (packet->connection == connection && packet->stream == stream)
+			break;
+	}
+	if (!*link)
+		packet = NULL;
+	encoded_ns = packet ? packet->encoded_ns : stream_get_monotime_ns(stream);
+	if (!encoded_ns || (packet && packet->eor) ||
+	    (now_ns >= encoded_ns && now_ns - encoded_ns <= budget_ns)) {
+		pthread_mutex_unlock(&midr_sync_packets_mutex);
+		return false;
+	}
+	if (packet) {
+		*link = packet->next;
+		packet->stream = NULL;
+		packet->written = false;
+		packet->timed_out = true;
+		/* Transfer a completion reference before dropping the registry lock;
+		 * teardown can release the session-list reference concurrently. */
+		midr_sync_packet_ref(packet);
+		packet->completion_next = midr_sync_completions;
+		midr_sync_completions = packet;
+	}
+	pthread_mutex_unlock(&midr_sync_packets_mutex);
+	if (packet)
+		event_add_event(bm->master, midr_sync_packet_event, packet, 0,
+				&packet->completion);
+	return true;
+}
+
+bool midr_sync_packet_timed_out(struct peer_connection *connection,
+				struct stream *stream)
+{
+	return midr_sync_packet_timed_out_at(connection, stream,
+					     midr_sync_now_ns());
+}
+
+bool midr_sync_test_packet_timed_out_at(
+	struct peer_connection *connection, struct stream *stream,
+	uint64_t now_ns)
+{
+	return midr_sync_packet_timed_out_at(connection, stream, now_ns);
+}
+
+void midr_sync_snapshot_begin(struct peer_connection *connection)
+{
+	struct midr_context *ctx;
+	struct midr_sync_session *session;
+
+	if (!connection || !connection->peer || !connection->peer->bgp ||
+	    !connection->peer->bgp->midr_info)
+		return;
+	ctx = &connection->peer->bgp->midr_info->ctx;
+	if (!ctx->sync_store)
+		return;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (!session || session->snapshot_active ||
+	    !session->snapshot_requested)
+		return;
+	session->snapshot_active = true;
+	session->snapshot_completed = false;
+	session->snapshot_generation++;
+	session->local_eor_queued = false;
+	session->local_eor_written = false;
+	session->needs_resync = false;
+	session->state = MIDR_SYNC_SESSION_SYNCING;
+}
+
+void midr_sync_snapshot_end(struct peer_connection *connection)
+{
+	struct midr_context *ctx;
+	struct midr_sync_session *session;
+
+	if (!connection || !connection->peer || !connection->peer->bgp ||
+	    !connection->peer->bgp->midr_info)
+		return;
+	ctx = &connection->peer->bgp->midr_info->ctx;
+	if (!ctx->sync_store)
+		return;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (!session || !session->snapshot_active)
+		return;
+	session->snapshot_active = false;
+	session->snapshot_completed = true;
+	session->snapshot_requested = false;
+}
+
+bool midr_sync_snapshot_requested(struct peer_connection *connection)
+{
+	struct midr_context *ctx;
+	struct midr_sync_session *session;
+
+	if (!connection || !connection->peer || !connection->peer->bgp ||
+	    !connection->peer->bgp->midr_info)
+		return false;
+	ctx = &connection->peer->bgp->midr_info->ctx;
+	if (!ctx->sync_store)
+		return false;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	return session && session->snapshot_requested;
+}
+
+void midr_sync_request_resync(struct peer_connection *connection)
+{
+	struct midr_context *ctx;
+	struct midr_sync_session *session;
+
+	if (!connection || !connection->peer || !connection->peer->bgp ||
+	    !connection->peer->bgp->midr_info)
+		return;
+	ctx = &connection->peer->bgp->midr_info->ctx;
+	if (!ctx->sync_store)
+		return;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (!session)
+		return;
+	session->needs_resync = true;
+	session->state = MIDR_SYNC_SESSION_RESYNC;
+	midr_sync_schedule_resync(session);
+}
+
+static bool midr_sync_peer_output_idle(struct midr_sync_session *session)
+{
+	struct peer_af *paf;
+	struct listnode *node;
+	struct midr_sync_session_packet *packet;
+
+	if (!session || session->snapshot_active || session->pending_updates)
+		return false;
+	for (ALL_LIST_ELEMENTS_RO(session->packets, node, packet))
+		if (packet->eor)
+			return false;
+	paf = peer_af_find(session->peer, AFI_BGP_LS, SAFI_MIDR_LS);
+	if (!paf)
+		return true;
+	if (paf->t_announce_route ||
+	    (paf->next_pkt_to_send && paf->next_pkt_to_send->buffer) ||
+	    !advertise_list_is_empty(PAF_SUBGRP(paf)))
+		return false;
+	return true;
+}
+
+static struct midr_sync_session *midr_sync_session_lookup_generation(
+	struct midr_sync_store *store, struct peer_connection *connection,
+	uint64_t generation)
+{
+	struct listnode *node;
+	struct midr_sync_session *session;
+
+	for (ALL_LIST_ELEMENTS_RO(store->sessions, node, session))
+		if (session->connection == connection &&
+		    session->generation == generation)
+			return session;
+	return NULL;
+}
+
+void midr_sync_shutdown_begin(struct midr_context *ctx)
+{
+	struct listnode *node;
+	struct midr_sync_session *session;
+	struct midr_sync_shutdown_target *target;
+
+	if (!ctx || !ctx->sync_store)
+		return;
+	list_delete_all_node(ctx->sync_store->shutdown_targets);
+	ctx->sync_store->shutdown_active = true;
+	ctx->sync_store->shutdown_announce_complete = false;
+	ctx->sync_store->shutdown_generation_failure_recorded = false;
+	ctx->sync_store->shutdown_state = MIDR_SYNC_SHUTDOWN_WAITING;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session)) {
+		if (session->state == MIDR_SYNC_SESSION_DOWN ||
+		    !peer_established(session->connection))
+			continue;
+		target = XCALLOC(MTYPE_MIDR_SYNC_SHUTDOWN_TARGET,
+					 sizeof(*target));
+		target->connection = session->connection;
+		target->generation = session->generation;
+		listnode_add(ctx->sync_store->shutdown_targets, target);
+	}
+}
+
+void midr_sync_shutdown_announce_complete(struct midr_context *ctx)
+{
+	if (ctx && ctx->sync_store && ctx->sync_store->shutdown_active) {
+		ctx->sync_store->shutdown_announce_complete = true;
+		if (ctx->sync_store->shutdown_state ==
+		    MIDR_SYNC_SHUTDOWN_GENERATION_FAILED)
+			ctx->sync_store->shutdown_state =
+				MIDR_SYNC_SHUTDOWN_WAITING;
+	}
+}
+
+void midr_sync_shutdown_generation_failed(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->sync_store || !ctx->sync_store->shutdown_active)
+		return;
+	ctx->sync_store->shutdown_announce_complete = false;
+	if (!ctx->sync_store->shutdown_generation_failure_recorded) {
+		ctx->sync_store->shutdown_generation_failures++;
+		ctx->sync_store->shutdown_generation_failure_recorded = true;
+	}
+	ctx->sync_store->shutdown_state =
+		MIDR_SYNC_SHUTDOWN_GENERATION_FAILED;
+}
+
+void midr_sync_capability_tuple_ignored(struct midr_context *ctx, bool llgr)
+{
+	if (!ctx || !ctx->sync_store)
+		return;
+	if (llgr)
+		ctx->sync_store->llgr_tuple_ignored++;
+	else
+		ctx->sync_store->gr_tuple_ignored++;
+}
+
+void midr_sync_shutdown_expired(struct midr_context *ctx)
+{
+	struct midr_sync_store *store;
+
+	if (!ctx || !(store = ctx->sync_store) || !store->shutdown_active)
+		return;
+	if (store->shutdown_state == MIDR_SYNC_SHUTDOWN_WAITING)
+		store->shutdown_state = MIDR_SYNC_SHUTDOWN_DEGRADED;
+}
+
+bool midr_sync_shutdown_ready(struct midr_context *ctx)
+{
+	struct listnode *node;
+	struct midr_sync_shutdown_target *target;
+	struct midr_sync_session *session;
+
+	if (!ctx || !ctx->sync_store || !ctx->sync_store->shutdown_active ||
+	    !ctx->sync_store->shutdown_announce_complete)
+		return false;
+	if (ctx->sync_store->shutdown_state == MIDR_SYNC_SHUTDOWN_DEGRADED)
+		return true;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->shutdown_targets, node, target)) {
+		if (target->failed)
+			return false;
+		session = midr_sync_session_lookup_generation(
+			ctx->sync_store, target->connection, target->generation);
+		if (session && !midr_sync_peer_output_idle(session))
+			return false;
+	}
+	if (ctx->sync_store->shutdown_state == MIDR_SYNC_SHUTDOWN_WAITING)
+		ctx->sync_store->shutdown_state = MIDR_SYNC_SHUTDOWN_COMPLETE;
+	return true;
+}
+
+bool midr_sync_shutdown_degraded(struct midr_context *ctx)
+{
+	return ctx && ctx->sync_store && ctx->sync_store->shutdown_active &&
+	       ctx->sync_store->shutdown_state == MIDR_SYNC_SHUTDOWN_DEGRADED;
+}
+
+void midr_sync_shutdown_finish(struct midr_context *ctx)
+{
+	struct midr_sync_store *store;
+	const char *result;
+
+	if (!ctx || !(store = ctx->sync_store))
+		return;
+	switch (store->shutdown_state) {
+	case MIDR_SYNC_SHUTDOWN_COMPLETE:
+		result = "COMPLETE";
+		break;
+	case MIDR_SYNC_SHUTDOWN_GENERATION_FAILED:
+		result = "GENERATION_FAILED";
+		break;
+	case MIDR_SYNC_SHUTDOWN_DEGRADED:
+		result = "DEGRADED";
+		break;
+	case MIDR_SYNC_SHUTDOWN_IDLE:
+	case MIDR_SYNC_SHUTDOWN_WAITING:
+	default:
+		result = "DEGRADED";
+		break;
+	}
+	zlog_info("MIDR shutdown result: %s", result);
+	store->shutdown_active = false;
+	store->shutdown_announce_complete = false;
+	list_delete_all_node(store->shutdown_targets);
+}
+
+void midr_sync_shutdown_cancel(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->sync_store)
+		return;
+	ctx->sync_store->shutdown_active = false;
+	ctx->sync_store->shutdown_announce_complete = false;
+	ctx->sync_store->shutdown_state = MIDR_SYNC_SHUTDOWN_IDLE;
+	list_delete_all_node(ctx->sync_store->shutdown_targets);
+}
+
+int midr_sync_connection_generation(struct midr_context *ctx,
+				    struct peer_connection *connection,
+				    uint64_t *generation)
+{
+	struct midr_sync_session *session;
+
+	if (!ctx || !ctx->sync_store)
+		return -ENOENT;
+	if (!connection || !generation)
+		return -EINVAL;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (!session)
+		return -ENOENT;
+	*generation = session->generation;
+	return 0;
+}
+
+void midr_sync_input_begin(struct midr_context *ctx,
+					   struct peer_connection *connection)
+{
+	struct midr_sync_session *session;
+
+	if (!ctx || !ctx->sync_store || !connection)
+		return;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (session)
+		session->pending_input++;
+}
+
+void midr_sync_input_end(struct midr_context *ctx,
+			struct peer_connection *connection, bool accepted)
+{
+	struct midr_sync_session *session;
+
+	if (!ctx || !ctx->sync_store || !connection)
+		return;
+	session = midr_sync_session_lookup(ctx->sync_store, connection);
+	if (!session)
+		return;
+	if (session->pending_input)
+		session->pending_input--;
+	if (!accepted)
+		midr_sync_request_resync(connection);
+	if (session->remote_eor)
+		midr_sync_peer_eor_connection(ctx, connection);
+}
+
+void midr_sync_derivation_complete(struct midr_context *ctx)
+{
+	struct listnode *node;
+	struct midr_sync_session *session;
+
+	if (!ctx || !ctx->sync_store)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session))
+		if (session->state != MIDR_SYNC_SESSION_DOWN && session->remote_eor)
+			midr_sync_peer_eor_connection(ctx, session->connection);
+}
+
+void midr_sync_connection_down(struct midr_context *ctx,
+					       struct peer_connection *connection)
+{
+	struct midr_sync_store *store;
+	struct midr_sync_session *session;
+	struct midr_sync_peer *entry;
+	struct listnode *node, *next;
+
+	if (!ctx || !ctx->sync_store || !connection)
+		return;
+	store = ctx->sync_store;
+	for (ALL_LIST_ELEMENTS(store->sessions, node, next, session)) {
+		if (session->connection != connection)
+			continue;
+		entry = midr_sync_peer_lookup(store, session->peer);
+		if (entry && entry->generation == session->generation) {
+			listnode_delete(store->peers, entry);
+			midr_sync_peer_free(entry);
+		}
+		if (store->shutdown_active) {
+			struct midr_sync_shutdown_target *target =
+				midr_sync_shutdown_target_lookup(
+					store, connection, session->generation);
+
+			if (target) {
+				target->failed = true;
+				store->shutdown_state =
+					MIDR_SYNC_SHUTDOWN_DEGRADED;
+			}
+		}
+		list_delete_node(store->sessions, node);
+		midr_sync_session_free(session);
+	}
+	midr_sync_complete_if_ready(store);
+}
+
+void midr_sync_test_session_start(struct midr_context *ctx, struct peer *peer,
+					  struct peer_connection *connection)
+{
+	if (!ctx || !ctx->sync_store)
+		return;
+	(void)midr_sync_session_create(ctx->sync_store, peer, connection);
+}
+
+void midr_sync_test_session_down(struct midr_context *ctx,
+					 struct peer_connection *connection)
+{
+	if (!ctx || !ctx->sync_store)
+		return;
+	midr_sync_session_mark_down(ctx->sync_store, connection);
 }
 
 int midr_sync_timeout_set(struct midr_context *ctx, uint32_t seconds)
@@ -249,6 +1364,7 @@ int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *stat
 	struct midr_sync_store *store;
 	struct listnode *node;
 	struct midr_sync_peer *entry;
+	struct midr_sync_session *session;
 
 	if (!ctx || !ctx->sync_store)
 		return -ENOENT;
@@ -261,11 +1377,54 @@ int midr_sync_status_get(struct midr_context *ctx, struct midr_sync_status *stat
 	status->initial_peer_count = listcount(store->peers);
 	status->barrier_count = store->barrier_count;
 	status->timeout_count = store->timeout_count;
+	status->next_session_generation = store->next_session_generation;
+	status->reconnect_count = store->reconnect_count;
+	status->stale_event_count = store->stale_event_count;
+	status->input_rejected_count = store->input_rejected_count;
+	status->output_timeout_count = store->output_timeout_count;
+	status->shutdown_generation_failures =
+		store->shutdown_generation_failures;
+	status->gr_tuple_ignored = store->gr_tuple_ignored;
+	status->llgr_tuple_ignored = store->llgr_tuple_ignored;
+	status->shutdown_state = store->shutdown_state;
+	status->shutdown_active = store->shutdown_active;
 	for (ALL_LIST_ELEMENTS_RO(store->peers, node, entry)) {
 		if (entry->waiting)
 			status->waiting_peer_count++;
 		if (entry->timed_out)
 			status->timed_out_peer_count++;
+	}
+	for (ALL_LIST_ELEMENTS_RO(store->sessions, node, session)) {
+		if (session->state == MIDR_SYNC_SESSION_DOWN)
+			continue;
+		status->active_session_count++;
+		if (session->state == MIDR_SYNC_SESSION_SYNCING)
+			status->syncing_session_count++;
+		if (session->remote_eor)
+			status->eor_received_count++;
+		if (session->local_eor_written)
+			status->eor_written_count++;
+		if (midr_sync_receive_drained(session))
+			status->receive_drained_count++;
+		if (session->needs_resync)
+			status->resync_required_count++;
+		if (session->snapshot_active)
+			status->snapshot_active_count++;
+		if (session->snapshot_completed)
+			status->snapshot_completed_count++;
+		status->pending_update_count += session->pending_updates;
+		status->pending_input_count += session->pending_input;
+	}
+	if (store->shutdown_active) {
+		struct midr_sync_shutdown_target *target;
+
+		for (ALL_LIST_ELEMENTS_RO(store->shutdown_targets, node, target)) {
+			session = midr_sync_session_lookup_generation(
+				store, target->connection, target->generation);
+			if (!target->failed && session &&
+			    !midr_sync_peer_output_idle(session))
+				status->shutdown_pending_count++;
+		}
 	}
 	return 0;
 }
@@ -279,4 +1438,86 @@ void midr_sync_test_timeout(struct midr_context *ctx)
 	event_cancel(&ctx->sync_store->t_timeout);
 	event.arg = ctx->sync_store;
 	midr_sync_timeout_event(&event);
+}
+
+int midr_sync_test_set_input_reject_backoff(struct midr_context *ctx,
+					     uint32_t msec)
+{
+	if (!ctx || !ctx->sync_store)
+		return -ENOENT;
+	ctx->sync_store->input_reject_backoff_msec = msec;
+	return 0;
+}
+
+size_t midr_sync_test_resync_pending(struct midr_context *ctx)
+{
+	struct midr_sync_session *session;
+	struct listnode *node;
+	size_t pending = 0;
+
+	if (!ctx || !ctx->sync_store)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session))
+		if (session->resync_event)
+			pending++;
+	return pending;
+}
+
+size_t midr_sync_test_fire_resync(struct midr_context *ctx)
+{
+	struct midr_sync_session *session;
+	struct listnode *node;
+	size_t fired = 0;
+
+	if (!ctx || !ctx->sync_store)
+		return 0;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session)) {
+		struct midr_sync_token *token = session->token;
+		struct event event = {};
+
+		if (!session->resync_event)
+			continue;
+		event_cancel(&session->resync_event);
+		event.arg = token;
+		midr_sync_resync_event(&event);
+		fired++;
+	}
+	return fired;
+}
+
+void midr_sync_test_drain_completions(struct midr_context *ctx)
+{
+	struct listnode *node, *pnode, *next;
+	struct midr_sync_session *session;
+	struct midr_sync_session_packet *packet;
+	struct event event = {};
+
+	if (!ctx || !ctx->sync_store)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(ctx->sync_store->sessions, node, session))
+		for (ALL_LIST_ELEMENTS(session->packets, pnode, next, packet)) {
+			if (!packet->completion)
+				continue;
+			event_cancel(&packet->completion);
+			event.arg = packet;
+			midr_sync_packet_event(&event);
+		}
+	/* Completions claimed before a session teardown are no longer reachable
+	 * through that session's packet list.  Drain their references directly
+	 * in the test harness while preserving the production teardown rule that
+	 * claimed completions are never cancelled by session destruction. */
+	for (;;) {
+		struct midr_sync_session_packet *completion;
+
+		pthread_mutex_lock(&midr_sync_packets_mutex);
+		completion = midr_sync_completions;
+		if (completion)
+			midr_sync_completions = completion->completion_next;
+		pthread_mutex_unlock(&midr_sync_packets_mutex);
+		if (!completion)
+			break;
+		event_cancel(&completion->completion);
+		event.arg = completion;
+		midr_sync_packet_event(&event);
+	}
 }

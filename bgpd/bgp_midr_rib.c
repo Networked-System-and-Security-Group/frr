@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
+#include <time.h>
 
 #include "command.h"
 #include "hash.h"
@@ -19,6 +20,9 @@
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_midr_attr.h"
+#include "bgpd/bgp_midr_canonical.h"
+#include "bgpd/bgp_midr_instance.h"
+#include "bgpd/bgp_midr_lsdb.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
 #include "bgpd/bgp_route.h"
@@ -26,6 +30,17 @@
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_STORE, "MIDR RIB store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_IDENTITY, "MIDR RIB identity");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_RIB_ADVERTISEMENT, "MIDR peer advertisement");
+
+#define MIDR_RIB_LIFETIME_SWEEP_MSEC 1000U
+#define MIDR_RIB_LIFETIME_SWEEP_LIMIT 256U
+
+struct midr_rib_advertisement {
+	struct midr_rib_advertisement *next;
+	struct peer *peer;
+	uint64_t sequence;
+	enum midr_instance_state state;
+};
 
 struct midr_rib_identity {
 	struct midr_ls_object_key key;
@@ -33,6 +48,11 @@ struct midr_rib_identity {
 	struct bgp_dest *dest;
 	enum midr_rib_identity_state state;
 	struct bgp_path_info *selected;
+	struct bgp_path_info *canonical_path;
+	/* Hold the reaped canonical path until old update-group/LSDB users
+	 * release their path locks. */
+	struct bgp_path_info *retired_path;
+	struct midr_rib_advertisement *advertisements;
 	size_t path_count;
 };
 
@@ -40,6 +60,7 @@ struct midr_rib_store {
 	struct midr_context *ctx;
 	struct hash *identities;
 	struct id_alloc *allocator;
+	struct midr_canonical *canonical;
 	size_t identity_limit;
 	size_t active_identity_count;
 	size_t path_count;
@@ -47,7 +68,29 @@ struct midr_rib_store {
 	size_t conflict_count;
 	uint64_t rejected_limit;
 	uint64_t rejected_payload_conflict;
+	uint64_t rejected_resource;
+	uint64_t rejected_internal;
+	uint64_t identities_reclaimed;
+	uint64_t lifetime_failures;
+	int last_lifetime_error;
+	struct event *lifetime_timer;
+	bool test_clock_enabled;
+	uint64_t test_now_ns;
 };
+
+static void midr_rib_lifetime_event(struct event *event);
+
+static uint64_t midr_rib_clock_now_ns(void *arg)
+{
+	struct midr_rib_store *store = arg;
+	struct timespec ts;
+
+	if (store && store->test_clock_enabled)
+		return store->test_now_ns;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 static unsigned int midr_rib_identity_hash_key(const void *arg)
 {
@@ -88,10 +131,161 @@ midr_rib_identity_lookup(struct midr_rib_store *store,
 static void midr_rib_identity_free(void *arg)
 {
 	struct midr_rib_identity *identity = arg;
+	struct midr_rib_advertisement *advertisement;
 
 	if (identity->dest)
 		identity->dest->midr_identity = NULL;
+	while ((advertisement = identity->advertisements) != NULL) {
+		identity->advertisements = advertisement->next;
+		XFREE(MTYPE_MIDR_RIB_ADVERTISEMENT, advertisement);
+	}
 	XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
+}
+
+static void midr_rib_identity_release_retired_path(
+	struct midr_rib_identity *identity)
+{
+	if (!identity || !identity->retired_path)
+		return;
+	bgp_path_info_unlock(identity->retired_path);
+	identity->retired_path = NULL;
+}
+
+/* Fully remove an identity from the store, mirroring the table-teardown
+ * template in midr_rib_dest_cleanup(): disconnect the dest back-pointer,
+ * drop the store counters, release the hash slot and the synthetic ID, and
+ * release the identity's creation reference on the dest so the empty dest
+ * is actually freed.  The identity must have no live export path. */
+static void midr_rib_identity_detach(struct midr_rib_store *store,
+				     struct midr_rib_identity *identity)
+{
+	struct bgp_dest *dest = identity->dest;
+
+	if (dest && identity->canonical_path &&
+	    !CHECK_FLAG(identity->canonical_path->flags, BGP_PATH_REMOVED)) {
+		/* Defensive reap: expiry normally reaps paths in the same
+		 * lifetime pass, before floor reclamation can run. */
+		struct bgp_dest *locked = bgp_dest_lock_node(dest);
+
+		bgp_path_info_mark_for_delete(locked, identity->canonical_path);
+		bgp_process_main_one(store->ctx->bgp, locked, AFI_BGP_LS,
+				     SAFI_MIDR_LS);
+		bgp_dest_unlock_node(locked);
+	}
+	assert(!identity->path_count);
+	assert(!identity->retired_path || identity->retired_path->lock == 1);
+	if (dest) {
+		dest->midr_identity = NULL;
+		identity->dest = NULL;
+	}
+	if (identity->selected)
+		store->selected_count--;
+	if (identity->state == MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED)
+		store->conflict_count--;
+	midr_rib_identity_release_retired_path(identity);
+	assert(hash_release(store->identities, identity) == identity);
+	idalloc_free(store->allocator, identity->synthetic_id);
+	midr_rib_identity_free(identity);
+	store->identities_reclaimed++;
+	/* Drop the never-yet-released creation reference; this may free the
+	 * dest, whose cleanup sees midr_identity == NULL and stops early. */
+	if (dest)
+		bgp_dest_unlock_node(dest);
+}
+
+static bool midr_rib_advertisement_has(
+	const struct midr_rib_identity *identity, const struct peer *peer)
+{
+	const struct midr_rib_advertisement *advertisement;
+
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		if (advertisement->peer == peer)
+			return true;
+	return false;
+}
+
+static struct midr_rib_advertisement *midr_rib_advertisement_lookup(
+	struct midr_rib_identity *identity, const struct peer *peer)
+{
+	struct midr_rib_advertisement *advertisement;
+
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		if (advertisement->peer == peer)
+			return advertisement;
+	return NULL;
+}
+
+static void midr_rib_advertisement_update(
+	struct midr_rib_identity *identity, struct peer *peer,
+	const struct midr_instance *instance)
+{
+	struct midr_rib_advertisement *advertisement;
+
+	advertisement = midr_rib_advertisement_lookup(identity, peer);
+	if (advertisement) {
+		advertisement->sequence = instance->object.ls_sequence;
+		advertisement->state = instance->state;
+		return;
+	}
+	advertisement = XCALLOC(MTYPE_MIDR_RIB_ADVERTISEMENT, sizeof(*advertisement));
+	/* FRR XCALLOC is fatal on OOM, so a NULL allocation branch is unreachable. */
+	advertisement->peer = peer;
+	advertisement->sequence = instance->object.ls_sequence;
+	advertisement->state = instance->state;
+	advertisement->next = identity->advertisements;
+	identity->advertisements = advertisement;
+}
+
+static bool midr_rib_advertisement_remove(struct midr_rib_identity *identity,
+						const struct peer *peer)
+{
+	struct midr_rib_advertisement **link;
+
+	for (link = &identity->advertisements; *link; link = &(*link)->next)
+		if ((*link)->peer == peer) {
+			struct midr_rib_advertisement *removed = *link;
+
+			*link = removed->next;
+			XFREE(MTYPE_MIDR_RIB_ADVERTISEMENT, removed);
+			return true;
+		}
+	return false;
+}
+
+bool midr_rib_peer_advertisement_has(
+	struct midr_context *ctx, const struct midr_ls_object_key *key,
+	const struct peer *peer)
+{
+	struct midr_rib_identity *identity;
+
+	if (!ctx || !ctx->rib_store || !key || !peer)
+		return false;
+	identity = midr_rib_identity_lookup(ctx->rib_store, key);
+	return identity && midr_rib_advertisement_has(identity, peer);
+}
+
+bool midr_rib_peer_advertisement_current(
+	struct midr_context *ctx, const struct midr_instance *instance,
+	const struct peer *peer)
+{
+	struct midr_rib_advertisement *advertisement;
+	struct midr_rib_identity *identity;
+
+	if (!ctx || !ctx->rib_store || !instance || !peer)
+		return false;
+	identity = midr_rib_identity_lookup(ctx->rib_store,
+					    &instance->object.key);
+	if (!identity)
+		return false;
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		if (advertisement->peer == peer)
+			return advertisement->sequence ==
+				       instance->object.ls_sequence &&
+			       advertisement->state == instance->state;
+	return false;
 }
 
 int midr_rib_init(struct midr_context *ctx)
@@ -113,7 +307,28 @@ int midr_rib_init(struct midr_context *ctx)
 			    midr_rib_identity_hash_cmp,
 			    "MIDR RIB identities");
 	store->allocator = idalloc_new("MIDR synthetic identity IDs");
+	{
+		struct midr_canonical_config config = {
+			.identity_limit = MIDR_RIB_MAX_IDENTITIES,
+			.event_limit = MIDR_RIB_MAX_IDENTITIES * 2U,
+			.max_age_ms = MIDR_CANONICAL_MAX_AGE_MS,
+			.now_ns = midr_rib_clock_now_ns,
+			.clock_arg = store,
+		};
+
+		if (midr_canonical_create(&config, &store->canonical) != 0) {
+			idalloc_destroy(store->allocator);
+			hash_clean_and_free(&store->identities,
+					    midr_rib_identity_free);
+			XFREE(MTYPE_MIDR_RIB_STORE, store);
+			return -ENOMEM;
+		}
+	}
 	ctx->rib_store = store;
+	if (bm && bm->master)
+		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
+				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
+				     &store->lifetime_timer);
 	return 0;
 }
 
@@ -125,104 +340,28 @@ void midr_rib_finish(struct midr_context *ctx)
 		return;
 	store = ctx->rib_store;
 	ctx->rib_store = NULL;
+	event_cancel(&store->lifetime_timer);
+	midr_canonical_destroy(&store->canonical);
 	hash_clean_and_free(&store->identities, midr_rib_identity_free);
 	idalloc_destroy(store->allocator);
 	XFREE(MTYPE_MIDR_RIB_STORE, store);
 }
 
-static int midr_rib_path_validate(struct midr_context *ctx,
-				  struct peer *peer,
-				  const struct midr_ls_object *object,
-				  const struct midr_propagation_path *path)
-{
-	uint32_t local_node_id;
-
-	if (!ctx || !ctx->bgp || !ctx->rib_store)
-		return -ENOENT;
-	if (!peer || peer->bgp != ctx->bgp || !object || !path)
-		return -EINVAL;
-	if (midr_ls_object_validate(object) != 0)
-		return -EINVAL;
-
-	local_node_id = ctx->bgp->router_id.s_addr;
-	if (!local_node_id)
-		return -ENOENT;
-	if (peer == ctx->bgp->peer_self) {
-		if (object->key.originator_node_id != local_node_id ||
-		    path->node_count != 1 || !path->nodes ||
-		    path->nodes[0] != local_node_id)
-			return -EINVAL;
-		return 0;
-	}
-	if (!peer->remote_id.s_addr)
-		return -EINVAL;
-	return midr_propagation_path_validate(
-		path, object->key.originator_node_id,
-		peer->remote_id.s_addr, local_node_id);
-}
-
-static void
-midr_rib_attributes_from_object(const struct midr_ls_object *object,
-				struct midr_ls_attributes *attributes)
-{
-	memset(attributes, 0, sizeof(*attributes));
-	attributes->present = MIDR_LS_ATTR_HAS_SEQUENCE;
-	attributes->ls_sequence = object->ls_sequence;
-	if (object->policy_tags) {
-		attributes->present |= MIDR_LS_ATTR_HAS_POLICY_TAGS;
-		attributes->policy_tags = object->policy_tags;
-	}
-
-	switch (object->key.type) {
-	case MIDR_NLRI_TYPE_MEMBERSHIP:
-		attributes->present |= MIDR_LS_ATTR_HAS_GROUP_ID |
-				       MIDR_LS_ATTR_HAS_CAP_FLAGS;
-		attributes->group_id = object->payload.membership.group_id;
-		attributes->cap_flags =
-			object->payload.membership.cap_flags;
-		if (object->payload.membership.has_transport_address) {
-			attributes->present |=
-				MIDR_LS_ATTR_HAS_TRANSPORT_ADDRESS;
-			attributes->transport_address =
-				object->payload.membership.transport_address;
-		}
-		break;
-	case MIDR_NLRI_TYPE_LINK:
-		attributes->present |=
-			MIDR_LS_ATTR_HAS_LINK_LOCAL_ADDRESS |
-			MIDR_LS_ATTR_HAS_LINK_REMOTE_ADDRESS |
-			MIDR_LS_ATTR_HAS_LINK_CANONICAL_COST;
-		attributes->link_local_address =
-			object->payload.link.link_local_address;
-		attributes->link_remote_address =
-			object->payload.link.link_remote_address;
-		attributes->link_canonical_cost =
-			object->payload.link.canonical_cost;
-		break;
-	case MIDR_NLRI_TYPE_NODE_PREFIX:
-	case MIDR_NLRI_TYPE_GROUP_PREFIX:
-		break;
-	case MIDR_NLRI_TYPE_RESERVED:
-		break;
-	}
-}
-
 static struct attr *
-midr_rib_attr_intern(struct bgp *bgp, const struct midr_ls_object *object,
-		     const struct midr_propagation_path *path)
+midr_rib_instance_attr_intern(struct bgp *bgp,
+			       const struct midr_instance *instance,
+			       uint32_t age_ms)
 {
-	struct midr_ls_attributes attributes;
 	struct attr parsed;
 	struct attr *interned;
 
+	if (!bgp || !instance || midr_instance_validate(instance))
+		return NULL;
 	bgp_attr_default_set(&parsed, bgp, BGP_ORIGIN_IGP);
 	parsed.mp_nexthop_len = IPV4_MAX_BYTELEN;
 	parsed.mp_nexthop_global_in = bgp->router_id;
-
-	midr_rib_attributes_from_object(object, &attributes);
-	parsed.midr_ls = bgp_midr_ls_attr_new(&attributes);
-	parsed.midr_propagation_path = bgp_midr_propagation_path_attr_new(path);
-	if (!parsed.midr_ls || !parsed.midr_propagation_path) {
+	parsed.midr_ls = bgp_midr_instance_attr_intern(instance, age_ms);
+	if (!parsed.midr_ls) {
 		aspath_unintern(&parsed.aspath);
 		bgp_attr_flush(&parsed);
 		return NULL;
@@ -278,6 +417,11 @@ midr_rib_identity_get(struct midr_context *ctx,
 		return NULL;
 	}
 	assert(!dest->midr_identity);
+	/* Keep one route-node reference for the identity itself.  Path and
+	 * caller references are transient; without this hold, reaping the last
+	 * path destroys the destination before the canonical floor retention
+	 * window and makes the identity impossible to reclaim safely. */
+	bgp_dest_lock_node(dest);
 	dest->midr_identity = identity;
 	identity->dest = dest;
 	*dest_out = dest;
@@ -307,150 +451,211 @@ midr_rib_dest_key(const struct bgp_dest *dest)
 	return &identity->key;
 }
 
-int midr_rib_path_object(const struct bgp_dest *dest,
-			 const struct bgp_path_info *path,
-			 struct midr_ls_object *object)
+static int midr_rib_path_instance_decode(const struct bgp_dest *dest,
+						 const struct bgp_path_info *path,
+						 struct midr_instance *instance)
 {
 	const struct midr_ls_attributes *attributes;
 	const struct midr_ls_object_key *key;
+	struct midr_instance_attributes wire;
 
-	if (!dest || !path || !path->attr || !object)
+	if (!dest || !path || !path->attr || !instance)
 		return -EINVAL;
 	key = midr_rib_dest_key(dest);
 	attributes = bgp_midr_ls_attr_value(path->attr->midr_ls);
 	if (!key || !attributes)
 		return -EINVAL;
-	if (midr_ls_object_from_wire(key, attributes, object) !=
-	    MIDR_CODEC_OK)
+	memset(&wire, 0, sizeof(wire));
+	wire.ls = *attributes;
+	wire.state = bgp_midr_ls_attr_state(path->attr->midr_ls);
+	wire.age_ms = bgp_midr_ls_attr_age(path->attr->midr_ls);
+	if (midr_instance_from_wire(key, &wire, instance) != MIDR_CODEC_OK)
 		return -EINVAL;
 	return 0;
 }
 
-static const struct midr_propagation_path *
-midr_rib_path_propagation(const struct bgp_path_info *path)
+int midr_rib_path_instance(struct midr_context *ctx,
+				 const struct bgp_dest *dest,
+				 const struct bgp_path_info *path,
+				 struct midr_instance *instance, uint32_t *age_ms)
 {
-	if (!path || !path->attr)
-		return NULL;
-	return bgp_midr_propagation_path_attr_value(
-		path->attr->midr_propagation_path);
-}
+	const struct midr_rib_identity *identity;
+	struct midr_canonical_view view;
+	int ret;
 
-static bool midr_rib_path_eligible(struct bgp_dest *dest,
-				   struct bgp_path_info *path,
-				   struct midr_ls_object *object)
-{
-	if (!path || CHECK_FLAG(path->flags, BGP_PATH_REMOVED) ||
-	    CHECK_FLAG(path->flags, BGP_PATH_STALE) ||
-	    !CHECK_FLAG(path->flags, BGP_PATH_VALID) ||
-	    !midr_rib_path_propagation(path))
-		return false;
-	return midr_rib_path_object(dest, path, object) == 0;
-}
-
-static unsigned int midr_rib_owner_rank(struct bgp *bgp,
-					const struct midr_ls_object *object,
-					const struct bgp_path_info *path)
-{
-	if (path->peer == bgp->peer_self ||
-	    (path->peer && path->peer->remote_id.s_addr ==
-				   object->key.originator_node_id))
+	if (!ctx || !ctx->rib_store || !dest || !path || !instance)
+		return -EINVAL;
+	ret = midr_rib_path_instance_decode(dest, path, instance);
+	if (ret)
+		return ret;
+	if (!age_ms)
 		return 0;
-	return 1;
+	*age_ms = bgp_midr_ls_attr_age(path->attr->midr_ls);
+	identity = dest->midr_identity;
+	if (!identity || !identity->canonical_path ||
+	    identity->canonical_path != path)
+		return 0;
+	ret = midr_canonical_lookup(ctx->rib_store->canonical,
+				    &identity->key, &view);
+	if (ret || view.state != MIDR_CANONICAL_CURRENT || !view.current)
+		return ret;
+	ret = midr_instance_ref_age(view.current, midr_rib_now_ns(ctx),
+				    0,
+				    midr_canonical_max_age_ms(
+					    ctx->rib_store->canonical),
+				    age_ms);
+	return ret;
 }
 
-static uint32_t midr_rib_peer_node_id(struct bgp *bgp,
-				      const struct bgp_path_info *path)
+int midr_rib_path_instance_ref(
+	struct midr_context *ctx, const struct bgp_dest *dest,
+	const struct bgp_path_info *path,
+	const struct midr_instance_ref **instance_ref)
 {
-	if (path->peer == bgp->peer_self)
-		return bgp->router_id.s_addr;
-	return path->peer ? path->peer->remote_id.s_addr : UINT32_MAX;
+	const struct midr_rib_identity *identity;
+	struct midr_canonical_view view;
+	int ret;
+
+	if (!ctx || !ctx->rib_store || !dest || !path || !instance_ref)
+		return -EINVAL;
+	*instance_ref = NULL;
+	identity = dest->midr_identity;
+	if (!identity || identity->canonical_path != path)
+		return -ESTALE;
+	ret = midr_canonical_lookup(ctx->rib_store->canonical,
+				    &identity->key, &view);
+	if (ret)
+		return ret;
+	if (view.state != MIDR_CANONICAL_CURRENT || !view.current)
+		return -ESTALE;
+	*instance_ref = view.current;
+	return 0;
 }
 
-static struct bgp_path_info *
-midr_rib_select(struct bgp *bgp, struct bgp_dest *dest, bool *conflict)
+uint64_t midr_rib_now_ns(struct midr_context *ctx)
 {
-	struct bgp_path_info *current = NULL;
-	struct bgp_path_info *candidate;
-	struct bgp_path_info *best = NULL;
-	struct midr_ls_object candidate_object;
-	struct midr_ls_object best_object;
-	unsigned int best_owner_rank = UINT_MAX;
-	uint64_t best_sequence = 0;
+	if (!ctx || !ctx->rib_store)
+		return 0;
+	return midr_rib_clock_now_ns(ctx->rib_store);
+}
 
-	*conflict = false;
-	for (candidate = bgp_dest_get_bgp_path_info(dest); candidate;
-	     candidate = candidate->next)
-		if (CHECK_FLAG(candidate->flags, BGP_PATH_SELECTED))
-			current = candidate;
+uint32_t midr_rib_max_age_ms(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->rib_store)
+		return 0;
+	return midr_canonical_max_age_ms(ctx->rib_store->canonical);
+}
 
-	for (candidate = bgp_dest_get_bgp_path_info(dest); candidate;
-	     candidate = candidate->next) {
-		unsigned int owner_rank;
+int midr_rib_instance_ref_age_at(
+	struct midr_context *ctx, const struct midr_instance_ref *instance_ref,
+	uint64_t now_ns, uint32_t budget_ms, uint32_t *age_ms)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_instance_ref_age(instance_ref, now_ns, budget_ms,
+				     midr_rib_max_age_ms(ctx), age_ms);
+}
 
-		if (!midr_rib_path_eligible(dest, candidate,
-					    &candidate_object))
-			continue;
-		owner_rank = midr_rib_owner_rank(
-			bgp, &candidate_object, candidate);
-		if (owner_rank < best_owner_rank ||
-		    (owner_rank == best_owner_rank &&
-		     candidate_object.ls_sequence > best_sequence)) {
-			best_owner_rank = owner_rank;
-			best_sequence = candidate_object.ls_sequence;
-			best = candidate;
-			best_object = candidate_object;
-			*conflict = false;
-			continue;
+static void midr_rib_apply_lifetime_events(struct midr_rib_store *store)
+{
+	const struct midr_canonical_event *event;
+
+	while ((event = midr_canonical_event_peek(store->canonical)) != NULL) {
+		const struct midr_ls_object_key *key;
+		struct midr_rib_identity *identity;
+
+		if (midr_canonical_event_change(event) != MIDR_CANONICAL_EXPIRE)
+			break;
+		key = midr_canonical_event_key(event);
+		identity = midr_rib_identity_lookup(store, key);
+		if (identity && identity->dest && identity->canonical_path &&
+		    !CHECK_FLAG(identity->canonical_path->flags, BGP_PATH_REMOVED)) {
+			struct bgp_dest *dest = bgp_dest_lock_node(identity->dest);
+
+			assert(!identity->retired_path);
+			identity->retired_path =
+				bgp_path_info_lock(identity->canonical_path);
+			bgp_path_info_mark_for_delete(dest, identity->canonical_path);
+			bgp_process_main_one(store->ctx->bgp, dest, AFI_BGP_LS,
+					     SAFI_MIDR_LS);
+			bgp_dest_unlock_node(dest);
 		}
-		if (owner_rank != best_owner_rank ||
-		    candidate_object.ls_sequence != best_sequence)
-			continue;
-		if (!midr_ls_object_same(&best_object,
-					 &candidate_object)) {
-			*conflict = true;
-			continue;
-		}
-		if (candidate == current) {
-			best = candidate;
-			best_object = candidate_object;
-			continue;
-		}
-		if (best == current)
-			continue;
-		if (midr_rib_path_propagation(candidate)->node_count <
-			    midr_rib_path_propagation(best)->node_count ||
-		    (midr_rib_path_propagation(candidate)->node_count ==
-			     midr_rib_path_propagation(best)->node_count &&
-		     ntohl(midr_rib_peer_node_id(bgp, candidate)) <
-			     ntohl(midr_rib_peer_node_id(bgp, best)))) {
-			best = candidate;
-			best_object = candidate_object;
-		}
+		midr_canonical_event_ack(store->canonical);
 	}
-
-	return *conflict ? NULL : best;
 }
 
-static void midr_rib_identity_set_selection(
-	struct midr_rib_store *store, struct midr_rib_identity *identity,
-	struct bgp_path_info *selected, bool conflict)
+/* A canonical floor whose retention expired was reclaimed: forget the
+ * matching RIB identity, its synthetic ID and its dest so the slot and the
+ * ID become reusable. */
+static bool midr_rib_canonical_reclaim(const struct midr_ls_object_key *key,
+					       void *arg)
 {
-	if (identity->selected)
-		store->selected_count--;
-	if (identity->state == MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED)
-		store->conflict_count--;
+	struct midr_rib_store *store = arg;
+	struct midr_rib_identity *identity;
 
-	identity->selected = selected;
-	if (conflict) {
-		identity->state =
-			MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED;
-		store->conflict_count++;
-	} else if (selected) {
-		identity->state = MIDR_RIB_IDENTITY_SELECTED;
-		store->selected_count++;
-	} else {
-		identity->state = MIDR_RIB_IDENTITY_NO_PATH;
+	identity = midr_rib_identity_lookup(store, key);
+	if (!identity)
+		return true;
+	if (identity->path_count || identity->canonical_path ||
+	    (identity->retired_path && identity->retired_path->lock != 1) ||
+	    !midr_lsdb_identity_reclaim_safe(store->ctx, key))
+		return false;
+	midr_rib_identity_detach(store, identity);
+	return true;
+}
+
+static int midr_rib_lifetime_pass(struct midr_rib_store *store)
+{
+	int first_error = 0;
+	int ret;
+
+	ret = midr_canonical_sweep(store->canonical,
+				   MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL);
+	if (ret && !first_error)
+		first_error = ret;
+	midr_rib_apply_lifetime_events(store);
+	ret = midr_canonical_gc(store->canonical,
+				MIDR_RIB_LIFETIME_SWEEP_LIMIT, NULL,
+				midr_rib_canonical_reclaim, store);
+	if (ret && !first_error)
+		first_error = ret;
+	if (first_error) {
+		store->lifetime_failures++;
+		if (store->last_lifetime_error != first_error)
+			zlog_warn("MIDR RIB lifetime pass failed: error %d", first_error);
+		store->last_lifetime_error = first_error;
+	} else if (store->last_lifetime_error) {
+		zlog_info("MIDR RIB lifetime pass recovered from error %d",
+			  store->last_lifetime_error);
+		store->last_lifetime_error = 0;
 	}
+	return first_error;
+}
+
+static void midr_rib_lifetime_event(struct event *event)
+{
+	struct midr_rib_store *store = EVENT_ARG(event);
+
+	if (!store || !store->ctx)
+		return;
+	store->lifetime_timer = NULL;
+	(void)midr_rib_lifetime_pass(store);
+	if (bm && bm->master)
+		event_add_timer_msec(bm->master, midr_rib_lifetime_event, store,
+				     MIDR_RIB_LIFETIME_SWEEP_MSEC,
+				     &store->lifetime_timer);
+}
+
+int midr_rib_path_object(const struct bgp_dest *dest,
+			 const struct bgp_path_info *path,
+			 struct midr_ls_object *object)
+{
+	struct midr_instance instance;
+
+	if (!object || midr_rib_path_instance_decode(dest, path, &instance))
+		return -EINVAL;
+	*object = instance.object;
+	return 0;
 }
 
 void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
@@ -461,8 +666,6 @@ void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
 	struct bgp_path_info *new_selected;
 	struct bgp_path_info *path;
 	struct bgp_path_info *next;
-	bool attr_changed;
-	bool conflict;
 
 	if (!bgp || !bgp->midr_info || !dest ||
 	    !dest->midr_identity)
@@ -476,26 +679,32 @@ void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
 		if (CHECK_FLAG(path->flags, BGP_PATH_SELECTED))
 			old_selected = path;
 
-	new_selected = midr_rib_select(bgp, dest, &conflict);
-	attr_changed = old_selected &&
-		       CHECK_FLAG(old_selected->flags,
-				  BGP_PATH_ATTR_CHANGED);
-	midr_rib_identity_set_selection(store, identity, new_selected,
-					conflict);
-
-	if (old_selected != new_selected || attr_changed) {
+	new_selected = identity->canonical_path;
+	if (!new_selected || CHECK_FLAG(new_selected->flags, BGP_PATH_REMOVED) ||
+	    CHECK_FLAG(new_selected->flags, BGP_PATH_STALE) ||
+	    !CHECK_FLAG(new_selected->flags, BGP_PATH_VALID))
+		new_selected = NULL;
+	if (old_selected != new_selected) {
 		if (old_selected)
-			bgp_path_info_unset_flag(
-				dest, old_selected, BGP_PATH_SELECTED);
-		if (new_selected) {
-			bgp_path_info_set_flag(
-				dest, new_selected, BGP_PATH_SELECTED);
-			UNSET_FLAG(new_selected->flags,
-				   BGP_PATH_ATTR_CHANGED);
-		}
+			bgp_path_info_unset_flag(dest, old_selected, BGP_PATH_SELECTED);
+		if (new_selected)
+			bgp_path_info_set_flag(dest, new_selected, BGP_PATH_SELECTED);
+		identity->selected = new_selected;
+		if (old_selected)
+			store->selected_count--;
+		if (new_selected)
+			store->selected_count++;
+		identity->state = new_selected ? MIDR_RIB_IDENTITY_SELECTED
+					       : MIDR_RIB_IDENTITY_NO_PATH;
 		bgp_bump_version(dest);
-		bgp_midr_rib_route_update_notify(
-			bgp, dest, old_selected, new_selected);
+		bgp_midr_rib_route_update_notify(bgp, dest, old_selected,
+						 new_selected);
+	} else if (new_selected &&
+		   CHECK_FLAG(new_selected->flags, BGP_PATH_ATTR_CHANGED)) {
+		UNSET_FLAG(new_selected->flags, BGP_PATH_ATTR_CHANGED);
+		bgp_bump_version(dest);
+		bgp_midr_rib_route_update_notify(bgp, dest, new_selected,
+						 new_selected);
 	}
 
 	for (path = bgp_dest_get_bgp_path_info(dest); path;
@@ -504,123 +713,235 @@ void bgp_midr_rib_process_main(struct bgp *bgp, struct bgp_dest *dest)
 		if (!CHECK_FLAG(path->flags, BGP_PATH_REMOVED))
 			continue;
 		assert(identity->path_count && store->path_count);
+		if (identity->canonical_path == path)
+			identity->canonical_path = NULL;
 		identity->path_count--;
 		store->path_count--;
 		assert(bgp_path_info_reap(dest, path));
 	}
 	if (!identity->path_count) {
-		assert(!identity->selected);
-		assert(identity->state == MIDR_RIB_IDENTITY_NO_PATH);
+		identity->selected = NULL;
+		identity->state = MIDR_RIB_IDENTITY_NO_PATH;
 		assert(store->active_identity_count);
 		store->active_identity_count--;
 	}
 	UNSET_FLAG(dest->flags, BGP_NODE_PROCESS_SCHEDULED);
 }
 
-int midr_rib_path_upsert(struct midr_context *ctx, struct peer *peer,
-			 const struct midr_ls_object *object,
-			 const struct midr_propagation_path *path)
+int midr_rib_instance_upsert(struct midr_context *ctx, struct peer *peer,
+			     const struct midr_instance *instance, uint32_t age_ms)
 {
 	struct midr_rib_store *store;
 	struct midr_rib_identity *identity;
-	struct bgp_path_info *existing;
+	struct bgp_path_info *old_path;
 	struct bgp_path_info *new_path;
-	struct midr_ls_object old_object;
-	struct attr *new_attr;
-	struct attr *old_attr;
 	struct bgp_dest *dest = NULL;
+	struct attr *new_attr;
+	enum midr_canonical_result result;
+	bool event_pending;
+	bool advertisement_was_present;
+	bool identity_created;
+	size_t identities_before;
+	uint64_t old_advertisement_sequence = 0;
+	enum midr_instance_state old_advertisement_state = 0;
+	struct midr_rib_advertisement *advertisement;
 	int ret;
 
-	ret = midr_rib_path_validate(ctx, peer, object, path);
-	if (ret)
-		return ret;
-	store = ctx->rib_store;
-	identity = midr_rib_identity_get(ctx, &object->key, &dest);
-	if (!identity)
-		return -ENOSPC;
-
-	existing = midr_rib_peer_path(dest, peer);
-	if (existing &&
-	    midr_rib_path_object(dest, existing, &old_object) == 0 &&
-	    old_object.ls_sequence == object->ls_sequence &&
-	    !midr_ls_object_same(&old_object, object)) {
-		store->rejected_payload_conflict++;
-		bgp_path_info_mark_for_delete(dest, existing);
-		bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
-				     SAFI_MIDR_LS);
-		bgp_dest_unlock_node(dest);
+	if (!ctx || !ctx->bgp || !ctx->rib_store)
+		return -ENOENT;
+	if (!peer || peer->bgp != ctx->bgp || !instance ||
+	    midr_instance_validate(instance))
+		return -EINVAL;
+	if (peer == ctx->bgp->peer_self) {
+		if (instance->object.key.originator_node_id !=
+		    ctx->bgp->router_id.s_addr)
+			return -EINVAL;
+	} else if (!peer->remote_id.s_addr ||
+		   instance->object.key.originator_node_id ==
+			ctx->bgp->router_id.s_addr) {
 		return -EINVAL;
 	}
 
-	new_attr = midr_rib_attr_intern(ctx->bgp, object, path);
+	store = ctx->rib_store;
+	identities_before = store->identities->count;
+	identity = midr_rib_identity_get(ctx, &instance->object.key, &dest);
+	if (!identity)
+		return -ENOSPC;
+	identity_created = store->identities->count > identities_before;
+	advertisement = midr_rib_advertisement_lookup(identity, peer);
+	advertisement_was_present = advertisement != NULL;
+	if (advertisement) {
+		old_advertisement_sequence = advertisement->sequence;
+		old_advertisement_state = advertisement->state;
+	}
+	midr_rib_advertisement_update(identity, peer, instance);
+	/* Build and intern the immutable path attribute before changing the
+	 * canonical store.  A failed allocation must leave both views unchanged. */
+	new_attr = midr_rib_instance_attr_intern(ctx->bgp, instance, age_ms);
 	if (!new_attr) {
+		store->rejected_resource++;
+		if (!advertisement_was_present)
+			midr_rib_advertisement_remove(identity, peer);
+		else {
+			advertisement = midr_rib_advertisement_lookup(identity, peer);
+			advertisement->sequence = old_advertisement_sequence;
+			advertisement->state = old_advertisement_state;
+		}
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return -ENOMEM;
 	}
-	if (existing) {
-		if (existing->attr == new_attr) {
-			bgp_attr_unintern(&new_attr);
-			bgp_dest_unlock_node(dest);
-			return 0;
+	ret = midr_canonical_accept(store->canonical, instance, age_ms,
+				    &result);
+	if (ret) {
+		if (ret == -ENOMEM || ret == -ENOSPC)
+			store->rejected_resource++;
+		else
+			store->rejected_internal++;
+		bgp_attr_unintern(&new_attr);
+		if (!advertisement_was_present)
+			midr_rib_advertisement_remove(identity, peer);
+		else {
+			advertisement = midr_rib_advertisement_lookup(identity, peer);
+			advertisement->sequence = old_advertisement_sequence;
+			advertisement->state = old_advertisement_state;
 		}
-		old_attr = existing->attr;
-		existing->attr = new_attr;
-		bgp_attr_unintern(&old_attr);
-		SET_FLAG(existing->flags, BGP_PATH_VALID |
-					      BGP_PATH_ATTR_CHANGED);
-		UNSET_FLAG(existing->flags,
-			   BGP_PATH_REMOVED | BGP_PATH_STALE);
-		bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
-				     SAFI_MIDR_LS);
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
+		bgp_dest_unlock_node(dest);
+		return ret;
+	}
+	if (result == MIDR_CANONICAL_DUPLICATE ||
+	    result == MIDR_CANONICAL_OLDER ||
+	    result == MIDR_CANONICAL_EXPIRED) {
+		bgp_attr_unintern(&new_attr);
+		/* No canonical entry was installed for a brand-new identity:
+		 * drop the stub instead of leaking a slot that no floor-GC
+		 * callback can ever reach. */
+		if (identity_created)
+			midr_rib_identity_detach(store, identity);
 		bgp_dest_unlock_node(dest);
 		return 0;
 	}
+	event_pending = result == MIDR_CANONICAL_ACCEPTED ||
+			result == MIDR_CANONICAL_CONFLICT;
 
+	old_path = identity->canonical_path;
+	if (result == MIDR_CANONICAL_CONFLICT) {
+		bgp_attr_unintern(&new_attr);
+		if (old_path && !CHECK_FLAG(old_path->flags, BGP_PATH_REMOVED))
+			bgp_path_info_mark_for_delete(dest, old_path);
+		identity->canonical_path = NULL;
+		if (identity->state != MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED) {
+			identity->state = MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED;
+			store->conflict_count++;
+		}
+		bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
+				     SAFI_MIDR_LS);
+		/* bgp_midr_rib_process_main() clears the selected path and reaps
+		 * the old candidate. Preserve the quarantine state after that
+		 * transition so it is not mistaken for an ordinary NO_PATH. */
+		identity->state = MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED;
+		bgp_dest_unlock_node(dest);
+		if (event_pending)
+			midr_canonical_event_ack(store->canonical);
+		return 0;
+	}
+
+	if (identity->state == MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED) {
+		assert(store->conflict_count);
+		store->conflict_count--;
+		identity->state = MIDR_RIB_IDENTITY_NO_PATH;
+	}
 	new_path = info_make(ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL, 0,
-			     peer, new_attr, dest);
+				     peer, new_attr, dest);
 	SET_FLAG(new_path->flags, BGP_PATH_VALID);
 	new_path->from = peer;
 	bgp_path_info_add(dest, new_path);
+	identity->canonical_path = new_path;
 	if (!identity->path_count)
 		store->active_identity_count++;
 	identity->path_count++;
 	store->path_count++;
+	if (old_path && old_path != new_path &&
+	    !CHECK_FLAG(old_path->flags, BGP_PATH_REMOVED))
+		bgp_path_info_mark_for_delete(dest, old_path);
 	bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
 			     SAFI_MIDR_LS);
+	/* A newer canonical version supersedes the floor.  Old packets retain
+	 * their own instance/path references; the identity hold is no longer a
+	 * reclamation gate once this identity is live again. */
+	midr_rib_identity_release_retired_path(identity);
 	bgp_dest_unlock_node(dest);
+	midr_canonical_event_ack(store->canonical);
 	return 0;
 }
 
-int midr_rib_path_withdraw(struct midr_context *ctx, struct peer *peer,
+int midr_rib_instance_upsert_received(
+	struct midr_context *ctx, struct peer *peer,
+	const struct midr_instance *instance, uint32_t age_ms,
+	uint64_t received_ns)
+{
+	struct midr_rib_store *store;
+	uint32_t current_age;
+	uint64_t now_ns;
+	int ret;
+
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	store = ctx->rib_store;
+	now_ns = midr_rib_now_ns(ctx);
+	if (!received_ns)
+		received_ns = now_ns;
+	ret = midr_instance_age(age_ms, received_ns, now_ns, 0,
+				midr_rib_max_age_ms(ctx), &current_age);
+	if (ret) {
+		store->rejected_internal++;
+		return ret;
+	}
+	return midr_rib_instance_upsert(ctx, peer, instance, current_age);
+}
+
+int midr_rib_peer_withdraw(struct midr_context *ctx, struct peer *peer,
 			   const struct midr_ls_object_key *key)
 {
 	struct midr_rib_identity *identity;
-	struct bgp_path_info *path;
-	struct bgp_dest *dest;
 
 	if (!ctx || !ctx->bgp || !ctx->rib_store)
 		return -ENOENT;
 	if (!peer || peer->bgp != ctx->bgp || !key ||
 	    midr_ls_object_key_validate(key) != 0)
 		return -EINVAL;
-	if (peer == ctx->bgp->peer_self &&
-	    key->originator_node_id != ctx->bgp->router_id.s_addr)
-		return -EINVAL;
-
 	identity = midr_rib_identity_lookup(ctx->rib_store, key);
 	if (!identity)
 		return -ENOENT;
-	dest = bgp_dest_lock_node(identity->dest);
-	path = midr_rib_peer_path(dest, peer);
-	if (!path) {
-		bgp_dest_unlock_node(dest);
-		return -ENOENT;
-	}
-	bgp_path_info_mark_for_delete(dest, path);
-	bgp_process_main_one(ctx->bgp, dest, AFI_BGP_LS,
-			     SAFI_MIDR_LS);
-	bgp_dest_unlock_node(dest);
-	return 0;
+	/* MP_UNREACH removes only this peer's advertisement relationship.  The
+	 * canonical instance remains authoritative until a newer instance arrives. */
+	return midr_rib_advertisement_remove(identity, peer) ? 0 : -ENOENT;
+}
+
+struct midr_rib_peer_cleanup_state {
+	const struct peer *peer;
+};
+
+static void midr_rib_peer_cleanup_iter(struct hash_bucket *bucket, void *arg)
+{
+	struct midr_rib_peer_cleanup_state *state = arg;
+	struct midr_rib_identity *identity = bucket->data;
+
+	while (midr_rib_advertisement_remove(identity, state->peer))
+		;
+}
+
+void midr_rib_peer_cleanup(struct midr_context *ctx, const struct peer *peer)
+{
+	struct midr_rib_peer_cleanup_state state = {.peer = peer};
+
+	if (!ctx || !ctx->rib_store || !peer)
+		return;
+	hash_iterate(ctx->rib_store->identities, midr_rib_peer_cleanup_iter,
+			     &state);
 }
 
 void midr_rib_dest_cleanup(struct bgp *bgp, struct bgp_dest *dest)
@@ -643,32 +964,36 @@ void midr_rib_dest_cleanup(struct bgp *bgp, struct bgp_dest *dest)
 		store->conflict_count--;
 	if (identity->path_count <= store->path_count)
 		store->path_count -= identity->path_count;
+	midr_rib_identity_release_retired_path(identity);
 	assert(hash_release(store->identities, identity) ==
 	       identity);
 	idalloc_free(store->allocator, identity->synthetic_id);
 	XFREE(MTYPE_MIDR_RIB_IDENTITY, identity);
 }
 
-int midr_rib_selected_get(
+int midr_rib_selected_instance_get(
 	struct midr_context *ctx, const struct midr_ls_object_key *key,
-	struct midr_ls_object *object,
-	const struct midr_propagation_path **path, struct peer **peer)
+	struct midr_instance *instance, uint32_t *age_ms, struct peer **peer)
 {
 	struct midr_rib_identity *identity;
 
 	if (!ctx || !ctx->rib_store)
 		return -ENOENT;
-	if (!key || !object || !path || !peer)
+	if (!key || !instance || !peer)
 		return -EINVAL;
 	identity = midr_rib_identity_lookup(ctx->rib_store, key);
 	if (!identity || !identity->selected)
 		return -ENOENT;
-	if (midr_rib_path_object(identity->dest, identity->selected,
-				 object) != 0)
+	if (midr_rib_path_instance(ctx, identity->dest, identity->selected,
+				   instance, age_ms) != 0)
 		return -EINVAL;
-	*path = midr_rib_path_propagation(identity->selected);
+	/* This accessor is the active-view API. A WITHDRAWN canonical
+	 * instance remains available to the flooding path through the selected
+	 * entry iterator, but must not be presented as usable state. */
+	if (instance->state != MIDR_INSTANCE_ACTIVE)
+		return -ENOENT;
 	*peer = identity->selected->peer;
-	return *path ? 0 : -EINVAL;
+	return 0;
 }
 
 struct midr_rib_foreach_state {
@@ -682,24 +1007,19 @@ static void midr_rib_selected_iter(struct hash_bucket *bucket,
 {
 	struct midr_rib_foreach_state *state = arg;
 	struct midr_rib_identity *identity = bucket->data;
-	const struct midr_propagation_path *propagation;
-	struct midr_ls_object object;
+	struct midr_instance instance;
 
 	if (state->result || !identity->selected)
 		return;
-	if (midr_rib_path_object(identity->dest,
-				 identity->selected, &object) != 0) {
+	if (midr_rib_path_instance_decode(identity->dest, identity->selected,
+					 &instance) != 0) {
 		state->result = -EINVAL;
 		return;
 	}
-	propagation =
-		midr_rib_path_propagation(identity->selected);
-	if (!propagation) {
-		state->result = -EINVAL;
+	if (instance.state != MIDR_INSTANCE_ACTIVE)
 		return;
-	}
 	state->result = state->callback(
-		&object, propagation, identity->selected->peer,
+		&instance, identity->selected->peer,
 		state->arg);
 }
 
@@ -731,23 +1051,17 @@ static void midr_rib_selected_entry_iter(struct hash_bucket *bucket,
 {
 	struct midr_rib_entry_foreach_state *state = arg;
 	struct midr_rib_identity *identity = bucket->data;
-	const struct midr_propagation_path *propagation;
-	struct midr_ls_object object;
+	struct midr_instance instance;
 
 	if (state->result || !identity->selected)
 		return;
-	if (midr_rib_path_object(identity->dest, identity->selected,
-				 &object) != 0) {
-		state->result = -EINVAL;
-		return;
-	}
-	propagation = midr_rib_path_propagation(identity->selected);
-	if (!propagation) {
+	if (midr_rib_path_instance_decode(identity->dest, identity->selected,
+					 &instance) != 0) {
 		state->result = -EINVAL;
 		return;
 	}
 	state->result = state->callback(
-		&object, propagation, identity->selected->peer,
+		&instance, identity->selected->peer,
 		identity->dest, identity->selected, state->arg);
 }
 
@@ -769,9 +1083,26 @@ int midr_rib_selected_entry_foreach(
 	return state.result;
 }
 
+struct midr_rib_advertisement_count {
+	size_t count;
+};
+
+static void midr_rib_advertisement_count_iter(struct hash_bucket *bucket,
+					      void *arg)
+{
+	struct midr_rib_advertisement_count *state = arg;
+	struct midr_rib_identity *identity = bucket->data;
+	struct midr_rib_advertisement *advertisement;
+
+	for (advertisement = identity->advertisements; advertisement;
+	     advertisement = advertisement->next)
+		state->count++;
+}
+
 int midr_rib_summary_get(struct midr_context *ctx,
 			 struct midr_rib_summary *summary)
 {
+	struct midr_rib_advertisement_count advertisements = {};
 	struct midr_rib_store *store;
 
 	if (!ctx || !ctx->rib_store)
@@ -779,8 +1110,12 @@ int midr_rib_summary_get(struct midr_context *ctx,
 	if (!summary)
 		return -EINVAL;
 	store = ctx->rib_store;
+	hash_iterate(store->identities, midr_rib_advertisement_count_iter,
+		     &advertisements);
 	*summary = (struct midr_rib_summary){
-		.identity_count = store->active_identity_count,
+		/* The identity limit includes floors and quarantined identities, not
+		 * only objects currently usable by the active view. */
+		.identity_count = store->identities->count,
 		.path_count = store->path_count,
 		.selected_count = store->selected_count,
 		.conflict_count = store->conflict_count,
@@ -788,6 +1123,20 @@ int midr_rib_summary_get(struct midr_context *ctx,
 		.rejected_limit = store->rejected_limit,
 		.rejected_payload_conflict =
 			store->rejected_payload_conflict,
+		.rejected_resource = store->rejected_resource,
+		.rejected_internal = store->rejected_internal,
+		.identities_reclaimed = store->identities_reclaimed,
+		.lifetime_failures = store->lifetime_failures,
+		.last_lifetime_error = store->last_lifetime_error,
+		.canonical_identity_count =
+			midr_canonical_identity_count(store->canonical),
+		.floor_count = midr_canonical_floor_count(store->canonical),
+		.pending_event_count = midr_canonical_event_count(store->canonical),
+		.retired_ref_count =
+			midr_canonical_retired_ref_count(store->canonical),
+		.retired_ref_bytes =
+			midr_canonical_retired_ref_bytes(store->canonical),
+		.advertisement_count = advertisements.count,
 	};
 	return 0;
 }
@@ -801,6 +1150,20 @@ static const char *midr_rib_identity_state_name(enum midr_rib_identity_state sta
 		return "SELECTED";
 	case MIDR_RIB_IDENTITY_CONFLICT_QUARANTINED:
 		return "CONFLICT_QUARANTINED";
+	}
+	return "UNKNOWN";
+}
+
+static const char *midr_rib_canonical_state_name(
+		enum midr_canonical_state state)
+{
+	switch (state) {
+	case MIDR_CANONICAL_CURRENT:
+		return "CURRENT";
+	case MIDR_CANONICAL_QUARANTINED:
+		return "QUARANTINED";
+	case MIDR_CANONICAL_FLOOR:
+		return "FLOOR";
 	}
 	return "UNKNOWN";
 }
@@ -884,21 +1247,39 @@ static void midr_rib_show_identity(struct hash_bucket *bucket, void *arg)
 	struct midr_rib_show_state *show = arg;
 	struct midr_rib_identity *identity = bucket->data;
 	struct bgp_path_info *path;
+	struct midr_canonical_view canonical = {};
+	int canonical_ret;
 
-	if (!identity->path_count)
+	canonical_ret = midr_canonical_lookup(show->ctx->rib_store->canonical,
+					     &identity->key, &canonical);
+	if (!identity->path_count && canonical_ret)
 		return;
 	show->identity_count++;
 	vty_out(show->vty,
-		"identity synthetic-id=%u state=%s paths=%zu\n",
+		"identity synthetic-id=%u state=%s paths=%zu",
 		identity->synthetic_id,
 		midr_rib_identity_state_name(identity->state),
 		identity->path_count);
+	if (!canonical_ret) {
+		uint32_t remaining = canonical.age_ms <
+					     midr_canonical_max_age_ms(
+						     show->ctx->rib_store->canonical)
+						 ? midr_canonical_max_age_ms(
+							   show->ctx->rib_store->canonical) -
+							   canonical.age_ms
+						 : 0;
+
+		vty_out(show->vty, " canonical=%s sequence=%" PRIu64
+				 " age-ms=%u remaining-ms=%u\n",
+				midr_rib_canonical_state_name(canonical.state),
+				canonical.sequence, canonical.age_ms, remaining);
+	} else {
+		vty_out(show->vty, " canonical=UNAVAILABLE\n");
+	}
 	for (path = bgp_dest_get_bgp_path_info(identity->dest); path;
 	     path = path->next) {
-		const struct midr_propagation_path *propagation;
 		struct midr_ls_object object;
 		struct in_addr peer_id;
-		size_t index;
 
 		show->path_count++;
 		vty_out(show->vty, "  path peer=");
@@ -922,18 +1303,10 @@ static void midr_rib_show_identity(struct hash_bucket *bucket, void *arg)
 			continue;
 		}
 		midr_rib_show_object(show->vty, &object);
-		propagation = midr_rib_path_propagation(path);
-		vty_out(show->vty, " propagation=[");
-		if (propagation)
-			for (index = 0; index < propagation->node_count; index++) {
-				struct in_addr node = {
-					.s_addr = propagation->nodes[index],
-				};
-
-				vty_out(show->vty, "%s%pI4",
-					index ? "," : "", &node);
-			}
-		vty_out(show->vty, "]\n");
+		vty_out(show->vty, " state=%s age-ms=%u\n",
+			bgp_midr_ls_attr_state(path->attr->midr_ls) ==
+				MIDR_INSTANCE_ACTIVE ? "ACTIVE" : "WITHDRAWN",
+			bgp_midr_ls_attr_age(path->attr->midr_ls));
 	}
 }
 
@@ -963,11 +1336,43 @@ int midr_rib_test_set_identity_limit(struct midr_context *ctx,
 {
 	if (!ctx || !ctx->rib_store)
 		return -ENOENT;
-	if (!limit || limit > MIDR_RIB_MAX_IDENTITIES ||
-	    limit < ctx->rib_store->identities->count)
+	if (!limit || limit > MIDR_RIB_MAX_IDENTITIES)
 		return -EINVAL;
+	/* Tests may lower the limit below the live identity count to drive
+	 * the new-identity rejection path; existing identities stay usable. */
 	ctx->rib_store->identity_limit = limit;
 	return 0;
+}
+
+int midr_rib_test_set_now_ns(struct midr_context *ctx, uint64_t now_ns)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	ctx->rib_store->test_clock_enabled = true;
+	ctx->rib_store->test_now_ns = now_ns;
+	return 0;
+}
+
+int midr_rib_test_set_gc_enabled(struct midr_context *ctx, bool enabled)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_canonical_gc_enable(ctx->rib_store->canonical, enabled);
+}
+
+int midr_rib_test_run_lifetime(struct midr_context *ctx)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_rib_lifetime_pass(ctx->rib_store);
+}
+
+int midr_rib_test_set_event_limit(struct midr_context *ctx, size_t limit)
+{
+	if (!ctx || !ctx->rib_store)
+		return -ENOENT;
+	return midr_canonical_test_set_event_limit(ctx->rib_store->canonical,
+						  limit);
 }
 
 int midr_rib_test_set_path_stale(

@@ -14,6 +14,7 @@
 
 #include "bgpd/bgp_memory.h"
 #include "bgpd/bgp_midr_ted_private.h"
+#include "bgpd/bgp_midr_lsdb.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_STORE, "MIDR TED store");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TED_SNAPSHOT, "MIDR TED snapshot");
@@ -1037,6 +1038,7 @@ void midr_ted_consumer_unregister(struct midr_context *ctx, struct midr_ted_cons
 int midr_ted_status_get(struct midr_context *ctx, struct midr_ted_status *status)
 {
 	struct midr_ted_snapshot_internal *snapshot;
+	struct midr_lsdb_summary lsdb;
 
 	if (!status)
 		return -EINVAL;
@@ -1046,6 +1048,8 @@ int midr_ted_status_get(struct midr_context *ctx, struct midr_ted_status *status
 
 	snapshot = ctx->ted_store->current;
 	status->consumer_count = listcount(ctx->ted_store->consumers);
+	if (ctx->lsdb_store && midr_lsdb_summary_get(ctx, &lsdb) == 0)
+		status->derivation_pending = lsdb.derivation_pending;
 	if (!snapshot)
 		return 0;
 

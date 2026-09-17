@@ -58,6 +58,8 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr.c \
 	bgpd/bgp_midr_attr.c \
 	bgpd/bgp_midr_codec.c \
+	bgpd/bgp_midr_instance.c \
+	bgpd/bgp_midr_canonical.c \
 	bgpd/bgp_midr_cost.c \
 	bgpd/bgp_midr_input.c \
 	bgpd/bgp_midr_ls.c \
@@ -182,6 +184,8 @@ noinst_HEADERS += \
 	bgpd/bgp_midr.h \
 	bgpd/bgp_midr_attr.h \
 	bgpd/bgp_midr_codec.h \
+	bgpd/bgp_midr_instance.h \
+	bgpd/bgp_midr_canonical.h \
 	bgpd/bgp_midr_cost.h \
 	bgpd/bgp_midr_ls.h \
 	bgpd/bgp_midr_lsdb.h \

@@ -127,7 +127,7 @@ void idalloc_free(struct id_alloc *alloc, uint32_t id)
 	word = ID_WORD(id);
 	offset = ID_OFFSET(id);
 
-	if ((page->allocated_mask[word] & (1 << offset)) == 0) {
+	if ((page->allocated_mask[word] & ((uint32_t)1 << offset)) == 0) {
 		flog_err(EC_LIB_ID_CONSISTENCY,
 			"ID Allocator %s cannot free #%u. ID was not allocated at the time of free.",
 			alloc->name, id);

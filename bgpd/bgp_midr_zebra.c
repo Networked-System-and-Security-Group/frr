@@ -392,6 +392,11 @@ static int midr_result_to_zapi(struct bgp *bgp, const struct prefix *p,
 	SET_FLAG(api->message, ZAPI_MESSAGE_DISTANCE);
 	api->distance = ZEBRA_BGP_MIDR_DISTANCE_DEFAULT;
 
+	/* MIDR links carry transport locators as nexthops.  Those locators are
+	 * normally learned through the underlay RIB rather than connected to a
+	 * local interface, so Zebra must recursively resolve them. */
+	SET_FLAG(api->flags, ZEBRA_FLAG_ALLOW_RECURSION);
+
 	SET_FLAG(api->message, ZAPI_MESSAGE_NEXTHOP);
 
 	/*

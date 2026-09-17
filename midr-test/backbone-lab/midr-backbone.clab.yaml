@@ -13,6 +13,7 @@ topology:
         - configs-backbone/b1/daemons:/etc/frr/daemons
         - logs-backbone/b1:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.101/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -29,6 +30,7 @@ topology:
         - configs-backbone/b2/daemons:/etc/frr/daemons
         - logs-backbone/b2:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.102/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -45,6 +47,7 @@ topology:
         - configs-backbone/b3/daemons:/etc/frr/daemons
         - logs-backbone/b3:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.103/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -61,6 +64,7 @@ topology:
         - configs-backbone/b4/daemons:/etc/frr/daemons
         - logs-backbone/b4:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.104/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -77,6 +81,7 @@ topology:
         - configs-backbone/b5/daemons:/etc/frr/daemons
         - logs-backbone/b5:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.105/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -93,6 +98,7 @@ topology:
         - configs-backbone/t1/daemons:/etc/frr/daemons
         - logs-backbone/t1:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.201/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -109,6 +115,7 @@ topology:
         - configs-backbone/t2/daemons:/etc/frr/daemons
         - logs-backbone/t2:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.202/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -126,6 +133,7 @@ topology:
         - configs-backbone/t3/daemons:/etc/frr/daemons
         - logs-backbone/t3:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.203/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -143,6 +151,7 @@ topology:
         - configs-backbone/r1/daemons:/etc/frr/daemons
         - logs-backbone/r1:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.111/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -159,6 +168,7 @@ topology:
         - configs-backbone/m1a/daemons:/etc/frr/daemons
         - logs-backbone/m1a:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.112/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -175,6 +185,7 @@ topology:
         - configs-backbone/m1b/daemons:/etc/frr/daemons
         - logs-backbone/m1b:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.113/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -191,6 +202,7 @@ topology:
         - configs-backbone/r2/daemons:/etc/frr/daemons
         - logs-backbone/r2:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.121/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -207,6 +219,7 @@ topology:
         - configs-backbone/m2a/daemons:/etc/frr/daemons
         - logs-backbone/m2a:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.122/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -224,6 +237,7 @@ topology:
         - logs-backbone/z1:/etc/frr/logs
         - configs-backbone/z1/midr-policy:/etc/frr/midr-policy:ro
       exec:
+        - ip addr replace 10.99.0.191/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -240,6 +254,7 @@ topology:
         - configs-backbone/z2/daemons:/etc/frr/daemons
         - logs-backbone/z2:/etc/frr/logs
       exec:
+        - ip addr replace 10.99.0.192/32 dev lo
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf

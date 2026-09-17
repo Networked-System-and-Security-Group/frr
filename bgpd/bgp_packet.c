@@ -42,6 +42,8 @@
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_mplsvpn.h"
 #include "bgpd/bgp_evpn.h"
+#include "bgpd/bgp_midr_private.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_updgrp.h"
@@ -204,6 +206,8 @@ static struct stream *bgp_update_packet_eor(struct peer *peer, afi_t afi,
 	}
 
 	bgp_packet_set_size(s);
+	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
+		midr_sync_packet_queued(peer->connection, s, true);
 	return s;
 }
 
@@ -596,7 +600,9 @@ void bgp_generate_updgrp_packets(struct event *event)
 						continue;
 					if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS &&
 					    peer->bgp->midr_info &&
-					    !midr_sync_local_ready(&peer->bgp->midr_info->ctx))
+					    (paf->t_announce_route ||
+					     !midr_sync_can_send_eor(&peer->bgp->midr_info->ctx,
+							    connection)))
 						continue;
 
 					SET_FLAG(peer->af_sflags[afi][safi],
@@ -619,7 +625,17 @@ void bgp_generate_updgrp_packets(struct event *event)
 			 * packet with appropriate attributes from peer
 			 * and advance peer */
 			s = bpacket_reformat_for_peer(next_pkt, paf);
+			if (!s && afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				/* The held instance expired, the age clock regressed, or
+				 * the age vector was invalid.  Never abort bgpd or send the
+				 * stale template; skip it and rebuild the session snapshot. */
+				bpacket_queue_advance_peer(paf);
+				midr_sync_request_resync(connection);
+				continue;
+			}
 			assert(s);
+			if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
+				midr_sync_packet_queued(connection, s, false);
 			bgp_packet_add(connection, s);
 			bpacket_queue_advance_peer(paf);
 		}
@@ -990,7 +1006,12 @@ static void bgp_notify_send_internal(struct peer_connection *connection,
 	bgp_packet_set_size(s);
 
 	/* wipe output buffer */
-	stream_fifo_clean(connection->obuf);
+	struct stream *discarded;
+
+	while ((discarded = stream_fifo_pop(connection->obuf)) != NULL) {
+		midr_sync_packet_dropped(connection, discarded);
+		stream_free(discarded);
+	}
 
 	/*
 	 * If possible, store last packet for debugging purposes. This check is
@@ -2319,7 +2340,7 @@ static void bgp_update_receive_eor(struct peer_connection *connection, afi_t afi
 	if (peer->nsf[afi][safi])
 		bgp_clear_stale_route(peer, afi, safi);
 	if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS && bgp->midr_info)
-		midr_sync_peer_eor(&bgp->midr_info->ctx, peer);
+		midr_sync_peer_eor_connection(&bgp->midr_info->ctx, connection);
 }
 
 /**
@@ -2530,6 +2551,12 @@ static int bgp_update_receive(struct peer_connection *connection, bgp_size_t siz
 		if (nlris[i].length == 0)
 			continue;
 
+		bool midr_input =
+			nlris[i].afi == AFI_BGP_LS && nlris[i].safi == SAFI_MIDR_LS &&
+			peer->bgp->midr_info;
+		if (midr_input)
+			midr_sync_input_begin(&peer->bgp->midr_info->ctx, connection);
+
 		switch (i) {
 		case NLRI_UPDATE:
 		case NLRI_MP_UPDATE:
@@ -2544,6 +2571,9 @@ static int bgp_update_receive(struct peer_connection *connection, bgp_size_t siz
 		default:
 			nlri_ret = BGP_NLRI_PARSE_ERROR;
 		}
+		if (midr_input)
+			midr_sync_input_end(&peer->bgp->midr_info->ctx, connection,
+					    nlri_ret == BGP_NLRI_PARSE_OK);
 
 		if (nlri_ret < BGP_NLRI_PARSE_OK
 		    && nlri_ret != BGP_NLRI_PARSE_ERROR_PREFIX_OVERFLOW) {
@@ -3606,6 +3636,10 @@ static void bgp_dynamic_capability_llgr(uint8_t *pnt, int action,
 						   peer->host,
 						   iana_afi2str(pkt_afi),
 						   iana_safi2str(pkt_safi));
+			} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				if (peer->bgp && peer->bgp->midr_info)
+					midr_sync_capability_tuple_ignored(
+						&peer->bgp->midr_info->ctx, true);
 			} else if (!peer->afc[afi][safi] ||
 				   !CHECK_FLAG(peer->af_cap[afi][safi],
 					       PEER_CAP_RESTART_AF_RCV)) {
@@ -3702,6 +3736,10 @@ static void bgp_dynamic_capability_graceful_restart(uint8_t *pnt, int action,
 					zlog_debug("%pBP: Addr-family %s/%s(afi/safi) not supported. Ignore the Graceful Restart capability for this AFI/SAFI",
 						   peer, iana_afi2str(pkt_afi),
 						   iana_safi2str(pkt_safi));
+			} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
+				if (peer->bgp && peer->bgp->midr_info)
+					midr_sync_capability_tuple_ignored(
+						&peer->bgp->midr_info->ctx, false);
 			} else if (!peer->afc[afi][safi]) {
 				if (bgp_debug_neighbor_events(peer))
 					zlog_debug("%pBP: Addr-family %s/%s(afi/safi) not enabled. Ignore the Graceful Restart capability",

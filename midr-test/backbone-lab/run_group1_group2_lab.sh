@@ -253,7 +253,6 @@ case "$MODE" in
 		;;
 	build)
 		preflight
-		check_existing_lab
 		prepare_run_root
 		build_image
 		;;

@@ -44,6 +44,9 @@ struct midr_lsdb_summary {
 	uint64_t commit_count;
 	uint64_t failure_count;
 	int last_error;
+	bool ready;
+	bool derivation_pending;
+	uint32_t retry_delay_msec;
 };
 
 struct midr_lsdb_group_prefix_candidate {
@@ -67,11 +70,15 @@ extern void midr_lsdb_input_state_changed(struct midr_context *ctx);
 extern void midr_lsdb_sync_changed(struct midr_context *ctx);
 extern bool midr_lsdb_export_eligible(struct midr_context *ctx, const struct bgp_dest *dest,
 				      const struct bgp_path_info *path, const struct peer *target);
+/* True only after the committed/staging LSDB no longer holds this identity. */
+extern bool midr_lsdb_identity_reclaim_safe(
+		struct midr_context *ctx, const struct midr_ls_object_key *key);
 
 extern int midr_lsdb_remote_snapshot_get(
 	struct midr_context *ctx, struct midr_remote_view_snapshot *snapshot);
 extern void midr_lsdb_remote_snapshot_release(
 	struct midr_remote_view_snapshot *snapshot);
+extern int midr_lsdb_remote_view_replay(struct midr_context *ctx);
 extern int midr_lsdb_summary_get(struct midr_context *ctx,
 				 struct midr_lsdb_summary *summary);
 extern void midr_show_lsdb(struct vty *vty, struct midr_context *ctx);
@@ -83,6 +90,8 @@ extern int midr_lsdb_local_group_prefix_foreach(struct midr_context *ctx,
 						midr_lsdb_group_prefix_cb cb, void *arg);
 
 extern int midr_lsdb_test_process(struct midr_context *ctx);
+extern int midr_lsdb_test_fire_commit(struct midr_context *ctx);
+extern bool midr_lsdb_test_retry_pending(struct midr_context *ctx);
 extern void midr_lsdb_test_fail_next_prepare(struct midr_context *ctx);
 
 #endif /* _FRR_BGP_MIDR_LSDB_H */

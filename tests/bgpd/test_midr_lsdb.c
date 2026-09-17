@@ -21,6 +21,7 @@
 #include "bgpd/bgp_midr_owned.h"
 #include "bgpd/bgp_midr_private.h"
 #include "bgpd/bgp_midr_rib.h"
+#include "bgpd/bgp_midr_sync.h"
 #include "bgpd/bgp_midr_ted_private.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
@@ -279,20 +280,35 @@ static void remote_link_withdraw(const struct midr_link_key *key, uint64_t seque
 
 static void install_remote(const struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = *object,
+	};
 
-	assert(midr_propagation_path_init(&path, remote_peer->remote_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, remote_peer, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, remote_peer, &instance, 0) == 0);
 }
 
 static void install_local(const struct midr_ls_object *object)
 {
-	struct midr_propagation_path path = {};
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_ACTIVE,
+		.object = *object,
+	};
 
-	assert(midr_propagation_path_init(&path, bgp->router_id.s_addr) == 0);
-	assert(midr_rib_path_upsert(ctx, bgp->peer_self, object, &path) == 0);
-	midr_propagation_path_fini(&path);
+	assert(midr_rib_instance_upsert(ctx, bgp->peer_self, &instance, 0) == 0);
+}
+
+static void withdraw_remote(const struct midr_ls_object *object)
+{
+	struct midr_instance instance = {
+		.state = MIDR_INSTANCE_WITHDRAWN,
+		.object = *object,
+	};
+
+	instance.object.ls_sequence++;
+	instance.object.policy_tags = 0;
+	memset(&instance.object.payload, 0, sizeof(instance.object.payload));
+	assert(midr_rib_instance_upsert(ctx, remote_peer, &instance, 0) == 0);
 }
 
 static void assert_prefix_key_same(const struct midr_ted_prefix_key *left,
@@ -517,7 +533,7 @@ static void test_pending_activation_and_four_objects(void)
 	assert(midr_ted_snapshot_get(ctx, &snapshot) == 0);
 	assert(snapshot->prefix_group_count == 0);
 	midr_ted_snapshot_release(&snapshot);
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &nonrepresentative.key) == 0);
+	withdraw_remote(&nonrepresentative);
 	assert(midr_lsdb_test_process(ctx) == 0);
 
 	install_remote(&membership);
@@ -563,6 +579,18 @@ static void test_pending_activation_and_four_objects(void)
 
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	lsdb_generation = lsdb.generation;
+	{
+		size_t node_updates = callbacks.node_updates;
+
+		/* A refresh changes the control-plane version but not the
+		 * topology-derived TED content. */
+		membership = remote_membership(2, 20);
+		install_remote(&membership);
+		assert(midr_lsdb_test_process(ctx) == 0);
+		assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+		assert(lsdb.generation == lsdb_generation);
+		assert(callbacks.node_updates == node_updates);
+	}
 	midr_lsdb_local_metadata_changed(ctx);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
@@ -587,38 +615,113 @@ static void test_pending_activation_and_four_objects(void)
 	assert(!midr_ted_path_consumer_stub_result_is_current(ctx, &path_consumer,
 							      held->generation));
 
-	membership = remote_membership(2, 30);
+	/* A reconnect alone must not invalidate an already usable TED. */
+	{
+		struct midr_sync_status sync_status;
+		uint64_t reasons = 0;
+
+		remote_peer->connection->status = Established;
+		remote_peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS] = 1;
+		assert(!midr_sync_view_ready(ctx, false, &reasons));
+		assert(!midr_sync_view_ready(ctx, true, &reasons));
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		assert(sync_status.waiting_peer_count == 1);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+
+		remote_peer->connection->status = Idle;
+		midr_sync_peer_status_changed(ctx, remote_peer);
+		remote_peer->connection->status = Established;
+		midr_sync_peer_status_changed(ctx, remote_peer);
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		/* Dropping the last waiting peer completes the initial barrier, so
+		 * the re-established session is a late peer: it keeps its own
+		 * snapshot/EoR state but must not rejoin the barrier peer set. */
+		assert(sync_status.waiting_peer_count == 0);
+		assert(sync_status.next_session_generation != 0);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+
+		midr_sync_peer_eor(ctx, remote_peer);
+		assert(midr_sync_status_get(ctx, &sync_status) == 0);
+		assert(sync_status.waiting_peer_count == 0);
+		assert(midr_ted_status_get(ctx, &status) == 0);
+		assert(status.ready);
+		assert(status.generation == ready_generation);
+	}
+
+	membership = remote_membership(3, 30);
 	install_remote(&membership);
 	midr_lsdb_test_fail_next_prepare(ctx);
-	assert(midr_lsdb_test_process(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.ready);
+	assert(lsdb.derivation_pending);
+	assert(lsdb.retry_delay_msec == 1000);
+	assert(lsdb.dirty_count > 0);
 	assert(midr_ted_status_get(ctx, &status) == 0);
 	assert(status.generation == ready_generation);
+	assert(status.ready);
+	assert(status.derivation_pending);
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
 	assert(remote.nodes[0].group_id == 20);
 	midr_remote_view_snapshot_release(ctx, &remote);
 
-	assert(midr_lsdb_test_process(ctx) == 0);
+	/* A second consecutive failure backs off without changing the
+	 * committed LSDB/TED state. */
+	link.ls_sequence = 3;
+	install_remote(&link);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	midr_lsdb_test_fail_next_prepare(ctx);
+	assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+	assert(midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(lsdb.retry_delay_msec == 2000);
+	assert(lsdb.failure_count >= 2);
+	{
+		static const uint32_t retry_delays[] = {
+			4000, 8000, 16000, 32000, 60000,
+		};
+
+		for (size_t i = 0; i < array_size(retry_delays); i++) {
+			midr_lsdb_test_fail_next_prepare(ctx);
+			assert(midr_lsdb_test_fire_commit(ctx) == -ENOMEM);
+			assert(midr_lsdb_test_retry_pending(ctx));
+			assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+			assert(lsdb.retry_delay_msec == retry_delays[i]);
+		}
+	}
+
+	assert(midr_lsdb_test_fire_commit(ctx) == 0);
+	assert(!midr_lsdb_test_retry_pending(ctx));
+	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
+	assert(!lsdb.derivation_pending);
+	assert(lsdb.retry_delay_msec == 0);
+	assert(lsdb.last_error == 0);
 	assert(midr_remote_view_snapshot_get(ctx, &remote) == 0);
 	assert(remote.nodes[0].group_id == 30);
 	midr_remote_view_snapshot_release(ctx, &remote);
 	assert(callbacks.node_updates == 2);
 
 	ctx->midr->remote_callbacks_registered = false;
-	membership = remote_membership(3, 31);
+	membership = remote_membership(4, 31);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 2);
 	ctx->midr->remote_callbacks_registered = true;
-	membership = remote_membership(4, 32);
+	membership = remote_membership(5, 32);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 3);
 
 	assert(midr_remote_view_callbacks_register(ctx, &empty_callbacks) == 0);
-	membership = remote_membership(5, 33);
+	membership = remote_membership(6, 33);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
+	withdraw_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 3);
 	assert(callbacks.node_withdraws == 0);
@@ -632,13 +735,14 @@ static void test_pending_activation_and_four_objects(void)
 							   .remote_link_withdraw =
 								   remote_link_withdraw,
 						   }) == 0);
-	membership = remote_membership(6, 34);
+	/* Sequence 7 is already occupied by the canonical WITHDRAWN instance. */
+	membership = remote_membership(8, 34);
 	install_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(callbacks.node_updates == 4);
 	assert(callbacks.link_updates == 2);
 
-	assert(midr_rib_path_withdraw(ctx, remote_peer, &membership.key) == 0);
+	withdraw_remote(&membership);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_lsdb_summary_get(ctx, &lsdb) == 0);
 	assert(lsdb.usable_count == 2);
@@ -684,8 +788,9 @@ static void test_out_of_sync_reason(void)
 	assert(midr_topology_link_upsert(ctx, &link) == -ENOSPC);
 	assert(midr_lsdb_test_process(ctx) == 0);
 	assert(midr_ted_status_get(ctx, &status) == 0);
-	assert(status.ready);
+	assert(!status.ready);
 	assert(status.sync_reason_flags == MIDR_TED_SYNC_REASON_RESYNC_FAILED);
+	assert(midr_ted_snapshot_get(ctx, &snapshot) == -EAGAIN);
 }
 
 int main(void)

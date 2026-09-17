@@ -267,8 +267,22 @@ DEFUN(show_midr_rib_summary, show_midr_rib_summary_cmd,
 		summary.selected_count);
 	vty_out(vty, "  conflicts:         %zu\n",
 		summary.conflict_count);
+	vty_out(vty, "  canonical entries: %zu\n",
+		summary.canonical_identity_count);
+	vty_out(vty, "  canonical floors:  %zu\n", summary.floor_count);
+	vty_out(vty, "  pending events:    %zu\n", summary.pending_event_count);
+	vty_out(vty, "  retired refs:      %zu (%zu bytes)\n",
+		summary.retired_ref_count, summary.retired_ref_bytes);
+	vty_out(vty, "  advertisements:    %zu\n",
+		summary.advertisement_count);
+	vty_out(vty, "  identities reclaimed: %" PRIu64 "\n",
+		summary.identities_reclaimed);
 	vty_out(vty, "  rejected limit:    %" PRIu64 "\n",
 		summary.rejected_limit);
+	vty_out(vty, "  rejected resource: %" PRIu64 "\n",
+		summary.rejected_resource);
+	vty_out(vty, "  rejected internal: %" PRIu64 "\n",
+		summary.rejected_internal);
 	vty_out(vty, "  payload conflicts: %" PRIu64 "\n",
 		summary.rejected_payload_conflict);
 	return CMD_SUCCESS;
@@ -279,7 +293,7 @@ DEFUN(show_midr_rib_paths, show_midr_rib_paths_cmd,
       SHOW_STR
       "MIDR information\n"
       "MIDR SAFI RIB\n"
-      "All identity paths and propagation paths\n")
+		      "All canonical identity paths\n")
 {
 	struct midr_context *ctx = midr_vty_context(vty);
 
@@ -491,6 +505,8 @@ DEFUN(show_midr_ted_summary, show_midr_ted_summary_cmd,
 
 	vty_out(vty, "MIDR TED summary:\n");
 	vty_out(vty, "  state:                 %s\n", status.ready ? "READY" : "NOT_READY");
+	vty_out(vty, "  source status:         %s\n",
+		status.derivation_pending ? "DERIVATION_PENDING" : "CURRENT");
 	vty_out(vty, "  generation:            %" PRIu64 "\n", status.generation);
 	vty_out(vty, "  sync reasons:          ");
 	midr_vty_show_sync_reasons(vty, status.sync_reason_flags);
@@ -659,6 +675,24 @@ DEFUN(show_midr_ted_detail, show_midr_ted_detail_cmd,
 	return CMD_SUCCESS;
 }
 
+static const char *midr_sync_shutdown_state_name(
+	enum midr_sync_shutdown_state state)
+{
+	switch (state) {
+	case MIDR_SYNC_SHUTDOWN_IDLE:
+		return "IDLE";
+	case MIDR_SYNC_SHUTDOWN_WAITING:
+		return "WAITING";
+	case MIDR_SYNC_SHUTDOWN_COMPLETE:
+		return "COMPLETE";
+	case MIDR_SYNC_SHUTDOWN_DEGRADED:
+		return "DEGRADED";
+	case MIDR_SYNC_SHUTDOWN_GENERATION_FAILED:
+		return "GENERATION_FAILED";
+	}
+	return "UNKNOWN";
+}
+
 DEFUN(show_midr_sync, show_midr_sync_cmd,
       "show midr sync",
       SHOW_STR
@@ -683,6 +717,33 @@ DEFUN(show_midr_sync, show_midr_sync_cmd,
 	vty_out(vty, "  timed-out peers:    %zu\n", status.timed_out_peer_count);
 	vty_out(vty, "  barriers/timeouts:  %" PRIu64 "/%" PRIu64 "\n",
 		status.barrier_count, status.timeout_count);
+	vty_out(vty, "  active sessions:    %zu\n", status.active_session_count);
+	vty_out(vty, "  syncing sessions:   %zu\n", status.syncing_session_count);
+	vty_out(vty, "  remote EoR:         %zu\n", status.eor_received_count);
+	vty_out(vty, "  local EoR written:  %zu\n", status.eor_written_count);
+	vty_out(vty, "  receive drained:    %zu\n", status.receive_drained_count);
+	vty_out(vty, "  resync required:    %zu\n", status.resync_required_count);
+	vty_out(vty, "  snapshots active/done: %zu/%zu\n",
+		status.snapshot_active_count, status.snapshot_completed_count);
+	vty_out(vty, "  shutdown pending:   %zu (%s)\n",
+		status.shutdown_pending_count,
+		status.shutdown_active ? "active" : "idle");
+	vty_out(vty, "  shutdown result:    %s\n",
+		midr_sync_shutdown_state_name(status.shutdown_state));
+	vty_out(vty, "  pending updates:    %zu\n", status.pending_update_count);
+	vty_out(vty, "  pending input:      %zu\n", status.pending_input_count);
+	vty_out(vty, "  input rejected:     %" PRIu64 "\n",
+		status.input_rejected_count);
+	vty_out(vty, "  output timeouts:    %" PRIu64 "\n",
+		status.output_timeout_count);
+	vty_out(vty, "  shutdown generation failures: %" PRIu64 "\n",
+		status.shutdown_generation_failures);
+	vty_out(vty, "  ignored GR/LLGR MIDR tuples:  %" PRIu64 "/%" PRIu64 "\n",
+		status.gr_tuple_ignored, status.llgr_tuple_ignored);
+	vty_out(vty, "  session generation: %" PRIu64 "\n",
+		status.next_session_generation);
+	vty_out(vty, "  reconnects/stale:   %" PRIu64 "/%" PRIu64 "\n",
+		status.reconnect_count, status.stale_event_count);
 	return CMD_SUCCESS;
 }
 

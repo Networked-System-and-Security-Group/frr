@@ -23,8 +23,6 @@
 struct zebra_privs_t bgpd_privs = {};
 struct event_loop *master;
 static struct bgp_master test_bm;
-struct bgp_master *bm = &test_bm;
-struct zclient *bgp_zclient;
 
 #define SENT_ROUTE_MAX 32
 
@@ -167,6 +165,7 @@ static void test_spf_pipeline(void)
 
 	master = event_master_create("MIDR SPF pipeline test");
 	test_bm.master = master;
+	bm = &test_bm;
 	reset_sent_routes();
 
 	assert(midr_ted_context_init(&ctx) == 0);
@@ -190,20 +189,36 @@ static void test_spf_pipeline(void)
 	assert(midr_spf_results_count(results) == 2);
 	midr_spf_results_release(&results);
 
+	/* A NOT_READY publication clears the cached SPF result and installed
+	 * routes; it is different from a failed derivation that retains READY. */
+	reset_sent_routes();
+	{
+		struct midr_ted_prepared *prepared = NULL;
+
+		assert(midr_ted_prepare_not_ready(&ctx, node_id("1.1.1.1"),
+						 MIDR_TED_SYNC_REASON_RESYNC_FAILED,
+						 &prepared) == 0);
+		midr_ted_prepared_commit(&prepared);
+	}
+	run_one_event();
+	midr_zebra_route_flush(&bgp);
+	assert(sent_route_count == 2);
+	assert(sent_routes[0].command == ZEBRA_ROUTE_DELETE);
+	assert(sent_routes[1].command == ZEBRA_ROUTE_DELETE);
+	assert(midr_spf_results_get(&ctx, &results) == -EAGAIN);
+
 	/* Two publications before the debounce event collapse to the newest one. */
 	reset_sent_routes();
 	publish_snapshot(&ctx, 20, true, 0);
 	publish_snapshot(&ctx, 7, true, 0);
 	assert(midr_spf_runtime_status_get(&ctx, &status) == 0);
 	assert(status.recompute_pending);
-	assert(status.pending_generation == 3);
+	assert(status.pending_generation == 4);
 	run_one_event();
 	midr_zebra_route_flush(&bgp);
-	assert(sent_route_count == 4);
-	assert(sent_routes[0].command == ZEBRA_ROUTE_DELETE);
-	assert_add(1, AF_INET, 7, 7);
-	assert(sent_routes[2].command == ZEBRA_ROUTE_DELETE);
-	assert_add(3, AF_INET6, 7, 8);
+	assert(sent_route_count == 2);
+	assert_add(0, AF_INET, 7, 7);
+	assert_add(1, AF_INET6, 7, 8);
 
 	/* A generation-only sync change has identical forwarding and emits nothing. */
 	reset_sent_routes();

@@ -96,6 +96,9 @@ struct stream {
 	size_t endp;	       /* last valid data position */
 	size_t size;	       /* size of data segment */
 	bool allow_expansion;  /* whether stream can be expanded */
+	/* Optional monotonic timestamp attached by packet producers.  BGP uses
+	 * this for receive-queue age accounting and encoded-output deadlines. */
+	uint64_t monotime_ns;
 	unsigned char *data;   /* data pointer */
 };
 
@@ -145,6 +148,8 @@ extern size_t stream_resize_inplace(struct stream **sptr, size_t newsize);
 extern size_t stream_get_getp(const struct stream *s);
 extern size_t stream_get_endp(const struct stream *s);
 extern size_t stream_get_size(const struct stream *s);
+extern uint64_t stream_get_monotime_ns(const struct stream *s);
+extern void stream_set_monotime_ns(struct stream *s, uint64_t monotime_ns);
 
 /**
  * Create a new stream structure; copy offset bytes from s1 to the new

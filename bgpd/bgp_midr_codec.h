@@ -15,6 +15,7 @@
 #include "stream.h"
 
 #include "bgpd/bgp_midr_ls.h"
+#include "bgpd/bgp_midr_instance.h"
 
 enum midr_codec_result {
 	MIDR_CODEC_OK = 0,
@@ -49,37 +50,30 @@ struct midr_ls_attributes {
 	uint32_t link_canonical_cost;
 };
 
-struct midr_propagation_path {
-	uint32_t *nodes;
-	uint16_t node_count;
-	uint16_t capacity;
+/* Explicit new-format entrypoints; legacy callers are not auto-upgraded. */
+struct midr_instance_attributes {
+	struct midr_ls_attributes ls;
+	enum midr_instance_state state;
+	uint32_t age_ms;
 };
+
+#define MIDR_INSTANCE_TLV_STATE 4U
+#define MIDR_INSTANCE_TLV_AGE 5U
+
+extern enum midr_codec_result midr_instance_attribute_encode(
+	struct stream *stream, const struct midr_instance *instance, uint32_t age_ms);
+extern enum midr_codec_result midr_instance_attribute_encode_tracked(
+	struct stream *stream, const struct midr_instance *instance,
+	uint32_t age_ms, size_t *age_offset);
+extern enum midr_codec_result midr_instance_attribute_decode(
+	struct stream *stream, size_t length, struct midr_instance_attributes *attributes);
+extern enum midr_codec_result midr_instance_from_wire(
+	const struct midr_ls_object_key *key, const struct midr_instance_attributes *attributes,
+	struct midr_instance *instance);
 
 extern enum midr_codec_result midr_nlri_encode(struct stream *stream,
 					       const struct midr_ls_object_key *key);
 extern enum midr_codec_result midr_nlri_decode(struct stream *stream,
 					       struct midr_ls_object_key *key);
-
-extern enum midr_codec_result midr_ls_attribute_encode(struct stream *stream,
-						       const struct midr_ls_object *object);
-extern enum midr_codec_result midr_ls_attribute_decode(struct stream *stream, size_t length,
-						       struct midr_ls_attributes *attributes);
-extern enum midr_codec_result midr_ls_object_from_wire(const struct midr_ls_object_key *key,
-						       const struct midr_ls_attributes *attributes,
-						       struct midr_ls_object *object);
-
-extern int midr_propagation_path_init(struct midr_propagation_path *path,
-				      uint32_t originator_node_id);
-extern void midr_propagation_path_fini(struct midr_propagation_path *path);
-extern bool midr_propagation_path_contains(const struct midr_propagation_path *path,
-					   uint32_t node_id);
-extern int midr_propagation_path_append(struct midr_propagation_path *path, uint32_t node_id);
-extern int midr_propagation_path_validate(const struct midr_propagation_path *path,
-					  uint32_t originator_node_id,
-					  uint32_t sending_peer_node_id, uint32_t local_node_id);
-extern enum midr_codec_result
-midr_propagation_path_encode(struct stream *stream, const struct midr_propagation_path *path);
-extern enum midr_codec_result midr_propagation_path_decode(struct stream *stream, size_t length,
-							   struct midr_propagation_path *path);
 
 #endif /* _FRR_BGP_MIDR_CODEC_H */

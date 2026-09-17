@@ -15,9 +15,6 @@
 #include "prefix.h"
 
 #define BGP_ATTR_MIDR_LS 253U
-#define BGP_ATTR_MIDR_PROPAGATION_PATH 254U
-
-#define MIDR_PROPAGATION_PATH_MAX_NODES 512U
 
 enum midr_nlri_type {
 	MIDR_NLRI_TYPE_RESERVED = 0,
@@ -95,5 +92,8 @@ extern bool midr_ls_object_key_same(const struct midr_ls_object_key *a,
 				    const struct midr_ls_object_key *b);
 extern unsigned int midr_ls_object_key_hash(const struct midr_ls_object_key *key);
 extern bool midr_ls_object_same(const struct midr_ls_object *a, const struct midr_ls_object *b);
+/* Compare the TED-relevant object content while ignoring LS sequence. */
+extern bool midr_ls_object_semantic_same(const struct midr_ls_object *a,
+					 const struct midr_ls_object *b);
 
 #endif /* _FRR_BGP_MIDR_LS_H */

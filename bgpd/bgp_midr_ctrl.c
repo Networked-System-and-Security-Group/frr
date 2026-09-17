@@ -2522,7 +2522,12 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct bgp *bgp, co
 
 		if (occupant) {
 			if (midr_nds_peer_is_overlay(occupant)) {
-				/* MIDR 自己的会话，正常复用（沉默）。 */
+				/* A shared overlay peer may survive graceful MIDR shutdown
+				 * with only the MIDR AF disabled. Re-enable that AF when the
+				 * topology asks for this session again. */
+				if (!occupant->afc[AFI_BGP_LS][SAFI_MIDR_LS])
+					peer_activate(occupant, AFI_BGP_LS,
+						      SAFI_MIDR_LS);
 			} else {
 				zlog_warn("MIDR ctrl: %pFX 的 transport 地址上有一条运维会话，MIDR 不整形运维配置、这条边建不起来；请检查该静态邻居是否误用了 transport（loopback）地址——静态会话只应配链路地址",
 					  &entry->node_id);
@@ -2608,6 +2613,8 @@ static void midr_try_disconnect(struct bgp *bgp,
 				bool force)
 {
 	union sockunion su;
+	afi_t afi;
+	safi_t safi;
 	struct ipaddr transport;
 
 	if (!entry->has_transport_addr ||
@@ -2682,7 +2689,18 @@ static void midr_try_disconnect(struct bgp *bgp,
 		return;
 	}
 
-	MIDR_LOG("MIDR ctrl: removing peer %pFX (node gone)", &entry->node_id);
+	FOREACH_AFI_SAFI (afi, safi) {
+		if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS)
+			continue;
+		if (peer->afc[afi][safi]) {
+			MIDR_LOG("MIDR ctrl: disabling MIDR AF on shared peer %pFX",
+				 &entry->node_id);
+			peer_deactivate(peer, AFI_BGP_LS, SAFI_MIDR_LS);
+			return;
+		}
+	}
+	MIDR_LOG("MIDR ctrl: removing MIDR-only peer %pFX (node gone)",
+		 &entry->node_id);
 	peer_delete(peer);
 }
 

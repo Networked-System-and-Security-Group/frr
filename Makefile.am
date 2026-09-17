@@ -133,6 +133,31 @@ SUFFIXES =
 
 bin_PROGRAMS =
 sbin_PROGRAMS =
+
+# Standalone MIDR daemon.  It intentionally links only the protocol-neutral
+# sources under midrd/; BGP remains an optional external Prefix adapter.
+sbin_PROGRAMS += midrd/midrd
+midrd_midrd_SOURCES = \
+	midrd/midrd.c \
+	midrd/midr-context.h midrd/midr-context-private.h \
+	midrd/midr-topology.h \
+	midrd/midr-core.c midrd/midr-core.h \
+	midrd/midr-engine.c midrd/midr-engine.h \
+	midrd/midr-consumer.c midrd/midr-consumer.h \
+	midrd/midr-owned.c midrd/midr-owned.h \
+	midrd/midr-prefix-provider.c midrd/midr-prefix-provider.h \
+	midrd/midr-prefix-ipc.c midrd/midr-prefix-ipc.h \
+	midrd/midr-cost.c midrd/midr-cost.h \
+	midrd/midr-local-provider.c midrd/midr-local-provider.h \
+	midrd/midr-local-ipc.c midrd/midr-local-ipc.h \
+	midrd/midr-scope.c midrd/midr-scope.h \
+	midrd/midr-lsdb.c midrd/midr-lsdb.h \
+	midrd/midr-spf.c midrd/midr-spf.h \
+	midrd/midr-ted.c midrd/midr-ted.h \
+	midrd/midr-transport.c midrd/midr-transport.h \
+	midrd/midr-wire.c midrd/midr-wire.h
+midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd
+midrd_midrd_LDADD = lib/libfrr.la $(LIBCAP)
 sbin_SCRIPTS =
 noinst_PROGRAMS =
 noinst_HEADERS =

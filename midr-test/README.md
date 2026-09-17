@@ -20,6 +20,14 @@ midr-test/
   run-spf-e2e-multinode.sh
                           # privileged 多节点 TED→SPF→Zebra→FIB 测试
   run-m6-m7-scenarios.py # M6/M7 Gherkin ID 与自动断言映射
+  run-midr-component-gate.sh
+                          # 全量 MIDR 组件与 TED fixture 双模式门禁
+  run-midr-zebra-e2e-gate.sh
+                          # 独立特权 Zebra/FIB E2E 门禁
+  midr-component-tests.txt
+                          # 非特权组件程序完整清单
+  check-source-build-artifacts.sh
+                          # 源码树 in-source 构建残留扫描
   check-command-reference.py
                           # 配置手册与实际 VTY 语法一致性检查
   ted-fixture-normalize.py
@@ -34,10 +42,33 @@ midr-test/
 
 `expect/*.expect` 中的普通非空行表示日志必须包含该固定字符串；以 `!` 开头的行表示日志不得包含其后的固定字符串；以 `#` 开头的行是注释。
 
-## 编译
+## 全量组件回归门禁
+
+协议语义提交使用同一测试清单运行全部非特权 MIDR 组件程序和 12 个 TED fixture，不按改动文件挑选测试。`worktree` 模式将当前提交、已跟踪修改和未跟踪源码复制到隔离容器中重新配置和构建，源码工作树只读挂载，不产生 in-source 构建残留；`image` 模式直接验证固定镜像中的已构建程序。默认工具链和基线镜像为 P6 验收镜像，可用环境变量覆盖。
 
 ```bash
-cd ~/yhy/frr
+# R1-R4：验证当前 worktree，不制作最终镜像
+./midr-test/run-midr-component-gate.sh worktree
+
+# R0/R5：验证固定镜像
+MIDR_GATE_IMAGE=frr-midr-p6:f9beedd0d653 \
+  ./midr-test/run-midr-component-gate.sh image
+
+# R5：需要 live zebra 和 NET_ADMIN 的独立特权检查
+MIDR_GATE_IMAGE=frr-midr-p6:f9beedd0d653 \
+  ./midr-test/run-midr-zebra-e2e-gate.sh image
+```
+
+默认日志保存到仓库同级的 `midr-gate-runs/<run-id>-<mode>/`，可用 `MIDR_GATE_OUT` 指定固定证据目录。`MIDR_GATE_TOOLCHAIN_IMAGE` 指定 worktree 构建环境，`MIDR_GATE_JOBS` 控制并行编译数。组件清单会与 `tests/bgpd/subdir.am` 中注册的全部 `test_midr_*` 自动比对；除单独运行的 `test_midr_zebra_e2e` 和由 Python fixture runner 驱动的 `test_midr_ted_fixture` 外，新增但未加入清单的测试会直接使门禁失败。
+
+所有手工编译命令也必须在独立构建目录或一次性容器副本中执行。不得直接在源码 worktree 中运行 `configure`/`make`；`bgpd/bgpd`、`*.o`、`.deps/`、`.libs/` 和测试二进制不得留在源码目录。
+
+## 编译
+
+以下命令只适用于已经配置好的独立构建树；全量提交门禁优先使用上一节的双模式 runner。
+
+```bash
+cd <independent-build-tree>
 make -j$(nproc) \
   bgpd/bgpd \
   tests/bgpd/test_midr_input \

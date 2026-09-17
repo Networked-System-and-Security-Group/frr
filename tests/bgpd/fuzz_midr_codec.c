@@ -74,8 +74,8 @@ static void fuzz_nlri(const uint8_t *data, size_t size)
 
 static void fuzz_ls_attribute(const uint8_t *data, size_t size)
 {
-	struct midr_ls_attributes attributes;
-	struct midr_ls_object object;
+	struct midr_instance_attributes attributes;
+	struct midr_instance instance;
 	struct midr_ls_object_key key;
 	struct stream *input = stream_new(size ? size : 1);
 	struct stream *output;
@@ -83,35 +83,17 @@ static void fuzz_ls_attribute(const uint8_t *data, size_t size)
 
 	if (size)
 		stream_put(input, data, size);
-	if (midr_ls_attribute_decode(input, size, &attributes) == MIDR_CODEC_OK) {
+	if (midr_instance_attribute_decode(input, size, &attributes) == MIDR_CODEC_OK) {
 		for (type = MIDR_NLRI_TYPE_MEMBERSHIP; type <= MIDR_NLRI_TYPE_GROUP_PREFIX;
 		     type++) {
 			key = fuzz_key(type);
-			if (midr_ls_object_from_wire(&key, &attributes, &object) != MIDR_CODEC_OK)
+			if (midr_instance_from_wire(&key, &attributes, &instance) != MIDR_CODEC_OK)
 				continue;
 			output = stream_new(256);
-			assert(midr_ls_attribute_encode(output, &object) == MIDR_CODEC_OK);
+			assert(midr_instance_attribute_encode(output, &instance,
+							      attributes.age_ms) == MIDR_CODEC_OK);
 			stream_free(output);
 		}
-	}
-	stream_free(input);
-}
-
-static void fuzz_propagation_path(const uint8_t *data, size_t size)
-{
-	struct midr_propagation_path path = {};
-	struct stream *input = stream_new(size ? size : 1);
-	struct stream *output;
-
-	if (size)
-		stream_put(input, data, size);
-	if (midr_propagation_path_decode(input, size, &path) == MIDR_CODEC_OK) {
-		output = stream_new(size);
-		assert(midr_propagation_path_encode(output, &path) == MIDR_CODEC_OK);
-		assert(stream_get_endp(output) == size);
-		assert(memcmp(STREAM_DATA(output), data, size) == 0);
-		stream_free(output);
-		midr_propagation_path_fini(&path);
 	}
 	stream_free(input);
 }
@@ -121,15 +103,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	if (!size)
 		return 0;
 
-	switch (data[0] % 3) {
+	switch (data[0] % 2) {
 	case 0:
 		fuzz_nlri(data + 1, size - 1);
 		break;
 	case 1:
 		fuzz_ls_attribute(data + 1, size - 1);
-		break;
-	case 2:
-		fuzz_propagation_path(data + 1, size - 1);
 		break;
 	}
 	return 0;

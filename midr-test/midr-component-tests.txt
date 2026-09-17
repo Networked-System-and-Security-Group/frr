@@ -1,0 +1,26 @@
+# MIDR component programs that must pass in every component-gate run.
+# test_midr_ted_fixture is driven by midr-test/run-ted-fixtures.py.
+# test_midr_zebra_e2e requires the separate privileged Zebra gate.
+test_midr_input
+test_midr_resync
+test_midr_sequence
+test_midr_cost
+test_midr_ls_object
+test_midr_codec
+test_midr_attr
+test_midr_safi
+test_midr_packet
+test_midr_rib
+test_midr_scope
+test_midr_owned
+test_midr_prefix
+test_midr_sync
+test_midr_lsdb
+test_midr_ted
+test_midr_instance
+test_midr_scale
+test_midr_zebra
+test_midr_spf
+test_midr_spf_install
+test_midr_spf_pipeline
+test_capability

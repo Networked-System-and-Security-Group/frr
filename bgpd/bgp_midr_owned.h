@@ -34,6 +34,17 @@ struct midr_owned_summary {
 	bool takeover_timer_pending;
 	uint64_t sequence_failures;
 	uint64_t fightbacks;
+	uint64_t withdraw_failures;
+	uint64_t refresh_failures;
+	int last_withdraw_error;
+	int last_refresh_error;
+};
+
+struct midr_owned_withdraw_result {
+	size_t attempted;
+	size_t completed;
+	size_t failed;
+	int first_error;
 };
 
 extern int midr_owned_init(struct midr_context *ctx);
@@ -43,10 +54,18 @@ extern void midr_owned_prefix_reconcile(struct midr_context *ctx);
 extern void midr_owned_group_reconcile(struct midr_context *ctx);
 extern void midr_owned_input_state_changed(struct midr_context *ctx);
 extern void midr_owned_identity_withdraw(struct midr_context *ctx);
+extern int midr_owned_shutdown_withdraw(
+	struct midr_context *ctx, struct midr_owned_withdraw_result *result);
 extern void midr_owned_identity_start(struct midr_context *ctx, uint32_t node_id);
 
 extern int midr_owned_observe_self_sequence(struct midr_context *ctx,
 					    const struct midr_ls_object *object);
+extern int midr_owned_observe_self_instance(
+					    struct midr_context *ctx,
+					    const struct midr_ls_object_key *key,
+					    uint64_t sequence);
+extern int midr_owned_observe_self_sequence_number(struct midr_context *ctx,
+						   uint64_t sequence);
 extern int midr_owned_link_metadata_get(struct midr_context *ctx,
 					const struct midr_ls_object_key *key,
 					ifindex_t *local_ifindex);
@@ -60,6 +79,7 @@ extern int midr_owned_test_set_sequence_store(
 	struct midr_context *ctx, const struct midr_sequence_store_ops *ops,
 	void *arg);
 extern void midr_owned_test_fire_timers(struct midr_context *ctx);
+extern void midr_owned_test_fire_refresh(struct midr_context *ctx);
 extern void midr_owned_test_fire_takeover(struct midr_context *ctx);
 
 #endif /* _FRR_BGP_MIDR_OWNED_H */
