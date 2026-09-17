@@ -256,7 +256,7 @@ else
 	fail "a blocked MIDR session was established:$bad"
 fi
 for t in $BLOCKED_TRANSPORTS; do
-	printf '%s\n' "$z1_log" | grep -qF "$(session_log "$t")" &&
+	printf '%s\n' "$z1_log" | grep -q "$(session_log "$t")" &&
 		fail "z1 requested a session towards blocked $t" ||
 		pass "z1 never requested a session towards blocked $t"
 done
@@ -303,7 +303,7 @@ for t in $established; do
 	case " $BLOCKED_TRANSPORTS " in
 		*" $t "*) fail "z1 is Established with blocked $t" ;;
 	esac
-	if printf '%s\n' "$z1_log" | grep -qF "$(session_log "$t")"; then
+	if printf '%s\n' "$z1_log" | grep -q "$(session_log "$t")"; then
 		via_api=$((via_api + 1))
 		if [ "$STACK" = midrd ]; then
 			pass "z1 session to $t was requested via midr_session_request (native midrd session)"
