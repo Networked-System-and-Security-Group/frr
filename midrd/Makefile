@@ -14,7 +14,8 @@ FRR_LDFLAGS ?= -Wl,-rpath,$(FRR_LIBDIR)
 .PHONY: all test clean boundary install native-smoke hardening-smoke
 
 CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
-	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-consumer.o \
+	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-session.o \
+	$(BUILD_DIR)/midr-consumer.o \
 	$(BUILD_DIR)/midr-prefix-provider.o $(BUILD_DIR)/midr-engine.o \
 	$(BUILD_DIR)/midr-spf.o $(BUILD_DIR)/midr-prefix-ipc.o \
 	$(BUILD_DIR)/midr-owned.o $(BUILD_DIR)/midr-scope.o \
@@ -26,6 +27,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
 	$(BUILD_DIR)/midrd-transport-test \
 	$(BUILD_DIR)/midrd-transport-budget-test \
+	$(BUILD_DIR)/midrd-session-test \
 	$(BUILD_DIR)/midrd-consumer-test \
 	$(BUILD_DIR)/midrd-spf-test $(BUILD_DIR)/midrd-engine-test \
 	$(BUILD_DIR)/midrd-prefix-ipc-test \
@@ -43,8 +45,8 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/midrd-contract-test: contract-test.c midr-core.h midr-transport.h 		midr-prefix-provider.h midr-consumer.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) contract-test.c -o $@
+$(BUILD_DIR)/midrd-contract-test: contract-test.c midr-core.h midr-transport.h midr-session.h midr-prefix-provider.h midr-consumer.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) contract-test.c -o $@
 
 $(BUILD_DIR)/midr-core.o: midr-core.c midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-core.c -o $@
@@ -54,6 +56,9 @@ $(BUILD_DIR)/midr-wire.o: midr-wire.c midr-wire.h midr-core.h | $(BUILD_DIR)
 
 $(BUILD_DIR)/midr-transport.o: midr-transport.c midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-transport.c -o $@
+
+$(BUILD_DIR)/midr-session.o: midr-session.c midr-session.h midr-session-private.h midr-context-private.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-session.c -o $@
 
 $(BUILD_DIR)/midr-consumer.o: midr-consumer.c midr-consumer.h midr-core.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-consumer.c -o $@
@@ -118,13 +123,19 @@ $(BUILD_DIR)/midrd-transport-budget-test.o: transport-budget-test.c midr-transpo
 $(BUILD_DIR)/midrd-transport-budget-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midrd-transport-budget-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
+$(BUILD_DIR)/midrd-session-test.o: session-test.c midr-session.h midr-session-private.h midr-context-private.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c session-test.c -o $@
+
+$(BUILD_DIR)/midrd-session-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o $(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-session.o $(BUILD_DIR)/midrd-session-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
 $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c consumer-test.c -o $@
 
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -225,6 +236,7 @@ test: all
 	$(BUILD_DIR)/midrd-wire-test
 	$(BUILD_DIR)/midrd-transport-test
 	$(BUILD_DIR)/midrd-transport-budget-test
+	$(BUILD_DIR)/midrd-session-test
 	$(BUILD_DIR)/midrd-consumer-test
 	$(BUILD_DIR)/midrd-spf-test
 	$(BUILD_DIR)/midrd-engine-test

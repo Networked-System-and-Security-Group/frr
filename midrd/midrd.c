@@ -17,6 +17,7 @@
 #include "midr-local-provider.h"
 #include "midr-prefix-provider.h"
 #include "midr-prefix-ipc.h"
+#include "midr-session-private.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-owned.h"
@@ -169,12 +170,8 @@ static int reconcile_group_prefixes(struct midr_context *daemon, uint64_t now_ms
 static uint32_t peer_node_id(const struct midr_context *daemon,
 			     const struct midr_transport_endpoint *peer)
 {
-	if (!daemon || !peer)
-		return 0;
-	for (size_t i = 0; i < daemon->peer_count; i++)
-		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint, peer))
-			return daemon->peers[i].node_id;
-	return 0;
+	return daemon ? midr_session_manager_remote_node_id(daemon->sessions,
+							 peer) : 0;
 }
 
 static struct midrd_snapshot_stage *stage_for(struct midr_context *daemon,
@@ -373,16 +370,8 @@ static int send_frame_at(struct midr_context *daemon,
 			 uint8_t type, const uint8_t *payload,
 			 size_t payload_len, uint64_t encoded_ns)
 {
-	struct midr_transport_frame frame = {
-		.version = MIDR_WIRE_VERSION,
-		.type = type,
-		.sequence = ++daemon->frame_sequence,
-		.encoded_ns = encoded_ns,
-		.payload = payload,
-		.payload_len = payload_len,
-	};
-
-	return midr_transport_send(daemon->transport, peer, &frame);
+	return midr_session_manager_send(daemon->sessions, peer, type, payload,
+					 payload_len, encoded_ns);
 }
 
 static int send_frame(struct midr_context *daemon,
@@ -390,23 +379,6 @@ static int send_frame(struct midr_context *daemon,
 		      uint8_t type, const uint8_t *payload, size_t payload_len)
 {
 	return send_frame_at(daemon, peer, type, payload, payload_len, 0);
-}
-
-static int send_hello(struct midr_context *daemon,
-			      const struct midr_transport_endpoint *peer)
-{
-	uint8_t payload[28] = {0};
-
-	uint32_t node = htonl(daemon->node_id);
-	uint32_t lifetime = htonl(daemon->lifetime_ms);
-	uint16_t port = htons(peer->port);
-
-	memcpy(payload, &node, sizeof(node));
-	memcpy(payload + 4, &lifetime, sizeof(lifetime));
-	payload[8] = peer->family;
-	memcpy(payload + 10, &port, sizeof(port));
-	memcpy(payload + 12, peer->address, 16);
-	return send_frame(daemon, peer, MIDR_WIRE_HELLO, payload, sizeof(payload));
 }
 
 static int send_object(struct midr_context *daemon,
@@ -456,21 +428,44 @@ static int send_snapshot_object(struct midr_context *daemon,
 			     length, encoded_ns);
 }
 
+struct midrd_flood_context {
+	struct midr_context *daemon;
+	const struct midr_core_object *object;
+	const struct midr_transport_endpoint *except;
+	uint64_t observed_ns;
+};
+
+static void flood_to_peer(void *arg,
+			  const struct midr_transport_endpoint *peer,
+			  uint32_t remote_node_id, uint64_t generation)
+{
+	struct midrd_flood_context *context = arg;
+
+	(void)generation;
+	if (context->except &&
+	    midr_transport_endpoint_equal(peer, context->except))
+		return;
+	if (!midr_engine_export(context->daemon->engine, context->object,
+				remote_node_id))
+		return;
+	(void)send_object(context->daemon, peer, context->object,
+			  context->observed_ns);
+}
+
 static void flood_object(struct midr_context *daemon,
 			 const struct midr_core_object *object,
 			 uint64_t observed_ns,
 			 const struct midr_transport_endpoint *except)
 {
-	for (size_t i = 0; i < daemon->peer_count; i++) {
-		if (except && midr_transport_endpoint_equal(
-				&daemon->peers[i].endpoint, except))
-			continue;
-		if (!midr_engine_export(daemon->engine, object,
-					daemon->peers[i].node_id))
-			continue;
-		(void)send_object(daemon, &daemon->peers[i].endpoint, object,
-				  observed_ns);
-	}
+	struct midrd_flood_context context = {
+		.daemon = daemon,
+		.object = object,
+		.except = except,
+		.observed_ns = observed_ns,
+	};
+
+	midr_session_manager_foreach_established(daemon->sessions,
+						flood_to_peer, &context);
 }
 
 static void reflood_scope(struct midr_context *daemon,
@@ -708,13 +703,15 @@ static void on_consumer_event(void *arg,
 }
 
 static void on_established(void *arg,
-			   const struct midr_transport_endpoint *peer)
+			   const struct midr_transport_endpoint *peer,
+			   uint32_t remote_node_id, uint64_t generation)
 {
 	struct midr_context *daemon = arg;
 
-	printf("node=%" PRIu32 " established family=%u port=%u\n",
-	       daemon->node_id, peer->family, peer->port);
-	(void)send_hello(daemon, peer);
+	printf("node=%" PRIu32 " established remote=%" PRIu32
+	       " family=%u port=%u generation=%" PRIu64 "\n",
+	       daemon->node_id, remote_node_id, peer->family, peer->port,
+	       generation);
 	send_snapshot(daemon, peer);
 }
 
@@ -738,14 +735,17 @@ static int stage_generation_check(const struct midrd_snapshot_stage *stage,
 }
 
 static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
+			      uint32_t remote_node_id, uint64_t generation,
 			      int reason)
 {
 	struct midr_context *daemon = arg;
 	struct midrd_snapshot_stage *stage = stage_for(daemon, peer, false);
 
 	stage_release(stage);
-	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
-	       daemon->node_id, peer->family, peer->port, reason);
+	printf("node=%" PRIu32 " closed remote=%" PRIu32
+	       " family=%u port=%u generation=%" PRIu64 " reason=%d\n",
+	       daemon->node_id, remote_node_id, peer->family, peer->port,
+	       generation, reason);
 }
 
 static void on_frame_written(void *arg,
@@ -788,27 +788,6 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 	printf("node=%" PRIu32 " rx family=%u port=%u type=%u\n",
 	       daemon->node_id, peer->family, peer->port, frame->type);
 	switch (frame->type) {
-	case MIDR_WIRE_HELLO:
-		{
-			uint32_t node_id;
-
-		if (frame->payload_len != 28U)
-			return -EINVAL;
-		memcpy(&node_id, frame->payload, sizeof(node_id));
-		node_id = ntohl(node_id);
-		for (size_t i = 0; i < daemon->peer_count; i++)
-			if (midr_transport_endpoint_equal(
-					&daemon->peers[i].endpoint, peer)) {
-				daemon->peers[i].node_id = node_id;
-				break;
-			}
-		/* The initial snapshot may have been sent before the peer's HELLO
-		 * arrived.  Re-send now that export eligibility is known. */
-		send_snapshot(daemon, peer);
-		return 0;
-		}
-	case MIDR_WIRE_KEEPALIVE:
-		return frame->payload_len ? -EINVAL : 0;
 	case MIDR_WIRE_SNAPSHOT_OBJECT:
 		{
 			struct midrd_snapshot_stage *stage = stage_for(daemon, peer,
@@ -2943,33 +2922,6 @@ static void periodic(struct midr_context *daemon, uint64_t now)
 		(void)reconcile_group_prefixes(daemon, now);
 }
 
-static void midrd_hello_timer(struct event *event)
-{
-	struct midr_context *daemon = EVENT_ARG(event);
-
-	daemon->hello_event = NULL;
-	if (daemon->terminating)
-		return;
-	for (size_t i = 0; i < daemon->peer_count; i++)
-		(void)send_hello(daemon, &daemon->peers[i].endpoint);
-	event_add_timer_msec(daemon->master, midrd_hello_timer, daemon,
-			     daemon->hello_ms, &daemon->hello_event);
-}
-
-static void midrd_keepalive_timer(struct event *event)
-{
-	struct midr_context *daemon = EVENT_ARG(event);
-
-	daemon->keepalive_event = NULL;
-	if (daemon->terminating)
-		return;
-	for (size_t i = 0; i < daemon->peer_count; i++)
-		(void)send_frame(daemon, &daemon->peers[i].endpoint,
-				 MIDR_WIRE_KEEPALIVE, NULL, 0);
-	event_add_timer_msec(daemon->master, midrd_keepalive_timer, daemon,
-			     daemon->hello_ms, &daemon->keepalive_event);
-}
-
 enum midrd_shutdown_result {
 	MIDRD_SHUTDOWN_COMPLETE,
 	MIDRD_SHUTDOWN_DEGRADED,
@@ -3011,8 +2963,8 @@ static void shutdown_withdraw(struct midr_context *daemon)
 			break;
 		if (mono_ms() >= deadline)
 			break;
-		if (daemon->transport)
-			(void)midr_transport_poll(daemon->transport, 10);
+		if (daemon->sessions)
+			(void)midr_session_manager_poll(daemon->sessions, 10);
 	}
 	/* Count one failure for this teardown generation.  Repeated polls below
 	 * are retries, not additional teardown generations. */
@@ -3020,8 +2972,7 @@ static void shutdown_withdraw(struct midr_context *daemon)
 		daemon->shutdown_generation_failures++;
 	{
 		size_t remaining = midr_owned_count(daemon->owned);
-		size_t pending = daemon->transport
-			? midr_transport_pending(daemon->transport) : 0;
+		size_t pending = midr_session_manager_pending(daemon->sessions);
 		enum midrd_shutdown_result result =
 			shutdown_result(remaining, pending, daemon->shutdown_write_failures);
 
@@ -3063,7 +3014,7 @@ static void midr_context_finish(struct midr_context *daemon)
 		stage_release(&daemon->stages[i]);
 	midr_local_ipc_server_destroy(&daemon->local_ipc);
 	midr_prefix_ipc_server_destroy(&daemon->prefix_ipc);
-	midr_transport_destroy(&daemon->transport);
+	midr_session_manager_destroy(&daemon->sessions);
 	midr_prefix_provider_destroy(&daemon->prefix_provider);
 	midr_owned_destroy(&daemon->owned);
 	midr_ted_destroy(&daemon->ted);
@@ -3098,13 +3049,18 @@ static int midr_context_initialize(
 		.on_event = on_consumer_event,
 		.arg = daemon,
 	};
-	struct midr_transport_callbacks transport_callbacks = {
-		.on_frame = on_frame,
-		.on_established = on_established,
-		.on_closed = on_closed,
-		.on_frame_written = on_frame_written,
-		.on_frame_dropped = on_frame_dropped,
+	struct midr_session_protocol_ops session_protocol = {
+		.established = on_established,
+		.closed = on_closed,
+		.frame = on_frame,
+		.frame_written = on_frame_written,
+		.frame_dropped = on_frame_dropped,
 		.arg = daemon,
+	};
+	struct midr_session_manager_config session_config = {
+		.local_node_id = daemon->node_id,
+		.hello_interval_ms = daemon->hello_ms,
+		.transport = *transport_config,
 	};
 
 	if (midr_engine_create(&engine_config, &daemon->engine) ||
@@ -3114,9 +3070,8 @@ static int midr_context_initialize(
 	    midr_engine_attach_consumer(daemon->engine, daemon->consumer) ||
 	    midr_owned_create(&owned_config, publish_owned, daemon,
 			      &daemon->owned) ||
-	    midr_transport_create(transport_config, &transport_callbacks,
-				  &daemon->transport) ||
-	    midr_transport_start(daemon->transport)) {
+	    midr_session_manager_create(&session_config, &session_protocol,
+					&daemon->sessions)) {
 		midr_context_finish(daemon);
 		return -1;
 	}
@@ -3130,8 +3085,6 @@ static FRR_NORETURN void midrd_terminate(int status)
 	if (daemon && !daemon->terminating) {
 		daemon->terminating = true;
 		event_cancel(&daemon->poll_event);
-		event_cancel(&daemon->hello_event);
-		event_cancel(&daemon->keepalive_event);
 		shutdown_withdraw(daemon);
 		printf("midrd node=%" PRIu32 " final-objects=%zu\n",
 		       daemon->node_id, midr_engine_count(daemon->engine));
@@ -3186,12 +3139,13 @@ int main(int argc, char **argv, char **envp)
 			listen_text = optarg;
 			break;
 		case MIDRD_OPT_PEER:
-			if (daemon.peer_count == MIDRD_MAX_PEERS ||
+			if (daemon.static_peer_count == MIDRD_MAX_PEERS ||
 			    parse_endpoint(optarg,
-					   &daemon.peers[daemon.peer_count].endpoint)) {
+					   &daemon.static_peers[
+						   daemon.static_peer_count].endpoint)) {
 				frr_help_exit(2);
 			}
-			daemon.peer_count++;
+			daemon.static_peer_count++;
 			break;
 		case MIDRD_OPT_PREFIX:
 			prefix_text = optarg;
@@ -3310,9 +3264,10 @@ int main(int argc, char **argv, char **envp)
 			goto fail;
 		}
 	}
-	for (size_t i = 0; i < daemon.peer_count; i++)
-		if (midr_transport_connect(daemon.transport,
-					    &daemon.peers[i].endpoint)) {
+	for (size_t i = 0; i < daemon.static_peer_count; i++)
+		if (midr_session_manager_request_static(
+				daemon.sessions,
+				&daemon.static_peers[i].endpoint)) {
 			fprintf(stderr, "peer connection setup failed\n");
 			goto fail;
 		}
@@ -3349,11 +3304,6 @@ int main(int argc, char **argv, char **envp)
 	midrd_runtime = &daemon;
 	(void)fflush(NULL);
 	frr_config_fork();
-	event_add_timer_msec(daemon.master, midrd_hello_timer, &daemon,
-			     daemon.hello_ms, &daemon.hello_event);
-	event_add_timer_msec(daemon.master, midrd_keepalive_timer, &daemon,
-			     daemon.hello_ms / 2U ? daemon.hello_ms / 2U : 1U,
-			     &daemon.keepalive_event);
 	event_add_timer_msec(daemon.master, midrd_poll, &daemon, 0,
 			     &daemon.poll_event);
 	frr_run(daemon.master);

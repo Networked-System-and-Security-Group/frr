@@ -201,7 +201,7 @@ static void test_snapshot_barrier_and_atomic_eor(void)
 			     NULL, 0) == 0);
 	assert(frame(&daemon, &peer, MIDR_WIRE_EOR, 14, snapshot_ns, NULL, 0) ==
 	       -EPROTO);
-	on_closed(&daemon, &peer, -ECONNRESET);
+	on_closed(&daemon, &peer, 2, 1, -ECONNRESET);
 	assert(stage_for(&daemon, &peer, false) == NULL);
 	assert(midr_consumer_snapshot_acquire(daemon.consumer, &snapshot) == 0);
 	count = snapshot.count;
@@ -233,7 +233,7 @@ static void test_reconnect_generation_isolation(void)
 				2, now, payload, length) == 0);
 	/* Disconnecting an incomplete snapshot discards only staging; the old
 	 * canonical view remains untouched. */
-	on_closed(&daemon, &peer, -ECONNRESET);
+	on_closed(&daemon, &peer, 2, 10, -ECONNRESET);
 	assert(stage_for(&daemon, &peer, false) == NULL);
 	assert(midr_engine_lookup(daemon.engine, &remote.identity, mono_ms(),
 					 &current, NULL) == -ENOENT);
