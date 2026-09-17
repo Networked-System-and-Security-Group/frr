@@ -13,7 +13,8 @@
 #     group-1 node its member list offers, CL selects no group-1 anchor;
 #   - z1 never establishes a MIDR session with r1 or m1a (both directions);
 #   - z1 ends up Established with r2 and m2a (group 2), and these sessions
-#     were created through midr_peer_session_request().
+#     were created through the session API: midr_peer_session_request() in
+#     bgpd, midr_session_request() in midrd (MIDR_LAB_STACK=midrd).
 #
 # Read-only; run after the base acceptance check has converged.
 
@@ -26,6 +27,7 @@ POLL_SECONDS="${MIDR_TIER1_POLL_SECONDS:-10}"
 OBSERVE_SECONDS="${MIDR_TIER1_OBSERVE_SECONDS:-120}"
 
 FAMILY="${MIDR_LAB_FAMILY:-ipv4}"
+STACK="${MIDR_LAB_STACK:-bgpd}"
 
 # Transport locator of node number N, and t1's address on the t1-t3 link.
 case "$FAMILY" in
@@ -48,12 +50,40 @@ pass() { printf 'PASS: %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$1"; FAIL=$((FAIL + 1)); }
 info() { printf 'INFO: %s\n' "$1"; }
 container() { printf '%s-%s' "$LAB_PREFIX" "$1"; }
-vty() { docker exec "$(container "$1")" vtysh -c "$2" 2>/dev/null; }
-node_log() { docker exec -u root "$(container "$1")" cat /etc/frr/logs/frr.log 2>/dev/null; }
+case "$STACK" in
+	bgpd)
+		VTYSH=(vtysh)
+		MIDR_LOG=/etc/frr/logs/frr.log
+		SESSION_LOG='midr_peer_session_request for [0-9./]* %s AS'
+		;;
+	midrd)
+		# MIDR runs in midrd; bgpd only carries the underlay.
+		VTYSH=(vtysh -d midrd)
+		MIDR_LOG=/etc/frr/logs/midrd.log
+		SESSION_LOG='midr_session_request for [0-9./]* %s ('
+		;;
+	*) printf 'MIDR_LAB_STACK must be bgpd or midrd\n' >&2; exit 2 ;;
+esac
+# midrd's vty socket is root-only (no privilege separation).
+vty() { docker exec -u root "$(container "$1")" "${VTYSH[@]}" -c "$2" 2>/dev/null; }
+node_log() { docker exec -u root "$(container "$1")" cat "$MIDR_LOG" 2>/dev/null; }
+session_log() { printf "$SESSION_LOG" "$1"; }
 
 # Prints "<state> <connectionsEstablished>" or "absent 0".
 peer_state()
 {
+	if [ "$STACK" = midrd ]; then
+		vty "$1" 'show midr neighbors json' | python3 -c '
+import json, sys
+try:
+    peer = json.load(sys.stdin).get("neighbors", {}).get(sys.argv[1])
+except ValueError:
+    peer = None
+print("absent 0" if not peer else
+      "%s %s" % (peer["state"], peer["connectionsEstablished"]))
+' "$2"
+		return
+	fi
 	vty "$1" "show bgp neighbors $2 json" | python3 -c '
 import json, sys
 try:
@@ -78,6 +108,19 @@ ping_rtt_us()
 # Established MIDR overlay peers on z1 (transport addresses).
 z1_established_overlays()
 {
+	if [ "$STACK" = midrd ]; then
+		vty z1 'show midr neighbors json' | python3 -c '
+import json, sys
+try:
+    peers = json.load(sys.stdin).get("neighbors", {})
+except ValueError:
+    peers = {}
+for addr, peer in peers.items():
+    if peer.get("state") == "Established":
+        print(addr)
+'
+		return
+	fi
 	vty z1 'show bgp neighbors json' | python3 -c '
 import json, sys
 try:
@@ -213,7 +256,7 @@ else
 	fail "a blocked MIDR session was established:$bad"
 fi
 for t in $BLOCKED_TRANSPORTS; do
-	printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t AS" &&
+	printf '%s\n' "$z1_log" | grep -qF "$(session_log "$t")" &&
 		fail "z1 requested a session towards blocked $t" ||
 		pass "z1 never requested a session towards blocked $t"
 done
@@ -226,7 +269,7 @@ for node in $BLOCKED_NODES; do
 done
 
 ########################################################################
-# 5. Allowed sessions were created through midr_peer_session_request()
+# 5. Allowed sessions were created through the session API
 ########################################################################
 anchor="$(printf '%s\n' "$(node_log z1)" | grep 'ANCHOR_PROBE_DONE → 群 1/' | tail -n 1)"
 printf '%s\n' "$anchor" | grep -q '共选出 0 个锚点候选' &&
@@ -260,23 +303,27 @@ for t in $established; do
 	case " $BLOCKED_TRANSPORTS " in
 		*" $t "*) fail "z1 is Established with blocked $t" ;;
 	esac
-	if printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t AS"; then
+	if printf '%s\n' "$z1_log" | grep -qF "$(session_log "$t")"; then
 		via_api=$((via_api + 1))
-		vty z1 "show bgp neighbors $t" | grep -qi 'midr' &&
-			pass "z1 session to $t was requested via midr_peer_session_request and carries MIDR-LS" ||
-			fail "z1 session to $t does not show the MIDR-LS address family"
+		if [ "$STACK" = midrd ]; then
+			pass "z1 session to $t was requested via midr_session_request (native midrd session)"
+		else
+			vty z1 "show bgp neighbors $t" | grep -qi 'midr' &&
+				pass "z1 session to $t was requested via midr_peer_session_request and carries MIDR-LS" ||
+				fail "z1 session to $t does not show the MIDR-LS address family"
+		fi
 	else
 		info "z1 session to $t was created by the remote side (passive) or pre-existed"
 	fi
 done
 [ "$via_api" -gt 0 ] &&
-	pass "$via_api Established z1 session(s) were created through midr_peer_session_request" ||
-	fail 'no Established z1 session was created through midr_peer_session_request'
+	pass "$via_api Established z1 session(s) were created through the session API" ||
+	fail 'no Established z1 session was created through the session API'
 
 for node in r2 m2a; do
-	node_log "$node" | grep -q 'session requested via midr_peer_session_request' &&
-		pass "$node also creates sessions through midr_peer_session_request" ||
-		fail "$node has no midr_peer_session_request log"
+	node_log "$node" | grep -qE 'session requested via midr_(peer_)?session_request' &&
+		pass "$node also creates sessions through the session API" ||
+		fail "$node has no session API log"
 done
 
 printf '\n----- z1 show midr links -----\n'

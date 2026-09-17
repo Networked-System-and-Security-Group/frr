@@ -12,6 +12,8 @@
 set -uo pipefail
 
 LAB_PREFIX="${MIDR_LAB_PREFIX:-clab-midr-backbone-v6}"
+# bgpd: MIDR in bgpd (reference); midrd: MIDR in midrd, bgpd is underlay only.
+STACK="${MIDR_LAB_STACK:-bgpd}"
 
 TRANSIT="t1 t2 t3"
 BOOTSTRAPS="b1 b2 b3 b4 b5"
@@ -36,6 +38,12 @@ fail() { printf 'FAIL: %s\n' "$1"; FAIL=$((FAIL + 1)); }
 info() { printf 'INFO: %s\n' "$1"; }
 container() { printf '%s-%s' "$LAB_PREFIX" "$1"; }
 vty() { docker exec "$(container "$1")" vtysh -c "$2" 2>/dev/null; }
+if [ "$STACK" = midrd ]; then
+	# midrd's vty socket is root-only (no privilege separation).
+	mvty() { docker exec -u root "$(container "$1")" vtysh -d midrd -c "$2" 2>/dev/null; }
+else
+	mvty() { vty "$@"; }
+fi
 rexec() { local node=$1; shift; docker exec -u root "$(container "$node")" "$@" 2>/dev/null; }
 loc() { printf 'fd00:99::%s' "${NUM[$1]}"; }
 
@@ -123,7 +131,7 @@ fi
 ########################################################################
 bad=
 for node in $MEMBERS; do
-	self="$(vty "$node" 'show midr self')"
+	self="$(mvty "$node" 'show midr self')"
 	printf '%s\n' "$self" | grep -q '^Address family *: IPv6' &&
 		printf '%s\n' "$self" | grep -q "^Active locator *: $(loc "$node")\$" ||
 		bad="$bad $node"
@@ -133,7 +141,7 @@ done
 
 bad=
 for node in $MIDR_NODES; do
-	neighbors="$(vty "$node" 'show midr neighbors')"
+	neighbors="$(mvty "$node" 'show midr neighbors')"
 	est="$(printf '%s\n' "$neighbors" | awk '$3 == "Established"')"
 	[ -n "$est" ] && ! printf '%s\n' "$est" | awk '{print $1}' | grep -qv ':' ||
 		bad="$bad $node"
@@ -143,7 +151,7 @@ done
 
 bad=
 for node in $MEMBERS; do
-	links="$(vty "$node" 'show midr group2-snapshot')"
+	links="$(mvty "$node" 'show midr group2-snapshot')"
 	printf '%s\n' "$links" | grep -q 'fd00:99::' &&
 		! printf '%s\n' "$links" | grep -qE '\b10\.99\.' || bad="$bad $node"
 done
@@ -151,19 +159,32 @@ done
 	fail "group-2 snapshot has missing or IPv4 endpoints on:$bad"
 
 bad=
-for node in $MEMBERS; do
+if [ "$STACK" = midrd ]; then
+	# midrd takes its service prefix from --prefix; SPF shows what it used.
+	for node in $MEMBERS; do
+		spf="$(mvty "$node" 'show midr spf')"
+		printf '%s\n' "$spf" | grep -qE '^  fd00:18::' &&
+			! printf '%s\n' "$spf" | grep -qE '^  [0-9]+\.[0-9]+\.' ||
+			bad="$bad $node"
+	done
+	[ -z "$bad" ] && pass 'midrd SPF carries IPv6 prefixes only' ||
+		fail "midrd SPF has missing or IPv4 prefixes on:$bad"
+fi
+for node in $([ "$STACK" = midrd ] || echo "$MEMBERS"); do
 	prefix="$(vty "$node" 'show midr prefix summary')"
 	v4=$(printf '%s\n' "$prefix" | awk -F: '/^  IPv4 contributors/ {gsub(/ /, "", $2); print $2}')
 	v6=$(printf '%s\n' "$prefix" | awk -F: '/^  IPv6 contributors/ {gsub(/ /, "", $2); print $2}')
 	[ "${v4:-x}" = 0 ] && [ "${v6:-0}" -gt 0 ] || bad="$bad $node(v4=${v4:-?},v6=${v6:-?})"
 done
-[ -z "$bad" ] && pass 'group-2 Prefix input sees IPv6 contributors only' ||
-	fail "unexpected Prefix contributors:$bad"
+if [ "$STACK" != midrd ]; then
+	[ -z "$bad" ] && pass 'group-2 Prefix input sees IPv6 contributors only' ||
+		fail "unexpected Prefix contributors:$bad"
+fi
 
 ########################################################################
 # 4. Group-3 IPv6 routes (information only)
 ########################################################################
-for node in $MEMBERS; do
+for node in $([ "$STACK" = midrd ] || echo "$MEMBERS"); do
 	spf="$(vty "$node" 'show midr spf summary')"
 	routes="$(vty "$node" 'show midr spf routes')"
 	v6_reach=$(printf '%s\n' "$routes" | grep -c 'route afi=2 .*reachable=yes')
@@ -172,6 +193,12 @@ for node in $MEMBERS; do
 	fib=$(rexec "$node" ip -6 route show proto 199 | wc -l)
 	info "$node SPF: IPv6 reachable routes=$v6_reach IPv4 routes=$v4_routes local/intra/inter=$counts kernel proto-199 IPv6 routes=$fib"
 done
+if [ "$STACK" = midrd ]; then
+	# midrd does not install routes yet (group 3's zclient work).
+	for node in $MEMBERS; do
+		info "$node midrd $(mvty "$node" 'show midr spf' | grep '^Summary')"
+	done
+fi
 sample="$(vty m1a "show ipv6 route $(loc r1)/128")"
 info "m1a zebra entry for r1 transport: $(printf '%s' "$sample" | tr '\n' ' ' | tr -s ' ')"
 

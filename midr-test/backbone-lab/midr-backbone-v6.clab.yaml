@@ -18,6 +18,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::101/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -38,6 +39,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::102/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -58,6 +60,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::103/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -78,6 +81,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::104/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -98,6 +102,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::105/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -118,6 +123,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::201/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -138,6 +144,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::202/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -159,6 +166,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::203/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -180,6 +188,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::111/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -200,6 +209,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::112/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -220,6 +230,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::113/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -240,6 +251,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::121/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -260,6 +272,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::122/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -281,6 +294,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::191/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
@@ -301,6 +315,7 @@ topology:
         - sudo -n ip -4 addr flush dev eth0
         - sudo -n ip -6 route flush default
         - sudo -n ip -6 addr flush dev eth0 scope global
+        - sudo -n ip -6 addr replace fd00:99::192/128 dev lo nodad
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
