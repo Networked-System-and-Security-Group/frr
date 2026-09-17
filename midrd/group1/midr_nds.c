@@ -2299,6 +2299,10 @@ void midr_nds_on_cluster_decision(struct midr_g1 *g1,
 				g1, mi->config_group_id);
 			struct midr_rep_identity configured;
 
+			/* midrd: a refreshed directory may list this node as its own
+			 * group's representative; it cannot ask itself for members. */
+			if (r && IPV4_ADDR_SAME(&r->rep_rid, &g1->router_id))
+				r = NULL;
 			if (!r) {
 				/*
 				 * 目录只是"某个引导节点知道的代表"、不是全网真相，
