@@ -32,6 +32,7 @@ cat >"$tmp/contract.c" <<'EOF'
 #include "midr-local-provider.h"
 #include "midr-prefix-ipc.h"
 #include "midr-prefix-provider.h"
+#include "midr-session.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-topology.h"

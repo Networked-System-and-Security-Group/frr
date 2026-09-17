@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "midr-consumer.h"
 #include "midr-prefix-provider.h"
+#include "midr-session.h"
 #include "midr-transport.h"
 
 #include <assert.h>
@@ -48,6 +49,9 @@ int main(void)
 		.port = 5859,
 		.scope_id = 0,
 	};
+	struct midr_session_endpoint session_endpoint = {
+		.port = 5859,
+	};
 	struct midr_transport_callbacks transport_cb = {
 		.on_frame = noop_frame,
 	};
@@ -83,6 +87,7 @@ int main(void)
 	memset(event.prefix.address, 0x0a, sizeof(event.prefix.address));
 	assert(object.identity.family == MIDR_CORE_AF_IPV6);
 	assert(endpoint.family == MIDR_TRANSPORT_AF_IPV6);
+	assert(session_endpoint.port == endpoint.port);
 	assert(provider_cfg.on_event == noop_prefix);
 	assert(transport_cb.on_frame == noop_frame);
 	assert(event.prefix.family == MIDR_CORE_AF_IPV4);

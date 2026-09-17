@@ -789,7 +789,7 @@ DEFUN(g1_midr_transport_address,
 	{
 		struct ipaddr listen;
 
-		if (midr_context_listen_address(g1->ctx, &listen) &&
+		if (midr_context_listen_endpoint(g1->ctx, &listen, NULL) &&
 		    ipaddr_cmp(&listen, &transport)) {
 			vty_out(vty,
 				"%% MIDR transport-address %s differs from the midrd listen address %pIA\n",

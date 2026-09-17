@@ -804,7 +804,7 @@ static bool peer_source_matches(struct midr_g1_peer *peer, struct admission_entr
 	struct ipaddr source;
 	if (!e)
 		return false;
-	if (!midr_context_listen_address(peer->g1->ctx, &source))
+	if (!midr_context_listen_endpoint(peer->g1->ctx, &source, NULL))
 		return true;
 	return midr_ipaddr_same(&source, &e->source);
 }

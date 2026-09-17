@@ -11,7 +11,8 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 | 方向 | 接口 | 说明 |
 | --- | --- | --- |
 | 第一组 → 第二组 | `midrd/midr-topology.h` | 本机 Node/Link 事实的增量上报；事实表通过 `midr_topology_provider_register()` 提供完整快照 |
-| 第一组 → midrd 传输层 | `midrd/midr-session.h`（第一组新增） | 运行时请求/释放原生 MIDR 会话，获知会话起落 |
+| 第一组 → 公共 Session 服务 | `midrd/midr-session.h`（第二组提供） | 运行时请求/释放原生 MIDR 会话，经 observer 获知会话起落与对端 `node_id` |
+| 第一组 → midrd | `midrd/midr-context.h` 中的 `midr_context_node_id()`、`midr_context_listen_endpoint()`（第一组新增） | 本节点 node_id、MIDR 监听地址与端口 |
 | 第一组只读 | `midrd/midr-spf.h` | `show midr spf` 读取 SPF 结果，用于验收 |
 
 第一组没有读写 owned、canonical、LSDB、TED 或 transport 的私有状态。
@@ -22,22 +23,26 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 
 | 文件 | 改动 | 原因 |
 | --- | --- | --- |
-| `midrd/midr-session.h`（新文件） | 会话接口，按交接文档第二版的公共 Session 服务命名：`midr_session_connect`、`midr_session_disconnect`（带关闭原因）、`midr_session_status_get`、`midr_session_observer_register`（DOWN/CONNECTING/ESTABLISHED/IDENTITY_MISMATCH），endpoint 含地址、端口、IPv6 scope；另有 `midr_context_node_id`、`midr_context_listen_address` | midrd 原来只能用 `--peer` 静态配置邻居，第一组的邻居发现需要运行时增删会话。第二组的公共 Session 服务到位后，以其实现替换本文件与 `midrd.c` 中对应代码 |
-| `midrd/midrd.c` | 上述接口的实现；会话由第一组管理时关闭未请求的入向连接；收到对端 HELLO 后才向第一组报“会话建立”；会话断开时通知；记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()` | 准入策略（Tier1）要对被动方生效；HELLO 带来对端身份（相当于 BGP OPEN）；弱符号让不含第一组的独立构建和组件测试照常链接 |
-| `midrd/midr-context-private.h` | `midrd_peer_config.up`；`midr_context` 增加监听端点和会话持有者回调 | 上述实现所需的状态 |
+| `midrd/midr-context.h` | 声明 `midr_context_node_id()`、`midr_context_listen_endpoint()` | 第一组的 Node/Link 要填本节点 node_id；公共 Session 服务要求 endpoint 端口非 0，第一组用本机监听端口（全部署同一 MIDR 端口）；准入校验要比对会话源地址（即监听地址）。公共接口里没有这两项查询 |
+| `midrd/midrd.c` | 上述两个函数的实现；`main()` 记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()` | 弱符号让不含第一组的独立构建和组件测试照常链接 |
+| `midrd/midr-context-private.h` | `midr_context` 增加监听端点 `listen` | 上述查询所需的状态 |
 | `midrd/midr-transport.c` | 主动建连前绑定到监听地址 | overlay 会话是多跳的，不绑定时内核选出口链路地址作源，对端认不出这是它请求过的会话（BGP 里对应 update-source） |
 | `Makefile.am` | `include midrd/group1/subdir.am` | 把第一组源文件编进 midrd，文件清单放在第一组自己的目录里 |
 | `vtysh/vtysh.h`、`vtysh/vtysh.c` | 新增 `VTYSH_MIDRD` 和 `midrd` 客户端 | midrd 带 CLI 后 vtysh 要能分发 MIDR 命令、下发配置 |
 | `tools/frrcommon.sh.in` | `DAEMONS` 加入 `midrd` | frrinit 按 daemons 文件启动 midrd |
 | `midr-test/backbone-group2/verify_group1_group2_evidence.py` | 合并时取第二组版本 | 之前第一组对它的修改（群规模、多跳传播路径）在单实例洪泛后已不适用 |
 
-会话接口语义（详见头文件注释）：
+会话接口（2026-09-17 起使用第二组的公共 Session 服务 `9a88097e2d`）：
 
-- 会话以远端 endpoint 为键；端口填 0 时用本机监听端口（同一部署内所有 midrd 用同一 MIDR 端口）。
-- connect 幂等，只登记意图，midrd 持续重连；首个有效 HELLO 绑定对端 `node_id` 后才报 ESTABLISHED。
-- disconnect 只清第一组的意图，同一 endpoint 的 `--peer` 静态会话保留；不撤销任何拓扑对象。
-- 注册了 observer 后，没有意图的入向连接会被关闭。未注册时 midrd 行为不变。
-- observer 在 midrd 收包路径里触发，不得在回调中同步 connect/disconnect（第一组把处理放进事件队列）。
+- 此前第二组尚未提供 Session 服务，第一组按交接文档第二版自写了一份 `midr-session.h`
+  及其在 `midrd.c`、`midr-context-private.h` 中的实现。合并第二组实现时这些代码已全部删除，
+  改用第二组版本；第一组只在 `midr_g1.c` 中适配：endpoint 端口填本机监听端口，observer
+  改用 `midr_session_observer_ops`（远端 endpoint 在 status 里），注销用
+  `midr_session_observer_unregister()`，邻居失效用 `MIDR_SESSION_CLOSE_NODE_DOWN`、准入拒绝用
+  `MIDR_SESSION_CLOSE_POLICY`。
+- 公共服务对建连失败也报 DOWN，第一组只对已建立会话的掉线记日志和关闭原因。
+- 公共服务总是关闭没有意图的入向连接（不再以是否注册 observer 区分），准入策略对被动方照样生效。
+- observer 在 midrd 收包路径里触发，第一组把处理放进事件队列，不在回调中同步 connect/disconnect。
 - 第一组不因 Session Down 撤销 Link：掉线只起断连计时，断开超过 5 分钟仍未恢复才拆边销账；
   PM 判定链路不可达、换群、节点离开、手工拆除、策略拒绝时照常撤销。
 

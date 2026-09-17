@@ -17,7 +17,7 @@
 #include "midr-owned.h"
 #include "midr-prefix-ipc.h"
 #include "midr-prefix-provider.h"
-#include "midr-session.h"
+#include "midr-session-private.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-topology.h"
@@ -37,16 +37,6 @@
 
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
-	uint32_t node_id;
-	/* 第一组新增：midr-session.h 的状态。up = HELLO 后已建立；discovery = 有第一组
-	 * 的建连意图；dynamic_only = 条目由 connect 创建（不是 --peer 静态条目），
-	 * 撤销意图时才删除；bound/mismatch = HELLO 身份绑定情况。 */
-	bool up;
-	bool discovery;
-	bool dynamic_only;
-	bool bound;
-	bool mismatch;
-	int last_error;
 };
 
 /* Development-time static Link input. */
@@ -115,15 +105,12 @@ struct midrd_local_stage {
 struct midr_context {
 	struct event_loop *master;
 	struct event *poll_event;
-	struct event *hello_event;
-	struct event *keepalive_event;
 	uint32_t node_id;
 	uint32_t group_id;
 	uint32_t lifetime_ms;
 	uint32_t hello_ms;
 	uint32_t hold_time_ms;
 	uint32_t takeover_delay_ms;
-	uint64_t frame_sequence;
 	struct midr_engine *engine;
 	struct midr_owned *owned;
 	struct midr_consumer *consumer;
@@ -131,9 +118,9 @@ struct midr_context {
 	struct midr_prefix_provider *prefix_provider;
 	struct midr_prefix_ipc *prefix_ipc;
 	struct midr_local_ipc *local_ipc;
-	struct midr_transport *transport;
+	struct midr_session_manager *sessions;
 	struct midr_spf_consumer *spf_consumers;
-	struct midrd_peer_config peers[MIDRD_MAX_PEERS];
+	struct midrd_peer_config static_peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
 	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];
 	struct midr_prefix ipc_prefixes[MIDRD_MAX_SNAPSHOT];
@@ -141,7 +128,7 @@ struct midr_context {
 	struct midrd_local_stage local_stage;
 	struct midrd_local_link_version local_link_versions[MIDRD_MAX_SNAPSHOT];
 	struct midrd_snapshot_stage stages[MIDRD_MAX_PEERS];
-	size_t peer_count;
+	size_t static_peer_count;
 	size_t link_count;
 	size_t group_prefix_count;
 	size_t ipc_prefix_count;
@@ -175,10 +162,8 @@ struct midr_context {
 	bool shutdown_active;
 	uint64_t shutdown_write_failures;
 	bool terminating;
-	/* 第一组新增：midr-session.h 的实现需要监听端点和会话持有者回调。 */
+	/* 第一组新增：midr_context_listen_endpoint() 返回的监听端点。 */
 	struct midr_transport_endpoint listen;
-	const struct midr_session_observer *session_observer;
-	void *session_arg;
 };
 
 #endif /* MIDRD_CONTEXT_PRIVATE_H */
