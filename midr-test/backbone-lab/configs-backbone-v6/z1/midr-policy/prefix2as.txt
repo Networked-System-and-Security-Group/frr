@@ -1,0 +1,25 @@
+# Lab-only IPv6 IP-to-ASN snapshot for z1 (tier1 admission scenario).
+# ASNs come from the RFC 5398 documentation range; no real network is named.
+# t1 is presented as the forbidden transit AS 64500.
+fd00:99::201/128 64500
+fd00:10:1::1/128 64500
+fd00:10:3::1/128 64500
+fd00:10:11::2/128 64500
+fd00:10:12::2/128 64500
+fd00:10:21::2/128 64500
+fd00:10:22::2/128 64500
+fd00:10:32::2/128 64500
+# t2 and t3 are ordinary transit ASes.
+fd00:99::202/128 64501
+fd00:10:1::2/128 64501
+fd00:10:2::1/128 64501
+fd00:10:13::2/128 64501
+fd00:10:23::2/128 64501
+fd00:10:24::2/128 64501
+fd00:99::203/128 64502
+fd00:10:2::2/128 64502
+fd00:10:3::2/128 64502
+fd00:10:14::2/128 64502
+fd00:10:15::2/128 64502
+fd00:10:25::2/128 64502
+fd00:10:31::2/128 64502

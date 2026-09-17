@@ -25,11 +25,21 @@ WAIT_SECONDS="${MIDR_TIER1_WAIT_SECONDS:-300}"
 POLL_SECONDS="${MIDR_TIER1_POLL_SECONDS:-10}"
 OBSERVE_SECONDS="${MIDR_TIER1_OBSERVE_SECONDS:-120}"
 
-Z1_TRANSPORT=10.99.0.191
-BLOCKED_TRANSPORTS="10.99.0.111 10.99.0.112" # r1 m1a, behind t1
-SCREENED_TRANSPORTS="10.99.0.111"            # candidates z1 actually traced
+FAMILY="${MIDR_LAB_FAMILY:-ipv4}"
+
+# Transport locator of node number N, and t1's address on the t1-t3 link.
+case "$FAMILY" in
+	ipv4) loc() { printf '10.99.0.%s' "$1"; }; T1_LINK=10.10.3.1; PING=(ping -4) ;;
+	ipv6) loc() { printf 'fd00:99::%s' "$1"; }; T1_LINK=fd00:10:3::1; PING=(ping -6) ;;
+	*) printf 'MIDR_LAB_FAMILY must be ipv4 or ipv6\n' >&2; exit 2 ;;
+esac
+LOC_PREFIX="$(loc '')"
+
+Z1_TRANSPORT=$(loc 191)
+BLOCKED_TRANSPORTS="$(loc 111) $(loc 112)" # r1 m1a, behind t1
+SCREENED_TRANSPORTS="$(loc 111)"           # candidates z1 actually traced
 BLOCKED_NODES="r1 m1a"
-SLOW_TRANSPORTS="10.99.0.113 10.99.0.121"    # m1b r2, behind t2
+SLOW_TRANSPORTS="$(loc 113) $(loc 121)"    # m1b r2, behind t2
 
 PASS=0
 FAIL=0
@@ -61,7 +71,7 @@ else:
 # Average RTT in microseconds from z1's transport to a target transport.
 ping_rtt_us()
 {
-	docker exec -u root "$(container z1)" ping -n -q -c 10 -i 0.2 -I "$Z1_TRANSPORT" "$1" 2>/dev/null |
+	docker exec -u root "$(container z1)" "${PING[@]}" -n -q -c 10 -i 0.2 -I "$Z1_TRANSPORT" "$1" 2>/dev/null |
 		awk -F/ '/^rtt|^round-trip/ {printf "%d\n", $5 * 1000}'
 }
 
@@ -75,11 +85,11 @@ try:
 except ValueError:
     data = {}
 for addr, peer in data.items():
-    if not isinstance(peer, dict) or not addr.startswith("10.99.0."):
+    if not isinstance(peer, dict) or not addr.startswith(sys.argv[1]):
         continue
     if peer.get("bgpState") == "Established":
         print(addr)
-'
+' "$LOC_PREFIX"
 }
 
 ########################################################################
@@ -90,9 +100,9 @@ printf '%s\n' "$tier1_list" | grep -q '64500' &&
 	pass 'z1 loaded the Tier1 list containing AS 64500' ||
 	fail "z1 did not load the Tier1 list: $tier1_list"
 
-lookup="$(vty z1 'show midr ip2asn 10.10.3.1')"
+lookup="$(vty z1 "show midr ip2asn $T1_LINK")"
 printf '%s\n' "$lookup" | grep -q '64500' &&
-	pass 'z1 maps t1 (10.10.3.1) to AS 64500' ||
+	pass "z1 maps t1 ($T1_LINK) to AS 64500" ||
 	fail "z1 IP2ASN lookup for t1 is wrong: $lookup"
 
 admission="$(vty z1 'show midr admission')"
@@ -112,7 +122,7 @@ for spec in t2:eth2 t3:eth1; do
 		fail "$node $dev has no netem delay"
 done
 
-trace="$(vty z1 'show midr traceroute 10.99.0.111 refresh')"
+trace="$(vty z1 "show midr traceroute $(loc 111) refresh")"
 info "z1 traceroute towards r1 (diagnostic, auto source): $(printf '%s' "$trace" | tr '\n' ' ' | cut -c1-300)"
 
 ########################################################################
@@ -163,13 +173,13 @@ gid="$(vty z1 'show midr self' | awk -F: '/^Group-ID/ {gsub(/ /, "", $2); print 
 # Screening entries expire after 10 minutes without re-evaluation, so the
 # refusal log is the durable record; the table is shown for reference.
 deadline=$(( $(date +%s) + WAIT_SECONDS ))
-until node_log z1 | grep -q 'MIDR admission: refusing 10.99.0.111: Tier1 observed'; do
+until node_log z1 | grep -qF "MIDR admission: refusing $(loc 111): Tier1 observed"; do
 	[ "$(date +%s)" -ge "$deadline" ] && break
 	sleep "$POLL_SECONDS"
 done
 z1_log="$(node_log z1)"
 for t in $SCREENED_TRANSPORTS; do
-	printf '%s\n' "$z1_log" | grep -q "MIDR admission: refusing $t: Tier1 observed" &&
+	printf '%s\n' "$z1_log" | grep -qF "MIDR admission: refusing $t: Tier1 observed" &&
 		pass "z1 admission refused $t: Tier1 observed on its path" ||
 		fail "z1 admission never refused $t"
 done
@@ -203,7 +213,7 @@ else
 	fail "a blocked MIDR session was established:$bad"
 fi
 for t in $BLOCKED_TRANSPORTS; do
-	printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t " &&
+	printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t AS" &&
 		fail "z1 requested a session towards blocked $t" ||
 		pass "z1 never requested a session towards blocked $t"
 done
@@ -224,7 +234,7 @@ printf '%s\n' "$anchor" | grep -q '共选出 0 个锚点候选' &&
 	fail "z1 CL anchor selection for group 1 is unexpected: ${anchor:-no ANCHOR log}"
 
 # Group 2 members.
-EXPECTED_TRANSPORTS="10.99.0.121 10.99.0.122"
+EXPECTED_TRANSPORTS="$(loc 121) $(loc 122)"
 deadline=$(( $(date +%s) + WAIT_SECONDS ))
 while :; do
 	established="$(z1_established_overlays)"
@@ -250,7 +260,7 @@ for t in $established; do
 	case " $BLOCKED_TRANSPORTS " in
 		*" $t "*) fail "z1 is Established with blocked $t" ;;
 	esac
-	if printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t "; then
+	if printf '%s\n' "$z1_log" | grep -q "midr_peer_session_request for [0-9./]* $t AS"; then
 		via_api=$((via_api + 1))
 		vty z1 "show bgp neighbors $t" | grep -qi 'midr' &&
 			pass "z1 session to $t was requested via midr_peer_session_request and carries MIDR-LS" ||
