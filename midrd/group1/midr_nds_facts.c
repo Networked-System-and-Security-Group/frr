@@ -579,17 +579,8 @@ uint32_t midr_nds_metric_loss_ppm(const struct midr_nds_link_metrics *m)
 
 uint32_t midr_nds_metric_bw_kbps(const struct midr_nds_link_metrics *m)
 {
-	static bool warned;
-
-	(void)m; /* bw_score 无量纲，无法换成 kbps —— 见头文件 TODO（问题 #7） */
-
-	if (!warned) {
-		warned = true;
-		zlog_warn("MIDR facts: available_bandwidth_kbps 用占位值 %u kbps 上报（PM 无真实带宽测量，等问题清单 #7 口径落定）",
-			  MIDR_NDS_BW_KBPS_PLACEHOLDER);
-	}
-
-	return MIDR_NDS_BW_KBPS_PLACEHOLDER;
+	/* bw_score 即带宽估计（见头文件）；第二组不收 0。 */
+	return m->bw_score ? m->bw_score : 1U;
 }
 
 bool midr_nds_metrics_to_group2(const struct midr_nds_link_metrics *m,

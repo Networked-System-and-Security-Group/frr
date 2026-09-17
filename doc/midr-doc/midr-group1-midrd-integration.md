@@ -67,6 +67,13 @@ NDS 仍通过原来的远端视图回调接收这些数据，逻辑未改。`sho
 | 优雅退网 | 等第二组确认撤销写出 | 固定延时后拆会话，撤销由 midrd 泛洪 |
 | `midr help` | VIEW 与配置态 | 只在配置态（同一字符串两边节点集合不同会让 vtysh 命令表撞名） |
 | AS_PATH 版 Tier1 检查 | 有 | 未搬（midrd 没有 BGP RIB） |
+| Link 的 `available_bandwidth_kbps` | 固定 1 Gbps 占位 | PM 短期 `bw_score`（下限 1），见下 |
+
+**带宽口径（需第二组知悉）**：PM 无法打流测带宽，`bw_score` 用 RTT 与丢包按 Mathis TCP
+吞吐公式估计带宽：`sqrt(1.5) / (RTT_s × sqrt(max(loss, 1%)))`（省去 MSS）。第一组把它直接
+填进 `available_bandwidth_kbps`。它是各节点口径一致的相对估计，不是真实 kbps。代入
+`midr_cost_from_metrics()` 后传输时间项约为 43×RTT，代价大致按 `RTT / sqrt(max(loss,1%))`
+排序，丢包的权重比原先 1 Gbps 占位时明显增大。例：RTT 179µs、无丢包时上报 68421，代价 79。
 
 midrd 以 root 运行且不降权，vty socket 只有 root 能连，检查脚本用 `docker exec -u root`。
 在同时装有 bgpd 旧实现的节点上查询 MIDR 状态请用 `vtysh -d midrd`。

@@ -185,24 +185,6 @@ extern uint64_t midr_nds_facts_link_id(struct midr_g1 *g1,
  * 单位换算（计划 Q16+Q17：「本段唯一的真工作量」）
  * =========================================================================*/
 
-/*
- * bw 占位值（kbps）。
- *
- * ⚠ 这不是测量值。我方 PM 只有 bw_score —— 由 rtt/loss 派生的无量纲合成分数
- * （bgp_midr_pm.h：loss 开方做分母），**没有任何 kbps 来源**。而第二组的
- * midr_validate_link_update() 要求 has_available_bandwidth_kbps 为真
- * **且** available_bandwidth_kbps != 0，否则 -EINVAL（bgp_midr_input.c:262-267）
- * —— 也就是说 bw 不是「可以先不填」，不填 link_upsert 直接失败。
- *
- * 所以过渡期填这个占位常量让上报链路能跑通，并在首次使用时 zlog_warn 一次，
- * 防止它静默混进联调。口径落定后删掉本常量、改 midr_nds_metric_bw_kbps()。
- *
- * TODO（问题清单 #7）：等第二组答复 —— ① cost 公式对带宽精度要求多高，
- * 「标称带宽 × (1−loss)」这类粗估行不行；② 过渡期允不允许先填配置的标称值。
- * 若答案是「必须真实测量」，则改 PM 补真带宽估计（归 PM owner 队友）。
- */
-#define MIDR_NDS_BW_KBPS_PLACEHOLDER 1000000U /* 1 Gbps，纯占位 */
-
 /* rtt：我方内部就是微秒（st_rtt_us / lt_rtt_us），直接平移。 */
 extern uint32_t midr_nds_metric_rtt_us(const struct midr_nds_link_metrics *m);
 
@@ -216,7 +198,14 @@ extern uint32_t midr_nds_metric_rtt_us(const struct midr_nds_link_metrics *m);
  */
 extern uint32_t midr_nds_metric_loss_ppm(const struct midr_nds_link_metrics *m);
 
-/* bw：见 MIDR_NDS_BW_KBPS_PLACEHOLDER。首次调用会 warn 一次。 */
+/*
+ * bw：PM 的 bw_score 直接作为 available_bandwidth_kbps 上报。
+ *
+ * 无法打流测带宽时，bw_score 用 RTT 与丢包按 Mathis TCP 吞吐公式估计链路带宽
+ * （sqrt(1.5) / (RTT_s × sqrt(max(loss, 1%)))，省去 MSS，见 midr_pm.c）。它是
+ * 相对估计值、不是真实 kbps；各节点口径一致，第二组的 cost 按它排序即可。
+ * 第二组要求该字段非 0，故下限夹到 1（RTT 超过约 1 秒时取整会得 0）。
+ */
 extern uint32_t midr_nds_metric_bw_kbps(const struct midr_nds_link_metrics *m);
 
 /*
