@@ -107,6 +107,7 @@ sg clab_admins -c './midr-test/backbone-lab/run_group1_group2_lab.sh all'
 | midrd 版 backbone lab，IPv4 | 基础验收 53/53，Tier1 准入 25/25 |
 | midrd 版 backbone lab，IPv6-only | 基础验收 53/53，Tier1 准入 25/25，IPv6-only 10/10 |
 | 整树编译 | 零告警；bgpd 29 个 MIDR 单元测试、midrd 21 个组件测试与边界扫描通过 |
+| 合并第二组公共 Session 服务后（`5d039b9e1a`） | IPv6：基础 53/53、Tier1 25/25、IPv6-only 10/10；IPv4：基础 53/53、Tier1 25/25；整树零告警，midrd `make test`（含 session-test）与边界扫描通过 |
 
 覆盖：underlay 转发（12 个 MIDR 节点传输地址两两互通）、原生会话（群内全互联、引导骨干网、
 r1–r2 手配边、代表挂靠）、按性能选群（零配置 z2 进群 1）、按策略选群（z1 跳过经 Tier1 的群 1、
