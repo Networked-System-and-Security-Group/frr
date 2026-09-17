@@ -38,8 +38,15 @@
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
 	uint32_t node_id;
-	/* 第一组新增：会话起落要通知 midr-session.h 的持有者，需记住当前是否已建立。 */
+	/* 第一组新增：midr-session.h 的状态。up = HELLO 后已建立；discovery = 有第一组
+	 * 的建连意图；dynamic_only = 条目由 connect 创建（不是 --peer 静态条目），
+	 * 撤销意图时才删除；bound/mismatch = HELLO 身份绑定情况。 */
 	bool up;
+	bool discovery;
+	bool dynamic_only;
+	bool bound;
+	bool mismatch;
+	int last_error;
 };
 
 /* Development-time static Link input. */
@@ -170,7 +177,7 @@ struct midr_context {
 	bool terminating;
 	/* 第一组新增：midr-session.h 的实现需要监听端点和会话持有者回调。 */
 	struct midr_transport_endpoint listen;
-	const struct midr_session_ops *session_ops;
+	const struct midr_session_observer *session_observer;
 	void *session_arg;
 };
 

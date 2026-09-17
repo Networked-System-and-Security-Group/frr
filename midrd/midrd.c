@@ -207,22 +207,67 @@ static void endpoint_to_ipaddr(const struct midr_transport_endpoint *endpoint,
 	}
 }
 
-static int ipaddr_to_session_endpoint(const struct midr_context *daemon,
-				      const struct ipaddr *address,
-				      struct midr_transport_endpoint *endpoint)
+static int session_endpoint_to_transport(
+	const struct midr_context *daemon,
+	const struct midr_session_endpoint *remote,
+	struct midr_transport_endpoint *endpoint)
 {
 	memset(endpoint, 0, sizeof(*endpoint));
-	if (IS_IPADDR_V4(address)) {
+	if (!daemon || !remote)
+		return -EINVAL;
+	if (IS_IPADDR_V4(&remote->address)) {
 		endpoint->family = MIDR_TRANSPORT_AF_IPV4;
-		memcpy(endpoint->address, &address->ipaddr_v4, 4);
-	} else if (IS_IPADDR_V6(address)) {
+		memcpy(endpoint->address, &remote->address.ipaddr_v4, 4);
+	} else if (IS_IPADDR_V6(&remote->address)) {
 		endpoint->family = MIDR_TRANSPORT_AF_IPV6;
-		memcpy(endpoint->address, &address->ipaddr_v6, 16);
+		memcpy(endpoint->address, &remote->address.ipaddr_v6, 16);
+		endpoint->scope_id = remote->scope_id;
 	} else {
 		return -EINVAL;
 	}
-	endpoint->port = daemon->listen.port;
+	endpoint->port = remote->port ? remote->port : daemon->listen.port;
 	return endpoint->family == daemon->listen.family ? 0 : -EINVAL;
+}
+
+static void transport_to_session_endpoint(
+	const struct midr_transport_endpoint *endpoint,
+	struct midr_session_endpoint *remote)
+{
+	memset(remote, 0, sizeof(*remote));
+	endpoint_to_ipaddr(endpoint, &remote->address);
+	remote->port = endpoint->port;
+	remote->scope_id = endpoint->scope_id;
+}
+
+static void session_status_fill(const struct midrd_peer_config *config,
+				 struct midr_session_status *status)
+{
+	memset(status, 0, sizeof(*status));
+	if (config->mismatch)
+		status->state = MIDR_SESSION_IDENTITY_MISMATCH;
+	else if (config->up)
+		status->state = MIDR_SESSION_ESTABLISHED;
+	else
+		status->state = MIDR_SESSION_CONNECTING;
+	status->remote_node_id = config->bound ? config->node_id : 0;
+	status->last_error = config->last_error;
+}
+
+static void session_notify(struct midr_context *daemon,
+			   const struct midrd_peer_config *config,
+			   enum midr_session_state state)
+{
+	struct midr_session_endpoint remote;
+	struct midr_session_status status;
+
+	if (!daemon->session_observer ||
+	    !daemon->session_observer->state_changed)
+		return;
+	transport_to_session_endpoint(&config->endpoint, &remote);
+	session_status_fill(config, &status);
+	status.state = state;
+	daemon->session_observer->state_changed(daemon, &remote, &status,
+						daemon->session_arg);
 }
 
 static struct midrd_snapshot_stage *stage_for(struct midr_context *daemon,
@@ -763,7 +808,7 @@ static void on_established(void *arg,
 
 	/* 第一组修改：会话由第一组管理时，未请求过的入向连接直接关掉，让准入策略
 	 * （如 Tier1 过滤）对被动方同样生效。建立通知等对端 HELLO 报出身份后再发。 */
-	if (daemon->session_ops && !config) {
+	if (daemon->session_observer && !config) {
 		(void)midr_transport_disconnect(daemon->transport, peer);
 		return;
 	}
@@ -802,16 +847,12 @@ static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
 	stage_release(stage);
 	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
 	       daemon->node_id, peer->family, peer->port, reason);
-	/* 第一组修改：已建立的会话断开时通知第一组。 */
+	/* 第一组修改：已建立的会话断开时通知第一组（附关闭原因）。 */
+	if (config)
+		config->last_error = reason;
 	if (config && config->up) {
 		config->up = false;
-		if (daemon->session_ops && daemon->session_ops->session_down) {
-			struct ipaddr remote;
-
-			endpoint_to_ipaddr(peer, &remote);
-			daemon->session_ops->session_down(daemon, &remote, reason,
-							 daemon->session_arg);
-		}
+		session_notify(daemon, config, MIDR_SESSION_DOWN);
 	}
 }
 
@@ -866,19 +907,29 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 		for (size_t i = 0; i < daemon->peer_count; i++)
 			if (midr_transport_endpoint_equal(
 					&daemon->peers[i].endpoint, peer)) {
-				daemon->peers[i].node_id = node_id;
-				/* 第一组修改：HELLO 带来对端身份，此时才向第一组报会话建立
-				 * （相当于 BGP 的 OPEN）。 */
-				if (!daemon->peers[i].up && daemon->session_ops) {
-					daemon->peers[i].up = true;
-					if (daemon->session_ops->session_up) {
-						struct ipaddr remote;
+				struct midrd_peer_config *config =
+					&daemon->peers[i];
 
-						endpoint_to_ipaddr(peer, &remote);
-						daemon->session_ops->session_up(
-							daemon, node_id, &remote,
-							daemon->session_arg);
+				/* 第一组修改：首个有效 HELLO 绑定对端身份，此后才向第一组
+				 * 报会话建立（相当于 BGP 的 OPEN）；身份与已绑定的不同则报
+				 * IDENTITY_MISMATCH。 */
+				if (daemon->session_observer && config->bound &&
+				    config->node_id != node_id) {
+					if (!config->mismatch) {
+						config->mismatch = true;
+						config->up = false;
+						session_notify(daemon, config,
+							       MIDR_SESSION_IDENTITY_MISMATCH);
 					}
+					return 0;
+				}
+				config->node_id = node_id;
+				config->bound = true;
+				config->mismatch = false;
+				if (!config->up && daemon->session_observer) {
+					config->up = true;
+					session_notify(daemon, config,
+						       MIDR_SESSION_ESTABLISHED);
 				}
 				break;
 			}
@@ -2637,31 +2688,30 @@ void midr_spf_consumer_unregister(struct midr_context *daemon,
 }
 
 /* 第一组新增：midr-session.h 的实现。 */
-int midr_session_owner_register(struct midr_context *daemon,
-				const struct midr_session_ops *ops, void *arg)
+int midr_session_observer_register(struct midr_context *daemon,
+				   const struct midr_session_observer *observer,
+				   void *arg)
 {
 	if (!daemon)
 		return -EINVAL;
-	daemon->session_ops = ops;
-	daemon->session_arg = ops ? arg : NULL;
+	daemon->session_observer = observer;
+	daemon->session_arg = observer ? arg : NULL;
 	return 0;
 }
 
-int midr_session_request(struct midr_context *daemon, uint32_t node_id,
-			 const struct ipaddr *remote)
+int midr_session_connect(struct midr_context *daemon,
+			 const struct midr_session_endpoint *remote)
 {
 	struct midr_transport_endpoint endpoint;
 	struct midrd_peer_config *config;
 	int ret;
 
-	/* node_id may be 0 until the remote HELLO names it. */
-	if (!daemon || !remote ||
-	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
+	if (session_endpoint_to_transport(daemon, remote, &endpoint) ||
+	    midr_transport_endpoint_validate(&endpoint))
 		return -EINVAL;
 	config = session_peer(daemon, &endpoint);
 	if (config) {
-		if (node_id)
-			config->node_id = node_id;
+		config->discovery = true;
 		return 0;
 	}
 	if (daemon->peer_count == MIDRD_MAX_PEERS)
@@ -2669,7 +2719,8 @@ int midr_session_request(struct midr_context *daemon, uint32_t node_id,
 	config = &daemon->peers[daemon->peer_count];
 	memset(config, 0, sizeof(*config));
 	config->endpoint = endpoint;
-	config->node_id = node_id;
+	config->discovery = true;
+	config->dynamic_only = true;
 	daemon->peer_count++;
 	ret = midr_transport_connect(daemon->transport, &endpoint);
 	if (ret) {
@@ -2679,19 +2730,25 @@ int midr_session_request(struct midr_context *daemon, uint32_t node_id,
 	return ret;
 }
 
-int midr_session_release(struct midr_context *daemon,
-			 const struct ipaddr *remote)
+int midr_session_disconnect(struct midr_context *daemon,
+			    const struct midr_session_endpoint *remote,
+			    enum midr_session_close_reason reason)
 {
 	struct midr_transport_endpoint endpoint;
 	struct midrd_peer_config *config;
 	size_t index;
 
-	if (!daemon || !remote ||
-	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
+	if (session_endpoint_to_transport(daemon, remote, &endpoint))
 		return -EINVAL;
 	config = session_peer(daemon, &endpoint);
-	if (!config)
+	if (!config || !config->discovery)
 		return -ENOENT;
+	printf("node=%" PRIu32 " session disconnect family=%u port=%u reason=%d\n",
+	       daemon->node_id, endpoint.family, endpoint.port, (int)reason);
+	config->discovery = false;
+	/* A static --peer intent keeps its session. */
+	if (!config->dynamic_only)
+		return 0;
 	/* Forget the peer first so the close callback does not report it. */
 	index = (size_t)(config - daemon->peers);
 	daemon->peers[index] = daemon->peers[daemon->peer_count - 1];
@@ -2702,19 +2759,21 @@ int midr_session_release(struct midr_context *daemon,
 	return 0;
 }
 
-bool midr_session_is_up(const struct midr_context *daemon,
-			const struct ipaddr *remote)
+int midr_session_status_get(const struct midr_context *daemon,
+			    const struct midr_session_endpoint *remote,
+			    struct midr_session_status *status)
 {
 	struct midr_transport_endpoint endpoint;
 
-	if (!daemon || !remote ||
-	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
-		return false;
+	if (!status || session_endpoint_to_transport(daemon, remote, &endpoint))
+		return -EINVAL;
 	for (size_t i = 0; i < daemon->peer_count; i++)
 		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint,
-						  &endpoint))
-			return daemon->peers[i].up;
-	return false;
+						  &endpoint)) {
+			session_status_fill(&daemon->peers[i], status);
+			return 0;
+		}
+	return -ENOENT;
 }
 
 uint32_t midr_context_node_id(const struct midr_context *daemon)

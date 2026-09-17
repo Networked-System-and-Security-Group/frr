@@ -4886,15 +4886,9 @@ static void midr_nds_report_link_on_established(struct midr_g1 *g1,
 }
 
 /*
- * 件④（轮 4）掉沿清账：MIDR 会话掉出 Established = 对端真死或真要重来
- * （默认 holdtime 180s 下 underlay 抖动根本走不到这个沿），当场把这条边的账
- * 清干净——拆 peer + 销台账 + 停探 + 撤 link 事件 + 清 is_adjacent + 通知 CL，
- * 即 midr_ctrl_detach_transport 那一整套（B1 老化调的也是它，本批只是把同一
- * 动作从 300s 提前到当场）。MANUAL 边由 force=false 保住配置本体（α 豁免）。
- *
- * 重连不在这里管：同群边由 periodic_sync 的补边兜底扫描（≤30s）重建，
- * midr_ctrl_connect 的 SAME_GROUP 分支会把 is_adjacent/探测/台账一次置全。
- *
+ * 会话建立时身份不合法（手配会话的对端身份与节点表冲突等）的延后清理。
+ * bgpd 版在会话掉线时也经此"当场拆边清账"；midrd 版掉线只起断连计时（见
+ * midr_nds_session_status），由老化扫描在 MIDR_SESSION_DOWN_AGE 后清理。
  * 钩子里只记名、下一拍再动手，理由同 attach_down_pending 的字段注释。
  */
 struct midr_session_down {
@@ -4932,38 +4926,6 @@ static void midr_session_reap_cb(struct event *t)
 		midr_ctrl_detach_transport(g1, cur.transport, cur.rid, false,
 					   MIDR_STOP_SESSION_DOWN);
 	}
-}
-
-static void midr_nds_session_note_down(struct midr_g1 *g1,
-				       struct ipaddr transport)
-{
-	struct midr_nds *mi = g1->midr_nds_info;
-	const struct midr_session_ledger_entry *e;
-	struct midr_session_down *slot;
-
-	/*
-	 * ⚠ 退网中不记名（08-23 实测必崩）：本机退网是"先撤身份、再自己把会话
-	 * 全拆掉"，清表/停探/销账 shutdown_enter 已一次做完，这里再排一拍无事
-	 * 可做；而那一拍会在**身份已撤**之后再碰一次路由处理，撞上第二组
-	 * `bgp_midr_rib_process_main()` 的 `active_identity_count` 断言 → abort
-	 * （与记档 56 那个 5s 延时同一个坑，只是从另一条路踩进去）。
-	 * 对端不受影响：它不在退网态，掉沿照常清账。
-	 */
-	if (mi->shutdown)
-		return;
-
-	/* 无账的会话不归 MIDR 管（⑦ 归属守卫同款判据的账本侧）。 */
-	e = midr_nds_ledger_lookup(g1, transport);
-	if (!e)
-		return;
-
-	slot = XCALLOC(MTYPE_MIDR_SESSION_DOWN, sizeof(*slot));
-	slot->transport = transport;
-	slot->rid = e->remote_rid;
-	listnode_add(mi->session_down_pending, slot);
-
-	event_add_event(midr_g1_master(), midr_session_reap_cb, g1, 0,
-			&mi->t_session_reap);
 }
 
 /*
@@ -5025,9 +4987,14 @@ void midr_nds_session_status(struct midr_g1_peer *peer, bool was_established)
 	if (!was_established)
 		return;
 
+	/*
+	 * midrd：会话掉线不再当场"拆边清账"。公共 Session 服务在意图仍在时会自动
+	 * 重连，交接文档（第二版）要求第一组不因 Session Down 撤销仍然有效的 Link；
+	 * 这里只起断连计时，断开超过 MIDR_SESSION_DOWN_AGE 仍未恢复才由老化扫描
+	 * 拆边销账。挂靠引导的故障切换照旧（挂靠边不上报 Link）。
+	 */
 	midr_ledger_note_down(peer->g1, transport);
 	midr_nds_attach_note_down(peer->g1, transport);
-	midr_nds_session_note_down(peer->g1, transport);
 }
 
 /* ===========================================================================

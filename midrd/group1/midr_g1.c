@@ -85,6 +85,39 @@ static void midr_g1_config_stop(struct vty *vty)
  * Overlay sessions
  * ---------------------------------------------------------------------- */
 
+/* Group 1 addresses sessions by transport address on the MIDR port. */
+static void midr_g1_endpoint(const struct ipaddr *transport,
+			     struct midr_session_endpoint *remote)
+{
+	memset(remote, 0, sizeof(*remote));
+	remote->address = *transport;
+}
+
+static int midr_g1_disconnect(struct midr_g1_peer *peer,
+			      enum midr_session_close_reason reason)
+{
+	struct midr_session_endpoint remote;
+
+	midr_g1_endpoint(&peer->transport, &remote);
+	return midr_session_disconnect(peer->g1->ctx, &remote, reason);
+}
+
+static bool midr_g1_session_established(struct midr_g1 *g1,
+					const struct ipaddr *transport,
+					uint32_t *node_id)
+{
+	struct midr_session_endpoint remote;
+	struct midr_session_status status;
+
+	midr_g1_endpoint(transport, &remote);
+	if (midr_session_status_get(g1->ctx, &remote, &status) ||
+	    status.state != MIDR_SESSION_ESTABLISHED)
+		return false;
+	if (node_id)
+		*node_id = status.remote_node_id;
+	return true;
+}
+
 struct midr_g1_peer *midr_g1_peer_lookup(struct midr_g1 *g1,
 					 const struct ipaddr *transport)
 {
@@ -136,14 +169,15 @@ struct midr_g1_peer *midr_g1_peer_create(struct midr_g1 *g1,
 
 void midr_g1_peer_start(struct midr_g1_peer *peer)
 {
+	struct midr_session_endpoint remote;
 	int ret;
 
 	if (!peer || peer->requested || g1_terminating)
 		return;
 	if (!midr_admission_begin(peer))
 		return;
-	ret = midr_session_request(peer->g1->ctx, peer->remote_id.s_addr,
-				   &peer->transport);
+	midr_g1_endpoint(&peer->transport, &remote);
+	ret = midr_session_connect(peer->g1->ctx, &remote);
 	if (ret) {
 		zlog_warn("MIDR: session request to %pIA failed: %d",
 			  &peer->transport, ret);
@@ -157,7 +191,7 @@ void midr_g1_peer_stop(struct midr_g1_peer *peer)
 	if (!peer || !peer->requested || peer->established || g1_terminating)
 		return;
 	MIDR_G1_LOG("MIDR: stop pending session %pIA", &peer->transport);
-	(void)midr_session_release(peer->g1->ctx, &peer->transport);
+	(void)midr_g1_disconnect(peer, MIDR_SESSION_CLOSE_POLICY);
 	peer->requested = false;
 }
 
@@ -165,7 +199,7 @@ void midr_g1_peer_stop(struct midr_g1_peer *peer)
  * requested again once a fresh permit exists. */
 static void midr_g1_peer_stop_established(struct midr_g1_peer *peer)
 {
-	(void)midr_session_release(peer->g1->ctx, &peer->transport);
+	(void)midr_g1_disconnect(peer, MIDR_SESSION_CLOSE_POLICY);
 	peer->requested = false;
 }
 
@@ -180,7 +214,7 @@ void midr_g1_peer_delete(struct midr_g1_peer *peer)
 	if (peer->requested && !g1_terminating) {
 		MIDR_G1_LOG("MIDR: release session %pIA (%s)", &peer->transport,
 			    midr_g1_peer_state_str(peer));
-		(void)midr_session_release(g1->ctx, &peer->transport);
+		(void)midr_g1_disconnect(peer, MIDR_SESSION_CLOSE_DISCOVERY);
 	}
 	listnode_delete(g1->peer, peer);
 	XFREE(MTYPE_MIDR_G1_PEER, peer);
@@ -249,9 +283,12 @@ static void midr_g1_session_event_cb(struct event *event)
 
 	if (peer && !g1_terminating) {
 		/* A stale up for a session released meanwhile is ignored. */
+		uint32_t node_id = 0;
+
 		if (ev->up && peer->requested &&
-		    midr_session_is_up(g1->ctx, &peer->transport))
-			midr_g1_session_up(g1, peer, ev->node_id);
+		    midr_g1_session_established(g1, &peer->transport,
+						&node_id))
+			midr_g1_session_up(g1, peer, node_id);
 		else if (!ev->up)
 			midr_g1_session_down(peer);
 	}
@@ -270,30 +307,41 @@ static void midr_g1_session_queue(const struct ipaddr *remote,
 	event_add_event(g1_master, midr_g1_session_event_cb, ev, 0, NULL);
 }
 
-static void midr_g1_session_up_cb(struct midr_context *ctx, uint32_t node_id,
-				  const struct ipaddr *remote, void *arg)
+static void midr_g1_session_state_cb(struct midr_context *ctx,
+				     const struct midr_session_endpoint *remote,
+				     const struct midr_session_status *status,
+				     void *arg)
 {
-	midr_g1_session_queue(remote, node_id, true);
+	struct midr_g1_peer *peer;
+
+	switch (status->state) {
+	case MIDR_SESSION_ESTABLISHED:
+		midr_g1_session_queue(&remote->address,
+				      status->remote_node_id, true);
+		break;
+	case MIDR_SESSION_IDENTITY_MISMATCH:
+		zlog_warn("MIDR: session %pIA reports a node other than %pI4 bound before",
+			  &remote->address,
+			  (struct in_addr *)&status->remote_node_id);
+		midr_g1_session_queue(&remote->address, 0, false);
+		break;
+	case MIDR_SESSION_DOWN:
+		/* 0 = closed by the remote, negative errno otherwise (e.g.
+		 * hold timer or write budget expiry). */
+		zlog_info("MIDR: session %pIA closed by midrd, reason %d",
+			  &remote->address, status->last_error);
+		peer = midr_g1_peer_lookup(arg, &remote->address);
+		if (peer)
+			peer->last_reset = status->last_error;
+		midr_g1_session_queue(&remote->address, 0, false);
+		break;
+	case MIDR_SESSION_CONNECTING:
+		break;
+	}
 }
 
-static void midr_g1_session_down_cb(struct midr_context *ctx,
-				    const struct ipaddr *remote, int reason,
-				    void *arg)
-{
-	struct midr_g1_peer *peer = midr_g1_peer_lookup(arg, remote);
-
-	/* midrd's reason: 0 = closed by the remote, negative errno otherwise
-	 * (e.g. hold timer or write budget expiry). */
-	zlog_info("MIDR: session %pIA closed by midrd, reason %d", remote,
-		  reason);
-	if (peer)
-		peer->last_reset = reason;
-	midr_g1_session_queue(remote, 0, false);
-}
-
-static const struct midr_session_ops midr_g1_session_ops = {
-	.session_up = midr_g1_session_up_cb,
-	.session_down = midr_g1_session_down_cb,
+static const struct midr_session_observer midr_g1_session_observer = {
+	.state_changed = midr_g1_session_state_cb,
 };
 
 /* ------------------------------------------------------------------------
@@ -484,7 +532,7 @@ void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	midr_tier1_vty_init();
 	midr_nds_vty_init();
 
-	(void)midr_session_owner_register(ctx, &midr_g1_session_ops, g1);
+	(void)midr_session_observer_register(ctx, &midr_g1_session_observer, g1);
 	midr_nodedir_init(g1);
 	midr_nds_init(g1);
 	zlog_notice("MIDR group 1 started, router-id %pI4", &g1->router_id);
@@ -499,7 +547,7 @@ void midr_group1_terminate(void)
 		return;
 	g1_terminating = true;
 	event_cancel(&t_config);
-	(void)midr_session_owner_register(g1->ctx, NULL, NULL);
+	(void)midr_session_observer_register(g1->ctx, NULL, NULL);
 	midr_nds_finish(g1);
 	midr_nodedir_finish(g1);
 	while ((peer = listnode_head(g1->peer)))

@@ -22,7 +22,7 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 
 | 文件 | 改动 | 原因 |
 | --- | --- | --- |
-| `midrd/midr-session.h`（新文件） | 会话接口：`midr_session_owner_register`、`midr_session_request`、`midr_session_release`、`midr_session_is_up`、`midr_context_node_id`、`midr_context_listen_address` | midrd 原来只能用 `--peer` 静态配置邻居，第一组的邻居发现需要运行时增删会话 |
+| `midrd/midr-session.h`（新文件） | 会话接口，按交接文档第二版的公共 Session 服务命名：`midr_session_connect`、`midr_session_disconnect`（带关闭原因）、`midr_session_status_get`、`midr_session_observer_register`（DOWN/CONNECTING/ESTABLISHED/IDENTITY_MISMATCH），endpoint 含地址、端口、IPv6 scope；另有 `midr_context_node_id`、`midr_context_listen_address` | midrd 原来只能用 `--peer` 静态配置邻居，第一组的邻居发现需要运行时增删会话。第二组的公共 Session 服务到位后，以其实现替换本文件与 `midrd.c` 中对应代码 |
 | `midrd/midrd.c` | 上述接口的实现；会话由第一组管理时关闭未请求的入向连接；收到对端 HELLO 后才向第一组报“会话建立”；会话断开时通知；记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()` | 准入策略（Tier1）要对被动方生效；HELLO 带来对端身份（相当于 BGP OPEN）；弱符号让不含第一组的独立构建和组件测试照常链接 |
 | `midrd/midr-context-private.h` | `midrd_peer_config.up`；`midr_context` 增加监听端点和会话持有者回调 | 上述实现所需的状态 |
 | `midrd/midr-transport.c` | 主动建连前绑定到监听地址 | overlay 会话是多跳的，不绑定时内核选出口链路地址作源，对端认不出这是它请求过的会话（BGP 里对应 update-source） |
@@ -33,10 +33,13 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 
 会话接口语义（详见头文件注释）：
 
-- 会话以远端 transport 地址为键，远端端口等于本机监听端口（同一部署内所有 midrd 用同一 MIDR 端口）。
-- 请求过的会话与 `--peer` 会话一样参与泛洪；`node_id` 可先填 0，由对端 HELLO 补上。
-- 一旦注册了持有者，未请求的入向连接会被关闭。持有者未注册时 midrd 行为不变。
-- 回调在 midrd 收包路径里触发，持有者不得在回调中同步请求/释放会话（第一组把处理放进事件队列）。
+- 会话以远端 endpoint 为键；端口填 0 时用本机监听端口（同一部署内所有 midrd 用同一 MIDR 端口）。
+- connect 幂等，只登记意图，midrd 持续重连；首个有效 HELLO 绑定对端 `node_id` 后才报 ESTABLISHED。
+- disconnect 只清第一组的意图，同一 endpoint 的 `--peer` 静态会话保留；不撤销任何拓扑对象。
+- 注册了 observer 后，没有意图的入向连接会被关闭。未注册时 midrd 行为不变。
+- observer 在 midrd 收包路径里触发，不得在回调中同步 connect/disconnect（第一组把处理放进事件队列）。
+- 第一组不因 Session Down 撤销 Link：掉线只起断连计时，断开超过 5 分钟仍未恢复才拆边销账；
+  PM 判定链路不可达、换群、节点离开、手工拆除、策略拒绝时照常撤销。
 
 ## 3. 节点目录（第一组自有协议）
 
