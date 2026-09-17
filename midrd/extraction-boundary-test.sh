@@ -34,9 +34,11 @@ cat >"$tmp/contract.c" <<'EOF'
 #include "midr-prefix-provider.h"
 #include "midr-session.h"
 #include "midr-spf.h"
+#include "midr-spf-install.h"
 #include "midr-ted.h"
 #include "midr-topology.h"
 #include "midr-transport.h"
+#include "midr-zebra.h"
 int main(void) { return MIDR_CORE_WIRE_VERSION == 1U ? 0 : 1; }
 EOF
 

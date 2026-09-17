@@ -23,6 +23,9 @@
 #include "midr-topology.h"
 #include "midr-transport.h"
 
+struct midr_spf_install_runtime;
+struct midr_zebra_backend_ops;
+
 #define MIDRD_MAX_PEERS 32U
 #define MIDRD_MAX_LINKS 64U
 #define MIDRD_MAX_SNAPSHOT 4096U
@@ -120,6 +123,9 @@ struct midr_context {
 	struct midr_local_ipc *local_ipc;
 	struct midr_session_manager *sessions;
 	struct midr_spf_consumer *spf_consumers;
+	struct midr_spf_install_runtime *spf_install;
+	const struct midr_zebra_backend_ops *zebra_ops;
+	void *zebra_arg;
 	struct midrd_peer_config static_peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
 	struct midr_core_identity group_prefixes[MIDRD_MAX_SNAPSHOT];

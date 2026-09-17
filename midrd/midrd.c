@@ -18,11 +18,13 @@
 #include "midr-prefix-provider.h"
 #include "midr-prefix-ipc.h"
 #include "midr-session-private.h"
+#include "midr-spf-install.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-owned.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
+#include "midr-zebra.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -3008,6 +3010,7 @@ static void midr_context_finish(struct midr_context *daemon)
 
 	if (!daemon)
 		return;
+	(void)midr_zebra_backend_unregister(daemon);
 	while ((spf_consumer = daemon->spf_consumers))
 		midr_spf_consumer_unregister(daemon, &spf_consumer);
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
