@@ -16,7 +16,9 @@
 #
 # Read-only.
 
-set -uo pipefail
+# No pipefail: pipelines here feed large logs into `grep -q`, which exits
+# at the first match and makes the writer fail with SIGPIPE.
+set -u
 
 LAB_PREFIX="${MIDR_LAB_PREFIX:-clab-midr-backbone-midrd}"
 FAMILY="${MIDR_LAB_FAMILY:-ipv4}"
@@ -68,6 +70,9 @@ mvty() { docker exec -u root "$(container "$1")" vtysh -d midrd -c "$2" 2>/dev/n
 bvty() { docker exec "$(container "$1")" vtysh -d bgpd -c "$2" 2>/dev/null; }
 rexec() { local node=$1; shift; docker exec -u root "$(container "$node")" "$@" 2>/dev/null; }
 midrd_log() { rexec "$1" cat /etc/frr/logs/midrd.log; }
+# grep inside the container: with pipefail, `cat | grep -q` fails when grep
+# exits early on a large log.
+midrd_log_has() { rexec "$1" grep -qE "$2" /etc/frr/logs/midrd.log; }
 
 field()
 {
@@ -273,11 +278,11 @@ done
 
 bad=
 for node in $MIDR_NODES; do
-	midrd_log "$node" | grep -q 'session requested via midr_session_request' ||
+	midrd_log_has "$node" 'session requested via midr_session_(connect|request)' ||
 		bad="$bad $node"
 done
-[ -z "$bad" ] && pass 'all MIDR nodes request their sessions through midr_session_request' ||
-	fail "no midr_session_request log on:$bad"
+[ -z "$bad" ] && pass 'all MIDR nodes request their sessions through midr_session_connect' ||
+	fail "no midr_session_connect log on:$bad"
 
 bad=
 for node in $MIDR_NODES; do

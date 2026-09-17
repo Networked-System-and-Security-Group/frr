@@ -2519,7 +2519,7 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct midr_g1 *g1,
 			  &entry->node_id, &entry->transport_addr);
 		return MIDR_ADMISSION_INVALID;
 	}
-	zlog_info("MIDR ctrl: session requested via midr_session_request for %pFX %pIA (%s)",
+	zlog_info("MIDR ctrl: session requested via midr_session_connect for %pFX %pIA (%s)",
 		  &entry->node_id, &entry->transport_addr,
 		  midr_session_reason_str(reason));
 	MIDR_FLOW_LOG("MIDR ctrl: peering initiated with %pFX AS %u",

@@ -9,7 +9,9 @@
 #
 # Read-only; run after the base acceptance check has converged.
 
-set -uo pipefail
+# No pipefail: pipelines feed command output into `grep -q`, which exits at
+# the first match and makes the writer fail with SIGPIPE.
+set -u
 
 LAB_PREFIX="${MIDR_LAB_PREFIX:-clab-midr-backbone-v6}"
 # bgpd: MIDR in bgpd (reference); midrd: MIDR in midrd, bgpd is underlay only.

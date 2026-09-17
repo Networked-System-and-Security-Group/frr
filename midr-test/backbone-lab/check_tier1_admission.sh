@@ -18,7 +18,9 @@
 #
 # Read-only; run after the base acceptance check has converged.
 
-set -uo pipefail
+# No pipefail: pipelines here feed large logs into `grep -q`, which exits
+# at the first match and makes the writer fail with SIGPIPE.
+set -u
 
 LAB_PREFIX="${MIDR_LAB_PREFIX:-clab-midr-backbone}"
 LOG_ROOT="${MIDR_LAB_LOG_ROOT:-}"
@@ -60,7 +62,7 @@ case "$STACK" in
 		# MIDR runs in midrd; bgpd only carries the underlay.
 		VTYSH=(vtysh -d midrd)
 		MIDR_LOG=/etc/frr/logs/midrd.log
-		SESSION_LOG='midr_session_request for [0-9./]* %s ('
+		SESSION_LOG='midr_session_(connect|request) for [0-9./]* %s \\('
 		;;
 	*) printf 'MIDR_LAB_STACK must be bgpd or midrd\n' >&2; exit 2 ;;
 esac
@@ -256,7 +258,7 @@ else
 	fail "a blocked MIDR session was established:$bad"
 fi
 for t in $BLOCKED_TRANSPORTS; do
-	printf '%s\n' "$z1_log" | grep -q "$(session_log "$t")" &&
+	printf '%s\n' "$z1_log" | grep -qE "$(session_log "$t")" &&
 		fail "z1 requested a session towards blocked $t" ||
 		pass "z1 never requested a session towards blocked $t"
 done
@@ -303,10 +305,10 @@ for t in $established; do
 	case " $BLOCKED_TRANSPORTS " in
 		*" $t "*) fail "z1 is Established with blocked $t" ;;
 	esac
-	if printf '%s\n' "$z1_log" | grep -q "$(session_log "$t")"; then
+	if printf '%s\n' "$z1_log" | grep -qE "$(session_log "$t")"; then
 		via_api=$((via_api + 1))
 		if [ "$STACK" = midrd ]; then
-			pass "z1 session to $t was requested via midr_session_request (native midrd session)"
+			pass "z1 session to $t was requested via midr_session_connect (native midrd session)"
 		else
 			vty z1 "show bgp neighbors $t" | grep -qi 'midr' &&
 				pass "z1 session to $t was requested via midr_peer_session_request and carries MIDR-LS" ||
@@ -321,7 +323,9 @@ done
 	fail 'no Established z1 session was created through the session API'
 
 for node in r2 m2a; do
-	node_log "$node" | grep -qE 'session requested via midr_(peer_)?session_request' &&
+	docker exec -u root "$(container "$node")" grep -qE \
+		'session requested via midr_(peer_session_request|session_(connect|request))' \
+		"$MIDR_LOG" 2>/dev/null &&
 		pass "$node also creates sessions through the session API" ||
 		fail "$node has no session API log"
 done
