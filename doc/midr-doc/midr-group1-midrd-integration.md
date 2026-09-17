@@ -85,7 +85,32 @@ sg clab_admins -c './midr-test/backbone-lab/run_group1_group2_lab.sh all'
   节点目录一致、第二组接受 Node/Link、SPF 可达同群全部成员。
 - `check_tier1_admission.sh`、`check_ipv6_only.sh` 在 `MIDR_LAB_STACK=midrd` 时读 midrd 状态。
 
-## 6. 已知限制
+## 6. 验证结果（2026-09-17）
+
+| 实验 | 结果 |
+| --- | --- |
+| midrd 版 backbone lab，IPv4 | 基础验收 53/53，Tier1 准入 25/25 |
+| midrd 版 backbone lab，IPv6-only | 基础验收 53/53，Tier1 准入 25/25，IPv6-only 10/10 |
+| 整树编译 | 零告警；bgpd 29 个 MIDR 单元测试、midrd 21 个组件测试与边界扫描通过 |
+
+覆盖：underlay 转发（12 个 MIDR 节点传输地址两两互通）、原生会话（群内全互联、引导骨干网、
+r1–r2 手配边、代表挂靠）、按性能选群（零配置 z2 进群 1）、按策略选群（z1 跳过经 Tier1 的群 1、
+进群 2、与 r1/m1a 始终无会话）、节点目录一致、第二组接受 Node/Link、SPF 可达同群全部成员。
+
+## 7. 已知限制与待转达问题
 
 - midrd 没有 zclient（第三组 F6 未做），MIDR 路由不进 FIB，转发仍走 underlay。
+- 群间路由为 0：各成员 `show midr spf` 的 inter 恒为 0，另一群的前缀不可达（与 bgpd 版的
+  G3-2 现象相同，归第二/三组）。
+- 负载高时引导节点之间的会话会断开重连（主机同时跑两套 lab 时尤为明显）。第一组没有主动释放
+  这些会话；怀疑是 midrd 传输层的发送队列 1 秒预算或 6 秒保活在高负载下触发，需第二组确认。
+  会话会自动恢复，验收不受影响。
+- 同时启动时，对端在本端读完配置、请求会话之前连进来的连接会被拒绝，对端 100ms 后重连，
+  启动期日志里会有一批 `closed ... reason=0`，属预期。
 - 组件测试仍针对 bgpd 里的第一组副本；midrd 副本靠两节点冒烟和 backbone lab 验证。
+
+## 8. 迁移中顺带修正的第一组问题
+
+- 加入流程在 60 秒探测期间向引导节点重拉一次群代表目录（同时启动时首个目录可能不全）。
+- 配置了群号的代表在目录里看到自己时，直接按配置群落定，不再向自己要成员表。
+- 生成 lab 配置时在 `router bgp` 块末尾写 `exit`，否则 vtysh 会把顶层 `midr` 命令发给 bgpd。
