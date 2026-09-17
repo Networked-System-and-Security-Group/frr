@@ -17,6 +17,7 @@
 #include "midr-owned.h"
 #include "midr-prefix-ipc.h"
 #include "midr-prefix-provider.h"
+#include "midr-session.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-topology.h"
@@ -37,6 +38,8 @@
 struct midrd_peer_config {
 	struct midr_transport_endpoint endpoint;
 	uint32_t node_id;
+	/* 第一组新增：会话起落要通知 midr-session.h 的持有者，需记住当前是否已建立。 */
+	bool up;
 };
 
 /* Development-time static Link input. */
@@ -165,6 +168,10 @@ struct midr_context {
 	bool shutdown_active;
 	uint64_t shutdown_write_failures;
 	bool terminating;
+	/* 第一组新增：midr-session.h 的实现需要监听端点和会话持有者回调。 */
+	struct midr_transport_endpoint listen;
+	const struct midr_session_ops *session_ops;
+	void *session_arg;
 };
 
 #endif /* MIDRD_CONTEXT_PRIVATE_H */

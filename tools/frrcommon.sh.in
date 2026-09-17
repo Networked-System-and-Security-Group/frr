@@ -36,7 +36,8 @@ FRR_DEFAULT_PROFILE="@DFLT_NAME@" # traditional / datacenter
 # - keep zebra first
 # - watchfrr does NOT belong in this list
 
-DAEMONS="mgmtd zebra bfdd bgpd ripd ripngd ospfd ospf6d isisd babeld pimd pim6d ldpd nhrpd eigrpd sharpd pbrd staticd fabricd vrrpd pathd"
+# 第一组修改：加入 midrd，frrinit 才能按 daemons 文件启动它。
+DAEMONS="mgmtd zebra bfdd bgpd ripd ripngd ospfd ospf6d isisd babeld pimd pim6d ldpd nhrpd eigrpd sharpd pbrd staticd fabricd vrrpd pathd midrd"
 RELOAD_SCRIPT="$D_PATH/frr-reload.py"
 
 #

@@ -650,6 +650,20 @@ static int connect_peer_now(struct midr_transport *transport,
 		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 		return ret;
 	}
+	/* 第一组修改：overlay 会话是多跳的，不绑定监听地址时内核会选出口链路地址作源，
+	 * 对端就认不出这是它请求过的会话（BGP 里对应 update-source）。 */
+	{
+		union sockunion local;
+
+		if (!endpoint_to_sockunion(&transport->config.local, &local) &&
+		    !sockunion_is_null(&local) &&
+		    sockunion_bind(fd, &local, 0, &local) < 0) {
+			ret = -errno;
+			close(fd);
+			schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
+			return ret;
+		}
+	}
 	result = sockunion_connect(fd, &peer->address,
 				   htons(peer->endpoint.port));
 	if (result == connect_success) {

@@ -62,6 +62,12 @@ struct midr_context *midr_context_get_default(void)
 
 static FRR_NORETURN void midrd_terminate(int status);
 
+/* 第一组新增：第一组（发现/测量/选群）与第二组同进程运行，midrd 在运行时就绪后调它
+ * 初始化、退出前调它收尾。弱符号让不含第一组的独立构建和组件测试照常链接。 */
+void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
+	__attribute__((weak));
+void midr_group1_terminate(void) __attribute__((weak));
+
 static void midrd_sighup(void)
 {
 	zlog_info("SIGHUP received and ignored");
@@ -175,6 +181,48 @@ static uint32_t peer_node_id(const struct midr_context *daemon,
 		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint, peer))
 			return daemon->peers[i].node_id;
 	return 0;
+}
+
+/* 第一组新增：midr-session.h 的实现所需的端点换算与查找。 */
+static struct midrd_peer_config *
+session_peer(struct midr_context *daemon,
+	     const struct midr_transport_endpoint *peer)
+{
+	for (size_t i = 0; daemon && peer && i < daemon->peer_count; i++)
+		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint, peer))
+			return &daemon->peers[i];
+	return NULL;
+}
+
+static void endpoint_to_ipaddr(const struct midr_transport_endpoint *endpoint,
+			       struct ipaddr *address)
+{
+	memset(address, 0, sizeof(*address));
+	if (endpoint->family == MIDR_TRANSPORT_AF_IPV4) {
+		address->ipa_type = IPADDR_V4;
+		memcpy(&address->ipaddr_v4, endpoint->address, 4);
+	} else if (endpoint->family == MIDR_TRANSPORT_AF_IPV6) {
+		address->ipa_type = IPADDR_V6;
+		memcpy(&address->ipaddr_v6, endpoint->address, 16);
+	}
+}
+
+static int ipaddr_to_session_endpoint(const struct midr_context *daemon,
+				      const struct ipaddr *address,
+				      struct midr_transport_endpoint *endpoint)
+{
+	memset(endpoint, 0, sizeof(*endpoint));
+	if (IS_IPADDR_V4(address)) {
+		endpoint->family = MIDR_TRANSPORT_AF_IPV4;
+		memcpy(endpoint->address, &address->ipaddr_v4, 4);
+	} else if (IS_IPADDR_V6(address)) {
+		endpoint->family = MIDR_TRANSPORT_AF_IPV6;
+		memcpy(endpoint->address, &address->ipaddr_v6, 16);
+	} else {
+		return -EINVAL;
+	}
+	endpoint->port = daemon->listen.port;
+	return endpoint->family == daemon->listen.family ? 0 : -EINVAL;
 }
 
 static struct midrd_snapshot_stage *stage_for(struct midr_context *daemon,
@@ -711,7 +759,14 @@ static void on_established(void *arg,
 			   const struct midr_transport_endpoint *peer)
 {
 	struct midr_context *daemon = arg;
+	struct midrd_peer_config *config = session_peer(daemon, peer);
 
+	/* 第一组修改：会话由第一组管理时，未请求过的入向连接直接关掉，让准入策略
+	 * （如 Tier1 过滤）对被动方同样生效。建立通知等对端 HELLO 报出身份后再发。 */
+	if (daemon->session_ops && !config) {
+		(void)midr_transport_disconnect(daemon->transport, peer);
+		return;
+	}
 	printf("node=%" PRIu32 " established family=%u port=%u\n",
 	       daemon->node_id, peer->family, peer->port);
 	(void)send_hello(daemon, peer);
@@ -742,10 +797,22 @@ static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
 {
 	struct midr_context *daemon = arg;
 	struct midrd_snapshot_stage *stage = stage_for(daemon, peer, false);
+	struct midrd_peer_config *config = session_peer(daemon, peer);
 
 	stage_release(stage);
 	printf("node=%" PRIu32 " closed family=%u port=%u reason=%d\n",
 	       daemon->node_id, peer->family, peer->port, reason);
+	/* 第一组修改：已建立的会话断开时通知第一组。 */
+	if (config && config->up) {
+		config->up = false;
+		if (daemon->session_ops && daemon->session_ops->session_down) {
+			struct ipaddr remote;
+
+			endpoint_to_ipaddr(peer, &remote);
+			daemon->session_ops->session_down(daemon, &remote, reason,
+							 daemon->session_arg);
+		}
+	}
 }
 
 static void on_frame_written(void *arg,
@@ -800,6 +867,19 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			if (midr_transport_endpoint_equal(
 					&daemon->peers[i].endpoint, peer)) {
 				daemon->peers[i].node_id = node_id;
+				/* 第一组修改：HELLO 带来对端身份，此时才向第一组报会话建立
+				 * （相当于 BGP 的 OPEN）。 */
+				if (!daemon->peers[i].up && daemon->session_ops) {
+					daemon->peers[i].up = true;
+					if (daemon->session_ops->session_up) {
+						struct ipaddr remote;
+
+						endpoint_to_ipaddr(peer, &remote);
+						daemon->session_ops->session_up(
+							daemon, node_id, &remote,
+							daemon->session_arg);
+					}
+				}
 				break;
 			}
 		/* The initial snapshot may have been sent before the peer's HELLO
@@ -2556,6 +2636,101 @@ void midr_spf_consumer_unregister(struct midr_context *daemon,
 		free(consumer);
 }
 
+/* 第一组新增：midr-session.h 的实现。 */
+int midr_session_owner_register(struct midr_context *daemon,
+				const struct midr_session_ops *ops, void *arg)
+{
+	if (!daemon)
+		return -EINVAL;
+	daemon->session_ops = ops;
+	daemon->session_arg = ops ? arg : NULL;
+	return 0;
+}
+
+int midr_session_request(struct midr_context *daemon, uint32_t node_id,
+			 const struct ipaddr *remote)
+{
+	struct midr_transport_endpoint endpoint;
+	struct midrd_peer_config *config;
+	int ret;
+
+	/* node_id may be 0 until the remote HELLO names it. */
+	if (!daemon || !remote ||
+	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
+		return -EINVAL;
+	config = session_peer(daemon, &endpoint);
+	if (config) {
+		if (node_id)
+			config->node_id = node_id;
+		return 0;
+	}
+	if (daemon->peer_count == MIDRD_MAX_PEERS)
+		return -ENOSPC;
+	config = &daemon->peers[daemon->peer_count];
+	memset(config, 0, sizeof(*config));
+	config->endpoint = endpoint;
+	config->node_id = node_id;
+	daemon->peer_count++;
+	ret = midr_transport_connect(daemon->transport, &endpoint);
+	if (ret) {
+		daemon->peer_count--;
+		memset(config, 0, sizeof(*config));
+	}
+	return ret;
+}
+
+int midr_session_release(struct midr_context *daemon,
+			 const struct ipaddr *remote)
+{
+	struct midr_transport_endpoint endpoint;
+	struct midrd_peer_config *config;
+	size_t index;
+
+	if (!daemon || !remote ||
+	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
+		return -EINVAL;
+	config = session_peer(daemon, &endpoint);
+	if (!config)
+		return -ENOENT;
+	/* Forget the peer first so the close callback does not report it. */
+	index = (size_t)(config - daemon->peers);
+	daemon->peers[index] = daemon->peers[daemon->peer_count - 1];
+	memset(&daemon->peers[daemon->peer_count - 1], 0, sizeof(*config));
+	daemon->peer_count--;
+	(void)midr_transport_disconnect(daemon->transport, &endpoint);
+	stage_release(stage_for(daemon, &endpoint, false));
+	return 0;
+}
+
+bool midr_session_is_up(const struct midr_context *daemon,
+			const struct ipaddr *remote)
+{
+	struct midr_transport_endpoint endpoint;
+
+	if (!daemon || !remote ||
+	    ipaddr_to_session_endpoint(daemon, remote, &endpoint))
+		return false;
+	for (size_t i = 0; i < daemon->peer_count; i++)
+		if (midr_transport_endpoint_equal(&daemon->peers[i].endpoint,
+						  &endpoint))
+			return daemon->peers[i].up;
+	return false;
+}
+
+uint32_t midr_context_node_id(const struct midr_context *daemon)
+{
+	return daemon ? daemon->node_id : 0;
+}
+
+bool midr_context_listen_address(const struct midr_context *daemon,
+				 struct ipaddr *address)
+{
+	if (!daemon || !address)
+		return false;
+	endpoint_to_ipaddr(&daemon->listen, address);
+	return !ipaddr_is_zero(address);
+}
+
 static void local_ipc_disconnect(void *arg, int reason)
 {
 	struct midr_context *daemon = arg;
@@ -3132,6 +3307,9 @@ static FRR_NORETURN void midrd_terminate(int status)
 		event_cancel(&daemon->poll_event);
 		event_cancel(&daemon->hello_event);
 		event_cancel(&daemon->keepalive_event);
+		/* 第一组修改：先让第一组停下，再撤销对象、关闭会话。 */
+		if (midr_group1_terminate)
+			midr_group1_terminate();
 		shutdown_withdraw(daemon);
 		printf("midrd node=%" PRIu32 " final-objects=%zu\n",
 		       daemon->node_id, midr_engine_count(daemon->engine));
@@ -3347,6 +3525,10 @@ int main(int argc, char **argv, char **envp)
 	       transport_config.local.port);
 	drain_events(&daemon, NULL);
 	midrd_runtime = &daemon;
+	/* 第一组修改：记下监听端点供会话接口使用，并在读配置前初始化第一组。 */
+	daemon.listen = transport_config.local;
+	if (midr_group1_init)
+		midr_group1_init(daemon.master, &daemon);
 	(void)fflush(NULL);
 	frr_config_fork();
 	event_add_timer_msec(daemon.master, midrd_hello_timer, &daemon,
