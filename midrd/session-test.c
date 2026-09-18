@@ -370,6 +370,48 @@ static void test_shared_address_three_nodes(void)
 	side_destroy(&c);
 }
 
+static void test_internal_reset_preserves_intent(void)
+{
+	struct session_side left, right;
+	struct midr_session_endpoint left_public =
+		session_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(8));
+	struct midr_session_endpoint right_public =
+		session_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(9));
+	struct midr_transport_endpoint right_transport =
+		transport_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(9));
+	struct midr_session_status status;
+	unsigned int left_established;
+	unsigned int right_established;
+	uint64_t first_generation;
+
+	side_create(&left, 601, MIDR_TRANSPORT_AF_IPV4, test_port(8));
+	side_create(&right, 602, MIDR_TRANSPORT_AF_IPV4, test_port(9));
+	assert(midr_session_connect(&left.ctx, &right_public) == 0);
+	assert(midr_session_connect(&right.ctx, &left_public) == 0);
+	wait_established(&left, &right);
+	left_established = left.state.protocol_established;
+	right_established = right.state.protocol_established;
+	first_generation = left.state.generation;
+	assert(midr_session_manager_reset(left.manager, &right_transport,
+					  -ENOMEM) == 0);
+	assert(left.state.protocol_closed == 1);
+	assert(midr_session_status_get(&left.ctx, &right_public, &status) == 0);
+	assert(status.state == MIDR_SESSION_DOWN && status.last_error == -ENOMEM);
+	for (unsigned int i = 0;
+	     i < 500 &&
+	     (left.state.protocol_established == left_established ||
+	      right.state.protocol_established == right_established);
+	     i++)
+		poll_pair(&left, &right);
+	assert(left.state.protocol_established > left_established);
+	assert(right.state.protocol_established > right_established);
+	assert(left.state.generation > first_generation);
+	assert(midr_session_status_get(&left.ctx, &right_public, &status) == 0);
+	assert(status.state == MIDR_SESSION_ESTABLISHED);
+	side_destroy(&left);
+	side_destroy(&right);
+}
+
 int main(void)
 {
 	struct midr_session_endpoint invalid = {0};
@@ -380,6 +422,7 @@ int main(void)
 	test_unregistered_inbound();
 	test_reconnect_identity_binding();
 	test_shared_address_three_nodes();
+	test_internal_reset_preserves_intent();
 	puts("midrd session tests: PASS");
 	return 0;
 }

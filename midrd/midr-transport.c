@@ -992,6 +992,20 @@ int midr_transport_promote(struct midr_transport *transport,
 	return 0;
 }
 
+int midr_transport_reset(struct midr_transport *transport,
+			 const struct midr_transport_endpoint *endpoint, int reason)
+{
+	struct midr_transport_peer *peer;
+
+	if (!transport || !endpoint || reason >= 0)
+		return -EINVAL;
+	peer = find_peer(transport, endpoint);
+	if (!peer || !peer->desired)
+		return -ENOENT;
+	close_peer(transport, peer, reason);
+	return 0;
+}
+
 int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_endpoint *endpoint,
 			const struct midr_transport_frame *frame)

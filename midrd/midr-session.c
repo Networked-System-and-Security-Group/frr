@@ -580,6 +580,20 @@ int midr_session_manager_request_static(
 	return request_source(manager, peer, MIDR_SESSION_SOURCE_STATIC);
 }
 
+int midr_session_manager_reset(
+	struct midr_session_manager *manager,
+	const struct midr_transport_endpoint *endpoint, int reason)
+{
+	const struct midr_session_peer *peer;
+
+	if (!manager || !endpoint || reason >= 0)
+		return -EINVAL;
+	peer = peer_find_const(manager, endpoint);
+	if (!peer || !peer->sources)
+		return -ENOENT;
+	return midr_transport_reset(manager->transport, endpoint, reason);
+}
+
 int midr_session_connect(struct midr_context *ctx,
 			 const struct midr_session_endpoint *remote)
 {

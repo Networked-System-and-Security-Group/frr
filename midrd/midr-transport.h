@@ -136,6 +136,8 @@ int midr_transport_disconnect(struct midr_transport *transport,
 int midr_transport_promote(struct midr_transport *transport,
 			   const struct midr_transport_endpoint *from,
 			   const struct midr_transport_endpoint *to);
+int midr_transport_reset(struct midr_transport *transport,
+			 const struct midr_transport_endpoint *peer, int reason);
 int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_endpoint *peer,
 			const struct midr_transport_frame *frame);
