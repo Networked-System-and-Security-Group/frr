@@ -811,6 +811,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			ret = age_object_lifetime(daemon,
 						 &stage->objects[stage->count],
 						 frame->received_ns, now_ns, 0);
+			if (ret == -ESTALE)
+				return 0;
 			if (ret)
 				return ret;
 			stage->received_ns[stage->count] = now_ns;
@@ -833,6 +835,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			now_ns = mono_ns();
 			ret = age_object_lifetime(daemon, &object, frame->received_ns,
 						 now_ns, 0);
+			if (ret == -ESTALE)
+				return 0;
 			if (ret)
 				return ret;
 			/* Incremental objects received before EoR belong to the same
@@ -922,6 +926,10 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					ret = age_object_lifetime(
 						daemon, &stage->objects[i],
 						stage->received_ns[i], now_ns, 0);
+					if (ret == -ESTALE) {
+						ret = 0;
+						continue;
+					}
 					if (ret)
 						break;
 					ret = midr_engine_apply(daemon->engine,
@@ -941,6 +949,10 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					ret = age_object_lifetime(
 						daemon, &stage->updates[i],
 						stage->update_received_ns[i], now_ns, 0);
+					if (ret == -ESTALE) {
+						ret = 0;
+						continue;
+					}
 					if (ret)
 						break;
 					ret = midr_engine_apply(daemon->engine,
