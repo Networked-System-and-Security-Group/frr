@@ -663,28 +663,45 @@ static void drain_events(struct midr_context *daemon,
 	drain_consumer(daemon);
 }
 
-static void send_snapshot(struct midr_context *daemon,
-			  const struct midr_transport_endpoint *peer)
+static int send_snapshot(struct midr_context *daemon,
+			 const struct midr_transport_endpoint *peer)
 {
 	struct midr_core_object *objects;
 	uint64_t snapshot_ns;
 	size_t count = 0;
+	int ret;
 
-	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
+	ret = send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
+	if (ret)
+		return ret;
 	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
+	if (!objects)
+		return -ENOMEM;
 	snapshot_ns = mono_ns();
-	if (objects && midr_engine_snapshot(daemon->engine,
-					    snapshot_ns / 1000000U, objects,
-					    MIDRD_MAX_SNAPSHOT, &count) == 0)
-		for (size_t i = 0; i < count; i++)
-			if (objects[i].state == MIDR_CORE_ACTIVE &&
-			    midr_engine_export(daemon->engine, &objects[i],
-					       peer_node_id(daemon, peer)))
-				(void)send_snapshot_object(daemon, peer, &objects[i],
-						   snapshot_ns);
+	ret = midr_engine_snapshot(daemon->engine, snapshot_ns / 1000000U,
+				   objects, MIDRD_MAX_SNAPSHOT, &count);
+	if (ret)
+		goto done;
+	for (size_t i = 0; i < count; i++) {
+		if (objects[i].state != MIDR_CORE_ACTIVE ||
+		    !midr_engine_export(daemon->engine, &objects[i],
+					peer_node_id(daemon, peer)))
+			continue;
+		ret = send_snapshot_object(daemon, peer, &objects[i], snapshot_ns);
+		if (ret == -ESTALE) {
+			ret = 0;
+			continue;
+		}
+		if (ret)
+			goto done;
+	}
+	ret = send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
+	if (!ret)
+		ret = send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
+
+done:
 	free(objects);
-	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
-	(void)send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
+	return ret;
 }
 
 static void on_consumer_event(void *arg,
@@ -709,12 +726,21 @@ static void on_established(void *arg,
 			   uint32_t remote_node_id, uint64_t generation)
 {
 	struct midr_context *daemon = arg;
+	int ret;
 
 	printf("node=%" PRIu32 " established remote=%" PRIu32
 	       " family=%u port=%u generation=%" PRIu64 "\n",
 	       daemon->node_id, remote_node_id, peer->family, peer->port,
 	       generation);
-	send_snapshot(daemon, peer);
+	ret = send_snapshot(daemon, peer);
+	if (ret) {
+		fprintf(stderr,
+			"node=%" PRIu32 " snapshot-send-failed remote=%" PRIu32
+			" family=%u port=%u generation=%" PRIu64 " error=%d\n",
+			daemon->node_id, remote_node_id, peer->family, peer->port,
+			generation, ret);
+		(void)midr_session_manager_reset(daemon->sessions, peer, ret);
+	}
 }
 
 static int stage_queue_update(struct midrd_snapshot_stage *stage,

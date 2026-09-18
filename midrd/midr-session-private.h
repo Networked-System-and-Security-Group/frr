@@ -47,6 +47,9 @@ void midr_session_manager_destroy(struct midr_session_manager **manager);
 int midr_session_manager_request_static(
 	struct midr_session_manager *manager,
 	const struct midr_transport_endpoint *peer);
+int midr_session_manager_reset(
+	struct midr_session_manager *manager,
+	const struct midr_transport_endpoint *peer, int reason);
 void midr_session_manager_foreach_established(
 	struct midr_session_manager *manager, midr_session_peer_cb callback,
 	void *arg);
