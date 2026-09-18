@@ -41,7 +41,31 @@
 #include <time.h>
 #include <unistd.h>
 
+struct vrf;
+extern void vrf_init(int (*create)(struct vrf *),
+		     int (*enable)(struct vrf *),
+		     int (*disable)(struct vrf *),
+		     int (*destroy)(struct vrf *));
+extern void vrf_terminate(void);
+
 static struct midr_context *midrd_runtime;
+static bool midrd_vrf_initialized;
+
+static void midrd_vrf_init(void)
+{
+	if (midrd_vrf_initialized)
+		return;
+	vrf_init(NULL, NULL, NULL, NULL);
+	midrd_vrf_initialized = true;
+}
+
+static void midrd_vrf_terminate(void)
+{
+	if (!midrd_vrf_initialized)
+		return;
+	vrf_terminate();
+	midrd_vrf_initialized = false;
+}
 
 struct midr_spf_results {
 	size_t references;
@@ -3195,6 +3219,7 @@ static FRR_NORETURN void midrd_terminate(int status)
 	if (midrd_di.pid_file)
 		(void)unlink(midrd_di.pid_file);
 	midrd_runtime = NULL;
+	midrd_vrf_terminate();
 	frr_fini();
 	exit(status);
 }
@@ -3395,9 +3420,11 @@ int main(int argc, char **argv, char **envp)
 		snprintf(frr_zclientpath, sizeof(frr_zclientpath), "%s",
 			 zserv_path);
 	daemon.master = frr_init();
+	midrd_vrf_init();
 	transport_config.master = daemon.master;
 	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
+		midrd_vrf_terminate();
 		frr_fini();
 		return 1;
 	}
@@ -3492,6 +3519,7 @@ int main(int argc, char **argv, char **envp)
 
 fail:
 	midr_context_finish(&daemon);
+	midrd_vrf_terminate();
 	frr_fini();
 	return exit_status;
 }
