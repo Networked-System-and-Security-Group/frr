@@ -10,6 +10,13 @@
 # lo so that the proto-199 routes installed into the Linux FIB really forward:
 # A reaches C's prefix through B and vice versa.
 #
+# After the IPv4 case the same three nodes are re-deployed over IPv6
+# point-to-point links (2001:db8:77:x::/64) in a second lab (midr-dp-int6):
+#   A(2001:db8:77:1::1) === B(2001:db8:77:1::2 / 2001:db8:77:2::1) === C(2001:db8:77:2::2)
+# with IPv6 MIDR prefixes on lo (2001:db8:1x::1/128) and IPv6 --link-addr
+# nexthops, so the joint acceptance exercises the IPv6 data plane end to end
+# as well (forwarding sysctls, lladdr family matching, nexthop-group FIB form).
+#
 # Run as root on the docker host (containerlab + docker required).  Logs are
 # kept under $MIDRD_INTEGRATION_LOG (default /tmp/midrd-dp-integration).
 set -euo pipefail
@@ -129,6 +136,73 @@ topology:
 EOF
 }
 
+# IPv6 variant of the same A-B-C chain.  The transit node must forward IPv6, so
+# every node enables net.ipv6.conf.all.forwarding (and the per-interface knob);
+# the point-to-point addresses use nodad to keep the links usable immediately.
+# The listen/peer endpoints are bracketed IPv6 literals, which is also what makes
+# midrd derive an IPv6 transport family and accept the IPv6 --link-addr nexthops.
+make_topology6() {
+	local topo=$1 a_listen=$2 b_listen=$3 c_listen=$4
+	local a_peer=$5 b_peer=$6 b_to_c=$7 c_peer=$8
+	local za='LD_LIBRARY_PATH=/opt/midrd-dp/lib /opt/midrd-dp/bin/zebra'
+
+	cat >"$topo" <<EOF
+name: $LAB
+topology:
+  nodes:
+    a:
+      kind: linux
+      image: $IMAGE
+      binds:
+        - $RUNTIME/bin:/opt/midrd-dp/bin:ro
+        - $RUNTIME/lib:/opt/midrd-dp/lib:ro
+      cmd: sleep infinity
+      exec:
+        - sh -lc 'sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1'
+        - ip addr add 2001:db8:77:1::1/64 dev eth1 nodad
+        - sh -lc 'sysctl -w net.ipv6.conf.eth1.forwarding=1 || true'
+        - ip addr add 2001:db8:11::1/128 dev lo
+        - sh -lc 'printf "hostname a\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
+        - sleep 1
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 101 --listen $a_listen --peer $a_peer --group 1 --prefix 2001:db8:11::1/128 --link 102:5 --link-addr 102:2001:db8:77:1::2 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+    b:
+      kind: linux
+      image: $IMAGE
+      binds:
+        - $RUNTIME/bin:/opt/midrd-dp/bin:ro
+        - $RUNTIME/lib:/opt/midrd-dp/lib:ro
+      cmd: sleep infinity
+      exec:
+        - sh -lc 'sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1'
+        - ip addr add 2001:db8:77:1::2/64 dev eth1 nodad
+        - ip addr add 2001:db8:77:2::1/64 dev eth2 nodad
+        - sh -lc 'sysctl -w net.ipv6.conf.eth1.forwarding=1 || true'
+        - sh -lc 'sysctl -w net.ipv6.conf.eth2.forwarding=1 || true'
+        - ip addr add 2001:db8:12::1/128 dev lo
+        - sh -lc 'printf "hostname b\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
+        - sleep 1
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 102 --listen $b_listen --peer $b_peer --peer $b_to_c --group 1 --prefix 2001:db8:12::1/128 --link 101:5 --link 103:7 --link-addr 101:2001:db8:77:1::1 --link-addr 103:2001:db8:77:2::2 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+    c:
+      kind: linux
+      image: $IMAGE
+      binds:
+        - $RUNTIME/bin:/opt/midrd-dp/bin:ro
+        - $RUNTIME/lib:/opt/midrd-dp/lib:ro
+      cmd: sleep infinity
+      exec:
+        - sh -lc 'sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1'
+        - ip addr add 2001:db8:77:2::2/64 dev eth1 nodad
+        - sh -lc 'sysctl -w net.ipv6.conf.eth1.forwarding=1 || true'
+        - ip addr add 2001:db8:13::1/128 dev lo
+        - sh -lc 'printf "hostname c\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
+        - sleep 1
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 103 --listen $c_listen --peer $c_peer --group 1 --prefix 2001:db8:13::1/128 --link 102:7 --link-addr 102:2001:db8:77:2::1 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+  links:
+    - endpoints: ["a:eth1", "b:eth1"]
+    - endpoints: ["b:eth2", "c:eth1"]
+EOF
+}
+
 wait_node_log() {
 	local n=$1 pattern=$2 timeout=$3
 	local i
@@ -203,7 +277,9 @@ nexec_cat() { nexec "$1" "cat /tmp/midrd.log" 2>/dev/null || true; }
 RUN="$RUNTIME/run"
 rm -rf "$RUN"
 mkdir -p "$RUN"
-TOPO="$RUN/topology.clab.yaml"
+TOPO4="$RUN/topology.clab.yaml"
+TOPO6="$RUN/topology6.clab.yaml"
+TOPO="$TOPO4"
 
 echo "=== MIDR group-3 three-node containerlab integration ==="
 echo "image=$IMAGE lab=$LAB runtime=$RUNTIME"
@@ -215,7 +291,10 @@ make_topology "$TOPO" \
 	"10.77.1.2:$((BASE_PORT + 1))" "10.77.1.1:$BASE_PORT" \
 	"10.77.2.2:$((BASE_PORT + 2))" "10.77.2.1:$((BASE_PORT + 1))"
 
-cleanup_case() { containerlab destroy --topo "$TOPO" --cleanup >/dev/null 2>&1 || true; }
+cleanup_case() {
+	containerlab destroy --topo "$TOPO4" --cleanup >/dev/null 2>&1 || true
+	containerlab destroy --topo "$TOPO6" --cleanup >/dev/null 2>&1 || true
+}
 trap cleanup_case EXIT
 
 hdr "1. deploy and wait for SPF convergence"
@@ -295,10 +374,141 @@ ping_midr_path() {
 	return 1
 }
 
+# IPv6 twin of ping_midr_path: the source is the node's own IPv6 MIDR prefix
+# (bound with ping6 -I), and the route lookup must resolve over the data link
+# rather than the containerlab management network.
+ping6_midr_path() {
+	local node=$1 src=$2 dev=$3 target=$4 label=$5
+	local i route_get
+
+	for ((i = 0; i < 5; i++)); do
+		route_get=$(nexec "$node" "ip -6 route get $target from $src" 2>/dev/null ||
+			true)
+		if [[ $route_get == *"dev $dev"* ]] &&
+			nexec "$node" "ping6 -c 3 -W 2 -I $src $target" >/dev/null 2>&1; then
+			ok "ping6 $label (source $src over $dev)"
+			return 0
+		fi
+		sleep 1
+	done
+	bad "ping6 $label failed over the MIDR path"
+	echo "    route get $target from $src: ${route_get:-<none>}" >&2
+	nexec "$node" "ip -6 route show proto $PROTO" >&2 || true
+	nexec "$node" "ip nexthop show" >&2 || true
+	return 1
+}
+
+# Spot check that the two address families do not bleed into each other: the
+# IPv4 proto-199 table must not carry any 2001: prefix and the IPv6 proto-199
+# table must not carry any 10.0.x MIDR prefix.
+v6_leak_check() {
+	local node=$1 v4 v6
+
+	v4=$(nexec "$node" "ip route show proto $PROTO" 2>/dev/null || true)
+	v6=$(nexec "$node" "ip -6 route show proto $PROTO" 2>/dev/null || true)
+	if [[ $v4 == *"2001:"* ]]; then
+		bad "IPv6 node $node: IPv6 prefix leaked into the IPv4 proto-$PROTO table"
+		return 1
+	fi
+	if [[ $v6 == *"10.0."* ]]; then
+		bad "IPv6 node $node: IPv4 prefix present in the IPv6 proto-$PROTO table"
+		return 1
+	fi
+	ok "IPv6 node $node: no cross-family leak in the proto-$PROTO tables"
+}
+
 ping_midr_path a 10.0.1.1 eth1 10.0.3.3 "a -> 10.0.3.3 (c prefix over b)" || true
 ping_midr_path c 10.0.3.3 eth1 10.0.1.1 "c -> 10.0.1.1 (a prefix over b)" || true
 
 hdr "5. destroy leaves nothing behind"
+containerlab destroy --topo "$TOPO" --cleanup >/dev/null 2>&1 || true
+leftover=$(docker ps -a --filter "name=clab-${LAB}-" --format '{{.Names}}' 2>/dev/null || true)
+if [[ -z "$leftover" ]]; then
+	ok "no clab-$LAB containers left"
+else
+	bad "leftover containers: $leftover"
+fi
+
+# ---------------------------------------------------------------------------
+# IPv6 case: same three-node topology, IPv6 point-to-point links and IPv6 MIDR
+# prefixes, in its own lab so the IPv4 case above stays untouched.
+# ---------------------------------------------------------------------------
+LAB=midr-dp-int6
+TOPO="$TOPO6"
+make_topology6 "$TOPO" \
+	"[2001:db8:77:1::1]:$BASE_PORT" "[::]:$((BASE_PORT + 1))" \
+	"[2001:db8:77:2::2]:$((BASE_PORT + 2))" \
+	"[2001:db8:77:1::2]:$((BASE_PORT + 1))" "[2001:db8:77:1::1]:$BASE_PORT" \
+	"[2001:db8:77:2::2]:$((BASE_PORT + 2))" "[2001:db8:77:2::1]:$((BASE_PORT + 1))"
+
+echo
+echo "--- IPv6 case: lab=$LAB topo=$TOPO"
+
+hdr "6. IPv6: deploy and wait for SPF convergence"
+if containerlab deploy --topo "$TOPO" --reconfigure >/dev/null 2>&1; then
+	ok "IPv6 containerlab deploy"
+else
+	bad "IPv6 containerlab deploy failed"
+	containerlab destroy --topo "$TOPO" --cleanup >/dev/null 2>&1 || true
+	exit 1
+fi
+
+converged=1
+for n in a b c; do
+	if wait_node_log "$n" 'spf generation=.* routes=3' 60; then
+		ok "IPv6 node $n: spf generation routes=3"
+	else
+		bad "IPv6 node $n: no spf generation routes=3"
+		converged=0
+	fi
+done
+sleep 1
+for n in a b c; do nexec_cat "$n" >"$RUN/$n.v6.log"; done
+if [[ "$converged" != 1 ]]; then
+	for n in a b c; do
+		echo "--- IPv6 $n" >&2
+		tail -30 "$RUN/$n.v6.log" >&2
+	done
+	exit 1
+fi
+
+hdr "7. IPv6: proto-$PROTO FIB per node matches the SPF expectation"
+# node a reaches b and c through b (2001:db8:77:1::2).  ip -6 route show prints
+# the /128 host prefixes without the length suffix, so match the bare address.
+for spec in "a 2001:db8:12::1 2001:db8:77:1::2" \
+	    "a 2001:db8:13::1 2001:db8:77:1::2" \
+	    "b 2001:db8:11::1 2001:db8:77:1::1" \
+	    "b 2001:db8:13::1 2001:db8:77:2::2" \
+	    "c 2001:db8:11::1 2001:db8:77:2::1" \
+	    "c 2001:db8:12::1 2001:db8:77:2::1"; do
+	set -- $spec
+	if wait_fib_nh "$1" "$2" "$3" 20; then
+		ok "IPv6 node $1: route $2 via $3"
+	else
+		bad "IPv6 node $1: missing route $2 via $3"
+		echo "--- IPv6 node $1 proto-$PROTO FIB:" >&2
+		node_fib "$1" >&2 || true
+	fi
+done
+
+hdr "8. IPv6: node b forwards towards c"
+if wait_fib_nh b 2001:db8:13::1 2001:db8:77:2::2 20; then
+	ok "IPv6 node b: c prefix 2001:db8:13::1 via 2001:db8:77:2::2"
+else
+	bad "IPv6 node b: no route towards c prefix"
+	node_fib b >&2 || true
+fi
+
+hdr "9. IPv6: true end-to-end forwarding over the MIDR path"
+ping6_midr_path a 2001:db8:11::1 eth1 2001:db8:13::1 "a -> 2001:db8:13::1 (c prefix over b)" || true
+ping6_midr_path c 2001:db8:13::1 eth1 2001:db8:11::1 "c -> 2001:db8:11::1 (a prefix over b)" || true
+
+hdr "10. IPv6: no cross-family leakage in the proto-$PROTO tables"
+for n in a b c; do
+	v6_leak_check "$n" || true
+done
+
+hdr "11. IPv6: destroy leaves nothing behind"
 containerlab destroy --topo "$TOPO" --cleanup >/dev/null 2>&1 || true
 leftover=$(docker ps -a --filter "name=clab-${LAB}-" --format '{{.Names}}' 2>/dev/null || true)
 if [[ -z "$leftover" ]]; then
