@@ -4,7 +4,9 @@
 
 数据面迁移后的构建分三档：FRR 顶层 autotools 构建（权威严格构建）、
 `midrd` 独立组件套件（含数据面单测与边界扫描）、以及容器内同步/构建流程。
-顶层构建与组件套件均已在本周期验证通过。
+顶层构建与组件套件均已在本周期验证通过；此外新增第三组 ZAPI/FIB smoke
+（`midrd/r7-dp-fib-smoke.sh`），在构建容器内用真实 zebra + 真实内核 FIB 验证完整
+ZAPI/FIB 链路，**不依赖第二组会话层**（见第 4.1 节）。
 
 ## 2. 范围
 
@@ -13,6 +15,8 @@
 - `midrd/dp-backend-test.c`（包裹 `zclient_route_send`，无需真实 zebra）。
 - harness 构建产物 `midrd-gre-tool`（`gre-link-tool.c`）与
   `midrd-dp-e2e-tool`（`dp-e2e-tool.c`）。
+- 第三组 ZAPI/FIB smoke `midrd/r7-dp-fib-smoke.sh`（构建容器内 root，真实 zebra +
+  真实内核 FIB）。
 - 容器内源码同步与构建命令。
 
 ## 3. FRR 顶层构建
@@ -27,7 +31,7 @@ make -j112                     # 期望 EXIT=0，0 警告/错误
 | --- | --- |
 | 命令 | `make -j112` |
 | 结果 | EXIT=0，0 警告/错误 |
-| 日志 | 容器 `frr-ubuntu24-ymy` 的 `/tmp/build-full.log` |
+| 日志 | 容器 `frr-ubuntu24-ymy` 的 `/tmp/verify-build.log` |
 | 状态 | 已验证 |
 
 顶层 `Makefile.am` 第 138-166 行把 `midrd/midrd` 加入 `sbin_PROGRAMS`，并在
@@ -58,7 +62,7 @@ make -j112 BUILD_DIR=/tmp/midrd-build test
 | --- | --- |
 | 命令 | `make -j112 BUILD_DIR=/tmp/midrd-build test` |
 | 结果 | 25 个程序全部 PASS，含 `midrd-dp-test: PASS`、`standalone libfrr boundary scan: PASS`，EXIT=0 |
-| 日志 | 容器 `/tmp/verify-comp.log` |
+| 日志 | 容器 `/tmp/verify-comp.log`、`/tmp/final-comp.log` |
 | 状态 | 已验证 |
 
 单独运行数据面单测：
@@ -75,6 +79,35 @@ make -j112 BUILD_DIR=/tmp/midrd-build test
 - `test_adapter_pipeline_and_recovery()`：READY 安装、同 generation resync
   no-op、zebra 重连 replay、deferred 失败两步恢复；
 - `test_gre_api()`：GRE API 的校验路径（NULL/族不一致/无 zclient/无后端）。
+
+### 4.1 第三组 ZAPI/FIB smoke（`midrd/r7-dp-fib-smoke.sh`）
+
+```sh
+# 容器 frr-ubuntu24-ymy 内，root
+bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
+```
+
+该脚本在构建容器内启动真实、新构建的 zebra 于私有 ZAPI socket，用
+`midrd-dp-e2e-tool` 驱动，落到真实内核 FIB；**不使用 MIDR 会话/洪泛层**，因此
+数据面可独立于第二组验收。
+
+| 项 | 值 |
+| --- | --- |
+| 命令 | `bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh` |
+| 结果 | `=== summary: PASS=15 FAIL=0 ===`，末行 `third-group ZAPI/FIB smoke: PASS`，EXIT=0 |
+| 日志 | 容器 `/tmp/fib-smoke.log` |
+| 状态 | 已验证 |
+
+覆盖（详见 `dp-03-e2e-and-integration.md` 第 3.1 节）：直接 facade add/delete（递归
+nexthop，proto 199 + `ip route get`）；完整 TED → SPF → adapter → backend → ZAPI →
+zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 形状（IPv6 用
+`ip -6 route show proto 199` 检查）；去重与替换。
+
+> **FIB 断言须同时解析两种安装形式（group-aware）**：zebra 既可能内联安装
+> （路由行含 `via N`），也可能经 nexthop group 安装（路由行含 `nhid N`）。断言
+> 必须先取 `nhid`，再用 `ip nexthop show id <nhid>` 展开，并跟随 `group` 列表继续
+> 展开成员 nexthop（`midrd/r7-dp-fib-smoke.sh` 第 80-101 行的 `fib_nhid()`/
+> `fib_nh_list()`）。只匹配单一形式曾造成多次误报失败。
 
 ## 5. 两阶段边界扫描
 
@@ -144,18 +177,22 @@ docker exec -u root frr-ubuntu24-ymy bash -lc '
 
 | 日志 | 内容 | 位置 |
 | --- | --- | --- |
-| `/tmp/build-full.log` | FRR 顶层 `make -j112` 输出 | 容器 `frr-ubuntu24-ymy` |
-| `/tmp/verify-comp.log` | `midrd` 组件套件输出 | 容器 `frr-ubuntu24-ymy` |
+| `/tmp/verify-build.log` | FRR 顶层 `make -j112` 输出 | 容器 `frr-ubuntu24-ymy` |
+| `/tmp/verify-comp.log`、`/tmp/final-comp.log` | `midrd` 组件套件输出 | 容器 `frr-ubuntu24-ymy` |
 | `/tmp/midrd-build/` | 独立组件构建目录 | 容器 `frr-ubuntu24-ymy` |
+| `/tmp/fib-smoke.log` | 第三组 ZAPI/FIB smoke | 容器 `frr-ubuntu24-ymy` |
 | `/tmp/fib-final.log`、`/tmp/midrd-dp-zapi-fib/run/` | group-3 隔离 ZAPI/FIB | 容器 `frr-ubuntu24-ymy` |
-| `/tmp/gre-run/test2.log` | 双容器 GRE 连通性 | docker 宿主 |
+| `/tmp/verify-integration.log` | 三节点 containerlab 联合测试 | docker 宿主 |
+| `/tmp/gre-test.log` | 双容器 GRE 连通性 | docker 宿主 |
 
 ## 8. 证据
 
 | 验证 | 结果 | 证据 |
 | --- | --- | --- |
-| FRR 顶层构建 | EXIT=0，0 errors/0 warnings | `/tmp/build-full.log`（容器 `frr-ubuntu24-ymy`） |
-| midrd 组件套件 | 25 程序 PASS，含 `midrd-dp-test: PASS`、`standalone libfrr boundary scan: PASS`，EXIT=0 | `/tmp/verify-comp.log`（容器 `frr-ubuntu24-ymy`） |
+| FRR 顶层构建 | EXIT=0，0 errors/0 warnings | `/tmp/verify-build.log`（容器 `frr-ubuntu24-ymy`） |
+| midrd 组件套件 | 25 程序 PASS，含 `midrd-dp-test: PASS`、`standalone libfrr boundary scan: PASS`，EXIT=0 | `/tmp/verify-comp.log`、`/tmp/final-comp.log`（容器 `frr-ubuntu24-ymy`） |
+| 第三组 ZAPI/FIB smoke | `PASS=15 FAIL=0`，`third-group ZAPI/FIB smoke: PASS`，EXIT=0 | `midrd/r7-dp-fib-smoke.sh`；`/tmp/fib-smoke.log`（容器 `frr-ubuntu24-ymy`） |
+| FIB 断言（group-aware） | 同时解析内联 `via N` 与 `nhid N` | `midrd/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
 | deferred-batch 恢复 | 缺陷已修复；先重试保留批再 resync | `midrd/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
 | 单测覆盖 | 编码模式、失败 abort、adapter 恢复、GRE 校验路径 | `midrd/dp-backend-test.c` |
 | 边界门禁 | 两阶段编译 + 源扫描 | `midrd/extraction-boundary-test.sh` |

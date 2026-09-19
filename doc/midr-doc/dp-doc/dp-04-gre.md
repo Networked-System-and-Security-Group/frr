@@ -5,7 +5,8 @@
 `midrd/midr-gre.{c,h}` 是 MIDR 控制面创建/删除 GRE 虚拟接口的唯一入口，由
 旧 `bgpd/bgp_midr_gre.c` 移植而来。它复用数据面后端的 zclient，经
 `ZEBRA_GRE_ADD/DELETE` 交给 zebra，最终由 netlink 生成 `RTM_NEWLINK` /
-`RTM_DELLINK`。真实双容器连通性已实测通过（**PASS=24 FAIL=0**），见第 5 节。
+`RTM_DELLINK`。真实双容器连通性已实测通过
+（**`=== summary: PASS=24 FAIL=0 ===`**），见第 5 节。
 
 ## 2. 范围
 
@@ -150,19 +151,21 @@ stage/midrd-gre-tool teardown --sock /tmp/zserv.api --name midr0
 bash midrd/midr-gre-connectivity-test.sh
 ```
 
-**实测结果（协调者今日执行）：PASS=24 FAIL=0。** 日志 `/tmp/gre-run/test2.log`
-（宿主）。脚本把构建容器的源码树 `midrd/gre-link-tool.c` 的产物
+**实测结果（验收执行）：`=== summary: PASS=24 FAIL=0 ===`。** 日志
+`/tmp/gre-test.log`（宿主）。脚本把构建容器的源码树 `midrd/gre-link-tool.c` 的产物
 `midrd-gre-tool` 与新构建的 zebra staged 到 `node1`/`node2` 的 `/opt/midr-dp`。
-覆盖：IPv4 GRE（`gre`）与 IPv6 GRE（`ip6gre`）均建立（`state=up` 且回报
-`ifindex`），`ip -d link show` kind 正确，IPv4 overlay 双向 ping，IPv6 overlay
-over IPv4 隧道双向 ping，重复 add / 状态查询幂等，teardown 删除全部接口。
+覆盖（24 项）：产物 staged 进两节点；两节点 zebra 运行；underlay IPv4 可达；
+IPv4 GRE（`gre`）在两节点建立（`state=up` 且回报 `ifindex`，`ip -d link show`
+kind 正确）；IPv4 与 IPv6 overlay 流量经该隧道双向 ping 通；IPv6 GRE（`ip6gre`）
+建立并承载 IPv6 流量；重复 add / 状态查询幂等；teardown 在两节点删除
+`gre1`/`gre6`。
 
 | 项 | 值 |
 | --- | --- |
 | 前置 | 两容器各运行 zebra；`/opt/midr-dp` 含 zebra + libfrr + `midrd-gre-tool`；root 在 `frrvty` 组；IPv6 用例前 `sysctl net.ipv6.conf.eth0.disable_ipv6=0` |
 | 命令 | `bash midrd/midr-gre-connectivity-test.sh`（docker 宿主，root） |
-| 结果 | PASS=24 FAIL=0（旧版同类脚本为 PASS=21） |
-| 日志 | 宿主 `/tmp/gre-run/test2.log` |
+| 结果 | `=== summary: PASS=24 FAIL=0 ===`（旧版同类脚本为 PASS=21） |
+| 日志 | 宿主 `/tmp/gre-test.log` |
 | 状态 | 已验证 |
 
 注意事项：删除请求发出后短命客户端不要立即退出（保持约 1 s），否则 zebra
@@ -191,5 +194,5 @@ over IPv4 隧道双向 ping，重复 add / 状态查询幂等，teardown 删除�
 | 旧版本 | 兄弟检出 `frr/frr`（HEAD `f8f4e81f2f`）的 `bgpd/bgp_midr_gre.{c,h}` |
 | 旧测试基线 | `frr/frr/doc/midr-doc/midr-gre-test-report.md`（21/21 PASS）、`frr/frr/doc/midr-doc/midr-gre-interface-api.md` |
 | 新测试（组件层） | `midrd/dp-backend-test.c` `test_gre_api()`（校验路径） |
-| 新测试（真实双容器） | `midrd/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-run/test2.log` |
+| 新测试（真实双容器） | `midrd/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |
 

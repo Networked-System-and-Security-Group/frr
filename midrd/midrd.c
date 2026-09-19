@@ -111,6 +111,7 @@ static const char midrd_help[] =
 	"  --group ID               Development-time local group\n"
 	"  --prefix ADDRESS/LEN     Development-time local Prefix\n"
 	"  --link NODE:COST         Development-time local Link\n"
+	"  --link-addr NODE:ADDR    Neighbour address of --link (SPF nexthop)\n"
 	"  --local-fact-socket PATH External Local Fact Provider\n"
 	"  --prefix-socket PATH     External Prefix Provider\n"
 	"  --sequence-file PATH     Persistent owner sequence file\n"
@@ -143,6 +144,7 @@ enum midrd_option {
 	MIDRD_OPT_GROUP,
 	MIDRD_OPT_PREFIX,
 	MIDRD_OPT_LINK,
+	MIDRD_OPT_LINK_ADDR,
 	MIDRD_OPT_LOCAL_FACT_SOCKET,
 	MIDRD_OPT_PREFIX_SOCKET,
 	MIDRD_OPT_SEQUENCE_FILE,
@@ -163,6 +165,7 @@ static const struct option midrd_longopts[] = {
 	{"group", required_argument, NULL, MIDRD_OPT_GROUP},
 	{"prefix", required_argument, NULL, MIDRD_OPT_PREFIX},
 	{"link", required_argument, NULL, MIDRD_OPT_LINK},
+	{"link-addr", required_argument, NULL, MIDRD_OPT_LINK_ADDR},
 	{"local-fact-socket", required_argument, NULL,
 	 MIDRD_OPT_LOCAL_FACT_SOCKET},
 	{"prefix-socket", required_argument, NULL, MIDRD_OPT_PREFIX_SOCKET},
@@ -2694,6 +2697,49 @@ static int install_local_membership(struct midr_context *daemon, uint32_t group_
 	return 0;
 }
 
+/* Neighbour address attached to a development-time static link.
+ *
+ * It becomes the Link event's remote_address, which is exactly what the SPF
+ * layer hands to the data plane as the route nexthop.  Without it a static
+ * link carries no address, the SPF result has an empty nexthop and the
+ * third-group backend correctly refuses to program a nexthop-less blackhole
+ * (it reports -EHOSTUNREACH instead). */
+struct midrd_link_addr_config {
+	uint32_t remote;
+	struct ipaddr address;
+};
+
+static int parse_link_addr(const char *text,
+			   struct midrd_link_addr_config *out)
+{
+	char copy[128], *separator, *end;
+	unsigned long remote;
+
+	if (!text || !out || strlen(text) >= sizeof(copy))
+		return -EINVAL;
+	strcpy(copy, text);
+	separator = strchr(copy, ':');
+	if (!separator)
+		return -EINVAL;
+	*separator++ = '\0';
+	errno = 0;
+	remote = strtoul(copy, &end, 10);
+	if (errno || *end || !remote || remote > UINT32_MAX)
+		return -EINVAL;
+	memset(&out->address, 0, sizeof(out->address));
+	if (strchr(separator, ':')) {
+		out->address.ipa_type = IPADDR_V6;
+		if (inet_pton(AF_INET6, separator, &out->address.ipaddr_v6) != 1)
+			return -EINVAL;
+	} else {
+		out->address.ipa_type = IPADDR_V4;
+		if (inet_pton(AF_INET, separator, &out->address.ipaddr_v4) != 1)
+			return -EINVAL;
+	}
+	out->remote = (uint32_t)remote;
+	return 0;
+}
+
 static int install_local_link(struct midr_context *daemon,
 			      const struct midrd_link_config *link)
 {
@@ -3142,6 +3188,8 @@ int main(int argc, char **argv, char **envp)
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
 	const char *zserv_path = NULL;
+	struct midrd_link_addr_config link_addrs[MIDRD_MAX_LINKS];
+	size_t link_addr_count = 0;
 	vrf_id_t vrf_id = VRF_DEFAULT;
 	bool zebra_enabled = true;
 	int runtime_sec = 0;
@@ -3180,6 +3228,13 @@ int main(int argc, char **argv, char **envp)
 			break;
 		case MIDRD_OPT_GROUP:
 			daemon.group_id = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_LINK_ADDR:
+			if (link_addr_count == MIDRD_MAX_LINKS ||
+			    parse_link_addr(optarg,
+					    &link_addrs[link_addr_count]))
+				frr_help_exit(2);
+			link_addr_count++;
 			break;
 		case MIDRD_OPT_LOCAL_FACT_SOCKET:
 			local_socket = optarg;
@@ -3252,6 +3307,46 @@ int main(int argc, char **argv, char **envp)
 				? MIDR_CORE_AF_IPV4
 				: MIDR_CORE_AF_IPV6;
 		daemon.links[i].last_cost_advertised_ms = mono_ms();
+	}
+	/* Attach the neighbour addresses supplied with --link-addr.  They are
+	 * what makes a development-time static link installable: the SPF result
+	 * carries them as nexthops. */
+	for (size_t i = 0; i < link_addr_count; i++) {
+		bool applied = false;
+
+		for (size_t j = 0; j < daemon.link_count; j++) {
+			bool address_is_v6 =
+				link_addrs[i].address.ipa_type == IPADDR_V6;
+
+			if (daemon.links[j].remote != link_addrs[i].remote)
+				continue;
+			if (address_is_v6 !=
+			    (transport_config.local.family ==
+			     MIDR_TRANSPORT_AF_IPV6)) {
+				fprintf(stderr,
+					"--link-addr %u: address family does not match the transport\n",
+					link_addrs[i].remote);
+				return 2;
+			}
+			daemon.links[j].address_family =
+				address_is_v6 ? MIDR_CORE_AF_IPV6
+					      : MIDR_CORE_AF_IPV4;
+			if (address_is_v6)
+				memcpy(daemon.links[j].remote_address,
+				       &link_addrs[i].address.ipaddr_v6,
+				       sizeof(link_addrs[i].address.ipaddr_v6));
+			else
+				memcpy(daemon.links[j].remote_address,
+				       &link_addrs[i].address.ipaddr_v4,
+				       sizeof(link_addrs[i].address.ipaddr_v4));
+			applied = true;
+		}
+		if (!applied) {
+			fprintf(stderr,
+				"--link-addr %u has no matching --link\n",
+				link_addrs[i].remote);
+			return 2;
+		}
 	}
 	transport_config.hello_interval_ms = daemon.hello_ms;
 	transport_config.hold_time_ms = daemon.hold_time_ms;

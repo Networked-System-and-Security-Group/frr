@@ -303,8 +303,10 @@ int main(int argc, char **argv)
 	}
 	midr_gre_init(ctx.master);
 
-	/* Let zclient_init()'s scheduled connect run to completion. */
-	pump(ctx.master, 500);
+	/* Let zclient_init()'s scheduled connect run to completion (up to 5 s:
+	 * the socket may exist slightly before zebra accepts clients). */
+	for (int i = 0; i < 50 && !midr_dp_backend_ready(); i++)
+		pump(ctx.master, 100);
 	if (!midr_dp_backend_ready()) {
 		fprintf(stderr, "zclient did not connect to %s\n", sock);
 		midr_dp_backend_stop();

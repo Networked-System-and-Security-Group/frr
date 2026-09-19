@@ -32,7 +32,7 @@ hdr() { echo; echo "==== $* ===="; }
 command -v containerlab >/dev/null 2>&1 || { echo 'containerlab is required' >&2; exit 2; }
 command -v docker >/dev/null 2>&1 || { echo 'docker is required' >&2; exit 2; }
 
-nexec() { docker exec "clab-${LAB}-$1" bash -c "$2"; }
+nexec() { timeout 15 docker exec "clab-${LAB}-$1" bash -c "$2"; }
 
 # fetch_lib <soname>: stage a shared library used by the built binaries.
 fetch_lib() {
@@ -93,7 +93,7 @@ topology:
         - ip addr add 10.0.1.1/32 dev lo
         - sh -lc 'printf "hostname a\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
         - sleep 1
-        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 101 --listen $a_listen --peer $a_peer --group 1 --prefix 10.0.1.1/32 --link 102:5 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 101 --listen $a_listen --peer $a_peer --group 1 --prefix 10.0.1.1/32 --link 102:5 --link-addr 102:10.77.1.2 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
     b:
       kind: linux
       image: $IMAGE
@@ -108,7 +108,7 @@ topology:
         - ip addr add 10.0.2.2/32 dev lo
         - sh -lc 'printf "hostname b\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
         - sleep 1
-        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 102 --listen $b_listen --peer $b_peer --peer $b_to_c --group 1 --prefix 10.0.2.2/32 --link 101:5 --link 103:7 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 102 --listen $b_listen --peer $b_peer --peer $b_to_c --group 1 --prefix 10.0.2.2/32 --link 101:5 --link 103:7 --link-addr 101:10.77.1.1 --link-addr 103:10.77.2.2 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
     c:
       kind: linux
       image: $IMAGE
@@ -122,7 +122,7 @@ topology:
         - ip addr add 10.0.3.3/32 dev lo
         - sh -lc 'printf "hostname c\nlog file /tmp/zebra.log\ndebug zebra kernel\n" >/tmp/zebra.conf; $za -u root -g root -f /tmp/zebra.conf -i /tmp/zebra.pid -z /tmp/zserv.api --vty_socket /tmp -d'
         - sleep 1
-        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 103 --listen $c_listen --peer $c_peer --group 1 --prefix 10.0.3.3/32 --link 102:7 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
+        - sh -lc 'export LD_LIBRARY_PATH=/opt/midrd-dp/lib; exec /opt/midrd-dp/bin/midrd --node-id 103 --listen $c_listen --peer $c_peer --group 1 --prefix 10.0.3.3/32 --link 102:7 --link-addr 102:10.77.2.1 --zserv-path /tmp/zserv.api --takeover-delay 1500 --lifetime 3000 --pidfile /tmp/midrd.pid >/tmp/midrd.log 2>&1 &'
   links:
     - endpoints: ["a:eth1", "b:eth1"]
     - endpoints: ["b:eth2", "c:eth1"]
@@ -142,11 +142,41 @@ wait_node_log() {
 	return 1
 }
 
-node_fib() { nexec "$1" "ip route show proto $PROTO" 2>/dev/null || true; }
-node_fib_has() { node_fib "$1" | grep -F -- "$2" >/dev/null 2>&1; }
-node_fib_nh() {
-	node_fib "$1" | grep -F -- "$2" | grep -F -- "$3" >/dev/null 2>&1
+node_fib() {
+	nexec "$1" "ip route show proto $PROTO" 2>/dev/null || true
+	nexec "$1" "ip -6 route show proto $PROTO" 2>/dev/null || true
 }
+node_fib_has() { node_fib "$1" | grep -F -- "$2" >/dev/null 2>&1; }
+
+# One docker exec per check: the node resolves inline ("via N") and nexthop
+# group ("nhid N") forms itself, so no nested exec can block the script.
+node_fib_check() {
+	# <node> <prefix> <nexthop>
+	nexec "$1" "
+		line=\$(ip route show proto $PROTO | grep -F -- '$2' | head -1)
+		if [ -z \"\$line\" ]; then
+			line=\$(ip -6 route show proto $PROTO | grep -F -- '$2' | head -1)
+		fi
+		[ -n \"\$line\" ] || exit 1
+		case \"\$line\" in *'$3'*) exit 0 ;; esac
+		nhid=\$(printf '%s' \"\$line\" | grep -oE 'nhid [0-9]+' | awk '{print \$2}')
+		[ -n \"\$nhid\" ] || exit 1
+		grp=\$(ip nexthop show id \"\$nhid\" 2>/dev/null |
+			grep -oE 'group [0-9,]+' | sed 's/group //' | tr ',' ' ')
+		if [ -z \"\$grp\" ]; then
+			ip nexthop show id \"\$nhid\" 2>/dev/null | grep -qF -- '$3'
+			exit \$?
+		fi
+		for id in \$grp; do
+			if ip nexthop show id \"\$id\" 2>/dev/null | grep -qF -- '$3'; then
+				exit 0
+			fi
+		done
+		exit 1
+	" 2>/dev/null
+}
+
+node_fib_nh() { node_fib_check "$1" "$2" "$3"; }
 
 # The SPF log line appears as soon as the adapter staged the batch; the route
 # reaches the Linux FIB only after the 100 ms deferred submit, the ZAPI round
@@ -227,7 +257,7 @@ for spec in "a 10.0.2.2 10.77.1.2" "a 10.0.3.3 10.77.1.2" \
 	else
 		bad "node $1: missing route $2 via $3"
 		echo "--- node $1 proto-$PROTO FIB:" >&2
-		node_fib "$1" >&2
+		node_fib "$1" >&2 || true
 	fi
 done
 
@@ -236,30 +266,37 @@ if wait_fib_nh b 10.0.3.3 10.77.2.2 20; then
 	ok "node b: c prefix 10.0.3.3 via 10.77.2.2"
 else
 	bad "node b: no route towards c prefix"
-	node_fib b >&2
+	node_fib b >&2 || true
 fi
 
-hdr "4. true end-to-end forwarding"
-# Both directions need the full path in every FIB; the pings are retried so a
-# late install cannot produce a false failure.
-ping_both() {
-	local from=$1 target=$2 label=$3
-	local i
+hdr "4. true end-to-end forwarding over the MIDR path"
+# The ping source must be the node's own MIDR prefix: the link address is not
+# routable from the far node, so a transit reply would fall back to the
+# management default route.  The source is bound so the packet cannot take the
+# management shortcut, and the route lookup must resolve over the data link.
+ping_midr_path() {
+	local node=$1 src=$2 dev=$3 target=$4 label=$5
+	local i route_get
 
 	for ((i = 0; i < 5; i++)); do
-		if nexec "$from" "ping -c 3 -W 2 $target" >/dev/null 2>&1; then
-			ok "ping $label"
+		route_get=$(nexec "$node" "ip route get $target from $src" 2>/dev/null ||
+			true)
+		if [[ $route_get == *"dev $dev"* ]] &&
+			nexec "$node" "ping -c 3 -W 2 -I $src $target" >/dev/null 2>&1; then
+			ok "ping $label (source $src over $dev)"
 			return 0
 		fi
 		sleep 1
 	done
-	bad "ping $label failed"
-	nexec "$from" "ip route show proto $PROTO" >&2 || true
+	bad "ping $label failed over the MIDR path"
+	echo "    route get $target from $src: ${route_get:-<none>}" >&2
+	nexec "$node" "ip route show proto $PROTO" >&2 || true
+	nexec "$node" "ip nexthop show" >&2 || true
 	return 1
 }
 
-ping_both a 10.0.3.3 "a -> 10.0.3.3 (c prefix over b)" || true
-ping_both c 10.0.1.1 "c -> 10.0.1.1 (a prefix over b)" || true
+ping_midr_path a 10.0.1.1 eth1 10.0.3.3 "a -> 10.0.3.3 (c prefix over b)" || true
+ping_midr_path c 10.0.3.3 eth1 10.0.1.1 "c -> 10.0.1.1 (a prefix over b)" || true
 
 hdr "5. destroy leaves nothing behind"
 containerlab destroy --topo "$TOPO" --cleanup >/dev/null 2>&1 || true
