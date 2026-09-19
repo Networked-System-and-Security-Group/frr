@@ -12,7 +12,9 @@
 
 #include "midr-cost.h"
 #include "midr-context-private.h"
+#include "midr-dp-backend.h"
 #include "midr-engine.h"
+#include "midr-gre.h"
 #include "midr-local-ipc.h"
 #include "midr-local-provider.h"
 #include "midr-prefix-provider.h"
@@ -116,6 +118,9 @@ static const char midrd_help[] =
 	"  --hold-time MS           Native session Hold Timer\n"
 	"  --runtime SEC            Stop after a bounded runtime\n"
 	"  --takeover-delay MS      Representative takeover delay\n"
+	"  --zserv-path PATH        Zebra ZAPI socket (enables route install)\n"
+	"  --vrf-id N               VRF the installed routes belong to\n"
+	"  --no-zebra               Disable the Zebra/FIB data-plane backend\n"
 	"  --pidfile PATH           Compatibility alias for --pid_file\n";
 
 /* clang-format off */
@@ -145,6 +150,9 @@ enum midrd_option {
 	MIDRD_OPT_HOLD_TIME,
 	MIDRD_OPT_RUNTIME,
 	MIDRD_OPT_TAKEOVER_DELAY,
+	MIDRD_OPT_ZEBRA_PATH,
+	MIDRD_OPT_VRF_ID,
+	MIDRD_OPT_NO_ZEBRA,
 	MIDRD_OPT_PIDFILE,
 };
 
@@ -163,6 +171,9 @@ static const struct option midrd_longopts[] = {
 	{"hold-time", required_argument, NULL, MIDRD_OPT_HOLD_TIME},
 	{"runtime", required_argument, NULL, MIDRD_OPT_RUNTIME},
 	{"takeover-delay", required_argument, NULL, MIDRD_OPT_TAKEOVER_DELAY},
+	{"zserv-path", required_argument, NULL, MIDRD_OPT_ZEBRA_PATH},
+	{"vrf-id", required_argument, NULL, MIDRD_OPT_VRF_ID},
+	{"no-zebra", no_argument, NULL, MIDRD_OPT_NO_ZEBRA},
 	{"pidfile", required_argument, NULL, MIDRD_OPT_PIDFILE},
 	{0},
 };
@@ -3010,7 +3021,11 @@ static void midr_context_finish(struct midr_context *daemon)
 
 	if (!daemon)
 		return;
-	(void)midr_zebra_backend_unregister(daemon);
+	/* GRE first: it borrows the data-plane zclient.  The backend then
+	 * unregisters, which withdraws the accepted SPF routes and flushes
+	 * immediately, before its zclient is destroyed. */
+	midr_gre_fini();
+	midr_dp_backend_stop();
 	while ((spf_consumer = daemon->spf_consumers))
 		midr_spf_consumer_unregister(daemon, &spf_consumer);
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
@@ -3126,6 +3141,9 @@ int main(int argc, char **argv, char **envp)
 	struct midr_transport_config transport_config = {0};
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
+	const char *zserv_path = NULL;
+	vrf_id_t vrf_id = VRF_DEFAULT;
+	bool zebra_enabled = true;
 	int runtime_sec = 0;
 	int exit_status = 1;
 	int opt;
@@ -3184,6 +3202,15 @@ int main(int argc, char **argv, char **envp)
 		case MIDRD_OPT_RUNTIME:
 			runtime_sec = atoi(optarg);
 			break;
+		case MIDRD_OPT_ZEBRA_PATH:
+			zserv_path = optarg;
+			break;
+		case MIDRD_OPT_VRF_ID:
+			vrf_id = (vrf_id_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_NO_ZEBRA:
+			zebra_enabled = false;
+			break;
 		case MIDRD_OPT_PIDFILE:
 			midrd_di.pid_file = optarg;
 			break;
@@ -3230,12 +3257,30 @@ int main(int argc, char **argv, char **envp)
 	transport_config.hold_time_ms = daemon.hold_time_ms;
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
+	/* libfrr derives the ZAPI endpoint from frr_zclientpath in frr_init(). */
+	if (zserv_path)
+		snprintf(frr_zclientpath, sizeof(frr_zclientpath), "%s",
+			 zserv_path);
 	daemon.master = frr_init();
 	transport_config.master = daemon.master;
 	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
 		frr_fini();
 		return 1;
+	}
+	/*
+	 * Third-group data plane: open the zclient, register the Zebra backend
+	 * and attach GRE provisioning.  The adapter starts with the backend and
+	 * installs the current committed SPF result once it is READY.
+	 */
+	if (zebra_enabled) {
+		if (midr_dp_backend_start(&daemon, daemon.master, vrf_id)) {
+			fprintf(stderr,
+				"zebra data-plane initialization failed\n");
+			exit_status = 1;
+			goto fail;
+		}
+		midr_gre_init(daemon.master);
 	}
 	if (prefix_socket) {
 		struct midr_prefix_ipc_config ipc_config = {

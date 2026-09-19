@@ -5,8 +5,13 @@ BUILD_DIR ?= build
 PREFIX ?= /usr/local
 SBINDIR ?= $(PREFIX)/sbin
 FRR_CPPFLAGS ?= -DHAVE_CONFIG_H -I.. -I../lib
+# libfrr public headers reachable through zclient.h -> vrf.h -> vty.h use the
+# anonymous-struct-member idiom, which GCC reports as "declaration does not
+# declare anything" (default-on, no -W option).  Extra -Wall warnings are still
+# reported, but -Werror cannot be kept for these translation units; the FRR
+# top-level build remains the authoritative strict build.
 FRR_CFLAGS ?= -std=gnu11 -Wno-pedantic -Wno-missing-field-initializers \
-	-Wno-unused-parameter
+	-Wno-unused-parameter -Wno-error
 FRR_LIBDIR ?= $(abspath ../lib/.libs)
 FRR_LIB ?= $(FRR_LIBDIR)/libfrr.so
 FRR_LDFLAGS ?= -Wl,-rpath,$(FRR_LIBDIR)
@@ -26,6 +31,10 @@ CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 INSTALL_OBJECTS = $(BUILD_DIR)/midr-spf-install.o \
 	$(BUILD_DIR)/midr-zebra.o
 
+# Third-group data plane: zclient backed route installation plus GRE
+# virtual-interface provisioning.  Requires the common libfrr zclient.
+DP_OBJECTS = $(BUILD_DIR)/midr-dp-backend.o $(BUILD_DIR)/midr-gre.o
+
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
 	$(BUILD_DIR)/midrd-transport-test \
@@ -43,7 +52,10 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-ted-test \
 	$(BUILD_DIR)/midrd-interface-test \
 	$(BUILD_DIR)/midrd-spf-install-test \
+	$(BUILD_DIR)/midrd-dp-test \
 	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
+	$(BUILD_DIR)/midrd-gre-tool \
+	$(BUILD_DIR)/midrd-dp-e2e-tool \
 	$(BUILD_DIR)/midrd
 
 $(BUILD_DIR):
@@ -178,24 +190,35 @@ $(BUILD_DIR)/midrd-local-ipc-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-lo
 $(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c local-transaction-test.c -o $@
 
-$(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
+$(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-interface-test.o: interface-test.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-spf.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c interface-test.c -o $@
 
-$(BUILD_DIR)/midrd-interface-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-interface-test.o
+$(BUILD_DIR)/midrd-interface-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-interface-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-spf-install-test.o: spf-install-test.c midrd.c midr-context.h midr-context-private.h midr-spf.h midr-spf-install.h midr-zebra.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c spf-install-test.c -o $@
 
-$(BUILD_DIR)/midrd-spf-install-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-spf-install-test.o
+$(BUILD_DIR)/midrd-spf-install-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-spf-install-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-ted-test.o: ted-test.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c ted-test.c -o $@
 
+$(BUILD_DIR)/midr-dp-backend.o: midr-dp-backend.c midr-dp-backend.h midr-zebra.h midr-spf-install.h midr-context.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-dp-backend.c -o $@
+
+$(BUILD_DIR)/midr-gre.o: midr-gre.c midr-gre.h midr-dp-backend.h midr-context.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-gre.c -o $@
+
+$(BUILD_DIR)/midrd-dp-test.o: dp-backend-test.c midrd.c midr-context.h midr-context-private.h midr-spf.h midr-spf-install.h midr-zebra.h midr-dp-backend.h midr-gre.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c dp-backend-test.c -o $@
+
+$(BUILD_DIR)/midrd-dp-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-dp-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wl,--wrap=zclient_route_send $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 $(BUILD_DIR)/midrd-ted-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midr-lsdb.o $(BUILD_DIR)/midr-ted.o $(BUILD_DIR)/midrd-ted-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
@@ -208,7 +231,7 @@ $(BUILD_DIR)/midrd-lsdb-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consume
 $(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-context.h midr-context-private.h midr-transport.h midr-engine.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c sync-test.c -o $@
 
-$(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
+$(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD_DIR)
@@ -220,7 +243,7 @@ $(BUILD_DIR)/midrd-owned-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-owned.
 $(BUILD_DIR)/midrd-prefix-transaction-test.o: prefix-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c prefix-transaction-test.c -o $@
 
-$(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o
+$(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-scope-test.o: scope-test.c midr-scope.h midr-core.h | $(BUILD_DIR)
@@ -242,7 +265,21 @@ $(BUILD_DIR)/midrd-engine-test.o: engine-test.c midr-engine.h midr-spf.h midr-te
 $(BUILD_DIR)/midrd-engine-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-engine-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
-$(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd.o
+$(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
+# Standalone GRE link provisioning tool for the two-container connectivity
+# test.  It reuses the midrd translation unit, so it links the same objects.
+$(BUILD_DIR)/midrd-gre-tool.o: gre-link-tool.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h midr-dp-backend.h midr-gre.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c gre-link-tool.c -o $@
+
+$(BUILD_DIR)/midrd-gre-tool: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-gre-tool.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
+$(BUILD_DIR)/midrd-dp-e2e-tool.o: dp-e2e-tool.c midrd.c midr-context.h midr-context-private.h midr-consumer.h midr-dp-backend.h midr-gre.h midr-spf.h midr-spf-install.h midr-ted.h midr-zebra.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c dp-e2e-tool.c -o $@
+
+$(BUILD_DIR)/midrd-dp-e2e-tool: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-dp-e2e-tool.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 test: all
@@ -267,6 +304,7 @@ test: all
 	$(BUILD_DIR)/midrd-ted-test
 	$(BUILD_DIR)/midrd-interface-test
 	$(BUILD_DIR)/midrd-spf-install-test
+	$(BUILD_DIR)/midrd-dp-test
 	$(BUILD_DIR)/midrd-sync-test
 	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh

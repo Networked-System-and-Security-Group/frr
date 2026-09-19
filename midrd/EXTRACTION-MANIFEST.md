@@ -63,3 +63,17 @@ parity gate.
 The post-extraction migration is tracked in `FRR-MIGRATION-MANIFEST.md`.
 During that migration, the allowed dependency boundary changes from libc-only
 to common libfrr, while every BGP exclusion above remains mandatory.
+
+F6 (third-group Zebra/FIB data plane) additionally uses libfrr's public
+`zclient`/ZAPI surface and the `GRE` ZAPI additions in `lib/zclient.[ch]` plus
+`zebra/{zapi_msg.c,zebra_dplane.c,zebra_dplane.h,if_netlink.c,kernel_netlink.c}`.
+Those are allowed by the boundary above; zebra daemon-private headers and
+in-process zebra state are still forbidden. Because `zclient.h` pulls in
+`vrf.h -> vty.h`, `midrd/extraction-boundary-test.sh` compiles the third-group
+headers in a second step that keeps `-Wall -Wextra` but cannot keep `-Werror`
+(the libfrr headers use the anonymous-struct-member idiom GCC warns about, a
+default-on warning with no `-W` option). The include/type scan itself is
+unchanged and still rejects `bgpd`/`bgp_`/`zebra/` headers and BGP types.
+
+The old `bgpd` MIDR/Zebra/GRE implementation remains untouched as a differential
+oracle: it is not linked into `midrd` and is not removed by F6.

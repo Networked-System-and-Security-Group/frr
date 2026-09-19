@@ -5292,6 +5292,97 @@ int zclient_send_zebra_gre_request(struct zclient *client,
 	return 0;
 }
 
+/*
+ * Encode a tunnel endpoint address as (family, address) so that the
+ * zebra-side decoder can consume it without a fixed-size union.
+ */
+static void zclient_gre_encode_addr(struct stream *s, const struct ipaddr *ia)
+{
+	if (IS_IPADDR_V6(ia)) {
+		stream_putc(s, AF_INET6);
+		stream_put(s, &ia->ipaddr_v6, sizeof(struct in6_addr));
+	} else {
+		stream_putc(s, AF_INET);
+		stream_put(s, &ia->ipaddr_v4, sizeof(struct in_addr));
+	}
+}
+
+/*
+ * Ask zebra to create (or update) a GRE tunnel netdevice.
+ *
+ * Wire format (after the ZAPI header):
+ *   IFNAMSIZ bytes            ifname
+ *   uint8 family + address    local  (4 or 16 bytes)
+ *   uint8 family + address    remote (4 or 16 bytes)
+ *   uint32                    link_ifindex
+ *   uint32                    ikey
+ *   uint32                    okey
+ *   uint16                    encap_flags
+ *   uint32                    mtu
+ */
+enum zclient_send_status
+zclient_send_gre_add(struct zclient *client, vrf_id_t vrf_id,
+		     const struct zclient_gre_if *gre)
+{
+	struct stream *s;
+
+	if (!client || client->sock < 0) {
+		zlog_err("%s : zclient not ready", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (!gre || gre->ifname[0] == '\0') {
+		zlog_err("%s : GRE interface name is mandatory", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+
+	s = client->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_GRE_ADD, vrf_id);
+	stream_put(s, gre->ifname, IFNAMSIZ);
+	zclient_gre_encode_addr(s, &gre->local);
+	zclient_gre_encode_addr(s, &gre->remote);
+	stream_putl(s, gre->link_ifindex);
+	stream_putl(s, gre->ikey);
+	stream_putl(s, gre->okey);
+	stream_putw(s, gre->encap_flags);
+	stream_putl(s, gre->mtu);
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return zclient_send_message(client);
+}
+
+/*
+ * Ask zebra to remove a GRE tunnel netdevice.
+ *
+ * Wire format (after the ZAPI header):
+ *   IFNAMSIZ bytes  ifname
+ */
+enum zclient_send_status
+zclient_send_gre_delete(struct zclient *client, vrf_id_t vrf_id,
+			const char *ifname)
+{
+	struct stream *s;
+	char name[IFNAMSIZ] = {};
+
+	if (!client || client->sock < 0) {
+		zlog_err("%s : zclient not ready", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (!ifname || ifname[0] == '\0') {
+		zlog_err("%s : GRE interface name is mandatory", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	strlcpy(name, ifname, sizeof(name));
+
+	s = client->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_GRE_DELETE, vrf_id);
+	stream_put(s, name, IFNAMSIZ);
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return zclient_send_message(client);
+}
+
 
 /*
  * Opaque notification features
