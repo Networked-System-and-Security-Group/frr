@@ -16,7 +16,8 @@ FRR_LIBDIR ?= $(abspath ../lib/.libs)
 FRR_LIB ?= $(FRR_LIBDIR)/libfrr.so
 FRR_LDFLAGS ?= -Wl,-rpath,$(FRR_LIBDIR)
 
-.PHONY: all test clean boundary install native-smoke hardening-smoke
+.PHONY: all test clean boundary install native-smoke hardening-smoke \
+	fib-smoke integration-smoke gre-smoke
 
 CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-transport.o $(BUILD_DIR)/midr-session.o \
@@ -316,6 +317,38 @@ hardening-smoke: $(BUILD_DIR)/midrd $(BUILD_DIR)/midrd-scale-test
 	MIDRD_BIN=$(abspath $(BUILD_DIR)/midrd) \
 	MIDRD_SCALE_BIN=$(abspath $(BUILD_DIR)/midrd-scale-test) \
 	./r7-hardening-smoke.sh
+
+# ---------------------------------------------------------------------------
+# Third-group acceptance smoke tests.
+#
+# These are explicit acceptance runs only: they need root, network namespaces
+# and a real zebra, so they are deliberately NOT wired into `all` or `test`.
+# ---------------------------------------------------------------------------
+
+# fib-smoke: runs INSIDE the build container as root.  It starts its own real
+# zebra (ZEBRA_BIN, default $FRR_ROOT/zebra/.libs/zebra) and installs proto-199
+# routes into the real kernel FIB using dummy underlay interfaces.  We build
+# the DP e2e tool and hand its absolute path to the script via DP_TOOL_BIN.
+# `exec` replaces the recipe shell so the tool path never appears in a
+# surviving parent's argv (the script's own `pkill -f midrd-dp-e2e-tool`
+# cleanup would otherwise kill that shell and make report the job as Killed).
+fib-smoke: $(BUILD_DIR)/midrd-dp-e2e-tool
+	DP_TOOL_BIN=$(abspath $(BUILD_DIR)/midrd-dp-e2e-tool) \
+		exec ./r7-dp-fib-smoke.sh
+
+# integration-smoke / gre-smoke: run on the docker HOST as root, NOT inside the
+# build container.  They drive containerlab/docker (three-node joint group 2 +
+# group 3 test, and the two-container GRE/ip6gre test respectively) and pull
+# the binaries out of $(MIDRD_BUILD_CONTAINER) (default frr-ubuntu24-ymy).
+# Both scripts check their own environment (docker/containerlab) and exit early
+# if it is unavailable.
+integration-smoke: $(BUILD_DIR)/midrd
+	MIDRD_BIN=$(abspath $(BUILD_DIR)/midrd) \
+		exec ./r7-dp-integration-smoke.sh
+
+gre-smoke: $(BUILD_DIR)/midrd-gre-tool
+	MIDRD_GRE_TOOL=$(abspath $(BUILD_DIR)/midrd-gre-tool) \
+		exec ./midr-gre-connectivity-test.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

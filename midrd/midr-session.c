@@ -22,6 +22,12 @@ struct midr_session_peer {
 	uint64_t generation;
 	int last_error;
 	bool used;
+	/* An accepted stream whose kernel-chosen source does not uniquely
+	 * identify a configured peer.  It is not a MIDR neighbour until a
+	 * HELLO advertises the peer's listening endpoint (see
+	 * hello_identify()).  Provisional peers never carry sources and are
+	 * never reported as established. */
+	bool provisional;
 };
 
 struct midr_session_manager {
@@ -136,6 +142,41 @@ static struct midr_session_peer *peer_ensure(
 	return NULL;
 }
 
+/* Find a configured (non-provisional) session peer by its listening endpoint.
+ * Scope is ignored because HELLO does not carry it and two listeners cannot
+ * share an address and port on one host anyway. */
+static struct midr_session_peer *peer_find_configured(
+	struct midr_session_manager *manager,
+	const struct midr_transport_endpoint *endpoint)
+{
+	for (size_t i = 0; i < array_size(manager->peers); i++) {
+		struct midr_session_peer *peer = &manager->peers[i];
+
+		if (!peer->used || peer->provisional)
+			continue;
+		if (peer->endpoint.family == endpoint->family &&
+		    peer->endpoint.port == endpoint->port &&
+		    !memcmp(peer->endpoint.address, endpoint->address,
+			    sizeof(peer->endpoint.address)))
+			return peer;
+	}
+	return NULL;
+}
+
+static struct midr_session_peer *peer_ensure_provisional(
+	struct midr_session_manager *manager,
+	const struct midr_transport_endpoint *endpoint)
+{
+	struct midr_session_peer *peer = peer_find(manager, endpoint);
+
+	if (peer)
+		return peer;
+	peer = peer_ensure(manager, endpoint);
+	if (peer)
+		peer->provisional = true;
+	return peer;
+}
+
 static void status_fill(const struct midr_session_peer *peer,
 			struct midr_session_status *status)
 {
@@ -202,9 +243,19 @@ static void transport_established(
 	struct midr_session_manager *manager = arg;
 	struct midr_session_peer *peer = peer_find(manager, endpoint);
 
-	/* Both endpoints must express an intent.  An arbitrary inbound socket is
-	 * not a MIDR neighbor until it belongs to the shared session registry. */
-	if (!peer || !peer->sources) {
+	/* A stream whose source does not uniquely select a configured peer
+	 * (changed for a loopback alias, shared by several peers, ...) is held
+	 * as a provisional candidate until its HELLO names the peer. */
+	if (!peer) {
+		(void)peer_ensure_provisional(manager, endpoint);
+		return;
+	}
+	if (peer->provisional)
+		return;
+	/* Both endpoints must express an intent.  An arbitrary inbound socket
+	 * is not a MIDR neighbor until it belongs to the shared session
+	 * registry. */
+	if (!peer->sources) {
 		(void)midr_transport_disconnect(manager->transport, endpoint);
 		return;
 	}
@@ -249,6 +300,62 @@ static int hello_receive(struct midr_session_manager *manager,
 	return 0;
 }
 
+/* Decode the listening endpoint a HELLO advertises for its sender.  The
+ * payload layout mirrors send_hello(): node id, hold time, family, port and
+ * the sender's address. */
+static int hello_listen_endpoint(const struct midr_transport_frame *frame,
+				 struct midr_transport_endpoint *endpoint)
+{
+	uint16_t port;
+
+	if (frame->payload_len != 28U)
+		return -EBADMSG;
+	memset(endpoint, 0, sizeof(*endpoint));
+	endpoint->family = frame->payload[8];
+	memcpy(&port, frame->payload + 10, sizeof(port));
+	endpoint->port = ntohs(port);
+	memcpy(endpoint->address, frame->payload + 12,
+	       sizeof(endpoint->address));
+	return midr_transport_endpoint_validate(endpoint) ? -EBADMSG : 0;
+}
+
+/* Resolve a provisional accepted stream to the configured peer whose
+ * listening endpoint its HELLO advertises, then finish the handshake on that
+ * peer.  A HELLO from a node that never expressed an intent is rejected, which
+ * closes the stream (the transport reports the error back through
+ * transport_closed()).  midr_transport_promote() applies the deterministic
+ * simultaneous-connect arbitration: it either keeps this stream (and
+ * re-issues on_established for the configured endpoint) or keeps the
+ * configured outbound stream and drops this one. */
+static int hello_identify(struct midr_session_manager *manager,
+			  struct midr_session_peer *provisional,
+			  const struct midr_transport_frame *frame)
+{
+	struct midr_transport_endpoint advertised;
+	struct midr_transport_endpoint from = provisional->endpoint;
+	struct midr_session_peer *peer;
+	int ret;
+
+	if (hello_listen_endpoint(frame, &advertised))
+		return -EBADMSG;
+	peer = peer_find_configured(manager, &advertised);
+	if (!peer)
+		return -EPERM;
+	ret = midr_transport_promote(manager->transport, &from, &advertised);
+	if (ret == -EALREADY)
+		return 0;
+	if (ret)
+		return -EPERM;
+	/* The accepted stream now answers to the configured endpoint.  Drop the
+	 * provisional candidate and complete the HELLO exchange on the real
+	 * peer (on_established() already moved it back to CONNECTING). */
+	memset(provisional, 0, sizeof(*provisional));
+	peer = peer_find(manager, &advertised);
+	if (!peer)
+		return -EPERM;
+	return hello_receive(manager, peer, frame);
+}
+
 static int transport_frame(void *arg,
 			   const struct midr_transport_endpoint *endpoint,
 			   const struct midr_transport_frame *frame)
@@ -256,6 +363,11 @@ static int transport_frame(void *arg,
 	struct midr_session_manager *manager = arg;
 	struct midr_session_peer *peer = peer_find(manager, endpoint);
 
+	if (peer && peer->provisional) {
+		if (frame->type != MIDR_WIRE_HELLO)
+			return -EPERM;
+		return hello_identify(manager, peer, frame);
+	}
 	if (!peer || !peer->sources)
 		return -EPERM;
 	if (frame->type == MIDR_WIRE_HELLO)
@@ -283,6 +395,12 @@ static void transport_closed(void *arg,
 
 	if (!peer)
 		return;
+	if (peer->provisional) {
+		/* A candidate that never named a configured peer: discard it
+		 * silently -- it was never a MIDR neighbour. */
+		memset(peer, 0, sizeof(*peer));
+		return;
+	}
 	was_established = peer->state == MIDR_SESSION_ESTABLISHED;
 	generation = peer->generation;
 	remote_node_id = peer->remote_node_id;
@@ -333,8 +451,9 @@ static void keepalive_timer(struct event *event)
 		else if (peer->state == MIDR_SESSION_CONNECTING)
 			(void)send_hello(manager, &peer->endpoint);
 	}
-	event_add_timer_msec(manager->config.transport.master, keepalive_timer,
-			     manager, manager->config.hello_interval_ms,
+	event_add_timer_msec(midr_transport_master(manager->transport),
+			     keepalive_timer, manager,
+			     manager->config.hello_interval_ms,
 			     &manager->keepalive_event);
 }
 
@@ -371,9 +490,10 @@ int midr_session_manager_create(
 		free(manager);
 		return ret;
 	}
-	if (config->transport.master)
-		event_add_timer_msec(config->transport.master, keepalive_timer,
-				     manager, config->hello_interval_ms,
+	if (midr_transport_master(manager->transport))
+		event_add_timer_msec(midr_transport_master(manager->transport),
+				     keepalive_timer, manager,
+				     config->hello_interval_ms,
 				     &manager->keepalive_event);
 	*out = manager;
 	return 0;

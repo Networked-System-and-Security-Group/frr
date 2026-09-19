@@ -312,6 +312,64 @@ static void test_reconnect_identity_binding(void)
 	side_destroy(&right);
 }
 
+static void poll_trio(struct session_side *a, struct session_side *b,
+		      struct session_side *c)
+{
+	(void)midr_session_manager_poll(a->manager, 5);
+	(void)midr_session_manager_poll(b->manager, 5);
+	(void)midr_session_manager_poll(c->manager, 5);
+}
+
+/* Three nodes on one address: B peers A and C, so an inbound stream at B
+ * cannot be attributed to a configured peer from its kernel-chosen source.
+ * Identity comes from HELLO.  Before the fix C's stream was bound to A's peer
+ * slot, produced MIDR_SESSION_IDENTITY_MISMATCH and was reset in a storm. */
+static void test_shared_address_three_nodes(void)
+{
+	struct session_side a, b, c;
+	struct midr_transport_endpoint a_ep =
+		transport_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(8));
+	struct midr_transport_endpoint b_ep =
+		transport_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(9));
+	struct midr_transport_endpoint c_ep =
+		transport_endpoint(MIDR_TRANSPORT_AF_IPV4, test_port(10));
+	unsigned int a_est, b_est, c_est;
+
+	side_create(&a, 601, MIDR_TRANSPORT_AF_IPV4, test_port(8));
+	side_create(&b, 602, MIDR_TRANSPORT_AF_IPV4, test_port(9));
+	side_create(&c, 603, MIDR_TRANSPORT_AF_IPV4, test_port(10));
+	assert(midr_session_manager_request_static(a.manager, &b_ep) == 0);
+	assert(midr_session_manager_request_static(b.manager, &a_ep) == 0);
+	assert(midr_session_manager_request_static(b.manager, &c_ep) == 0);
+	assert(midr_session_manager_request_static(c.manager, &b_ep) == 0);
+	for (unsigned int i = 0;
+	     i < 800 && (!a.state.protocol_established ||
+			 b.state.protocol_established < 2 ||
+			 !c.state.protocol_established);
+	     i++)
+		poll_trio(&a, &b, &c);
+	assert(a.state.protocol_established > 0);
+	assert(b.state.protocol_established == 2);
+	assert(c.state.protocol_established > 0);
+	assert(a.state.remote_node_id == 602);
+	assert(c.state.remote_node_id == 602);
+	/* Once converged the shared-address rendezvous must not flap: the
+	 * counts stay put and no identity mismatch is ever reported. */
+	a_est = a.state.protocol_established;
+	b_est = b.state.protocol_established;
+	c_est = c.state.protocol_established;
+	for (unsigned int i = 0; i < 100; i++)
+		poll_trio(&a, &b, &c);
+	assert(a.state.protocol_established == a_est);
+	assert(b.state.protocol_established == b_est);
+	assert(c.state.protocol_established == c_est);
+	assert(a.state.mismatch == 0 && b.state.mismatch == 0 &&
+	       c.state.mismatch == 0);
+	side_destroy(&a);
+	side_destroy(&b);
+	side_destroy(&c);
+}
+
 int main(void)
 {
 	struct midr_session_endpoint invalid = {0};
@@ -321,6 +379,7 @@ int main(void)
 	test_ipv6();
 	test_unregistered_inbound();
 	test_reconnect_identity_binding();
+	test_shared_address_three_nodes();
 	puts("midrd session tests: PASS");
 	return 0;
 }

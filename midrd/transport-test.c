@@ -18,6 +18,11 @@ struct callback_state {
 	uint64_t received_ns;
 	uint64_t received_generation;
 	bool disconnect_on_frame;
+	/* Endpoint reported by the most recent on_established().  For an
+	 * accepted stream that the transport could not attribute to a
+	 * configured peer this is the kernel-chosen source endpoint. */
+	struct midr_transport_endpoint last_peer;
+	bool have_peer;
 };
 
 struct test_clock {
@@ -43,6 +48,8 @@ static void on_established(void *arg,
 	assert(peer && (peer->family == MIDR_TRANSPORT_AF_IPV4 ||
 			peer->family == MIDR_TRANSPORT_AF_IPV6));
 	state->established++;
+	state->last_peer = *peer;
+	state->have_peer = true;
 }
 
 static void on_closed(void *arg, const struct midr_transport_endpoint *peer,
@@ -328,6 +335,172 @@ static void test_hold_timer(void)
 	midr_transport_destroy(&right);
 }
 
+/* Two configured peers share one address, so the kernel-chosen source of an
+ * accepted stream cannot identify which one dialled in.  The transport must
+ * not guess: the stream stays unbound until its identity is supplied through
+ * midr_transport_promote().  Before the fix the inbound was bound to the
+ * first address match (peer1) and the identity was silently wrong. */
+static void test_shared_address_promote(void)
+{
+	struct callback_state server_state = {0}, client_state = {0};
+	struct midr_transport *server = NULL, *client = NULL;
+	struct midr_transport_endpoint server_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39101,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_endpoint peer1_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39102,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_endpoint peer2_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39103,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_config server_config = {
+		.local = server_endpoint,
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_config client_config = {
+		.local = {
+			.family = MIDR_TRANSPORT_AF_IPV4,
+			.port = 39104,
+			.address = {127, 0, 0, 1},
+		},
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_frame frame = {
+		.version = MIDR_WIRE_VERSION,
+		.type = MIDR_FRAME_KEEPALIVE,
+		.sequence = 1,
+	};
+	struct midr_transport_callbacks server_callbacks =
+		callbacks(&server_state);
+	struct midr_transport_callbacks client_callbacks =
+		callbacks(&client_state);
+
+	assert(midr_transport_create(&server_config, &server_callbacks,
+				     &server) == 0);
+	assert(midr_transport_create(&client_config, &client_callbacks,
+				     &client) == 0);
+	assert(midr_transport_start(server) == 0);
+	assert(midr_transport_start(client) == 0);
+	assert(midr_transport_connect(server, &peer1_endpoint) == 0);
+	assert(midr_transport_connect(server, &peer2_endpoint) == 0);
+	/* The third node dials in from 127.0.0.1, which matches both peers. */
+	assert(midr_transport_connect(client, &server_endpoint) == 0);
+	for (unsigned int i = 0; i < 100 && !server_state.established; i++)
+		poll_pair(server, client);
+	assert(server_state.established == 1);
+	assert(server_state.have_peer);
+	/* The stream was left unbound: neither configured peer may claim it. */
+	assert(midr_transport_send(server, &peer1_endpoint, &frame) ==
+	       -ENOTCONN);
+	assert(midr_transport_send(server, &peer2_endpoint, &frame) ==
+	       -ENOTCONN);
+	/* HELLO identified the stream as peer2; re-key it and use it. */
+	assert(midr_transport_promote(server, &server_state.last_peer,
+				      &peer2_endpoint) == 0);
+	assert(server_state.established == 2);
+	assert(midr_transport_send(server, &peer1_endpoint, &frame) ==
+	       -ENOTCONN);
+	frame.sequence = 2;
+	assert(midr_transport_send(server, &peer2_endpoint, &frame) == 0);
+	for (unsigned int i = 0; i < 50 && !client_state.frames; i++)
+		poll_pair(server, client);
+	assert(client_state.frames == 1);
+	midr_transport_destroy(&server);
+	midr_transport_destroy(&client);
+}
+
+/* A configured peer must always have an outbound connect initiated, even when
+ * several peers share one address. */
+static void test_outbound_connect_shared_address(void)
+{
+	struct callback_state server_state = {0};
+	struct callback_state client1_state = {0}, client2_state = {0};
+	struct midr_transport *server = NULL, *client1 = NULL, *client2 = NULL;
+	struct midr_transport_endpoint peer1_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39112,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_endpoint peer2_endpoint = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.port = 39113,
+		.address = {127, 0, 0, 1},
+	};
+	struct midr_transport_config server_config = {
+		.local = {
+			.family = MIDR_TRANSPORT_AF_IPV4,
+			.port = 39111,
+			.address = {127, 0, 0, 1},
+		},
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_config client1_config = {
+		.local = peer1_endpoint,
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_config client2_config = {
+		.local = peer2_endpoint,
+		.hold_time_ms = 2000,
+		.tx_budget_ms = 1000,
+		.max_frame_size = 4096,
+	};
+	struct midr_transport_frame frame = {
+		.version = MIDR_WIRE_VERSION,
+		.type = MIDR_FRAME_KEEPALIVE,
+		.sequence = 1,
+	};
+	struct midr_transport_callbacks server_callbacks =
+		callbacks(&server_state);
+	struct midr_transport_callbacks client1_callbacks =
+		callbacks(&client1_state);
+	struct midr_transport_callbacks client2_callbacks =
+		callbacks(&client2_state);
+
+	assert(midr_transport_create(&server_config, &server_callbacks,
+				     &server) == 0);
+	assert(midr_transport_create(&client1_config, &client1_callbacks,
+				     &client1) == 0);
+	assert(midr_transport_create(&client2_config, &client2_callbacks,
+				     &client2) == 0);
+	assert(midr_transport_start(server) == 0);
+	assert(midr_transport_start(client1) == 0);
+	assert(midr_transport_start(client2) == 0);
+	assert(midr_transport_connect(server, &peer1_endpoint) == 0);
+	assert(midr_transport_connect(server, &peer2_endpoint) == 0);
+	for (unsigned int i = 0; i < 100 && server_state.established < 2; i++) {
+		poll_pair(server, client1);
+		poll_pair(server, client2);
+	}
+	assert(server_state.established == 2);
+	assert(midr_transport_peer_count(server) == 2);
+	assert(midr_transport_send(server, &peer1_endpoint, &frame) == 0);
+	frame.sequence = 2;
+	assert(midr_transport_send(server, &peer2_endpoint, &frame) == 0);
+	for (unsigned int i = 0;
+	     i < 50 && (!client1_state.frames || !client2_state.frames); i++) {
+		poll_pair(server, client1);
+		poll_pair(server, client2);
+	}
+	assert(client1_state.frames == 1 && client2_state.frames == 1);
+	midr_transport_destroy(&server);
+	midr_transport_destroy(&client1);
+	midr_transport_destroy(&client2);
+}
+
 int main(void)
 {
 	struct callback_state left_state = {0}, right_state = {0};
@@ -448,6 +621,8 @@ int main(void)
 	test_callback_disconnect();
 	test_ipv6();
 	test_hold_timer();
+	test_shared_address_promote();
+	test_outbound_connect_shared_address();
 	puts("midrd-transport-test: PASS");
 	return 0;
 }

@@ -57,6 +57,13 @@ make -j112 BUILD_DIR=/tmp/midrd-build test
 - `FRR_CFLAGS` 对第三组翻译单元设 `-Wno-error`（第 8-14 行）：libfrr 公开头经
   `zclient.h → vrf.h → vty.h` 拉入匿名结构体成员写法，触发 GCC 默认开启且无
   `-W` 开关的警告；FRR 顶层构建仍是权威严格构建。
+- 显式验收目标 `fib-smoke`、`integration-smoke`、`gre-smoke`（第 335/345/349 行，
+  `.PHONY` 第 19-20 行）：这三个目标**不属于** `all`/`test`，需 root/网络命名空间/
+  真实 zebra，分别包装 `r7-dp-fib-smoke.sh`（容器内 root）、
+  `r7-dp-integration-smoke.sh`（docker 宿主 root + containerlab）、
+  `midr-gre-connectivity-test.sh`（docker 宿主 root），并通过环境变量
+  `DP_TOOL_BIN`/`MIDRD_BIN`/`MIDRD_GRE_TOOL` 传入构建产物路径，例如
+  `make -C midrd BUILD_DIR=/tmp/midrd-build fib-smoke`。
 
 | 项 | 值 |
 | --- | --- |
