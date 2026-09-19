@@ -3,8 +3,17 @@
 ## 1. 结论
 
 第一组（NDS、Control、PM、CL、Facts、Tier1 准入、traceroute、IP2ASN、Tier1 名单）已作为
-`midrd` 进程内模块运行，代码在 `midrd/group1/`。bgpd 里的旧实现原样保留作对照，新
-backbone lab 中 bgpd 只承担 eBGP underlay。
+`midrd` 进程内模块运行，代码在 `midrd/group1/`。新 backbone lab 中 bgpd 只承担 eBGP underlay。
+
+本分支 `feat/midr-group1-midrd` 是第二组集成基线与第一组代码合并后的结果：先后合入第二组的
+`feat/yhy-midr-single-instance-ls-flooding`、公共 Session 服务 `9a88097e2d`，以及
+`fix/midrd-integration-hardening`（到 `c7320a2c9a`，含兼容 Zebra 门面、SPF install、
+过期对象不再断会话、snapshot 发送失败处理、midrd 统一持有 VRF 生命周期）。
+
+bgpd 对照路径：分支里保留了可运行的 bgpd 版第一组实现（`MIDR_LAB_STACK=bgpd`），但它**不是
+原样不变的旧代码**。分支还带着第一组此前在 bgpd 上的 IPv6、Tier1 准入、traceroute 等提交
+（相对第二组主线改了 37 个 bgpd 文件，并删除旧的 `midr_trace_exec.c/.h`）。迁入 midrd 之后，
+第一组不再修改 bgpd 版，新功能只在 `midrd/group1/` 里做。
 
 对接方式：
 
@@ -24,10 +33,10 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 | 文件 | 改动 | 原因 |
 | --- | --- | --- |
 | `midrd/midr-context.h` | 声明 `midr_context_node_id()`、`midr_context_listen_endpoint()` | 第一组的 Node/Link 要填本节点 node_id；公共 Session 服务要求 endpoint 端口非 0，第一组用本机监听端口（全部署同一 MIDR 端口）；准入校验要比对会话源地址（即监听地址）。公共接口里没有这两项查询 |
-| `midrd/midrd.c` | 上述两个函数的实现；`main()` 记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()` | 弱符号让不含第一组的独立构建和组件测试照常链接 |
+| `midrd/midrd.c` | 上述两个函数的实现；`main()` 记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()`；`midr_group1_init()` 返回错误时 midrd 不进入运行状态 | 弱符号让不含第一组的独立构建和组件测试照常链接；第一组依赖的公共服务注册失败时不能带病运行 |
 | `midrd/midr-context-private.h` | `midr_context` 增加监听端点 `listen` | 上述查询所需的状态 |
 | `midrd/midr-transport.c` | 主动建连前绑定到监听地址 | overlay 会话是多跳的，不绑定时内核选出口链路地址作源，对端认不出这是它请求过的会话（BGP 里对应 update-source） |
-| `Makefile.am` | `include midrd/group1/subdir.am` | 把第一组源文件编进 midrd，文件清单放在第一组自己的目录里 |
+| `Makefile.am` | `include midrd/group1/subdir.am`，放在 `include tests/subdir.am` 之后 | 把第一组源文件和组件测试编进来，清单放在第一组自己的目录里；测试程序要追加到 `check_PROGRAMS`，必须排在它的定义之后 |
 | `vtysh/vtysh.h`、`vtysh/vtysh.c` | 新增 `VTYSH_MIDRD` 和 `midrd` 客户端 | midrd 带 CLI 后 vtysh 要能分发 MIDR 命令、下发配置 |
 | `tools/frrcommon.sh.in` | `DAEMONS` 加入 `midrd` | frrinit 按 daemons 文件启动 midrd |
 | `midr-test/backbone-group2/verify_group1_group2_evidence.py` | 合并时取第二组版本 | 之前第一组对它的修改（群规模、多跳传播路径）在单实例洪泛后已不适用 |
@@ -50,17 +59,26 @@ backbone lab 中 bgpd 只承担 eBGP underlay。
 
 bgpd 里第二组替第一组把每个节点的群号、locator、角色位泛洪给全网，并通过远端视图回调交给
 NDS。midrd 的 Membership 对象只带群号，交接文档也明确 `transport_address`、`cap_flags`
-不再传播，因此第一组在自己的控制通道上补了一份节点目录（`midrd/group1/midr_nodedir.c`）：
+不再传播，因此第一组在自己的 UDP 5859 控制通道上用 `NODE_ADV` 报文分发一份节点目录
+（`midrd/group1/midr_nodedir.c`）。NDS 仍通过原来的远端视图回调接收这些数据，逻辑未改。
 
-- 每个节点把它交给 `midr_topology_node_upsert/withdraw` 的本机 Node 事实作为
-  `NODE_ADV`（UDP 5859，48 字节）发给所有已建立的 overlay 邻居；
-- 收到更高序号的通告就更新目录、回调 NDS，并转发给其他邻居（全网泛洪，与 Membership 范围一致）；
-- 每 10 秒刷新一次，45 秒未刷新视为节点离开；撤销保留墓碑，防止旧通告复活；
-- 新会话建立时把整份目录发给对端。
+这份目录归第一组所有，不属于第二组的 LS Object wire，也不进入 canonical、LSDB 或 TED。
+报文格式、序号、刷新、老化、撤销和丢包恢复的规则见
+[`midr-group1-node-directory.md`](midr-group1-node-directory.md)。
 
-NDS 仍通过原来的远端视图回调接收这些数据，逻辑未改。`show midr directory` 查看目录。
-**待与第二组讨论**：若第二组以后在 Membership 中携带 locator 和角色位并提供远端视图回调，
-第一组可以删掉这份目录。
+如果第二组以后在 Membership 中携带 locator 和角色位并提供远端视图回调，第一组可以删掉这份目录。
+
+## 3a. 生命周期
+
+- 启动：midrd 先初始化 VRF 和自己的运行时，再调用 `midr_group1_init()`。第一组先注册 Session
+  observer 和 topology snapshot provider，任一失败就撤销已完成的注册、释放状态并返回错误，
+  midrd 随即退出，不进入运行状态。两项都成功后才初始化 NDS、PM、CL、traceroute 等模块。
+- VRF：第一组不再调用 `vrf_init()`/`vrf_terminate()`，traceroute 的 `vrf_socket()` 使用 midrd
+  初始化的默认 VRF。
+- 退出顺序（`midrd_terminate()`）：`midr_group1_terminate()` 停止第一组，注销 observer 和
+  provider，此后不再产生新的 Node/Link，但不主动断开会话 → 第二组 `shutdown_withdraw()` 通过
+  这些会话泛洪撤销 → `midr_context_finish()` 注销第三组 Zebra backend 并释放公共运行时 →
+  midrd 终止 VRF。
 
 ## 4. 与 bgpd 版的行为差异
 
@@ -108,6 +126,7 @@ sg clab_admins -c './midr-test/backbone-lab/run_group1_group2_lab.sh all'
 | midrd 版 backbone lab，IPv6-only | 基础验收 53/53，Tier1 准入 25/25，IPv6-only 10/10 |
 | 整树编译 | 零告警；bgpd 29 个 MIDR 单元测试、midrd 21 个组件测试与边界扫描通过 |
 | 合并第二组公共 Session 服务后（`5d039b9e1a`） | IPv6：基础 53/53、Tier1 25/25、IPv6-only 10/10；IPv4：基础 53/53、Tier1 25/25；整树零告警，midrd `make test`（含 session-test）与边界扫描通过 |
+| 合并 `fix/midrd-integration-hardening` 并处理审查反馈后（`e9c502c6d7`，2026-09-19） | midrd 与 `test_midr_group1` 编译零告警；midrd 23 个组件测试、边界扫描、`git diff --check` 通过；`test_midr_group1` 5 项通过。IPv6：基础 53/53、Tier1 25/25、IPv6-only 10/10；IPv4：基础 53/53、Tier1 25/25（3 个引导节点运行约 6 分钟，会话关闭 0 次）。IPv6 lab 运行约 7.5 分钟，6 个抽查节点（含 3 个引导节点）的会话关闭次数为 0（此前每个引导节点每轮 20–50 次）。z2 收到 SIGTERM 后 0.2 秒内正常退出，同群 m1a 的 SPF 随即不再包含 z2（reachable 4 → 3），说明第一组停止后第二组的撤销照常泛洪 |
 
 覆盖：underlay 转发（12 个 MIDR 节点传输地址两两互通）、原生会话（群内全互联、引导骨干网、
 r1–r2 手配边、代表挂靠）、按性能选群（零配置 z2 进群 1）、按策略选群（z1 跳过经 Tier1 的群 1、
@@ -118,15 +137,19 @@ r1–r2 手配边、代表挂靠）、按性能选群（零配置 z2 进群 1）
 - midrd 没有 zclient（第三组 F6 未做），MIDR 路由不进 FIB，转发仍走 underlay。
 - 群间路由为 0：各成员 `show midr spf` 的 inter 恒为 0，另一群的前缀不可达（与 bgpd 版的
   G3-2 现象相同，归第二/三组）。
-- **会话因过期对象被关闭（请第二组处理）**：负载高时会话会断开重连，引导节点之间最明显
-  （IPv6 lab 一轮中每个引导节点 20–50 次）。第一组记录的关闭原因只有两种：-116（ESTALE）与
-  -104（对端复位）。ESTALE 来自 `midrd.c` 的 `age_object_lifetime()`：收到的对象剩余寿命为 0
-  时返回 -ESTALE，`on_frame()` 把错误交回传输层，传输层随即关闭整条会话，对端看到 -104。
-  即一个在途中过期的对象（默认寿命 6 秒、转发预算 1 秒）就会拆掉会话。建议过期对象只丢弃、
-  不断会话，或调整寿命。第一组已不因会话掉线撤销 Link，验收不再受影响。
+- 会话因过期对象被关闭：第二组已在 `4066f4debb` 中修复（过期对象只丢弃，不再断会话）。
+  合入后的 IPv6 lab 中抽查节点的会话关闭次数为 0。
 - 同时启动时，对端在本端读完配置、请求会话之前连进来的连接会被拒绝，对端 100ms 后重连，
   启动期日志里会有一批 `closed ... reason=0`，属预期。
-- 组件测试仍针对 bgpd 里的第一组副本；midrd 副本靠两节点冒烟和 backbone lab 验证。
+- IPv6 link-local transport 暂不支持：第一组只支持 IPv4 和全局 IPv6 transport 地址。公共 Session
+  API 对 link-local endpoint 要求非零 `scope_id`（出接口编号），而第一组的 locator、邻居和节点目录
+  只保存地址、不保存接口。直连邻居用 link-local 建邻列为后续工作。
+- `midrd/group1` 的组件测试 `test_midr_group1`（`midrd/group1/test_midr_group1.c`）把第一组的
+  真实模块接到 Session/Topology 服务的桩上，覆盖：observer 或 provider 注册失败时的回滚；
+  Session Up、Down、Identity Mismatch、迟到事件和未知对端事件；Node upsert 失败后事实保留、
+  进入 resync 快照并在下次上报时重试；terminate 时仍在队列里的 Session 事件不访问已释放的状态，
+  第一组停止后不断开会话、不再上报。其余功能仍由两节点冒烟和 backbone lab 覆盖；bgpd 里第一组
+  副本的单元测试保留。
 
 ## 8. 迁移中顺带修正的第一组问题
 
