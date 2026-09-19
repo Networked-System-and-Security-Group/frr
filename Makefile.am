@@ -162,8 +162,6 @@ midrd_midrd_SOURCES = \
 	midrd/midr-wire.c midrd/midr-wire.h
 midrd_midrd_CPPFLAGS = $(AM_CPPFLAGS) -Imidrd
 midrd_midrd_LDADD = lib/libfrr.la $(LIBCAP)
-# 第一组新增：第一组（发现/测量/选群）编进 midrd，源文件清单放在自己的目录里。
-include midrd/group1/subdir.am
 sbin_SCRIPTS =
 noinst_PROGRAMS =
 noinst_HEADERS =
@@ -247,6 +245,9 @@ include pathd/subdir.am
 include vtysh/subdir.am
 include tests/subdir.am
 include tests/topotests/subdir.am
+# 第一组新增：第一组（发现/测量/选群）编进 midrd，源文件清单与组件测试放在自己的
+# 目录里；须排在 tests/subdir.am 之后，测试程序才能追加到 check_PROGRAMS。
+include midrd/group1/subdir.am
 
 if PKGSRC
 rcdir=@pkgsrcrcdir@

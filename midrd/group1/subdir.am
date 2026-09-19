@@ -3,8 +3,7 @@
 # running inside midrd.
 #
 
-midrd_midrd_SOURCES += \
-	midrd/midr-session.h \
+midr_group1_sources = \
 	midrd/group1/midr_g1.c \
 	midrd/group1/midr_g1.h \
 	midrd/group1/midr_nodedir.c \
@@ -45,4 +44,17 @@ midrd_midrd_SOURCES += \
 	midrd/group1/midr_trace_udp.c \
 	midrd/group1/midr_trace_udp.h \
 	# end
+
+midrd_midrd_SOURCES += midrd/midr-session.h $(midr_group1_sources)
 midrd_midrd_LDADD += -lm
+
+# Group 1 against stubs of midrd's Session and Topology services
+# (registration/upsert failures, queued events across terminate).
+# Run: midrd/group1/test_midr_group1
+check_PROGRAMS += midrd/group1/test_midr_group1
+midrd_group1_test_midr_group1_CFLAGS = $(TESTS_CFLAGS)
+midrd_group1_test_midr_group1_CPPFLAGS = $(TESTS_CPPFLAGS) -Imidrd
+midrd_group1_test_midr_group1_LDADD = $(ALL_TESTS_LDADD) -lm
+midrd_group1_test_midr_group1_SOURCES = \
+	midrd/group1/test_midr_group1.c \
+	$(midr_group1_sources)
