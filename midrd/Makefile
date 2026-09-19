@@ -23,6 +23,9 @@ CORE_OBJECTS = $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-wire.o \
 	$(BUILD_DIR)/midr-local-ipc.o $(BUILD_DIR)/midr-lsdb.o \
 	$(BUILD_DIR)/midr-ted.o
 
+INSTALL_OBJECTS = $(BUILD_DIR)/midr-spf-install.o \
+	$(BUILD_DIR)/midr-zebra.o
+
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
 	$(BUILD_DIR)/midrd-transport-test \
@@ -39,6 +42,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-lsdb-test \
 	$(BUILD_DIR)/midrd-ted-test \
 	$(BUILD_DIR)/midrd-interface-test \
+	$(BUILD_DIR)/midrd-spf-install-test \
 	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
 	$(BUILD_DIR)/midrd
 
@@ -135,7 +139,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -143,6 +147,12 @@ $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider
 
 $(BUILD_DIR)/midr-spf.o: midr-spf.c midr-spf.h midr-consumer.h midr-ted.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c midr-spf.c -o $@
+
+$(BUILD_DIR)/midr-spf-install.o: midr-spf-install.c midr-spf-install.h midr-spf.h midr-zebra.h midr-context-private.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-spf-install.c -o $@
+
+$(BUILD_DIR)/midr-zebra.o: midr-zebra.c midr-zebra.h midr-spf-install.h midr-context-private.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-zebra.c -o $@
 
 $(BUILD_DIR)/midr-prefix-ipc.o: midr-prefix-ipc.c midr-prefix-ipc.h midr-prefix-provider.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-prefix-ipc.c -o $@
@@ -168,13 +178,19 @@ $(BUILD_DIR)/midrd-local-ipc-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-lo
 $(BUILD_DIR)/midrd-local-transaction-test.o: local-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-local-ipc.h midr-local-provider.h midr-engine.h midr-owned.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c local-transaction-test.c -o $@
 
-$(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
+$(BUILD_DIR)/midrd-local-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-local-transaction-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-interface-test.o: interface-test.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-spf.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c interface-test.c -o $@
 
-$(BUILD_DIR)/midrd-interface-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-interface-test.o
+$(BUILD_DIR)/midrd-interface-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-interface-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
+$(BUILD_DIR)/midrd-spf-install-test.o: spf-install-test.c midrd.c midr-context.h midr-context-private.h midr-spf.h midr-spf-install.h midr-zebra.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c spf-install-test.c -o $@
+
+$(BUILD_DIR)/midrd-spf-install-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-spf-install-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-ted-test.o: ted-test.c midr-ted.h midr-consumer.h | $(BUILD_DIR)
@@ -192,7 +208,7 @@ $(BUILD_DIR)/midrd-lsdb-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consume
 $(BUILD_DIR)/midrd-sync-test.o: sync-test.c midrd.c midr-context.h midr-context-private.h midr-transport.h midr-engine.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c sync-test.c -o $@
 
-$(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
+$(BUILD_DIR)/midrd-sync-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-sync-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-owned-test.o: owned-test.c midr-owned.h midr-core.h | $(BUILD_DIR)
@@ -204,7 +220,7 @@ $(BUILD_DIR)/midrd-owned-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-owned.
 $(BUILD_DIR)/midrd-prefix-transaction-test.o: prefix-transaction-test.c midrd.c midr-context.h midr-context-private.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-spf.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c prefix-transaction-test.c -o $@
 
-$(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o
+$(BUILD_DIR)/midrd-prefix-transaction-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd-prefix-transaction-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-scope-test.o: scope-test.c midr-scope.h midr-core.h | $(BUILD_DIR)
@@ -226,7 +242,7 @@ $(BUILD_DIR)/midrd-engine-test.o: engine-test.c midr-engine.h midr-spf.h midr-te
 $(BUILD_DIR)/midrd-engine-test: $(CORE_OBJECTS) $(BUILD_DIR)/midrd-engine-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
-$(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(BUILD_DIR)/midrd.o
+$(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(BUILD_DIR)/midrd.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 test: all
@@ -250,6 +266,7 @@ test: all
 	$(BUILD_DIR)/midrd-lsdb-test
 	$(BUILD_DIR)/midrd-ted-test
 	$(BUILD_DIR)/midrd-interface-test
+	$(BUILD_DIR)/midrd-spf-install-test
 	$(BUILD_DIR)/midrd-sync-test
 	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh

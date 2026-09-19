@@ -18,11 +18,13 @@
 #include "midr-prefix-provider.h"
 #include "midr-prefix-ipc.h"
 #include "midr-session-private.h"
+#include "midr-spf-install.h"
 #include "midr-spf.h"
 #include "midr-ted.h"
 #include "midr-owned.h"
 #include "midr-transport.h"
 #include "midr-wire.h"
+#include "midr-zebra.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -37,7 +39,31 @@
 #include <time.h>
 #include <unistd.h>
 
+struct vrf;
+extern void vrf_init(int (*create)(struct vrf *),
+		     int (*enable)(struct vrf *),
+		     int (*disable)(struct vrf *),
+		     int (*destroy)(struct vrf *));
+extern void vrf_terminate(void);
+
 static struct midr_context *midrd_runtime;
+static bool midrd_vrf_initialized;
+
+static void midrd_vrf_init(void)
+{
+	if (midrd_vrf_initialized)
+		return;
+	vrf_init(NULL, NULL, NULL, NULL);
+	midrd_vrf_initialized = true;
+}
+
+static void midrd_vrf_terminate(void)
+{
+	if (!midrd_vrf_initialized)
+		return;
+	vrf_terminate();
+	midrd_vrf_initialized = false;
+}
 
 struct midr_spf_results {
 	size_t references;
@@ -699,28 +725,45 @@ static void drain_events(struct midr_context *daemon,
 	drain_consumer(daemon);
 }
 
-static void send_snapshot(struct midr_context *daemon,
-			  const struct midr_transport_endpoint *peer)
+static int send_snapshot(struct midr_context *daemon,
+			 const struct midr_transport_endpoint *peer)
 {
 	struct midr_core_object *objects;
 	uint64_t snapshot_ns;
 	size_t count = 0;
+	int ret;
 
-	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
+	ret = send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_BEGIN, NULL, 0);
+	if (ret)
+		return ret;
 	objects = calloc(MIDRD_MAX_SNAPSHOT, sizeof(*objects));
+	if (!objects)
+		return -ENOMEM;
 	snapshot_ns = mono_ns();
-	if (objects && midr_engine_snapshot(daemon->engine,
-					    snapshot_ns / 1000000U, objects,
-					    MIDRD_MAX_SNAPSHOT, &count) == 0)
-		for (size_t i = 0; i < count; i++)
-			if (objects[i].state == MIDR_CORE_ACTIVE &&
-			    midr_engine_export(daemon->engine, &objects[i],
-					       peer_node_id(daemon, peer)))
-				(void)send_snapshot_object(daemon, peer, &objects[i],
-						   snapshot_ns);
+	ret = midr_engine_snapshot(daemon->engine, snapshot_ns / 1000000U,
+				   objects, MIDRD_MAX_SNAPSHOT, &count);
+	if (ret)
+		goto done;
+	for (size_t i = 0; i < count; i++) {
+		if (objects[i].state != MIDR_CORE_ACTIVE ||
+		    !midr_engine_export(daemon->engine, &objects[i],
+					peer_node_id(daemon, peer)))
+			continue;
+		ret = send_snapshot_object(daemon, peer, &objects[i], snapshot_ns);
+		if (ret == -ESTALE) {
+			ret = 0;
+			continue;
+		}
+		if (ret)
+			goto done;
+	}
+	ret = send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
+	if (!ret)
+		ret = send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
+
+done:
 	free(objects);
-	(void)send_frame(daemon, peer, MIDR_WIRE_SNAPSHOT_END, NULL, 0);
-	(void)send_frame(daemon, peer, MIDR_WIRE_EOR, NULL, 0);
+	return ret;
 }
 
 static void on_consumer_event(void *arg,
@@ -745,12 +788,21 @@ static void on_established(void *arg,
 			   uint32_t remote_node_id, uint64_t generation)
 {
 	struct midr_context *daemon = arg;
+	int ret;
 
 	printf("node=%" PRIu32 " established remote=%" PRIu32
 	       " family=%u port=%u generation=%" PRIu64 "\n",
 	       daemon->node_id, remote_node_id, peer->family, peer->port,
 	       generation);
-	send_snapshot(daemon, peer);
+	ret = send_snapshot(daemon, peer);
+	if (ret) {
+		fprintf(stderr,
+			"node=%" PRIu32 " snapshot-send-failed remote=%" PRIu32
+			" family=%u port=%u generation=%" PRIu64 " error=%d\n",
+			daemon->node_id, remote_node_id, peer->family, peer->port,
+			generation, ret);
+		(void)midr_session_manager_reset(daemon->sessions, peer, ret);
+	}
 }
 
 static int stage_queue_update(struct midrd_snapshot_stage *stage,
@@ -847,6 +899,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			ret = age_object_lifetime(daemon,
 						 &stage->objects[stage->count],
 						 frame->received_ns, now_ns, 0);
+			if (ret == -ESTALE)
+				return 0;
 			if (ret)
 				return ret;
 			stage->received_ns[stage->count] = now_ns;
@@ -869,6 +923,8 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 			now_ns = mono_ns();
 			ret = age_object_lifetime(daemon, &object, frame->received_ns,
 						 now_ns, 0);
+			if (ret == -ESTALE)
+				return 0;
 			if (ret)
 				return ret;
 			/* Incremental objects received before EoR belong to the same
@@ -958,6 +1014,10 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					ret = age_object_lifetime(
 						daemon, &stage->objects[i],
 						stage->received_ns[i], now_ns, 0);
+					if (ret == -ESTALE) {
+						ret = 0;
+						continue;
+					}
 					if (ret)
 						break;
 					ret = midr_engine_apply(daemon->engine,
@@ -977,6 +1037,10 @@ static int on_frame(void *arg, const struct midr_transport_endpoint *peer,
 					ret = age_object_lifetime(
 						daemon, &stage->updates[i],
 						stage->update_received_ns[i], now_ns, 0);
+					if (ret == -ESTALE) {
+						ret = 0;
+						continue;
+					}
 					if (ret)
 						break;
 					ret = midr_engine_apply(daemon->engine,
@@ -3046,6 +3110,7 @@ static void midr_context_finish(struct midr_context *daemon)
 
 	if (!daemon)
 		return;
+	(void)midr_zebra_backend_unregister(daemon);
 	while ((spf_consumer = daemon->spf_consumers))
 		midr_spf_consumer_unregister(daemon, &spf_consumer);
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
@@ -3134,6 +3199,7 @@ static FRR_NORETURN void midrd_terminate(int status)
 	if (midrd_di.pid_file)
 		(void)unlink(midrd_di.pid_file);
 	midrd_runtime = NULL;
+	midrd_vrf_terminate();
 	frr_fini();
 	exit(status);
 }
@@ -3269,9 +3335,11 @@ int main(int argc, char **argv, char **envp)
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
 	daemon.master = frr_init();
+	midrd_vrf_init();
 	transport_config.master = daemon.master;
 	if (midr_context_initialize(&daemon, &transport_config)) {
 		fprintf(stderr, "midrd initialization failed\n");
+		midrd_vrf_terminate();
 		frr_fini();
 		return 1;
 	}
@@ -3356,6 +3424,7 @@ int main(int argc, char **argv, char **envp)
 
 fail:
 	midr_context_finish(&daemon);
+	midrd_vrf_terminate();
 	frr_fini();
 	return exit_status;
 }

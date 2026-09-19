@@ -153,7 +153,9 @@ midrd_midrd_SOURCES = \
 	midrd/midr-scope.c midrd/midr-scope.h \
 	midrd/midr-lsdb.c midrd/midr-lsdb.h \
 	midrd/midr-spf.c midrd/midr-spf.h \
+	midrd/midr-spf-install.c midrd/midr-spf-install.h \
 	midrd/midr-ted.c midrd/midr-ted.h \
+	midrd/midr-zebra.c midrd/midr-zebra.h \
 	midrd/midr-transport.c midrd/midr-transport.h \
 	midrd/midr-session.c midrd/midr-session.h \
 	midrd/midr-session-private.h \

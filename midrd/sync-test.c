@@ -275,6 +275,73 @@ static void test_reconnect_generation_isolation(void)
 	teardown(&daemon);
 }
 
+static void test_expired_objects_do_not_close_sync(void)
+{
+	struct midr_context daemon;
+	struct midr_transport_endpoint peer = {
+		.family = MIDR_TRANSPORT_AF_IPV4,
+		.address = {127, 0, 0, 1},
+		.port = 39003,
+	};
+	struct midr_core_object current;
+	struct midr_core_object old_prefix = prefix(2, 1, 10);
+	struct midr_core_object expired_prefix = prefix(2, 2, 20);
+	struct midr_core_object expired_snapshot = prefix(3, 1, 30);
+	struct midr_core_object stale_at_eor = prefix(4, 1, 40);
+	struct midr_core_object valid_at_eor = prefix(5, 1, 50);
+	uint8_t payload[MIDR_WIRE_OBJECT_LEN];
+	uint64_t now_ns;
+	size_t length;
+	enum midr_core_result result;
+
+	setup(&daemon);
+	assert(midr_engine_apply(daemon.engine, &old_prefix, mono_ms(), &result) ==
+	       0);
+	expired_prefix.lifetime_ms = 1;
+	assert(midr_wire_encode_object(&expired_prefix, payload, sizeof(payload),
+				       &length) == 0);
+	now_ns = mono_ns();
+	assert(frame(&daemon, &peer, MIDR_WIRE_UPDATE, 1,
+		     now_ns - 2000000U, payload, length) == 0);
+	assert(midr_engine_lookup(daemon.engine, &old_prefix.identity, mono_ms(),
+				  &current, NULL) == 0);
+	assert(current.sequence == 1 && current.metric == 10);
+
+	assert(frame(&daemon, &peer, MIDR_WIRE_SNAPSHOT_BEGIN, 2, now_ns, NULL,
+		     0) == 0);
+	expired_snapshot.lifetime_ms = 1;
+	assert(midr_wire_encode_object(&expired_snapshot, payload,
+				       sizeof(payload), &length) == 0);
+	assert(frame(&daemon, &peer, MIDR_WIRE_SNAPSHOT_OBJECT, 3,
+		     now_ns - 2000000U, payload, length) == 0);
+	assert(stage_for(&daemon, &peer, false)->count == 0);
+
+	stale_at_eor.lifetime_ms = 10;
+	assert(midr_wire_encode_object(&stale_at_eor, payload, sizeof(payload),
+				       &length) == 0);
+	assert(frame(&daemon, &peer, MIDR_WIRE_SNAPSHOT_OBJECT, 4, mono_ns(),
+		     payload, length) == 0);
+	assert(midr_wire_encode_object(&valid_at_eor, payload, sizeof(payload),
+				       &length) == 0);
+	assert(frame(&daemon, &peer, MIDR_WIRE_SNAPSHOT_OBJECT, 5, mono_ns(),
+		     payload, length) == 0);
+	assert(stage_for(&daemon, &peer, false)->count == 2);
+	stage_for(&daemon, &peer, false)->received_ns[0] -= 20000000U;
+	assert(frame(&daemon, &peer, MIDR_WIRE_SNAPSHOT_END, 6, mono_ns(), NULL,
+		     0) == 0);
+	assert(frame(&daemon, &peer, MIDR_WIRE_EOR, 7, mono_ns(), NULL, 0) == 0);
+	assert(midr_engine_lookup(daemon.engine, &stale_at_eor.identity,
+				  mono_ms(), &current, NULL) == -ENOENT);
+	assert(midr_engine_lookup(daemon.engine, &valid_at_eor.identity,
+				  mono_ms(), &current, NULL) == 0);
+
+	assert(midr_wire_encode_object(&valid_at_eor, payload, sizeof(payload),
+				       &length) == 0);
+	assert(frame(&daemon, &peer, MIDR_WIRE_UPDATE, 8,
+		     mono_ns() + 1000000000U, payload, length) == -ERANGE);
+	teardown(&daemon);
+}
+
 static void test_shutdown_result_classification(void)
 {
 	assert(shutdown_result(0, 0, 0) == MIDRD_SHUTDOWN_COMPLETE);
@@ -330,6 +397,7 @@ int main(void)
 {
 	test_snapshot_barrier_and_atomic_eor();
 	test_reconnect_generation_isolation();
+	test_expired_objects_do_not_close_sync();
 	test_shutdown_result_classification();
 	test_publication_failure_gates_ted_and_recovers();
 	puts("midrd-sync-test: PASS");
