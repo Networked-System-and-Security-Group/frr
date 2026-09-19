@@ -160,7 +160,9 @@ void midr_nodedir_finish(struct midr_g1 *g1);
 void midr_nodedir_show(struct midr_g1 *g1, struct vty *vty);
 
 /* midrd entry points (weak in midrd.c). */
-void midr_group1_init(struct event_loop *master, struct midr_context *ctx);
+/* Returns 0, or the negative errno of the public service registration that
+ * failed; on failure nothing of group 1 is left behind. */
+int midr_group1_init(struct event_loop *master, struct midr_context *ctx);
 void midr_group1_terminate(void);
 
 #endif /* _MIDR_G1_H */

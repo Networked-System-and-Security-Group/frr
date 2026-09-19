@@ -66,12 +66,7 @@ void midr_nds_facts_init(struct midr_g1 *g1)
 	/* node 事实留空：router-id 就绪后由 midr_nds_facts_node_refresh() 填
 	 * （轮 1）。node_valid 为假期间不得上报。 */
 	mi->facts = f;
-
-	/* midrd pulls the complete fact table through these on resync. */
-	if (midr_topology_provider_register(g1->ctx,
-					    midr_nds_topology_snapshot_get,
-					    midr_nds_topology_snapshot_release))
-		zlog_warn("MIDR facts: topology provider registration failed");
+	/* The resync snapshot provider is registered by midr_group1_init(). */
 
 	MIDR_LOG("MIDR facts: 本地事实表就绪 (instance %s)", g1->name_pretty);
 }
@@ -88,7 +83,6 @@ void midr_nds_facts_finish(struct midr_g1 *g1)
 
 	mi = g1->midr_nds_info;
 	f = mi->facts;
-	midr_topology_provider_unregister(g1->ctx);
 
 	for (ALL_LIST_ELEMENTS(f->links, node, nnode, fl))
 		XFREE(MTYPE_MIDR_NDS_FACT_LINK, fl);

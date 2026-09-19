@@ -12,6 +12,7 @@
 
 #include "midrd/group1/midr_g1.h"
 #include "midrd/group1/midr_nds.h"
+#include "midrd/group1/midr_nds_facts.h"
 #include "midrd/group1/midr_nds_vty.h"
 #include "midrd/group1/midr_admission.h"
 #include "midrd/group1/midr_tier1_list.h"
@@ -513,9 +514,10 @@ static void midr_g1_debug_init(void)
  * midrd entry points
  * ---------------------------------------------------------------------- */
 
-void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
+int midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 {
 	struct midr_g1 *g1;
+	int ret;
 
 	g1_master = master;
 	g1 = XCALLOC(MTYPE_MIDR_G1, sizeof(*g1));
@@ -525,12 +527,31 @@ void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	g1->router_id.s_addr = midr_context_node_id(ctx);
 	g1->name_pretty = "midrd";
 	g1->vrf_id = VRF_DEFAULT;
-	g1->peer = list_new();
 	g1_instance = g1;
 
-	/* The traceroute backend opens sockets with vrf_socket(), which needs
-	 * the default VRF/netns set up; bgpd did this for group 1. */
-	vrf_init(NULL, NULL, NULL, NULL);
+	/* Without session state or a resync snapshot group 1 cannot keep its
+	 * facts right, so both registrations come first and failing either
+	 * aborts start-up.  The snapshot callback answers -EAGAIN until the
+	 * fact table exists, so registering it this early is safe. */
+	ret = midr_session_observer_register(ctx, &midr_g1_session_observer, g1);
+	if (ret) {
+		zlog_err("MIDR group 1: session observer registration failed: %d",
+			 ret);
+		goto fail;
+	}
+	ret = midr_topology_provider_register(ctx,
+					      midr_nds_topology_snapshot_get,
+					      midr_nds_topology_snapshot_release);
+	if (ret) {
+		zlog_err("MIDR group 1: topology provider registration failed: %d",
+			 ret);
+		midr_session_observer_unregister(ctx);
+		goto fail;
+	}
+
+	/* The default VRF that traceroute's vrf_socket() needs is set up by
+	 * midrd before this runs and torn down after midr_group1_terminate(). */
+	g1->peer = list_new();
 	cmd_init_config_callbacks(midr_g1_config_start, midr_g1_config_stop);
 	midr_g1_debug_init();
 	if (midr_trace_scheduler_init(master) != 0)
@@ -538,10 +559,16 @@ void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	midr_tier1_vty_init();
 	midr_nds_vty_init();
 
-	(void)midr_session_observer_register(ctx, &midr_g1_session_observer, g1);
 	midr_nodedir_init(g1);
 	midr_nds_init(g1);
 	zlog_notice("MIDR group 1 started, router-id %pI4", &g1->router_id);
+	return 0;
+
+fail:
+	g1_instance = NULL;
+	g1_master = NULL;
+	XFREE(MTYPE_MIDR_G1, g1);
+	return ret;
 }
 
 void midr_group1_terminate(void)
@@ -554,6 +581,7 @@ void midr_group1_terminate(void)
 	g1_terminating = true;
 	event_cancel(&t_config);
 	midr_session_observer_unregister(g1->ctx);
+	midr_topology_provider_unregister(g1->ctx);
 	midr_nds_finish(g1);
 	midr_nodedir_finish(g1);
 	while ((peer = listnode_head(g1->peer)))
@@ -561,7 +589,6 @@ void midr_group1_terminate(void)
 	list_delete(&g1->peer);
 	midr_trace_scheduler_fini();
 	midr_tier1_list_fini();
-	vrf_terminate();
 	g1_instance = NULL;
 	XFREE(MTYPE_MIDR_G1, g1);
 }

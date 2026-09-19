@@ -91,7 +91,7 @@ static FRR_NORETURN void midrd_terminate(int status);
 
 /* 第一组新增：第一组（发现/测量/选群）与第二组同进程运行，midrd 在运行时就绪后调它
  * 初始化、退出前调它收尾。弱符号让不含第一组的独立构建和组件测试照常链接。 */
-void midr_group1_init(struct event_loop *master, struct midr_context *ctx)
+int midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	__attribute__((weak));
 void midr_group1_terminate(void) __attribute__((weak));
 
@@ -3411,10 +3411,14 @@ int main(int argc, char **argv, char **envp)
 	       transport_config.local.port);
 	drain_events(&daemon, NULL);
 	midrd_runtime = &daemon;
-	/* 第一组修改：记下监听端点供身份查询使用，并在读配置前初始化第一组。 */
+	/* 第一组修改：记下监听端点供身份查询使用，并在读配置前初始化第一组；
+	 * 第一组依赖的公共服务注册失败时不进入运行状态。 */
 	daemon.listen = transport_config.local;
-	if (midr_group1_init)
-		midr_group1_init(daemon.master, &daemon);
+	if (midr_group1_init && midr_group1_init(daemon.master, &daemon)) {
+		fprintf(stderr, "midrd group 1 initialization failed\n");
+		midrd_runtime = NULL;
+		goto fail;
+	}
 	(void)fflush(NULL);
 	frr_config_fork();
 	event_add_timer_msec(daemon.master, midrd_poll, &daemon, 0,
