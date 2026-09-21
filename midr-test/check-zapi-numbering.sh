@@ -228,6 +228,74 @@ if ! diff -q "$TMP/base.desc.nongre" "$TMP/work.desc.nongre" > /dev/null; then
 	diff -u "$TMP/base.desc.nongre" "$TMP/work.desc.nongre" | sed 's/^/    /' >&2
 fi
 
+# --- assertion 4: the dispatch/encoding tables stay index-safe --------------
+# Review 2.1 asks for the *indexed* tables to be checked as well, not only the
+# enum and lib/log.c.  zebra/zapi_msg.c's zserv_handlers[] must stay built with
+# designated initialisers keyed by the enum member, so appending an enum member
+# can never move an existing handler (a positional table would silently shift
+# every later handler when the enum grows).  The two GRE handlers must be
+# dispatched, and lib/zclient.c must never encode a message type as a numeric
+# literal.
+MSG_TABLE=zebra/zapi_msg.c
+ZCLIENT_C=lib/zclient.c
+
+awk '/zserv_handlers\[\]\)\(ZAPI_HANDLER_ARGS\) = \{/,/^\};/' "$MSG_TABLE" \
+	| tail -n +2 > "$TMP/handlers.txt"
+if [ ! -s "$TMP/handlers.txt" ]; then
+	err "could not locate zserv_handlers[] in $MSG_TABLE"
+else
+	# Every non-empty, non-comment line of the table body must be a
+	# designated initialiser "[ENUM_MEMBER] = handler,".  Anything else --
+	# a bare handler name (positional table), a numeric key, or a bracketed
+	# numeric key -- means the table would shift when the enum grows.
+	grep -vE '^[[:space:]]*($|/\*|\*|//|#)' "$TMP/handlers.txt" \
+		| grep -vE '^\};[[:space:]]*$' \
+		| grep -vE '^[[:space:]]*\[[A-Z][A-Z0-9_]*\][[:space:]]*=' \
+		> "$TMP/handlers.pos" || true
+	if [ -s "$TMP/handlers.pos" ]; then
+		err "zserv_handlers[] has positional or numerically keyed entries:"
+		sed 's/^/    /' "$TMP/handlers.pos" >&2
+	fi
+	grep -qE "\[$GRE_ADD\][[:space:]]*=" "$TMP/handlers.txt" \
+		|| err "zserv_handlers[] has no dispatch entry for $GRE_ADD"
+	grep -qE "\[$GRE_DEL\][[:space:]]*=" "$TMP/handlers.txt" \
+		|| err "zserv_handlers[] has no dispatch entry for $GRE_DEL"
+fi
+
+if grep -nE 'zclient_create_header\([^,]+, *[0-9]' "$ZCLIENT_C" > "$TMP/zc.num"; then
+	err "$ZCLIENT_C encodes a ZAPI message type as a numeric literal:"
+	sed 's/^/    /' "$TMP/zc.num" >&2
+fi
+
+# --- assertion 5: the shared (group 2) common branch is synced --------------
+# Review 4 allows the working branch to carry the shared commits as
+# cherry-picks, so equivalence is checked by commit subject rather than by
+# ancestry: every commit of the shared branch that is not an ancestor of HEAD
+# must have a counterpart with the same subject in HEAD.  Override the ref with
+# MIDR_COMMON_REF; the check is skipped when the ref is not fetched.
+SYNC_REF=${MIDR_COMMON_REF:-origin/fix/midrd-integration-hardening}
+if git rev-parse --verify --quiet "${SYNC_REF}^{commit}" >/dev/null 2>&1; then
+	: > "$TMP/sync.missing"
+	git log --format=%H "${SYNC_REF}" --not HEAD > "$TMP/sync.missing" \
+		2>/dev/null || true
+	git log --format=%s HEAD > "$TMP/sync.subjects"
+	sync_missing=0
+	while read -r sha; do
+		[ -n "$sha" ] || continue
+		subject=$(git log -1 --format=%s "$sha")
+		if grep -Fxq -- "$subject" "$TMP/sync.subjects"; then
+			echo "note: $SYNC_REF $sha is present in HEAD: $subject"
+		else
+			err "$SYNC_REF commit $sha is missing from HEAD: $subject"
+			sync_missing=$((sync_missing + 1))
+		fi
+	done < "$TMP/sync.missing"
+	[ "$sync_missing" -eq 0 ] \
+		|| echo "note: $sync_missing shared-branch commit(s) need syncing" >&2
+else
+	echo "note: $SYNC_REF not fetched; shared-baseline sync check skipped"
+fi
+
 if [ "$fail" -ne 0 ]; then
 	echo "check-zapi-numbering: FAIL" >&2
 	exit 1
