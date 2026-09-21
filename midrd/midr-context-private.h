@@ -124,7 +124,18 @@ struct midr_context {
 	struct midr_session_manager *sessions;
 	struct midr_spf_consumer *spf_consumers;
 	struct midr_spf_install_runtime *spf_install;
-	const struct midr_zebra_backend_ops *zebra_ops;
+	/*
+	 * midrd-owned deep copy of the registered backend ops table.  The
+	 * public register function allocates it and unregister (or a failed
+	 * registration) frees it; callers never hand us a pointer they still
+	 * own.  NULL means "no backend registered".
+	 */
+	struct midr_zebra_backend_ops *zebra_ops;
+	/*
+	 * Opaque backend handle passed through to the ops callbacks.  Not
+	 * copied: the caller retains ownership and must keep it valid until
+	 * midr_zebra_backend_unregister().
+	 */
 	void *zebra_arg;
 	struct midrd_peer_config static_peers[MIDRD_MAX_PEERS];
 	struct midrd_link_config links[MIDRD_MAX_LINKS];
