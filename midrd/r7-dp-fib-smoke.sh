@@ -13,6 +13,10 @@
 #      shutdown withdraw
 #   C. ECMP, UCMP and IPv6 adds and their FIB shape
 #   D. dedup (dup4) and replacement (replace4)
+#   E. deferred-batch failure on a real zebra: the batch is staged while zebra
+#      is down, so it fails after the adapter already committed its desired
+#      generation; a fresh desired generation arrives during recovery; the
+#      reconnect must converge both the FIB and the installed bookkeeping
 set -u
 
 ROOT=${FRR_ROOT:-/home/frr/frr-midrd3}
@@ -38,6 +42,8 @@ FAIL=0
 ok() { echo "[PASS] $*"; PASS=$((PASS + 1)); }
 bad() { echo "[FAIL] $*"; FAIL=$((FAIL + 1)); }
 hdr() { echo; echo "==== $* ===="; }
+# Extract "name=<number>" from a captured tool status line.
+field() { echo "$1" | sed -nE "s/.*$2=([0-9-]+).*/\1/p" | tail -1; }
 
 export LD_LIBRARY_PATH=$LIB
 
@@ -288,6 +294,108 @@ else
 	fib 10.40.0.0
 fi
 wait $D2 2>/dev/null || true
+
+hdr "E. deferred-batch failure on a real zebra + FIB (fail the batch, reconnect, converge)"
+"$TOOL" -s "$SOCK" -t 30 interleave-ted 4 >"$D/e.out" 2>&1 &
+E_PID=$!
+if wait_line "$D/e.out" 'ACTION interleave-ready' 20; then
+	ok "seed result applied against the live zebra"
+else
+	bad "the interleave seed did not complete"
+fi
+if wait_fib_nh 198.51.100.0/24 "$SPFNH" 15; then
+	ok "FIB: seed route 198.51.100.0/24 via $SPFNH"
+else
+	bad "seed route missing from the FIB"
+	fib 198.51.100.0
+fi
+
+# Inject the interleave: kill zebra so that the batch staged next is submitted
+# while the socket is gone.  update_deferred() still reports success, so the
+# adapter advances its desired generation and the deferred batch timer then
+# fails -- the exact sequence review section 5 asks to be covered on a real
+# zebra/FIB rather than only against the fake zclient.
+zebra_stop
+if wait_line "$D/e.out" 'ACTION interleave-batch' 45; then
+	ok "deferred batch failed after the desired generation was committed"
+else
+	bad "the injected deferred-batch failure was not observed"
+fi
+wait_line "$D/e.out" 'ACTION interleave-newdesired' 45
+
+seed_line=$(grep 'DP action=interleave-seed' "$D/e.out" | tail -1)
+batch_line=$(grep 'DP action=interleave-batch' "$D/e.out" | tail -1)
+new_line=$(grep 'DP action=interleave-newdesired' "$D/e.out" | tail -1)
+seed_gen=$(field "$seed_line" desired_gen)
+batch_gen=$(field "$batch_line" desired_gen)
+if [[ -n $seed_gen && -n $batch_gen && $batch_gen -gt $seed_gen ]]; then
+	ok "control plane advanced its desired generation ($seed_gen -> $batch_gen) with the FIB behind"
+else
+	bad "desired generation did not advance across the failed batch ($seed_gen -> $batch_gen)"
+fi
+fails=$(field "$batch_line" fails)
+pending=$(field "$batch_line" pending)
+recovering=$(field "$batch_line" recovering)
+# The failing batch carries count-1 adds (the seed prefix is already
+# installed), and all of them must survive as retained recovery work.
+if [[ ${fails:-0} -ge 1 && ${pending:-0} -ge 2 && ${recovering:-0} == 1 ]]; then
+	ok "failed batch retained as recovery work (fails=$fails pending=$pending recovering=$recovering)"
+else
+	bad "the failed batch was not retained (fails=$fails pending=$pending recovering=$recovering)"
+fi
+new_pending=$(field "$new_line" pending)
+if [[ -n $new_pending && -n $pending && $new_pending -gt $pending ]]; then
+	ok "a fresh desired generation during recovery joined the retained set ($pending -> $new_pending)"
+else
+	bad "the fresh desired update was lost during recovery ($pending -> $new_pending)"
+fi
+
+if zebra_start; then
+	ok "zebra restarted after the injected failure"
+else
+	bad "zebra restart failed"
+fi
+if wait_line "$D/e.out" 'ACTION interleave-converged' 90; then
+	ok "data plane converged after the reconnect (batch drained, recovery idle)"
+else
+	bad "data plane did not converge after the reconnect"
+	wait_line "$D/e.out" 'ACTION interleave-timeout' 5
+fi
+
+missing=0
+for i in 0 1 2 3 4; do
+	pfx="198.51.$((100 + i)).0/24"
+	wait_fib_nh "$pfx" "$SPFNH" 20 || {
+		missing=$((missing + 1))
+		fib "$pfx"
+	}
+done
+if [[ $missing -eq 0 ]]; then
+	ok "FIB holds all 5 SPF prefixes after the failure/reconnect interleave"
+else
+	bad "FIB is missing $missing of the 5 expected prefixes"
+fi
+
+final_line=$(grep 'DP action=interleave-final' "$D/e.out" | tail -1)
+installed=$(field "$final_line" installed)
+final_pending=$(field "$final_line" pending)
+final_recovering=$(field "$final_line" recovering)
+resyncs=$(field "$final_line" resyncs)
+replays=$(field "$final_line" replays)
+if [[ ${installed:-0} == 5 && ${final_pending:-0} == 0 && ${final_recovering:-0} == 0 ]]; then
+	ok "final consistency: installed=5 pending=0 recovering=0 (resyncs=$resyncs replays=$replays)"
+else
+	bad "final state inconsistent: installed=$installed pending=$final_pending recovering=$final_recovering"
+fi
+grep -E 'DP action=interleave-' "$D/e.out"
+
+kill -TERM "$E_PID" 2>/dev/null || true
+wait "$E_PID" 2>/dev/null || true
+if wait_fib_gone 198.51.100.0/24 15; then
+	ok "tool exit withdrew the routes after the interleave"
+else
+	bad "routes survived the tool exit"
+fi
 
 echo
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="

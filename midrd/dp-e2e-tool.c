@@ -14,14 +14,20 @@
  *   add4-te PREFIX NH              del PREFIX [SPF|TE]
  *   status
  *   serve-ted SEC                  apply a synthetic committed TED, stay alive
+ *   interleave-ted COUNT           deferred-failure interleave driven by the
+ *                                  harness (kill zebra, fail the batch,
+ *                                  reconnect, converge)
  *
  * serve-ted exercises the full midrd chain (TED -> SPF -> adapter -> backend ->
  * ZAPI -> zebra RIB -> FIB) and is what the zebra-restart replay and the
  * shutdown-withdraw checks use.
  *
  * Usage: dp-e2e-tool -s ZAPI_SOCKET <command> [args]
- * Every action prints one machine-readable line:
- *   DP action=<name> prefix=<p> rc=<n> installed=<n> adds=<n> dels=<n> fails=<n>
+ * Every action prints one machine-readable line carrying the data-plane
+ * counters and the adapter's desired generation:
+ *   DP action=<name> prefix=<p> rc=<n> installed=<n> pending=<n> adds=<n>
+ *      dels=<n> fails=<n> replays=<n> resyncs=<n> desired_gen=<n>
+ *      recovering=<0|1> stalled=<0|1> last_error=<n>
  */
 
 #define main midrd_program_main
@@ -79,12 +85,19 @@ static void pump(struct event_loop *master, uint32_t ms)
 static void report(const char *action, const char *prefix, int rc)
 {
 	struct midr_dp_status st;
+	struct midr_spf_install_status spf = {};
 
 	midr_dp_backend_status_get(&st);
-	printf("DP action=%s prefix=%s rc=%d installed=%zu adds=%" PRIu64
-	       " dels=%" PRIu64 " fails=%" PRIu64 "\n",
-	       action, prefix ? prefix : "-", rc, st.installed, st.route_adds,
-	       st.route_deletes, st.send_failures);
+	if (midr_spf_install_status_get(&ctx, &spf))
+		memset(&spf, 0, sizeof(spf));
+	printf("DP action=%s prefix=%s rc=%d installed=%zu pending=%zu adds=%" PRIu64
+	       " dels=%" PRIu64 " fails=%" PRIu64 " replays=%" PRIu64
+	       " resyncs=%" PRIu64 " desired_gen=%" PRIu64 " recovering=%d"
+	       " stalled=%d last_error=%d\n",
+	       action, prefix ? prefix : "-", rc, st.installed, st.pending,
+	       st.route_adds, st.route_deletes, st.send_failures, st.replays,
+	       st.resyncs, spf.desired_generation, st.recovering ? 1 : 0,
+	       st.recovery_stalled ? 1 : 0, st.last_error);
 	(void)fflush(stdout);
 }
 
@@ -199,22 +212,27 @@ static int run_del(const char *prefix_text, const char *instance_text)
 }
 
 /*
- * Synthetic committed TED: node 2 advertises 198.51.100.0/24 through the link
- * 1->2 whose nexthop is 192.0.200.2.  The SPF adapter turns that into the same
- * facade add a real TED commit would produce, so the whole midrd chain
- * (TED -> SPF -> adapter -> backend -> ZAPI -> zebra RIB -> FIB) is exercised.
+ * Synthetic committed TED with @count prefixes: node 2 advertises
+ * 198.51.100+i.0/24 through the link 1->2 whose nexthop is 192.0.200.2.  The
+ * SPF adapter turns that into the same facade adds a real TED commit would
+ * produce, so the whole midrd chain (TED -> SPF -> adapter -> backend -> ZAPI
+ * -> zebra RIB -> FIB) is exercised.  @generation selects the desired
+ * generation, so successive calls model fresh topology commits.
  */
-static int apply_synthetic_ted(void)
+static int apply_synthetic_ted_n(unsigned count, uint64_t generation)
 {
-	struct midr_consumer_event events[2] = {0};
-	struct midr_consumer_snapshot snapshot = {
-		.generation = 7,
-		.count = 2,
-		.events = events,
-	};
+	struct midr_consumer_event *events;
+	struct midr_consumer_snapshot snapshot;
+	unsigned i;
+
+	if (count == 0 || count > 32)
+		return 1;
+	events = calloc(count + 1, sizeof(*events));
+	if (!events)
+		return 1;
 
 	events[0].kind = MIDR_CONSUMER_LINK;
-	events[0].generation = 7;
+	events[0].generation = generation;
 	events[0].originator = 1;
 	events[0].remote = 2;
 	events[0].link_id = 1;
@@ -225,21 +243,91 @@ static int apply_synthetic_ted(void)
 	events[0].remote_address[2] = 200;
 	events[0].remote_address[3] = 2;
 
-	events[1].kind = MIDR_CONSUMER_NODE_PREFIX;
-	events[1].generation = 7;
-	events[1].originator = 2;
-	events[1].family = MIDR_CORE_AF_IPV4;
-	events[1].prefix_len = 24;
-	events[1].prefix[0] = 198;
-	events[1].prefix[1] = 51;
-	events[1].prefix[2] = 100;
-	events[1].metric = 3;
+	for (i = 0; i < count; i++) {
+		events[i + 1].kind = MIDR_CONSUMER_NODE_PREFIX;
+		events[i + 1].generation = generation;
+		events[i + 1].originator = 2;
+		events[i + 1].family = MIDR_CORE_AF_IPV4;
+		events[i + 1].prefix_len = 24;
+		events[i + 1].prefix[0] = 198;
+		events[i + 1].prefix[1] = 51;
+		events[i + 1].prefix[2] = (uint8_t)(100 + i);
+		events[i + 1].metric = 3;
+	}
+
+	snapshot.generation = generation;
+	snapshot.count = count + 1;
+	snapshot.events = events;
 
 	if (midr_ted_apply_snapshot(ctx.ted, &snapshot)) {
 		fprintf(stderr, "TED snapshot rejected\n");
+		free(events);
 		return 1;
 	}
+	free(events);
 	return 0;
+}
+
+/*
+ * Synthetic committed TED: node 2 advertises 198.51.100.0/24 through the link
+ * 1->2 whose nexthop is 192.0.200.2.
+ */
+static int apply_synthetic_ted(void)
+{
+	return apply_synthetic_ted_n(1, 7);
+}
+
+/* Let SIGTERM/SIGINT request a graceful shutdown so the exit path withdraws
+ * the installed routes instead of leaving them in the FIB. */
+static void install_stop_handler(void)
+{
+	struct sigaction sa = {
+		.sa_handler = stop_cb,
+	};
+	sigset_t set;
+
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	/* libfrr may leave the process signals blocked; make sure SIGTERM can
+	 * actually reach stop_cb() so the shutdown withdraw path runs instead
+	 * of an abrupt exit. */
+	sigemptyset(&set);
+	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGINT);
+	sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+/* Wait until zebra is unreachable (the harness killed it). */
+static int wait_zebra_down(uint32_t timeout_ms)
+{
+	uint64_t deadline = mono_ms() + timeout_ms;
+
+	while (mono_ms() < deadline && !stop_requested) {
+		if (!midr_dp_backend_ready())
+			return 0;
+		pump(ctx.master, 20);
+	}
+	return 1;
+}
+
+/*
+ * Wait until the control plane and the installed-route bookkeeping agree:
+ * recovery finished, nothing pending and exactly @want_installed routes
+ * recorded as installed.
+ */
+static int wait_converged(uint32_t timeout_ms, size_t want_installed)
+{
+	uint64_t deadline = mono_ms() + timeout_ms;
+	struct midr_dp_status st;
+
+	while (mono_ms() < deadline && !stop_requested) {
+		midr_dp_backend_status_get(&st);
+		if (!st.recovering && st.pending == 0 &&
+		    st.installed == want_installed)
+			return 0;
+		pump(ctx.master, 100);
+	}
+	return 1;
 }
 
 int main(int argc, char **argv)
@@ -372,28 +460,91 @@ int main(int argc, char **argv)
 		rc |= run_del(argv[optind], NULL);
 	} else if (strcmp(command, "status") == 0)
 		report("status", "-", 0);
-	else if (strcmp(command, "serve-ted") == 0) {
+	else if (strcmp(command, "interleave-ted") == 0) {
+		/*
+		 * Real-zebra deferred-batch interleave (review section 5,
+		 * residual risk 5).  Sequence, driven together with the
+		 * harness:
+		 *
+		 *   1. seed: one prefix from generation 7 while zebra is up;
+		 *   2. the harness kills zebra; we wait for the socket to go
+		 *      away;
+		 *   3. generation 8 carries @count prefixes, so the adapter
+		 *      commits the desired generation and the deferred batch
+		 *      timer then fails -- the exact "batch failed after
+		 *      update_deferred() returned success" interleave;
+		 *   4. generation 9 arrives while recovery is still pending (a
+		 *      fresh desired generation during recovery);
+		 *   5. wait for convergence once the harness restarted zebra.
+		 *
+		 * Every step prints the control-plane state (desired
+		 * generation, installed set, recovery flags) so the caller can
+		 * assert it together with the real FIB.
+		 */
+		unsigned count = optind < argc ?
+					 (unsigned)strtoul(argv[optind], NULL,
+							   10) :
+					 0;
+		unsigned want = count + 1;
+		int converge_rc;
+
+		if (count < 2 || count > 16) {
+			fprintf(stderr, "interleave-ted needs 2..16 routes\n");
+			rc = 2;
+			goto out;
+		}
+		install_stop_handler();
+		if (apply_synthetic_ted_n(1, 7)) {
+			rc = 1;
+			goto out;
+		}
+		pump(ctx.master, 500);
+		report("interleave-seed", "198.51.100.0/24", 0);
+		puts("ACTION interleave-ready");
+		(void)fflush(stdout);
+
+		if (wait_zebra_down(30000)) {
+			puts("ACTION interleave-nodown");
+			(void)fflush(stdout);
+			rc = 1;
+			goto out;
+		}
+
+		if (apply_synthetic_ted_n(count, 8)) {
+			rc = 1;
+			goto out;
+		}
+		/* Let the 100 ms batch timer fire and its failure be
+		 * recorded; the batch is retained as recovery work. */
+		pump(ctx.master, 800);
+		report("interleave-batch", "-", 0);
+		printf("ACTION interleave-batch count=%u\n", count);
+		(void)fflush(stdout);
+
+		/* Fresh desired generation while recovery is pending. */
+		if (apply_synthetic_ted_n(count + 1, 9)) {
+			rc = 1;
+			goto out;
+		}
+		pump(ctx.master, 800);
+		report("interleave-newdesired", "-", 0);
+		puts("ACTION interleave-newdesired");
+		(void)fflush(stdout);
+
+		/* The harness restarts zebra while we wait here. */
+		converge_rc = wait_converged(90000, want);
+		report("interleave-final", "-", converge_rc);
+		printf("ACTION interleave-%s want=%u\n",
+		       converge_rc ? "timeout" : "converged", want);
+		(void)fflush(stdout);
+		rc = converge_rc ? 1 : 0;
+	} else if (strcmp(command, "serve-ted") == 0) {
 		uint32_t run_ms = 30000;
 		uint64_t deadline;
 
 		if (optind < argc)
 			run_ms = (uint32_t)strtoul(argv[optind], NULL, 10) * 1000U;
-		{
-			struct sigaction sa = {
-				.sa_handler = stop_cb,
-			};
-			sigset_t set;
-
-			sigaction(SIGTERM, &sa, NULL);
-			sigaction(SIGINT, &sa, NULL);
-			/* libfrr may leave the process signals blocked; make sure
-			 * SIGTERM can actually reach stop_cb() so the shutdown
-			 * withdraw path runs instead of an abrupt exit. */
-			sigemptyset(&set);
-			sigaddset(&set, SIGTERM);
-			sigaddset(&set, SIGINT);
-			sigprocmask(SIG_UNBLOCK, &set, NULL);
-		}
+		install_stop_handler();
 		if (apply_synthetic_ted()) {
 			rc = 1;
 			goto out;
