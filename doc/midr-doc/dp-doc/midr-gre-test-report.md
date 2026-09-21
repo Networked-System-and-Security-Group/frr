@@ -212,4 +212,3 @@ LD_LIBRARY_PATH=/opt/midr/lib /opt/midr/test_midr_gre_link teardown \
 2. 如需二层 GRETAP（`gretap`/`ip6gretap`），可在此框架上扩展 kind 选择。
 3. 建议将 `tests/bgpd/test_midr_gre_e2e.c` 与
    `midr_gre_connectivity_test.sh` 纳入 CI（后者需 docker 与 NET_ADMIN）。
-

@@ -1,8 +1,8 @@
 # MIDR 数据平面测试报告 v5.0
 
-> **日期**: 2026-07-09  
-> **环境**: 服务器 101.6.30.220:50022，Docker `frr-ubuntu24-ymy`  
-> **编译策略**: 链接 `bgp_midr_zebra.o` + `libfrr.so`（共享库链接）  
+> **日期**: 2026-07-09
+> **环境**: 服务器 101.6.30.220:50022，Docker `frr-ubuntu24-ymy`
+> **编译策略**: 链接 `bgp_midr_zebra.o` + `libfrr.so`（共享库链接）
 > **测试脚本**: `tests/bgpd/scripts/test01-06_*.sh`
 
 ---
@@ -26,7 +26,7 @@
 
 ### 测试 01：bgpd 编译验证
 
-**脚本**: `tests/bgpd/scripts/test01_bgpd_build.sh`  
+**脚本**: `tests/bgpd/scripts/test01_bgpd_build.sh`
 **测试码**: `bgpd/bgp_midr_zebra.c` `bgpd/bgp_midr_zebra.h` `bgpd/subdir.am`
 
 ```
@@ -58,8 +58,8 @@ ar t bgpd/libbgp.a | grep midr_zebra
 
 ### 测试 02：Netlink C Protocol 199 验证
 
-**脚本**: `tests/bgpd/scripts/test02_proto199_netlink.sh`  
-**测试码**: `tests/bgpd/test_midr_proto199.c`  
+**脚本**: `tests/bgpd/scripts/test02_proto199_netlink.sh`
+**测试码**: `tests/bgpd/test_midr_proto199.c`
 **协议号**: `RTPROT_BGP_MIDR = 199`
 
 ```
@@ -89,8 +89,8 @@ ar t bgpd/libbgp.a | grep midr_zebra
 
 ### 测试 03：单元测试 (10 项，46 断言)
 
-**脚本**: `tests/bgpd/scripts/test03_unit_tests.sh`  
-**测试码**: `tests/bgpd/test_midr_zebra.c`  
+**脚本**: `tests/bgpd/scripts/test03_unit_tests.sh`
+**测试码**: `tests/bgpd/test_midr_zebra.c`
 **编译**: 共享库链接 + `-Wl,--wrap=zclient_route_send` mock
 
 ```
@@ -127,7 +127,7 @@ ar t bgpd/libbgp.a | grep midr_zebra
 
 ### 测试 04：E2E ZAPI 端到端路由测试
 
-**脚本**: `tests/bgpd/scripts/test04_e2e_zapi.sh`  
+**脚本**: `tests/bgpd/scripts/test04_e2e_zapi.sh`
 **测试码**: `tests/bgpd/test_midr_zebra_e2e.c`
 
 ```
@@ -166,8 +166,8 @@ zebra socket: /var/run/frr/zserv.api
 
 ### 测试 05：ZAPI 批量压力测试
 
-**脚本**: `tests/bgpd/scripts/test05_zapi_batch_stress.sh`  
-**测试码**: `tests/bgpd/test_midr_zapi_batch.c`  
+**脚本**: `tests/bgpd/scripts/test05_zapi_batch_stress.sh`
+**测试码**: `tests/bgpd/test_midr_zapi_batch.c`
 **测试规模**: 64 路由 + 5 前缀 Dual-Instance
 
 ```
@@ -207,8 +207,8 @@ zebra socket: /var/run/frr/zserv.api
 
 ### 测试 06：Containerlab 连通性测试
 
-**脚本**: `tests/bgpd/scripts/test06_zapi_clab.sh`  
-**测试码**: `tests/bgpd/test_midr_zapi_clab.c`  
+**脚本**: `tests/bgpd/scripts/test06_zapi_clab.sh`
+**测试码**: `tests/bgpd/test_midr_zapi_clab.c`
 **拓扑**: 2 节点 (r1 ↔ r2), zebra-only, 无 BGP
 
 **核心概念**:

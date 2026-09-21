@@ -195,4 +195,3 @@ kind 正确）；IPv4 与 IPv6 overlay 流量经该隧道双向 ping 通；IPv6 
 | 旧测试基线 | `frr/frr/doc/midr-doc/midr-gre-test-report.md`（21/21 PASS）、`frr/frr/doc/midr-doc/midr-gre-interface-api.md` |
 | 新测试（组件层） | `midrd/dp-backend-test.c` `test_gre_api()`（校验路径） |
 | 新测试（真实双容器） | `midrd/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |
-

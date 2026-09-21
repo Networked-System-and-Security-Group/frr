@@ -61,7 +61,7 @@
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| P0 | 迁移边界与清单 | 完成 | 
+| P0 | 迁移边界与清单 | 完成 |
 | P1 | 数据面分支 `f8f4e81f2f` 的 GRE 支撑复制进 `lib/log.c`、`lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c`；FRR 顶层构建 | 完成 |
 | P2 | `midrd/midr-dp-backend.{c,h}`（五 ops、BASIC/ECMP/UCMP/SRv6 编码、双 instance、installed-hash 仅发成功后才更新、100 ms 批、有界重试 + resync、重连清 hash + replay） | 完成 |
 | P3 | `midrd/midr-gre.{c,h}`（bgpd→midrd 移植，复用后端 zclient）+ 双容器 GRE/ip6gre 连通性 | 完成 |
@@ -85,11 +85,24 @@
 ### 5.1 FRR 顶层构建（P1）
 
 ```sh
-cd /home/frr/frr-midrd3 && make -j112
+cd /home/frr/frr-midrd3 && make clean && make -j112      # 从零重建
 ```
 
-摘要：**EXIT=0，0 errors / 0 warnings**。日志 `/tmp/verify-build.log`（容器
-`frr-ubuntu24-ymy`，源码树 `/home/frr/frr-midrd3`）。
+摘要：**EXIT=0，但 11 行 `warning:`（非 0）**，且这 11 条**全部**是既有 bgpd midr 告警。
+T9 修复 `zebra/dplane_fpm_nl.c` 的 2 条 `DPLANE_OP_GRE_ADD`/`DPLANE_OP_GRE_DELETE`
+`-Wswitch` 之前为 13 条；修复后对最终日志 `grep warning: ... | grep dplane` **0 命中**。
+最终日志 `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log`（T9 前：
+`/tmp/verify-build-7ad4671558.log`；容器 `frr-ubuntu24-ymy`，源码树 `/home/frr/frr-midrd3`）。
+
+> **更正**：本节早前写的「0 errors / 0 warnings」来自一次**增量构建**——源码树当时
+> 基本最新，`make` 只重编了 10 个 `vtysh/vtysh_cmd.*.o` 并重链 `vtysh`，没有重编任何
+> `zebra/`、`bgpd/` 翻译单元，故潜伏的 `-Wswitch` 缺口未触发。只有 `make clean` 后的
+> 完整重建才会暴露。11 条 bgpd 告警（`bgp_midr_pm.c` ×2 `-Wbad-function-cast`、
+> `midr_trace_scheduler.c:1682` ×8 `-Wswitch-enum`、`bgp_midr_nds.c:3375` ×1
+> `-Wunused-function`）都在本分支改动集之外，属**既存问题、OUT OF SCOPE**；
+> 审查 `第三组最新midrd分支审查反馈与同步建议-2026-09-20.md` 第 6 节禁止把第一组
+> group1 接线 / peer discovery / session 改动拉进第三组。2 条 `zebra/*` DPLANE 告警已由
+> T9 修复并复测归零（最终 11 条全部为 bgpd）。详见 `dp-02-build-and-test.md` 第 3.1 节。
 
 ### 5.2 midrd 组件套件（P2/P4）
 
@@ -340,7 +353,7 @@ bash midrd/r7-dp-e2e-zapi.sh                                # 三节点 routes=3
 
 | 验证 | 结果摘要 | 日志 |
 | --- | --- | --- |
-| FRR 顶层构建 | EXIT=0，0 errors/0 warnings | 容器 `/tmp/verify-build.log` |
+| FRR 顶层构建（从零重建） | EXIT=0；**11 行 `warning:`（非 0）**，全部为既有 bgpd（OUT OF SCOPE）；2 条 DPLANE_OP_GRE_* 已由 T9 消除（T9 前 13） | 容器 `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log` |
 | midrd 组件套件 | 25 程序 PASS，EXIT=0 | 容器 `/tmp/verify-comp.log`、`/tmp/final-comp.log` |
 | 第三组 ZAPI/FIB smoke | PASS=15 FAIL=0 EXIT=0 | 容器 `/tmp/fib-smoke.log` |
 | 三节点 containerlab 联合测试（IPv4 + IPv6） | PASS=31 FAIL=0 EXIT=0（IPv4 14 + IPv6 17） | 宿主 `/tmp/ipv6-verify.log`（旧 IPv4-only：`/tmp/verify-integration.log`） |
@@ -351,4 +364,3 @@ bash midrd/r7-dp-e2e-zapi.sh                                # 三节点 routes=3
 | 单容器 loopback E2E | 已通过（group-2 传输层修复后）；三节点 `routes=3`，至少一个远端前缀经 MIDR underlay 入 FIB | `r7-dp-e2e-zapi.sh`；`/tmp/tp-e2e4.log` |
 | group-2 传输层修复 | `find_peer_by_address()` 不再猜测 + `midr_transport_promote()` | `midrd/midr-transport.c`、`midrd/midr-session.c`、`midrd/transport-test.c` `test_shared_address_promote()` |
 | deferred-batch 恢复缺陷 | 已修复并覆盖 | `midrd/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
-

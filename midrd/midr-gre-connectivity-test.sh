@@ -29,7 +29,7 @@ SOCK=/tmp/zserv_midr.api
 LD=/opt/midr-dp/lib
 LINK=/opt/midr-dp/midrd-gre-tool
 ZEBRA=/opt/midr-dp/zebra
-BUILD_TOOL=/tmp/midrd-build-harness/midrd-gre-tool
+BUILD_TOOL=${MIDRD_GRE_TOOL:-}
 BUILD_ZEBRA=/home/frr/frr-midrd3/zebra/.libs/zebra
 BUILD_LIB=/home/frr/frr-midrd3/lib/.libs
 STAGE=
@@ -53,6 +53,29 @@ for c in "$NODE1" "$NODE2" "$BUILD"; do
 	}
 done
 command -v docker >/dev/null 2>&1 || { echo 'docker is required' >&2; exit 2; }
+
+# Resolve the gre-link-tool inside the build container.  The historical
+# harness path is preferred only when it exists; the canonical component
+# build dir (/tmp/midrd-build, i.e. the gate-2 BUILD_DIR) is tried first so
+# the test exercises the freshly built sources rather than a stale harness
+# copy.  Override with MIDRD_GRE_TOOL.
+if [[ -z $BUILD_TOOL ]]; then
+	for cand in /tmp/midrd-build/midrd-gre-tool /tmp/midrd-build-harness/midrd-gre-tool; do
+		if docker exec "$BUILD" test -x "$cand" 2>/dev/null; then
+			BUILD_TOOL=$cand
+			break
+		fi
+	done
+fi
+[[ -n $BUILD_TOOL ]] || {
+	echo "no gre-link-tool found in $BUILD (set MIDRD_GRE_TOOL)" >&2
+	exit 2
+}
+docker exec "$BUILD" test -x "$BUILD_TOOL" || {
+	echo "gre-link-tool not executable in $BUILD: $BUILD_TOOL" >&2
+	exit 2
+}
+echo "using gre-link-tool: $BUILD_TOOL"
 
 # fetch_lib <soname>: stage the build-container copy of a shared library.
 fetch_lib() {

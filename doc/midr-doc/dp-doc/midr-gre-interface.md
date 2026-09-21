@@ -462,4 +462,3 @@ gcc -std=gnu11 -g -O0 -include config.h -I lib -I bgpd -I . \
    `ZEBRA_GRE_SOURCE_SET` 之后，会使后续枚举值整体后移。由于该枚举是
    daemon 间协议，**升级时必须整体重编所有 daemon（含 vtysh）**，不可只替换
    单个二进制。
-

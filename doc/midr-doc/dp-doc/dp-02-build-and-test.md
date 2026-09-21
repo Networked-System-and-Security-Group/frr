@@ -24,15 +24,57 @@ ZAPI/FIB 链路，**不依赖第二组会话层**（见第 4.1 节）。
 ```sh
 # 容器 frr-ubuntu24-ymy，源码树 /home/frr/frr-midrd3
 cd /home/frr/frr-midrd3
-make -j112                     # 期望 EXIT=0，0 警告/错误
+make clean && make -j112        # 从零重建：EXIT=0；11 行 warning（非 0），明细见 3.1
 ```
 
 | 项 | 值 |
 | --- | --- |
-| 命令 | `make -j112` |
-| 结果 | EXIT=0，0 警告/错误 |
-| 日志 | 容器 `frr-ubuntu24-ymy` 的 `/tmp/verify-build.log` |
-| 状态 | 已验证 |
+| 命令 | `make clean && make -j112`（从零重建） |
+| 结果 | EXIT=0；**11 行 `warning:`（非 0）**，全部为既有 bgpd midr 告警（2 条 DPLANE_OP_GRE_* 已由 T9 消除；T9 前为 13） |
+| 日志 | 容器 `frr-ubuntu24-ymy` 的 `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log`（T9 前：`/tmp/verify-build-7ad4671558.log`） |
+| 状态 | 已验证（最终 11）；旧「0 警告/错误」结论已更正，见 3.1 |
+
+### 3.1 从零重建的告警实测（最终 11 条，非 0；T9 前 13 条）
+
+`make clean && make -j112` 的最终日志为容器内 `/tmp/verify-build-T10.log`（1199 行，
+`build_exit=0`），`grep -c 'warning:'` 得 **11**，且这 11 条**全部**在 `bgpd/` 内
+（`grep warning: ... | grep -v bgpd/` 为空）。T9 修 `zebra/dplane_fpm_nl.c` **之前**
+的一次从零重建（`/tmp/verify-build-7ad4671558.log`，1205 行）为 **13** 条；多出的
+2 条正是 `zebra/dplane_fpm_nl.c:978` 的 `DPLANE_OP_GRE_ADD`/`DPLANE_OP_GRE_DELETE`
+`-Wswitch`，T9 把它们补进 `dplane_fpm_nl.c` 的 no-op 分组后归零。
+
+文档早前写下的「0 警告/错误」来自一次**增量构建**：当时源码树基本是最新的，`make`
+只重编了 `vtysh/vtysh_cmd.*.o` 并重链 `vtysh`（旧日志 `/tmp/verify-build.log` 仅
+10 行 `CC`，没有重编任何 `zebra/`、`bgpd/` 翻译单元），因此这些**潜伏的 `-Wswitch`
+缺口根本没有被触发**；只有在 `make clean` 后的完整重建里才会暴露。
+
+**(a) DPLANE 开关告警：T9 前 2 条，T9 后 0 条。** T9 前（`/tmp/verify-build-7ad4671558.log`）：
+
+```
+zebra/dplane_fpm_nl.c:978:9: warning: enumeration value 'DPLANE_OP_GRE_ADD' not handled in switch [-Wswitch]
+zebra/dplane_fpm_nl.c:978:9: warning: enumeration value 'DPLANE_OP_GRE_DELETE' not handled in switch [-Wswitch]
+```
+
+T9 在 `zebra/dplane_fpm_nl.c` 第 1098-1100 行的 no-op 分组（`case DPLANE_OP_GRE_SET:`
+旁）补上这两个 case 后，对最终日志
+`grep warning: /tmp/verify-build-T10.log | grep dplane` **0 命中**。这与 `e7c78d33a7`
+在 `zebra/zebra_dplane.c` / `zebra/zebra_rib.c` 修的是同一类缺陷，T9 补上了漏掉的
+这一个文件。
+
+**(b) 既有 bgpd midr 告警 11 条（T9 后剩余的全部告警）**（**pre-existing，明确 OUT OF SCOPE**）：
+
+```
+bgpd/bgp_midr_pm.c:156:31: warning: cast from function call of type 'double' to non-matching type 'unsigned int' [-Wbad-function-cast]
+bgpd/bgp_midr_pm.c:171:33: warning: cast from function call of type 'double' to non-matching type 'unsigned int' [-Wbad-function-cast]
+bgpd/midr_trace_scheduler.c:1682:9: warning: ... [-Wswitch-enum]   （8 条枚举值：MIDR_TRACE_OK / ERR_INVALID / ERR_NO_SNAPSHOT / ERR_UNSUPPORTED / ERR_QUEUE_FULL / ERR_REQUEST_LIMIT / ERR_CANCELED / ERR_SHUTDOWN）
+bgpd/bgp_midr_nds.c:3375:13: warning: 'midr_bootstrap_seed_load_cb' defined but not used [-Wunused-function]
+```
+
+这 11 条都在 `bgpd/` 内、且都不在本分支的改动集里，属于既存问题。审查依据
+`doc/midr-doc/第三组最新midrd分支审查反馈与同步建议-2026-09-20.md` 第 6 节
+（「不在本次同步范围内的内容」）明确要求第三组**不**合并第一组的 group1 接线 /
+peer discovery / session observer，因此本组**有意不**把这类 bgpd 改动拉进来，
+它们**不计入本分支的修复验收**。
 
 顶层 `Makefile.am` 第 138-166 行把 `midrd/midrd` 加入 `sbin_PROGRAMS`，并在
 `midrd_midrd_SOURCES` 中列出 `midrd/midr-dp-backend.{c,h}`、
@@ -137,8 +179,10 @@ zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 �
 `dp-contract.c` 放宽 `-Werror` 的原因（脚本第 21-24 行注释）：第三组头经
 libfrr `vrf.h → vty.h` 链拉入匿名结构体成员写法，GCC 报 “declaration does
 not declare anything”，该警告默认开启且没有 `-W` 开关，故无法在该翻译单元
-保留 `-Werror`。**FRR 顶层构建仍是权威严格构建**（`make -j112` 的 0 警告即
-此含义）。
+保留 `-Werror`。**FRR 顶层构建仍是权威严格构建**，其权威性在于编译 FRR
+全部翻译单元并暴露 `-Wswitch` 等真实告警，而**不是**「0 警告」；实测
+从零重建（`make clean && make -j112`）最终为 11 行 `warning:`（全部为分支外
+既有 bgpd 告警，OUT OF SCOPE），见第 3.1 节。
 
 命令与预期末行：
 
@@ -184,7 +228,7 @@ docker exec -u root frr-ubuntu24-ymy bash -lc '
 
 | 日志 | 内容 | 位置 |
 | --- | --- | --- |
-| `/tmp/verify-build.log` | FRR 顶层 `make -j112` 输出 | 容器 `frr-ubuntu24-ymy` |
+| `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log` | FRR 顶层从零重建（`make clean && make -j112`）最终输出，含 11 行 `warning:`（T9 前 13 行，见 `/tmp/verify-build-7ad4671558.log`） | 容器 `frr-ubuntu24-ymy` |
 | `/tmp/verify-comp.log`、`/tmp/final-comp.log` | `midrd` 组件套件输出 | 容器 `frr-ubuntu24-ymy` |
 | `/tmp/midrd-build/` | 独立组件构建目录 | 容器 `frr-ubuntu24-ymy` |
 | `/tmp/fib-smoke.log` | 第三组 ZAPI/FIB smoke | 容器 `frr-ubuntu24-ymy` |
@@ -196,11 +240,10 @@ docker exec -u root frr-ubuntu24-ymy bash -lc '
 
 | 验证 | 结果 | 证据 |
 | --- | --- | --- |
-| FRR 顶层构建 | EXIT=0，0 errors/0 warnings | `/tmp/verify-build.log`（容器 `frr-ubuntu24-ymy`） |
+| FRR 顶层构建（从零重建） | EXIT=0；**11 行 `warning:`（非 0）**，全部为既有 bgpd（OUT OF SCOPE）；2 条 DPLANE_OP_GRE_* 已由 T9 消除（T9 前 13） | `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log`（容器 `frr-ubuntu24-ymy`） |
 | midrd 组件套件 | 25 程序 PASS，含 `midrd-dp-test: PASS`、`standalone libfrr boundary scan: PASS`，EXIT=0 | `/tmp/verify-comp.log`、`/tmp/final-comp.log`（容器 `frr-ubuntu24-ymy`） |
 | 第三组 ZAPI/FIB smoke | `PASS=15 FAIL=0`，`third-group ZAPI/FIB smoke: PASS`，EXIT=0 | `midrd/r7-dp-fib-smoke.sh`；`/tmp/fib-smoke.log`（容器 `frr-ubuntu24-ymy`） |
 | FIB 断言（group-aware） | 同时解析内联 `via N` 与 `nhid N` | `midrd/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
 | deferred-batch 恢复 | 缺陷已修复；先重试保留批再 resync | `midrd/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
 | 单测覆盖 | 编码模式、失败 abort、adapter 恢复、GRE 校验路径 | `midrd/dp-backend-test.c` |
 | 边界门禁 | 两阶段编译 + 源扫描 | `midrd/extraction-boundary-test.sh` |
-

@@ -507,10 +507,10 @@ echo "thu325325" | sudo -S docker exec frr-ubuntu24-ymy \
    - `midr_installed_entry` 新增 `instance` 字段
    - `midr_prefix_hash_key()`: 引入 `instance * 31` 混合哈希
    - `midr_prefix_cmp()`: 增加 instance 相等判断
-   - `midr_path_result_eq()`: 
+   - `midr_path_result_eq()`:
      - 新增 `instance` 比较
      - 只比较 `prefix.family` 对应的地址族（修复缺陷）
-   - `midr_result_to_zapi()`: 
+   - `midr_result_to_zapi()`:
      - 新增 `uint8_t instance` 参数（从调用方传入）
      - `api->instance = instance`（不再硬编码为 0）
      - TE mode: `api->metric = 1`；SPF mode: `api->metric = paths[0].metric`
@@ -523,4 +523,3 @@ echo "thu325325" | sudo -S docker exec frr-ubuntu24-ymy \
    - `test_midr_zebra.c`: 新增 Test 10 dual-instance, `installed_has` 增加 instance 参数, struct 副本同步更新
    - `test_midr_zebra_e2e.c`: 新增 Dual-Instance SPF+TE SRv6 验证
    - `test_midr_batch.c`: 新建 1024 路由批量压力测试
-

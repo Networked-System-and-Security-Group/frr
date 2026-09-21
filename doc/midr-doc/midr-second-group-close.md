@@ -40,7 +40,7 @@ R7-full 及第二组 hardening 已完成，主体收口提交为 `6bf1f9c524`，
 
 ## 4. 自动化证据
 
-Linux GCC 独立 `/tmp` 构建执行 `make test`，20 个测试程序全部通过：contract、core、Prefix Provider、wire、transport、transport budget、Consumer、SPF、engine、Prefix IPC、owned、Prefix transaction、scope、cost、Local IPC、Local transaction、LSDB、TED、sync、scale。`extraction-boundary-test.sh` 同轮通过。`5eab85832a` 上以独立 `/tmp/midrd-close-final-20260916` 构建目录复测同一门禁，结果仍为全部 PASS。FRR 顶层 `make -j4 midrd/midrd` 构建通过，无未解释 warning。收口日志为 `component-final.log`、`frr-build-final.log` 和 `containerlab.log`。
+Linux GCC 独立 `/tmp` 构建执行 `make test`，20 个测试程序全部通过：contract、core、Prefix Provider、wire、transport、transport budget、Consumer、SPF、engine、Prefix IPC、owned、Prefix transaction、scope、cost、Local IPC、Local transaction、LSDB、TED、sync、scale。`extraction-boundary-test.sh` 同轮通过。`5eab85832a` 上以独立 `/tmp/midrd-close-final-20260916` 构建目录复测同一门禁，结果仍为全部 PASS。FRR 顶层 `make -j4 midrd/midrd` 构建通过，无未解释 warning（该目标只依赖 libfrr，不编译 `zebra/`、`bgpd/`，故不含其告警；对当前第三组分支做完整从零重建 `make clean && make -j112` 时 `zebra/dplane_fpm_nl.c` 与 `bgpd/` 仍有告警，见 `dp-doc/dp-02-build-and-test.md` 第 3.1 节）。收口日志为 `component-final.log`、`frr-build-final.log` 和 `containerlab.log`。
 
 收口后审查补充了 refresh/scope query、Prefix event、非字节对齐 Prefix、WITHDRAWN wire payload 和 Provider generation 回归，并修正两项真实缺陷：合法 Prefix withdraw 生成的 WITHDRAWN 对象未清零 ACTIVE metric；batch 内 refresh identity 查找失败未标记整个事务失败。
 

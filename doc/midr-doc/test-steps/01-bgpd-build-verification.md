@@ -77,7 +77,17 @@ $ nm bgpd/bgp_midr_zebra.o | grep ' T '
 0000000000000e70 T midr_zebra_route_update_deferred
 ```
 
-全部 6 个公共 DP API 符号正确导出，编译零错误零警告。
+全部 6 个公共 DP API 符号正确导出，编译零错误零警告（该次 2026-07-08 的 bgpd 目标构建；当前分支从零重建的 bgpd 情况见下）。
+
+> **范围更正（2026-09-21）**：本行是 2026-07-08 这一次 **bgpd 目标**
+> （`make bgpd/bgpd`）的历史观察结果。对当前分支
+> `feat/yhy-midr-single-instance-ls-flooding` 做**从零重建**
+> （`make clean && make -j112`）时，`bgpd/` 仍有 11 条既存 midr 告警
+> （`bgp_midr_pm.c` ×2 `-Wbad-function-cast`、`midr_trace_scheduler.c:1682`
+> ×8 `-Wswitch-enum`、`bgp_midr_nds.c:3375` ×1 `-Wunused-function`）。这些属
+> **pre-existing / OUT OF SCOPE**（审查 `第三组最新midrd分支审查反馈与同步建议-2026-09-20.md`
+> 第 6 节），故「零警告」只应理解为该次历史构建的结论，不代表当前分支 bgpd 无告警。
+> 详见 `dp-02-build-and-test.md` 第 3.1 节。
 
 ## 结论
 

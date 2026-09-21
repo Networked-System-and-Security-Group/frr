@@ -154,4 +154,3 @@ zebra 重连路径（清 installed hash + `midr_spf_install_replay()`）。依�
 | 公共层 GRE 支撑 | 同上仓库 `lib/log.c`、`lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c` |
 | 新实现 | `midrd/midr-dp-backend.{c,h}`、`midrd/midr-gre.{c,h}`、`midrd/dp-backend-test.c`、`midrd/Makefile`、`Makefile.am`、`midrd/midrd.c` |
 | 接口契约 | `doc/midr-doc/14_midrd与第三组输出接口交接.md`、`doc/midr-doc/MIDR-TED路径计算接口规范.md` |
-

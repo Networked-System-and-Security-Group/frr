@@ -4,7 +4,7 @@
 
 本测试是 MIDR 分层验证中的**底层内核协议号验证**——独立于 MIDR 代码，验证 Linux 内核能通过 libnl-3/netlink 识别 `RTPROT_BGP_MIDR = 199` 协议号。
 
-**为什么不引用 MIDR 头文件？**  
+**为什么不引用 MIDR 头文件？**
 这是有意的设计：先隔离验证"内核是否接受 proto 199"，再在上层测试 MIDR DP 逻辑。如果 E2E 测试失败，可以排除内核层的嫌疑。
 
 **MIDR 关联**：测试成功后，意味着当 MIDR DP 调用 `zclient_route_send()` → zebra → netlink 时，内核能识别 proto 199。MIDR DP 代码的正确性由单元测试（mock zclient）和 E2E ZAPI 测试（真实 zebra 连接）验证。
@@ -85,7 +85,7 @@ sudo /tmp/test_midr_proto199
 [Step 3] Add 10.200.200.0/24 via 203.0.113.1 proto 199
   Route added via netlink
 [Step 4] Verify proto midr visible
-  10.200.200.0/24 via 203.0.113.1 dev dummy_nl 
+  10.200.200.0/24 via 203.0.113.1 dev dummy_nl
   OK: 10.200.200.0/24 shows as proto midr
 [Step 5] Verify proto 199 visible
   OK: 10.200.200.0/24 shows as proto 199

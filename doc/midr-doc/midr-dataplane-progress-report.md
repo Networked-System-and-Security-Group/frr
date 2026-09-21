@@ -535,8 +535,8 @@ flowchart LR
 
 ## 七、测试报告与质量指标
 
-> **最新完整测试报告**: `documents/midr-test-report-20260709.md` (v5.0, 2026-07-09)  
-> **详细测试步骤**: `documents/test-steps/01-06_*.md`  
+> **最新完整测试报告**: `documents/midr-test-report-20260709.md` (v5.0, 2026-07-09)
+> **详细测试步骤**: `documents/test-steps/01-06_*.md`
 > **自动化脚本**: `tests/bgpd/scripts/test01-06_*.sh`
 
 ### 7.1 6 项测试概览（v5.0, 100% 通过率）
@@ -650,7 +650,7 @@ gcc -std=gnu11 -g -O0 -include config.h -I lib -I bgpd -I . \
   -lcap -lcrypt -ljson-c -lrt -lpthread -lsqlite3 -lresolv -ldl -lm -lfl -lyang
 ```
 
-\- 单元测试 (test03) 额外使用 `-Wl,--wrap=zclient_route_send` 进行 mock  
+\- 单元测试 (test03) 额外使用 `-Wl,--wrap=zclient_route_send` 进行 mock
 \- E2E/Batch/Clab 测试 (test04-06) 需要运行 zebra daemon，通过真实 ZAPI socket 通信
 
 ### 7.7 历史版本

@@ -306,5 +306,3 @@ bgpd: if_lookup_by_name() 命中 → state=PENDING→UP，记录 ifindex，触�
    后立刻关闭 zclient，zebra 可能在该次读中同时读到数据与 EOF 而丢弃请求。
    长时间运行的 bgpd 无此问题；一次性客户端应在发送后保持存活约 1s。
 7. `midr_gre_fini()` 只释放本地注册表，**不会删除内核设备**。
-
-
