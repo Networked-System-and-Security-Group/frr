@@ -158,6 +158,22 @@ zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 �
 > 展开成员 nexthop（`midrd/r7-dp-fib-smoke.sh` 第 80-101 行的 `fib_nhid()`/
 > `fib_nh_list()`）。只匹配单一形式曾造成多次误报失败。
 
+### 4.2 ZAPI 编号门禁的覆盖范围（断言 1–5）
+
+`midr-test/check-zapi-numbering.sh` 不只是"enum 序号不变"，它现在覆盖审查 2.1 明确要求检查的**按编号索引的
+名称/编码/分发数组**，共 5 组断言：
+
+| 断言 | 内容 |
+| --- | --- |
+| 1 | `lib/zclient.h` 中每一个**既有** enum 成员序号不变（基线里被插进中间的两个 GRE 成员先归一化剔除） |
+| 2 | 新成员只能是 `ZEBRA_GRE_ADD`/`ZEBRA_GRE_DELETE`，且必须落在 enum 末尾（147/148） |
+| 3 | `lib/log.c` 的 `command_types[]` 源码顺序仍随 enum 单调、非 GRE 条目未重排、两个 GRE 条目为表尾 |
+| 4 | `zebra/zapi_msg.c` 的 `zserv_handlers[]` 每一行都必须是 **designated initializer**（`[ENUM] = handler,`）；裸名（位置绑定）、裸数字键、`[数字]` 键都会 FAIL；两个 GRE 分发项必须存在；`lib/zclient.c` 不得把数字字面量当消息号传给 `zclient_create_header()` |
+| 5 | 公共分支 `origin/fix/midrd-integration-hardening` 相对 HEAD 多出的每个提交，必须在 HEAD 中有**同标题**的对应提交（cherry-pick 后 hash 变化也能通过；漏同步会 FAIL）。可用 `MIDR_COMMON_REF` 覆盖分支名 |
+
+断言 4/5 的反证（每条都能让门禁 FAIL）见
+`doc/midr-doc/第三组midrd第二轮修复与验证报告-2026-09-21.md` §4。
+
 ## 5. 两阶段边界扫描
 
 `midrd/extraction-boundary-test.sh`（60 行）是 `midrd` 组件的独立边界门禁：

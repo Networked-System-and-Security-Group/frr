@@ -244,6 +244,42 @@ loopback alias（`127.0.0.11`/`127.0.0.12`）场景“始终无法建立”。�
   `192.168.77.1/24`（`--link-addr`）并断言 `ip route get` 在该 dummy 上解析。
 
 
+### 3.4 场景 D：真实 zebra 上的 deferred 批次失败交错（`r7-dp-fib-smoke.sh` case E）
+
+审查 §5 要求"失败恢复测试应在**真实** zebra/FIB 上覆盖部分批次成功、批次失败、重连恢复以及恢复期间新的
+desired 更新，并同时检查控制面 desired generation、已安装 FIB 路由集合与恢复后的最终一致性"。
+原先只有 `midrd-dp-test`（假 zclient）覆盖该语义，因为 facade 的 `route_flush` 是**同步**的：失败会直接
+返回给调用者，走不到"`update_deferred()` 已返回成功后 100 ms 批次定时器才失败"这条路径。
+
+现由工具命令 `dp-e2e-tool interleave-ted COUNT` + smoke case E 在真机上构造该交错：
+
+1. generation 7（1 个前缀）作为 seed 落到真实 FIB；
+2. 脚本 `zebra_stop` 杀掉 zebra，工具等到 socket 真的断开；
+3. generation 8（`COUNT` 个前缀）在 socket 已断开时提交 → adapter **照常提交 desired generation**，
+   100 ms 批次定时器随后失败 → 失败批次被保留为 recovery 工作；
+4. generation 9 在 recovery 仍 pending 时到达（恢复期间的新 desired）；
+5. 脚本 `zebra_start` 重启 zebra → 重连 replay + 保留批次收敛。
+
+命令与摘要：
+
+```sh
+# 容器 frr-ubuntu24-ymy 内，root（由 r7-dp-fib-smoke.sh case E 驱动）
+bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
+# 场景 D 断言 10 条全 PASS；实测：
+#   interleave-seed       installed=1 pending=0 fails=0 desired_gen=1
+#   interleave-batch      installed=1 pending=3 fails=1 desired_gen=2 recovering=1
+#   interleave-newdesired installed=1 pending=4 fails=2 desired_gen=3 recovering=1
+#   interleave-final      installed=5 pending=0 fails=2 replays=2 resyncs=1 desired_gen=3 recovering=0
+```
+
+断言同时覆盖三类状态：控制面 `desired_gen` 前进而 FIB 落后；保留集合随新 desired 增长（3→4）；
+最终 `installed=5 / pending=0 / recovering=0` 且内核 FIB 中 5 个前缀齐全、工具退出后撤销。
+工具的状态行因此扩展为
+`installed/pending/adds/dels/fails/replays/resyncs/desired_gen/recovering/stalled/last_error`。
+
+> **未覆盖**：真实 zebra 上"前几条被接受、其余保留"的**精确切分**依赖写入与对端崩溃的竞态，
+> 未构造确定性用例；该切分仍由 `midrd-dp-test` 的 `test_deferred_partial_batch_failure`（假 zclient）覆盖。
+
 ## 4. 覆盖对照（相对旧 DP 报告）
 
 | 旧用例/报告 | 旧覆盖内容 | 新对应 | 状态 |
