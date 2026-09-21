@@ -200,15 +200,32 @@ static struct midr_transport_peer *find_peer(
 	return NULL;
 }
 
+/* Rendezvous an accepted stream with a configured (desired) peer.
+ *
+ * The source address of an outbound connect is chosen by the kernel and is
+ * not guaranteed to equal the peer's listening address (every loopback
+ * alias, for example, is reached from source 127.0.0.1).  It is therefore
+ * only used as a hint: when exactly one desired peer carries the address the
+ * stream is unambiguously that peer's.  When several configured peers share
+ * one address the hint is worthless and we must not guess -- the stream is
+ * left unbound and its identity is resolved later from the HELLO frame via
+ * midr_transport_promote(). */
 static struct midr_transport_peer *find_peer_by_address(
 	struct midr_transport *transport,
 	const struct midr_transport_endpoint *endpoint)
 {
-	for (size_t i = 0; i < transport->peer_count; i++)
-		if (transport->peers[i].used && transport->peers[i].desired &&
-		    endpoint_address_equal(&transport->peers[i].endpoint, endpoint))
-			return &transport->peers[i];
-	return NULL;
+	struct midr_transport_peer *match = NULL;
+
+	for (size_t i = 0; i < transport->peer_count; i++) {
+		if (!transport->peers[i].used || !transport->peers[i].desired ||
+		    !endpoint_address_equal(&transport->peers[i].endpoint,
+					    endpoint))
+			continue;
+		if (match)
+			return NULL; /* ambiguous: do not guess */
+		match = &transport->peers[i];
+	}
+	return match;
 }
 
 static struct midr_transport_peer *ensure_peer(
@@ -413,6 +430,35 @@ static void close_peer(struct midr_transport *transport,
 	if (peer->used && peer->desired && peer->fd < 0) {
 		schedule_reconnect(peer, MIDR_TRANSPORT_RECONNECT_MS);
 	}
+}
+
+/* Retire a transport peer whose configured identity has been taken over by an
+ * accepted stream.  Unlike close_peer() this never re-arms the reconnect
+ * timer: the surviving stream inherits the desired state. */
+static void retire_peer(struct midr_transport *transport,
+			struct midr_transport_peer *peer, int reason)
+{
+	struct midr_transport_endpoint endpoint = peer->endpoint;
+	bool notify = peer->established || peer->connecting;
+
+	event_cancel(&peer->read_event);
+	event_cancel(&peer->write_event);
+	event_cancel(&peer->hold_event);
+	event_cancel(&peer->tx_budget_event);
+	event_cancel(&peer->reconnect_event);
+	if (peer->fd >= 0)
+		close(peer->fd);
+	peer->fd = -1;
+	peer->connecting = false;
+	peer->established = false;
+	peer->desired = false;
+	free_tx(transport, peer, reason);
+	stream_free(peer->rx);
+	peer->rx = NULL;
+	peer->used = false;
+	if (notify && transport->callbacks.on_closed)
+		transport->callbacks.on_closed(transport->callbacks.arg,
+					       &endpoint, reason);
 }
 
 static int transport_set_nonblocking(int fd)
@@ -928,6 +974,52 @@ int midr_transport_reset(struct midr_transport *transport,
 	return 0;
 }
 
+/* Give an accepted stream its configured peer identity once that identity is
+ * known (from the HELLO frame, see midr-session.c).
+ *
+ * `from` is the provisional endpoint the stream was reported under (the
+ * kernel-chosen source), `to` is the configured peer endpoint whose listen
+ * address/port the HELLO advertised.  When both endpoints initiated, the same
+ * deterministic rule used for an address-matched accept is applied: the lower
+ * listening endpoint keeps its outbound stream and the higher endpoint keeps
+ * the matching inbound stream.  The surviving inbound stream is re-keyed to
+ * `to`, so callers observe one stable identity and one generation. */
+int midr_transport_promote(struct midr_transport *transport,
+			   const struct midr_transport_endpoint *from,
+			   const struct midr_transport_endpoint *to)
+{
+	struct midr_transport_peer *inbound, *desired;
+	union sockunion address;
+
+	if (!transport || !from || !to ||
+	    midr_transport_endpoint_validate(from) ||
+	    midr_transport_endpoint_validate(to) ||
+	    endpoint_to_sockunion(to, &address))
+		return -EINVAL;
+	inbound = find_peer(transport, from);
+	if (!inbound || inbound->desired || inbound->fd < 0)
+		return -ENOENT;
+	desired = find_peer(transport, to);
+	if (desired && desired != inbound) {
+		if (desired->fd >= 0 &&
+		    local_keeps_outbound(transport, inbound->fd, desired)) {
+			/* The outbound stream wins; drop the inbound. */
+			close_peer(transport, inbound, -ECONNRESET);
+			return -EALREADY;
+		}
+		/* The inbound stream wins; retire the losing outbound and
+		 * hand its configured identity to the accepted stream. */
+		retire_peer(transport, desired, -ECONNABORTED);
+	}
+	inbound->endpoint = *to;
+	inbound->address = address;
+	inbound->desired = true;
+	if (transport->callbacks.on_established)
+		transport->callbacks.on_established(transport->callbacks.arg,
+						    &inbound->endpoint);
+	return 0;
+}
+
 int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_endpoint *endpoint,
 			const struct midr_transport_frame *frame)
@@ -1072,6 +1164,11 @@ size_t midr_transport_peer_count(const struct midr_transport *transport)
 		    (transport->peers[i].desired || transport->peers[i].fd >= 0))
 			count++;
 	return count;
+}
+
+struct event_loop *midr_transport_master(const struct midr_transport *transport)
+{
+	return transport ? transport->master : NULL;
 }
 
 size_t midr_transport_pending(const struct midr_transport *transport)

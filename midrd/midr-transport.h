@@ -118,6 +118,26 @@ int midr_transport_disconnect(struct midr_transport *transport,
 			      const struct midr_transport_endpoint *peer);
 int midr_transport_reset(struct midr_transport *transport,
 			 const struct midr_transport_endpoint *peer, int reason);
+
+/* Addressing / re-key rule
+ * ------------------------
+ * A configured peer is identified by its listening endpoint (address, port,
+ * scope).  An accepted stream, however, only exposes the kernel-chosen source
+ * of the remote connect, which may differ from the peer's listening address
+ * (all loopback aliases are reached from source 127.0.0.1) and may be shared
+ * by several configured peers.  An accepted stream is therefore only bound to
+ * a configured peer when that address uniquely selects one.  Otherwise it is
+ * kept unbound and later re-keyed to the configured endpoint advertised by the
+ * peer's HELLO, through this call.  When both ends initiated, the same
+ * deterministic arbitration used for an address-matched accept is applied:
+ * the lower listening endpoint keeps its outbound stream, the higher one
+ * keeps the matching inbound stream.  On success the accepted stream is now
+ * identified by `to` and its on_established callback has been re-issued; on
+ * -EALREADY the existing outbound stream was retained and the accepted stream
+ * was closed. */
+int midr_transport_promote(struct midr_transport *transport,
+			   const struct midr_transport_endpoint *from,
+			   const struct midr_transport_endpoint *to);
 int midr_transport_send(struct midr_transport *transport,
 			const struct midr_transport_endpoint *peer,
 			const struct midr_transport_frame *frame);
@@ -125,5 +145,10 @@ int midr_transport_poll(struct midr_transport *transport, int timeout_ms);
 size_t midr_transport_peer_count(const struct midr_transport *transport);
 /* Number of frames still queued or partially written on all peers. */
 size_t midr_transport_pending(const struct midr_transport *transport);
+/* The event loop the transport runs on: the configured master when one was
+ * supplied, otherwise the private loop created for tests.  Callers that arm
+ * their own timers (the session keepalive/hold machinery) must use this so
+ * they fire even when no master was configured. */
+struct event_loop *midr_transport_master(const struct midr_transport *transport);
 
 #endif /* MIDRD_TRANSPORT_H */

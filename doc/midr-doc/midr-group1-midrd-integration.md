@@ -36,6 +36,7 @@ bgpd 对照路径：分支里保留了可运行的 bgpd 版第一组实现（`MI
 | `midrd/midrd.c` | 上述两个函数的实现；`main()` 记录监听端点；弱符号钩子 `midr_group1_init()` / `midr_group1_terminate()`；`midr_group1_init()` 返回错误时 midrd 不进入运行状态 | 弱符号让不含第一组的独立构建和组件测试照常链接；第一组依赖的公共服务注册失败时不能带病运行 |
 | `midrd/midr-context-private.h` | `midr_context` 增加监听端点 `listen` | 上述查询所需的状态 |
 | `midrd/midr-transport.c` | 主动建连前绑定到监听地址 | overlay 会话是多跳的，不绑定时内核选出口链路地址作源，对端认不出这是它请求过的会话（BGP 里对应 update-source） |
+| `midrd/midr-transport.c`、`midrd/midr-transport.h`、`midrd/midr-session.c`、`midrd/transport-test.c`、`midrd/session-test.c` | 移植第三组 `64fd75560e` 的 rendezvous 修复（非第一组原创代码，逐函数移植，保留第一组自己的 `midr_transport_reset()`/`midr_session_manager_reset()` 和 group1 回调） | 第二组 `0920第一组对接.md` 审查要求：accept 到的连接不能按地址猜邻居 |
 | `Makefile.am` | `include midrd/group1/subdir.am`，放在 `include tests/subdir.am` 之后 | 把第一组源文件和组件测试编进来，清单放在第一组自己的目录里；测试程序要追加到 `check_PROGRAMS`，必须排在它的定义之后 |
 | `vtysh/vtysh.h`、`vtysh/vtysh.c` | 新增 `VTYSH_MIDRD` 和 `midrd` 客户端 | midrd 带 CLI 后 vtysh 要能分发 MIDR 命令、下发配置 |
 | `tools/frrcommon.sh.in` | `DAEMONS` 加入 `midrd` | frrinit 按 daemons 文件启动 midrd |
