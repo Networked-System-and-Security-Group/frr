@@ -13,6 +13,23 @@
  *
  * See doc/midr-doc/MIDR-TED路径计算接口规范.md for the contract and
  * doc/midr-doc/dp-doc/ for the migration notes.
+ *
+ * Deferred-batch failure semantics (frozen contract section 6, review 2.2):
+ * update_deferred() reports success as soon as the batch is queued, so a
+ * failure detected later by the batch timer happens after the SPF adapter has
+ * already advanced its desired generation.  The backend therefore never drops
+ * the un-applied queue remainder in that case: those operations are the only
+ * replay of the missing installs and are retained (and re-driven) until they
+ * are accepted, after which midr_spf_install_resync() reconciles.  Dropping
+ * them would leave the FIB permanently behind the adapter's desired state.
+ * abort_pending() still discards the operations staged by the round the
+ * adapter just rejected; retained recovery operations from an earlier,
+ * already-committed round are preserved.
+ *
+ * Recovery liveness (review 2.3): the retained batch is driven by an explicit
+ * state machine (active fast retries, then a slow heartbeat) and is re-armed by
+ * a connection-state change or fresh adapter work as well, so a socket that
+ * stays up while sends keep failing can no longer stall recovery forever.
  */
 
 #include <stdbool.h>
@@ -39,6 +56,12 @@ struct midr_dp_status {
 	uint64_t send_failures;
 	uint64_t replays;
 	uint64_t resyncs;
+	/* Recovery state machine (see midr-dp-backend.c): recovering is true
+	 * while a retained deferred batch is being driven to convergence, and
+	 * recovery_stalled is true once it fell back to the slow heartbeat. */
+	bool recovering;
+	bool recovery_stalled;
+	uint32_t recovery_attempts;
 	size_t pending;
 	size_t installed;
 	int last_error;

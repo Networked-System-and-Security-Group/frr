@@ -39,15 +39,20 @@ struct zapi_capture {
 
 static struct zapi_capture captures[MIDR_TEST_MAX_SENDS];
 static size_t capture_count;
-static bool fail_next_send;
+static long fail_skip_sends;   /* succeed this many attempts first */
+static long fail_next_sends;   /* then fail this many (-1 handled below) */
+static bool fail_forever;      /* when true, fail every attempt from now on */
 
 enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
 						   struct zclient *zc,
 						   struct zapi_route *api)
 {
 	(void)zc;
-	if (fail_next_send) {
-		fail_next_send = false;
+	if (fail_skip_sends > 0) {
+		fail_skip_sends--;
+	} else if (fail_forever || fail_next_sends > 0) {
+		if (!fail_forever)
+			fail_next_sends--;
 		return ZCLIENT_SEND_FAILURE;
 	}
 	if (capture_count < MIDR_TEST_MAX_SENDS) {
@@ -58,11 +63,35 @@ enum zclient_send_status __wrap_zclient_route_send(uint8_t cmd,
 	return ZCLIENT_SEND_SUCCESS;
 }
 
+/* Fail exactly the next send attempt. */
+static void fail_one_send(void)
+{
+	fail_skip_sends = 0;
+	fail_next_sends = 1;
+	fail_forever = false;
+}
+
+/* Succeed @ok send attempts, then fail @bad more; @bad < 0 means forever. */
+static void fail_sends_after(long ok, long bad)
+{
+	fail_skip_sends = ok;
+	fail_forever = bad < 0;
+	fail_next_sends = bad < 0 ? 0 : bad;
+}
+
+/* Let every future send succeed again. */
+static void allow_sends(void)
+{
+	fail_skip_sends = 0;
+	fail_next_sends = 0;
+	fail_forever = false;
+}
+
 static void capture_reset(void)
 {
 	memset(captures, 0, sizeof(captures));
 	capture_count = 0;
-	fail_next_send = false;
+	allow_sends();
 }
 
 static struct midr_dp_status dp_status(void)
@@ -341,7 +370,7 @@ static void test_send_failure_and_abort(void)
 	result.instance = MIDR_INSTANCE_SPF;
 
 	/* A rejected send is reported and never recorded as installed. */
-	fail_next_send = true;
+	fail_one_send();
 	assert(midr_zebra_route_add(&ctx, &p, &result) == 0);
 	assert(midr_zebra_route_flush(&ctx) == -EIO);
 	dp = dp_status();
@@ -357,7 +386,7 @@ static void test_send_failure_and_abort(void)
 	assert(dp_status().installed == 1);
 
 	/* A rejected delete keeps the route installed. */
-	fail_next_send = true;
+	fail_one_send();
 	assert(midr_zebra_route_del(&ctx, &p, MIDR_INSTANCE_SPF) == 0);
 	assert(midr_zebra_route_flush(&ctx) == -EIO);
 	dp = dp_status();
@@ -481,7 +510,7 @@ static void test_adapter_pipeline_and_recovery(void)
 	 * only the retained-batch retry can converge the FIB; the resync that
 	 * follows is the spec-visible reconciliation and is a no-op here.
 	 */
-	fail_next_send = true;
+	fail_one_send();
 	events[0].metric = 6;
 	events[1].metric = 4;
 	events[0].generation = 8;
@@ -534,6 +563,319 @@ static void test_adapter_pipeline_and_recovery(void)
 	midr_dp_backend_stop();
 	assert(midr_dp_backend_get() == NULL);
 	assert(!midr_dp_backend_ready());
+	midr_ted_destroy(&ctx.ted);
+}
+
+/*
+ * =========================================================================
+ *  Deferred-batch failure consistency (review 2.2)
+ * =========================================================================
+ *  Partial and whole-batch failures, failure across a zebra reconnect and a
+ *  new desired generation arriving while recovery is in flight.  Each case
+ *  asserts observable state: the adapter's desired generation, the
+ *  installed-hash size, the pending queue and the number of re-sent ZAPI
+ *  operations.
+ */
+
+/* Fill a two-event TED snapshot (one link + one node prefix) for @generation.
+ * A changed link/prefix metric makes the SPF adapter produce a metric-only
+ * route change, which it expresses as DELETE + ADD. */
+static void snapshot_two_routes(struct midr_consumer_snapshot *snapshot,
+				struct midr_consumer_event *events,
+				uint64_t generation, uint32_t link_metric,
+				uint32_t prefix_metric)
+{
+	memset(events, 0, sizeof(*events) * 2);
+	snapshot->generation = generation;
+	snapshot->count = 2;
+	snapshot->events = events;
+
+	events[0].kind = MIDR_CONSUMER_LINK;
+	events[0].generation = generation;
+	events[0].originator = 1;
+	events[0].remote = 2;
+	events[0].link_id = 1;
+	events[0].family = MIDR_CORE_AF_IPV4;
+	events[0].metric = link_metric;
+	events[0].remote_address[0] = 192;
+	events[0].remote_address[1] = 0;
+	events[0].remote_address[2] = 2;
+	events[0].remote_address[3] = 2;
+
+	events[1].kind = MIDR_CONSUMER_NODE_PREFIX;
+	events[1].generation = generation;
+	events[1].originator = 2;
+	events[1].family = MIDR_CORE_AF_IPV4;
+	events[1].prefix_len = 24;
+	events[1].prefix[0] = 198;
+	events[1].prefix[1] = 51;
+	events[1].prefix[2] = 100;
+	events[1].metric = prefix_metric;
+}
+
+/* Gen 7 is applied on the cold path (immediate submit). */
+static void stage_gen7(struct midr_context *ctx,
+		       struct midr_consumer_snapshot *snapshot,
+		       struct midr_consumer_event *events)
+{
+	snapshot_two_routes(snapshot, events, 7, 5, 3);
+	assert(midr_ted_apply_snapshot(ctx->ted, snapshot) == 0);
+}
+
+static void test_deferred_partial_batch_failure(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	stage_gen7(&ctx, &snapshot, events);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 0 && capture_count == 1);
+
+	/* Gen 8 metric-only change: the DELETE succeeds and the ADD fails, and
+	 * sends keep failing so the retained state is observable. */
+	fail_sends_after(1, -1);
+	snapshot_two_routes(&snapshot, events, 8, 6, 4);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	assert(dp_status().pending == 2);
+
+	pump_events(ctx.master, 300);
+	dp = dp_status();
+	/* Partial success: the DELETE was applied, the ADD is retained. */
+	assert(capture_count == 2);
+	assert(captures[1].cmd == ZEBRA_ROUTE_DELETE);
+	assert(dp.installed == 0 && dp.pending == 1);
+	assert(dp.recovering && !dp.recovery_stalled);
+	assert(dp.last_error == -EIO);
+
+	/* Recovery applies the retained remainder and reconciles. */
+	allow_sends();
+	pump_events(ctx.master, 300);
+	dp = dp_status();
+	assert(capture_count == 3);
+	assert(captures[2].cmd == ZEBRA_ROUTE_ADD);
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(!dp.recovering && dp.last_error == 0);
+	assert(dp.resyncs == 1);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+static void test_deferred_whole_batch_failure(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	stage_gen7(&ctx, &snapshot, events);
+	assert(dp_status().installed == 1 && capture_count == 1);
+
+	/* Every send fails: the whole DELETE + ADD batch is retained. */
+	fail_sends_after(0, -1);
+	snapshot_two_routes(&snapshot, events, 8, 6, 4);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	assert(dp_status().pending == 2);
+
+	pump_events(ctx.master, 300);
+	dp = dp_status();
+	/* Nothing was applied; the previous route is still installed. */
+	assert(capture_count == 1);
+	assert(dp.installed == 1 && dp.pending == 2);
+	assert(dp.recovering && dp.last_error == -EIO);
+
+	/* abort_pending() from a later rejected round must not clobber the
+	 * retained remainder: it is the only replay of the missing installs. */
+	midr_zebra_route_abort(&ctx);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 2 && dp.recovering);
+
+	allow_sends();
+	pump_events(ctx.master, 300);
+	dp = dp_status();
+	assert(capture_count == 3);
+	assert(captures[1].cmd == ZEBRA_ROUTE_DELETE);
+	assert(captures[2].cmd == ZEBRA_ROUTE_ADD);
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(!dp.recovering && dp.last_error == 0);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+static void test_deferred_failure_across_reconnect(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	stage_gen7(&ctx, &snapshot, events);
+	assert(dp_status().installed == 1 && capture_count == 1);
+
+	/* Gen 8 fails and is retained; recovery is in flight. */
+	fail_sends_after(0, -1);
+	snapshot_two_routes(&snapshot, events, 8, 6, 4);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	pump_events(ctx.master, 200);
+	dp = dp_status();
+	assert(dp.pending == 2 && dp.installed == 1 && dp.recovering);
+
+	/*
+	 * zebra reconnects: the backend drops the stale installed hash and
+	 * replays the whole desired set; the retained batch is re-sent first
+	 * (its DELETE is a no-op now that the local hash is empty).
+	 */
+	allow_sends();
+	backend_fake_reconnect();
+	pump_events(ctx.master, 200);
+	dp = dp_status();
+	assert(dp.replays == 1);
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(!dp.recovering && dp.last_error == 0);
+	assert(capture_count == 2);
+	assert(captures[1].cmd == ZEBRA_ROUTE_ADD);
+	assert(dp.resyncs == 1);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+/*
+ * =========================================================================
+ *  Recovery liveness: new desired in flight, and past-cap re-arm (review 2.3)
+ * =========================================================================
+ */
+
+static void test_recovery_with_new_desired_inflight(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_spf_install_status spf;
+	uint64_t gen8_desired;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	stage_gen7(&ctx, &snapshot, events);
+	assert(dp_status().installed == 1 && capture_count == 1);
+
+	/* Gen 8 whole batch retained with recovery in flight. */
+	fail_sends_after(0, -1);
+	snapshot_two_routes(&snapshot, events, 8, 6, 4);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	pump_events(ctx.master, 200);
+	dp = dp_status();
+	assert(dp.pending == 2 && dp.installed == 1 && dp.recovering);
+	assert(midr_spf_install_status_get(&ctx, &spf) == 0);
+	assert(spf.desired_generation != 0);
+	gen8_desired = spf.desired_generation;
+
+	/* A new desired generation arrives while the retained batch is still
+	 * failing: its operations append behind the retained remainder. */
+	snapshot_two_routes(&snapshot, events, 9, 7, 5);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	dp = dp_status();
+	assert(dp.pending == 4 && dp.recovering);
+	assert(midr_spf_install_status_get(&ctx, &spf) == 0);
+	assert(spf.desired_generation != gen8_desired);
+
+	/* Let sends through: the retained remainder then the new diff apply in
+	 * FIFO order and converge on gen 9. */
+	allow_sends();
+	pump_events(ctx.master, 400);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(!dp.recovering && dp.last_error == 0);
+	assert(capture_count == 5);
+	assert(captures[1].cmd == ZEBRA_ROUTE_DELETE);
+	assert(captures[2].cmd == ZEBRA_ROUTE_ADD);
+	assert(captures[3].cmd == ZEBRA_ROUTE_DELETE);
+	assert(captures[4].cmd == ZEBRA_ROUTE_ADD);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+static void test_recovery_past_cap_rearm(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	stage_gen7(&ctx, &snapshot, events);
+	assert(dp_status().installed == 1 && capture_count == 1);
+
+	/* Gen 8 fails and the socket never disconnects; run past the fast-retry
+	 * cap (50 x 100 ms) so recovery falls back to the slow heartbeat. */
+	fail_sends_after(0, -1);
+	snapshot_two_routes(&snapshot, events, 8, 6, 4);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+
+	pump_events(ctx.master, 7000);
+	dp = dp_status();
+	assert(dp.recovery_stalled);
+	assert(dp.recovery_attempts >= 50);
+	assert(dp.installed == 1 && dp.pending == 2);
+	assert(dp.last_error == -EIO);
+
+	/* No reconnect: a fresh desired generation must re-arm recovery through
+	 * the explicit re-arm path and converge the retained batch. */
+	allow_sends();
+	snapshot_two_routes(&snapshot, events, 9, 7, 5);
+	assert(midr_ted_apply_snapshot(ctx.ted, &snapshot) == 0);
+	dp = dp_status();
+	assert(!dp.recovery_stalled && dp.recovering);
+	assert(dp.pending == 4);
+
+	pump_events(ctx.master, 400);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(!dp.recovering && !dp.recovery_stalled && dp.last_error == 0);
+	assert(capture_count == 5);
+	assert(captures[1].cmd == ZEBRA_ROUTE_DELETE);
+	assert(captures[2].cmd == ZEBRA_ROUTE_ADD);
+	assert(captures[3].cmd == ZEBRA_ROUTE_DELETE);
+	assert(captures[4].cmd == ZEBRA_ROUTE_ADD);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
 	midr_ted_destroy(&ctx.ted);
 }
 
@@ -606,6 +948,11 @@ int main(void)
 	test_encoding_modes();
 	test_send_failure_and_abort();
 	test_adapter_pipeline_and_recovery();
+	test_deferred_partial_batch_failure();
+	test_deferred_whole_batch_failure();
+	test_deferred_failure_across_reconnect();
+	test_recovery_with_new_desired_inflight();
+	test_recovery_past_cap_rearm();
 	test_gre_api();
 	puts("midrd-dp-test: PASS");
 	return 0;

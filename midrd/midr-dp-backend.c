@@ -20,14 +20,26 @@
  *
  * Deferred-batch failure recovery is two-step.  A deferred batch can fail
  * after update_deferred() already returned success, so the adapter never saw
- * the error and has already advanced its desired generation.  The failed ops
- * are retained as the un-applied remainder of the diff between the last
- * accepted result and the current one; dp_recovery_cb() therefore (1) retries
- * that retained batch, and only once it was applied calls (2)
+ * the error and has already advanced its desired generation.  The operations
+ * left in the queue are exactly the un-applied remainder of the diff between
+ * the last accepted result and the current one; they are therefore RETAINED
+ * (marked as recovery operations) instead of being dropped.  dp_recovery_cb()
+ * (1) retries that retained batch and only once it was applied calls (2)
  * midr_spf_install_resync() as the spec-visible reconciliation, which is a
- * no-op when the adapter already reached the desired generation.  Retries are
- * bounded (MIDR_DP_RECOVERY_MAX_ATTEMPTS, 100 ms apart); if zebra is
- * unreachable the recovery returns without rescheduling and leaves
+ * no-op when the adapter already reached the desired generation.
+ *
+ * Pending operations are never cleared while the adapter's desired generation
+ * is ahead of the installed hash: dropping them would leave the FIB missing
+ * operations the adapter will never re-generate, a permanent divergence.  The
+ * retained batch is itself the replay that re-creates every missing install,
+ * so it is the only safe thing to keep.  abort_pending() still discards the
+ * operations staged by the current round, preserving the backend-rejection
+ * contract that the previous desired generation is kept; it deliberately
+ * keeps retained recovery operations, which belong to an earlier round whose
+ * desired generation the adapter already committed.
+ *
+ * Retries are bounded (MIDR_DP_RECOVERY_MAX_ATTEMPTS, 100 ms apart); if zebra
+ * is unreachable the recovery returns without rescheduling and leaves
  * convergence to the zebra-reconnect path (clear installed hash +
  * midr_spf_install_replay()).
  */
@@ -60,10 +72,35 @@
  * to be negligible for convergence. */
 #define MIDR_BATCH_INTERVAL_MS 100
 
-/* Send-failure recovery: resync attempts and spacing before giving up and
- * waiting for a zebra reconnect (which triggers a full replay). */
+/* Send-failure recovery: fast retries for the first
+ * MIDR_DP_RECOVERY_MAX_ATTEMPTS attempts, then a slow heartbeat so a socket
+ * that stays up but keeps failing sends still re-arms recovery instead of
+ * stalling forever. */
 #define MIDR_DP_RECOVERY_MS 100
 #define MIDR_DP_RECOVERY_MAX_ATTEMPTS 50
+#define MIDR_DP_RECOVERY_HEARTBEAT_MS 2000
+
+/*
+ * Recovery state machine (review 2.3).  A deferred batch that fails leaves the
+ * adapter's desired generation ahead of the FIB, so the retained batch (see the
+ * file header) must be driven to convergence.  The state is explicit and is
+ * re-armed by a timer, a connection-state change or fresh adapter work, never
+ * by a reconnect alone:
+ *
+ *   IDLE    - nothing to recover.
+ *   ACTIVE  - fast retries, MIDR_DP_RECOVERY_MS apart, below the attempt cap.
+ *   STALLED - attempt cap reached or zebra unreachable: a slow heartbeat,
+ *             MIDR_DP_RECOVERY_HEARTBEAT_MS apart, keeps re-arming so the
+ *             batch is retried until it succeeds, a reconnect happens or a
+ *             new desired generation re-kicks recovery back to ACTIVE.  The
+ *             heartbeat is slow on purpose: recovery must not spin at 100 ms
+ *             forever.
+ */
+enum midr_dp_recovery_state {
+	MIDR_DP_RECOVERY_IDLE = 0,
+	MIDR_DP_RECOVERY_ACTIVE,
+	MIDR_DP_RECOVERY_STALLED,
+};
 
 /* Keep the historical distance so regular EBGP routes stay preferred over
  * MIDR routes. */
@@ -75,7 +112,12 @@ enum midr_op_type {
 };
 
 /* A queued operation.  For MIDR_OP_ADD the paths and SID list are deep-copied
- * so the producer may free its result as soon as route_add() returns. */
+ * so the producer may free its result as soon as route_add() returns.
+ *
+ * @recovery marks an operation retained from a deferred batch that already
+ * failed: the adapter has advanced its desired generation, so this operation
+ * is part of the only replay that can re-create the missing install and must
+ * survive abort_pending() of a later round. */
 struct midr_pending_op {
 	enum midr_op_type op;
 	struct prefix prefix;
@@ -84,6 +126,7 @@ struct midr_pending_op {
 	uint8_t path_count;
 	uint8_t sid_count;
 	struct in6_addr sid_list[MIDR_SRV6_MAX_SEGS];
+	bool recovery;
 };
 
 /* Last state accepted by zebra for one (prefix, instance) identity. */
@@ -106,6 +149,7 @@ struct midr_dp_backend {
 	struct list *pending_ops;
 	struct hash *installed;
 	struct event *t_recovery;
+	enum midr_dp_recovery_state recovery_state;
 	uint32_t recovery_attempts;
 
 	bool flush_pending;
@@ -451,25 +495,7 @@ static int dp_zapi_send(struct midr_dp_backend *b, struct zapi_route *api,
 }
 
 /*
- * Only delivery failures are worth retrying.  An encoding failure (unusable
- * nexthop, unsupported family, oversized SID list) is deterministic, so the
- * incomplete batch is dropped instead of spinning until the retry budget is
- * exhausted; the error stays visible through the status.
- */
-static bool dp_error_retryable(int error)
-{
-	switch (error) {
-	case -EIO:
-	case -ENOTCONN:
-	case -ENOBUFS:
-	case -EAGAIN:
-		return true;
-	default:
-		return false;
-	}
-}
-
-/* DELETE carries only the identity: route type, VRF, table and instance must
+ * DELETE carries only the identity: route type, VRF, table and instance must
  * match the ADD so zebra removes exactly the route we installed. */
 static int dp_send_delete(struct midr_dp_backend *b, const struct prefix *p,
 			  uint8_t instance)
@@ -584,14 +610,46 @@ static int dp_flush_pending(struct midr_dp_backend *b)
 	return ret;
 }
 
-/* Discard every operation staged since the last successful submission. */
+/*
+ * Keep the queue remainder as the retained recovery batch.  dp_flush_pending()
+ * has just failed, so every operation still queued is un-applied and is part
+ * of the diff the adapter will not re-create; mark all of them as recovery
+ * operations so a later abort_pending() of a new round cannot drop them.
+ */
+static void dp_retain_remainder(struct midr_dp_backend *b)
+{
+	struct listnode *node;
+	struct midr_pending_op *op;
+
+	if (!b->pending_ops)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(b->pending_ops, node, op))
+		op->recovery = true;
+}
+
+/*
+ * Discard the operations staged by the current round only.  The adapter calls
+ * abort_pending() when it rejects the current diff and it keeps its previous
+ * desired generation, so the current round's operations are safe to drop.
+ * Retained recovery operations belong to an earlier, already-committed round
+ * and are the only replay of their missing installs, so they are kept.
+ */
 static void dp_abort_pending_ops(struct midr_dp_backend *b)
 {
+	struct listnode *node, *nnode;
+	struct midr_pending_op *op;
+
 	if (b->t_deferred)
 		event_cancel(&b->t_deferred);
 	b->flush_pending = false;
-	if (b->pending_ops)
-		list_delete_all_node(b->pending_ops);
+	if (!b->pending_ops)
+		return;
+	for (ALL_LIST_ELEMENTS(b->pending_ops, node, nnode, op)) {
+		if (op->recovery)
+			continue;
+		list_delete_node(b->pending_ops, node);
+		dp_pending_op_free(op);
+	}
 }
 
 static void dp_flush_timer_cb(struct event *t);
@@ -623,8 +681,18 @@ static void dp_schedule_recovery(struct midr_dp_backend *b, int error)
 	b->last_error = error;
 	if (!b->master || b->t_recovery)
 		return;
+	b->recovery_state = MIDR_DP_RECOVERY_ACTIVE;
 	b->recovery_attempts = 0;
 	event_add_timer_msec(b->master, dp_recovery_cb, b, MIDR_DP_RECOVERY_MS,
+			     &b->t_recovery);
+}
+
+/* Arm the recovery timer; the caller owns state/attempt updates. */
+static void dp_recovery_arm(struct midr_dp_backend *b, uint32_t delay_ms)
+{
+	if (!b->master)
+		return;
+	event_add_timer_msec(b->master, dp_recovery_cb, b, delay_ms,
 			     &b->t_recovery);
 }
 
@@ -643,28 +711,29 @@ static void dp_flush_timer_cb(struct event *t)
 	if (!ret)
 		return;
 
-	if (!dp_error_retryable(ret)) {
-		zlog_warn("MIDR data plane: batch rejected (%d), dropping the incomplete batch",
-			  ret);
-		dp_abort_pending_ops(b);
-		return;
-	}
-
-	zlog_warn("MIDR data plane: batch submission failed (%d), retrying", ret);
+	/* The adapter was already told this batch succeeded, so its desired
+	 * generation is ahead of the FIB and it will not re-create the missing
+	 * operations.  Retain the un-applied remainder and drive recovery; it
+	 * is never dropped while the desired generation is ahead. */
+	dp_retain_remainder(b);
+	zlog_warn("MIDR data plane: batch submission failed (%d), retained %u ops"
+		  " for recovery", ret, listcount(b->pending_ops));
 	dp_schedule_recovery(b, ret);
 }
 
-/* Two-step deferred-batch recovery (see dp_schedule_recovery()):
+/* Two-step deferred-batch recovery (see the recovery state machine above):
  *
  *   1. retry the retained pending batch; on continued failure re-arm the
- *      timer while MIDR_DP_RECOVERY_MAX_ATTEMPTS is not exhausted;
+ *      timer while MIDR_DP_RECOVERY_MAX_ATTEMPTS is not exhausted, then fall
+ *      back to the slow heartbeat;
  *   2. once the batch was applied (or was empty), call
  *      midr_spf_install_resync() as the spec-visible reconciliation -- a
  *      no-op when generation already matches.
  *
- * If zebra is unreachable the callback returns without rescheduling: the
- * zebra-reconnect path clears the installed hash and calls
- * midr_spf_install_replay() to rebuild from an empty baseline.
+ * If zebra is unreachable the callback keeps the needs-recovery state and
+ * re-arms the slow heartbeat, so a socket that stays up without ever
+ * disconnecting cannot stall recovery permanently; a reconnect or a fresh
+ * desired generation re-kicks the fast path.
  */
 static void dp_recovery_cb(struct event *t)
 {
@@ -672,30 +741,43 @@ static void dp_recovery_cb(struct event *t)
 	int ret;
 
 	b->t_recovery = NULL;
-	if (!b->ctx || !b->zebra_up || !b->zc || b->zc->sock < 0)
+	if (!b->ctx) {
+		b->recovery_state = MIDR_DP_RECOVERY_IDLE;
 		return;
+	}
+
+	/* Cannot talk to zebra right now.  Keep the retained batch and the
+	 * needs-recovery state, but only the slow heartbeat can re-arm it.  The
+	 * zclient socket is the authoritative reachability signal. */
+	if (!b->zc || b->zc->sock < 0) {
+		b->recovery_state = MIDR_DP_RECOVERY_STALLED;
+		dp_recovery_arm(b, MIDR_DP_RECOVERY_HEARTBEAT_MS);
+		return;
+	}
 
 	/* Step 1: retry the retained batch.  The queued ops are the
-	 * un-applied remainder of the diff, so this is idempotent. */
+	 * un-applied remainder of the diff, so this is idempotent.  A failure
+	 * never drops the batch -- that would be a permanent divergence -- it
+	 * is retried while the budget lasts. */
 	if (listcount(b->pending_ops)) {
 		ret = dp_flush_pending(b);
 		if (ret) {
-			if (!dp_error_retryable(ret)) {
-				zlog_warn("MIDR data plane: retained batch rejected (%d), dropping it",
-					  ret);
-				dp_abort_pending_ops(b);
-				return;
-			}
+			b->last_error = ret;
 			b->recovery_attempts++;
 			if (b->recovery_attempts <
 			    MIDR_DP_RECOVERY_MAX_ATTEMPTS) {
-				event_add_timer_msec(b->master, dp_recovery_cb,
-						     b, MIDR_DP_RECOVERY_MS,
-						     &b->t_recovery);
+				b->recovery_state = MIDR_DP_RECOVERY_ACTIVE;
+				dp_recovery_arm(b, MIDR_DP_RECOVERY_MS);
 				return;
 			}
-			zlog_warn("MIDR data plane: batch retry failed %u times, waiting for zebra reconnect",
-				  b->recovery_attempts);
+			/* Budget exhausted: switch to the slow heartbeat so the
+			 * socket staying up without a disconnect cannot stall
+			 * recovery forever. */
+			b->recovery_state = MIDR_DP_RECOVERY_STALLED;
+			zlog_warn("MIDR data plane: retained batch still failing after"
+				  " %u retries (%d), slow heartbeat armed",
+				  b->recovery_attempts, ret);
+			dp_recovery_arm(b, MIDR_DP_RECOVERY_HEARTBEAT_MS);
 			return;
 		}
 	}
@@ -707,18 +789,39 @@ static void dp_recovery_cb(struct event *t)
 		b->last_error = ret;
 		b->recovery_attempts++;
 		if (b->recovery_attempts < MIDR_DP_RECOVERY_MAX_ATTEMPTS) {
-			event_add_timer_msec(b->master, dp_recovery_cb, b,
-					     MIDR_DP_RECOVERY_MS, &b->t_recovery);
+			b->recovery_state = MIDR_DP_RECOVERY_ACTIVE;
+			dp_recovery_arm(b, MIDR_DP_RECOVERY_MS);
 			return;
 		}
-		zlog_warn("MIDR data plane: resync failed %u times, waiting for zebra reconnect",
-			  b->recovery_attempts);
+		b->recovery_state = MIDR_DP_RECOVERY_STALLED;
+		zlog_warn("MIDR data plane: resync still failing after %u retries"
+			  " (%d), slow heartbeat armed",
+			  b->recovery_attempts, ret);
+		dp_recovery_arm(b, MIDR_DP_RECOVERY_HEARTBEAT_MS);
 		return;
 	}
+	b->recovery_state = MIDR_DP_RECOVERY_IDLE;
 	b->recovery_attempts = 0;
 	b->last_error = 0;
 	zlog_info("MIDR data plane: recovery complete (installed=%zu)",
 		  dp_installed_count(b));
+}
+
+/*
+ * Re-arm recovery from an external trigger (a fresh desired generation or a
+ * zebra reconnect): reset the fast-retry budget and bring the timer forward,
+ * so a stalled batch does not have to wait for the slow heartbeat.  A no-op
+ * when there is nothing to recover.
+ */
+static void dp_recovery_kick(struct midr_dp_backend *b)
+{
+	if (!b || b->recovery_state == MIDR_DP_RECOVERY_IDLE)
+		return;
+	if (b->t_recovery)
+		event_cancel(&b->t_recovery);
+	b->recovery_state = MIDR_DP_RECOVERY_ACTIVE;
+	b->recovery_attempts = 0;
+	dp_recovery_arm(b, MIDR_DP_RECOVERY_MS);
 }
 
 /*
@@ -752,6 +855,10 @@ static void dp_zebra_connected(struct zclient *zc)
 		b->last_error = ret;
 		zlog_warn("MIDR data plane: replay deferred (%d)", ret);
 	}
+
+	/* A reconnect is a connection-state change: re-arm any outstanding
+	 * recovery so it does not depend on the slow heartbeat. */
+	dp_recovery_kick(b);
 }
 
 /*
@@ -831,6 +938,10 @@ static int dp_route_update_deferred(void *arg)
 	if (!b || !b->master)
 		return -EINVAL;
 
+	/* Fresh adapter work is an explicit re-arm: a new desired generation
+	 * must not have to wait for the slow heartbeat. */
+	dp_recovery_kick(b);
+
 	if (b->immediate_next) {
 		b->immediate_next = false;
 		zlog_info("MIDR data plane: cold-path submit (%u ops)",
@@ -890,6 +1001,7 @@ static void dp_backend_destroy(struct midr_dp_backend *b)
 		event_cancel(&b->t_deferred);
 	if (b->t_recovery)
 		event_cancel(&b->t_recovery);
+	b->recovery_state = MIDR_DP_RECOVERY_IDLE;
 	dp_abort_pending_ops(b);
 	if (b->installed)
 		hash_clean_and_free(&b->installed, dp_installed_entry_free);
@@ -1023,6 +1135,10 @@ void midr_dp_backend_status_get(struct midr_dp_status *status)
 	status->send_failures = b->send_failures;
 	status->replays = b->replays;
 	status->resyncs = b->resyncs;
+	status->recovering = b->recovery_state != MIDR_DP_RECOVERY_IDLE;
+	status->recovery_stalled =
+		b->recovery_state == MIDR_DP_RECOVERY_STALLED;
+	status->recovery_attempts = b->recovery_attempts;
 	status->pending = b->pending_ops ? listcount(b->pending_ops) : 0;
 	status->installed = dp_installed_count(b);
 	status->last_error = b->last_error;
@@ -1035,9 +1151,12 @@ void midr_dp_backend_log_status(const char *tag)
 	midr_dp_backend_status_get(&st);
 	printf("dp backend=%s zebra=%s installed=%zu pending=%zu route-adds=%" PRIu64
 	       " route-deletes=%" PRIu64 " send-failures=%" PRIu64
-	       " replays=%" PRIu64 " resyncs=%" PRIu64 " last-error=%d\n",
+	       " replays=%" PRIu64 " resyncs=%" PRIu64 " recovery=%s last-error=%d\n",
 	       tag ? tag : "status", st.zebra_up ? "up" : "down", st.installed,
 	       st.pending, st.route_adds, st.route_deletes, st.send_failures,
-	       st.replays, st.resyncs, st.last_error);
+	       st.replays, st.resyncs,
+	       st.recovery_stalled ? "stalled"
+				   : (st.recovering ? "active" : "idle"),
+	       st.last_error);
 	(void)fflush(stdout);
 }
