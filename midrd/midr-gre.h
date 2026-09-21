@@ -24,6 +24,13 @@
  *     endpoints as well as by name.
  *   - Deletion is best-effort: the registry entry is dropped and the request
  *     is forwarded to zebra (which emits RTM_DELLINK).
+ *   - The registry holds at most one entry per device name and per
+ *     (vrf, local, remote) endpoint pair, so lookup-by-name and
+ *     lookup-by-endpoints always agree.  Re-adding an existing name with new
+ *     endpoints updates that entry in place (the old endpoints stop
+ *     matching); re-adding an already-known endpoint pair under a different
+ *     explicit name renames the entry so the explicit name wins; re-adding
+ *     the identical name and endpoints is a no-op.
  *
  *   wire path:
  *     CP (SPF/CSPF)
@@ -149,8 +156,10 @@ extern void midr_gre_unregister_notify(midr_gre_notify_cb cb);
  *   FAILED  - rejected (see status->err)
  *
  * Returns 0 when the request was accepted (UP or PENDING), -1 otherwise.
- * For a PENDING request use midr_gre_interface_wait_up() or the notify
- * callback to obtain the confirmed result.
+ * A -1 result with status->err == ENOMEM means the local registry entry
+ * could not be allocated: the tunnel is not tracked and must not be treated
+ * as registered.  For a PENDING request use midr_gre_interface_wait_up() or
+ * the notify callback to obtain the confirmed result.
  */
 extern int midr_gre_interface_add(struct midr_context *ctx,
 				  const struct midr_gre_tunnel *tun,

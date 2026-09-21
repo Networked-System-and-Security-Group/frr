@@ -54,6 +54,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-interface-test \
 	$(BUILD_DIR)/midrd-spf-install-test \
 	$(BUILD_DIR)/midrd-dp-test \
+	$(BUILD_DIR)/midrd-gre-registry-test \
 	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
 	$(BUILD_DIR)/midrd-gre-tool \
 	$(BUILD_DIR)/midrd-dp-e2e-tool \
@@ -220,6 +221,12 @@ $(BUILD_DIR)/midrd-dp-test.o: dp-backend-test.c midrd.c midr-context.h midr-cont
 
 $(BUILD_DIR)/midrd-dp-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-dp-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wl,--wrap=zclient_route_send $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
+
+$(BUILD_DIR)/midrd-gre-registry-test.o: gre-registry-test.c midrd.c midr-context.h midr-context-private.h midr-dp-backend.h midr-gre.h midr-ted.h midr-zebra.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c gre-registry-test.c -o $@
+
+$(BUILD_DIR)/midrd-gre-registry-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-gre-registry-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wl,--wrap=zclient_send_gre_add -Wl,--wrap=zclient_send_gre_delete -Wl,--wrap=calloc $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 $(BUILD_DIR)/midrd-ted-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midr-scope.o $(BUILD_DIR)/midr-lsdb.o $(BUILD_DIR)/midr-ted.o $(BUILD_DIR)/midrd-ted-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
@@ -306,6 +313,7 @@ test: all
 	$(BUILD_DIR)/midrd-interface-test
 	$(BUILD_DIR)/midrd-spf-install-test
 	$(BUILD_DIR)/midrd-dp-test
+	$(BUILD_DIR)/midrd-gre-registry-test
 	$(BUILD_DIR)/midrd-sync-test
 	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh

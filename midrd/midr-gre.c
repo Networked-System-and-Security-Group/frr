@@ -66,6 +66,10 @@ static struct list *midr_gre_registry;
 static struct list *midr_gre_notifiers;
 static uint32_t midr_gre_name_seq;
 
+/* Defined below; forward-declared for the registry update/rebind path. */
+static void midr_gre_registry_del(struct midr_gre_entry *e);
+static void midr_gre_confirm_cancel(struct midr_gre_entry *e);
+
 /* Monotonic milliseconds, used to report how long an interface is up. */
 static uint64_t midr_gre_now_ms(void)
 {
@@ -135,13 +139,66 @@ midr_gre_registry_lookup_by_endpoints(vrf_id_t vrf_id,
 	return NULL;
 }
 
+/*
+ * Insert, or update in place, the mapping between a netdevice name and a set
+ * of tunnel endpoints.  The registry keeps a single entry per name and a
+ * single entry per (vrf, local, remote) endpoint pair, so both
+ * lookup-by-name and lookup-by-endpoints always agree:
+ *
+ *   - same name + identical endpoints: idempotent no-op, entry unchanged;
+ *   - same name + new endpoints: the entry's endpoints are updated in place
+ *     (the old endpoint pair is no longer matched, and any *other* entry
+ *     still holding the new pair is dropped first);
+ *   - new name + endpoints already bound to another name: the existing entry
+ *     is renamed in place, so the explicit name wins without leaving a
+ *     duplicate endpoint entry behind.
+ *
+ * Returns the entry, or NULL on allocation failure.  On NULL the registry is
+ * unchanged.
+ */
 static struct midr_gre_entry *
 midr_gre_registry_add(const char *ifname, vrf_id_t vrf_id,
 		      const struct ipaddr *local, const struct ipaddr *remote)
 {
 	struct midr_gre_entry *e;
+	struct midr_gre_entry *other;
+
+	if (!ifname || !local || !remote)
+		return NULL;
+
+	e = midr_gre_registry_lookup_by_name(ifname);
+	if (e) {
+		if (e->vrf_id == vrf_id &&
+		    ipaddr_cmp(&e->local, local) == 0 &&
+		    ipaddr_cmp(&e->remote, remote) == 0)
+			return e; /* idempotent re-add */
+
+		/* Rebinding this name to new endpoints: drop any other entry
+		 * that already owns the new pair to keep it unique. */
+		other = midr_gre_registry_lookup_by_endpoints(vrf_id, local,
+							      remote);
+		if (other && other != e)
+			midr_gre_registry_del(other);
+
+		e->vrf_id = vrf_id;
+		e->local = *local;
+		e->remote = *remote;
+		return e;
+	}
+
+	/* The endpoints may already be tracked under another (e.g. generated)
+	 * name.  Keep one entry: the explicitly requested name wins. */
+	e = midr_gre_registry_lookup_by_endpoints(vrf_id, local, remote);
+	if (e) {
+		strlcpy(e->ifname, ifname, sizeof(e->ifname));
+		e->vrf_id = vrf_id;
+		return e;
+	}
 
 	e = calloc(1, sizeof(*e));
+	if (!e)
+		return NULL;
+
 	strlcpy(e->ifname, ifname, sizeof(e->ifname));
 	e->vrf_id = vrf_id;
 	e->local = *local;
@@ -158,6 +215,8 @@ static void midr_gre_registry_del(struct midr_gre_entry *e)
 	if (!e)
 		return;
 
+	/* Drop any pending confirmation timer before freeing the entry. */
+	midr_gre_confirm_cancel(e);
 	listnode_delete(midr_gre_registry, e);
 	free(e);
 }
@@ -404,11 +463,20 @@ int midr_gre_interface_add(struct midr_context *ctx,
 		goto out_fail;
 	}
 
-	/* Remember the mapping so the same name is reused / can be removed. */
-	e = midr_gre_registry_lookup_by_name(name);
-	if (!e)
-		e = midr_gre_registry_add(name, vrf_id, &tun->local,
-					  &tun->remote);
+	/*
+	 * Remember (or update in place) the name <-> endpoints mapping so the
+	 * same name is reused and the tunnel can later be removed by
+	 * endpoints.  A NULL return means the new entry could not be
+	 * allocated; fail without arming the confirmation poller so the
+	 * caller never treats the tunnel as registered.
+	 */
+	e = midr_gre_registry_add(name, vrf_id, &tun->local, &tun->remote);
+	if (!e) {
+		zlog_warn("%s: no memory to register GRE interface %s",
+			  __func__, name);
+		err = ENOMEM;
+		goto out_fail;
+	}
 
 	/*
 	 * If zebra already knows the device report UP straight away,
