@@ -928,6 +928,79 @@ static void test_installed_set_failure(void)
 
 /*
  * =========================================================================
+ *  Cold-path batch submit (review 3, D5)
+ * =========================================================================
+ */
+
+/*
+ * The batch that midr_dp_backend_start() submits after the registration-time
+ * reconciliation has already been reported to the adapter as accepted, so a
+ * failure there must retain the remainder and arm recovery -- otherwise the
+ * operations sit in the queue with no timer and the FIB stays permanently
+ * behind the adapter's desired generation.  The start sequence cannot reach
+ * that state today (the zclient is not connected yet), so the same code path
+ * is driven through the test-only hook.
+ */
+static void test_cold_path_submit_failure(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct midr_consumer_event events[2] = {0};
+	struct midr_consumer_snapshot snapshot;
+	struct prefix p = prefix_v4("10.50.0.0", 24);
+	struct midr_path path = {};
+	struct midr_path_result result = {};
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	/* Prime the adapter with one committed result so the recovery
+	 * reconciliation has a desired generation to compare against. */
+	stage_gen7(&ctx, &snapshot, events);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 0 && capture_count == 1);
+
+	path_v4(&path, "192.0.2.1", 5, 10, 0);
+	result.paths = &path;
+	result.path_count = 1;
+	result.instance = MIDR_INSTANCE_SPF;
+
+	/* Stage one more operation without submitting it yet. */
+	assert(midr_zebra_route_add(&ctx, &p, &result) == 0);
+	dp = dp_status();
+	assert(dp.pending == 1 && dp.installed == 1 && capture_count == 1);
+
+	/* The cold-path submit fails: the operation must be retained as
+	 * recovery work and a timer must be armed. */
+	fail_sends_after(0, -1);
+	midr_dp_backend_test_cold_submit();
+	dp = dp_status();
+	assert(capture_count == 1);
+	assert(dp.pending == 1 && dp.installed == 1);
+	assert(dp.recovering && !dp.recovery_stalled);
+	assert(dp.last_error == -EIO);
+
+	/* Recovery re-sends the retained operation; the reconciliation that
+	 * follows is a no-op because the adapter's desired generation did not
+	 * change, so recovery returns to idle. */
+	allow_sends();
+	pump_events(ctx.master, 300);
+	dp = dp_status();
+	assert(capture_count == 2 && captures[1].cmd == ZEBRA_ROUTE_ADD);
+	assert(dp.installed == 2 && dp.pending == 0);
+	assert(!dp.recovering && dp.last_error == 0);
+	assert(dp.resyncs == 1);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+/*
+ * =========================================================================
  *  GRE provisioning API
  * =========================================================================
  *  Validation paths only: the tunnel itself is created against a real zebra
@@ -1001,6 +1074,7 @@ int main(void)
 	test_recovery_with_new_desired_inflight();
 	test_recovery_past_cap_rearm();
 	test_installed_set_failure();
+	test_cold_path_submit_failure();
 	test_gre_api();
 	puts("midrd-dp-test: PASS");
 	return 0;

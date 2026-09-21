@@ -308,6 +308,23 @@ void midr_dp_backend_test_fail_installed(bool enable)
 	dp_test_fail_installed = enable;
 }
 
+/* Cold-path batch submit performed right after the backend registers; defined
+ * with the submit/recovery machinery further down. */
+static void dp_cold_submit(struct midr_dp_backend *b);
+
+/*
+ * Test-only entry point for the cold-path submit that
+ * midr_dp_backend_start() performs after the registration-time
+ * reconciliation.  In production that path needs the zclient to be connected
+ * while a batch is staged, which the start sequence cannot produce today, so
+ * the failure handling (retain + arm recovery) is exercised through this hook.
+ */
+void midr_dp_backend_test_cold_submit(void)
+{
+	if (midr_dp_current)
+		dp_cold_submit(midr_dp_current);
+}
+
 static void dp_installed_unset(struct hash *h, const struct prefix *p,
 			       uint8_t instance)
 {
@@ -1063,6 +1080,35 @@ static void dp_backend_destroy(struct midr_dp_backend *b)
 	free(b);
 }
 
+/*
+ * Deliver a batch left over from the registration-time reconciliation.
+ *
+ * update_deferred() already reported success for this batch, so the adapter's
+ * desired generation is ahead of the FIB and it will not re-create these
+ * operations.  A failure here therefore has the same consequence as a failed
+ * deferred batch: the queued remainder is the only replay of the missing
+ * installs, so it is retained and handed to the recovery state machine.
+ * Leaving it queued without arming recovery would strand it forever when the
+ * socket never disconnects (review 3, D5).
+ */
+static void dp_cold_submit(struct midr_dp_backend *b)
+{
+	int ret;
+
+	if (!b->zc || b->zc->sock < 0 || !listcount(b->pending_ops))
+		return;
+
+	b->immediate_next = false;
+	ret = dp_flush_pending(b);
+	if (!ret)
+		return;
+
+	dp_retain_remainder(b);
+	zlog_warn("MIDR data plane: cold-path batch failed (%d), retained %u ops"
+		  " for recovery", ret, listcount(b->pending_ops));
+	dp_schedule_recovery(b, ret);
+}
+
 int midr_dp_backend_start(struct midr_context *ctx, struct event_loop *master,
 			  vrf_id_t vrf_id)
 {
@@ -1107,13 +1153,10 @@ int midr_dp_backend_start(struct midr_context *ctx, struct event_loop *master,
 		return ret;
 	}
 
-	/* If zebra is already reachable and the adapter staged a first batch,
-	 * the cold-path submit above already handled it; otherwise the batch is
-	 * retried by the recovery timer and the reconnect replay. */
-	if (b->zc->sock >= 0 && listcount(b->pending_ops)) {
-		b->immediate_next = false;
-		(void)dp_flush_pending(b);
-	}
+	/* Deliver the batch the registration-time reconciliation may have
+	 * staged.  A failure is handled exactly like a failed deferred batch:
+	 * retain the remainder and let the recovery state machine drive it. */
+	dp_cold_submit(b);
 
 	zlog_info("MIDR data plane backend started (vrf %u, zserv %s)", vrf_id,
 		  frr_zclientpath);

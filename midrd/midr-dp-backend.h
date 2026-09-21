@@ -30,6 +30,11 @@
  * state machine (active fast retries, then a slow heartbeat) and is re-armed by
  * a connection-state change or fresh adapter work as well, so a socket that
  * stays up while sends keep failing can no longer stall recovery forever.
+ *
+ * The same retention rule covers the cold-path submit performed right after
+ * registration (review 3, D5): if that batch cannot be delivered, the
+ * remainder is retained and recovery is armed instead of being left queued
+ * with no timer.
  */
 
 #include <stdbool.h>
@@ -104,5 +109,14 @@ void midr_dp_backend_log_status(const char *tag);
  * production use; the flag self-clears after one use.
  */
 void midr_dp_backend_test_fail_installed(bool enable);
+
+/*
+ * Test-only: drive the cold-path batch submit that midr_dp_backend_start()
+ * performs after the registration-time reconciliation.  The production entry
+ * point only reaches it when the zclient is already connected while a batch is
+ * staged, so the failure handling (retain the remainder, arm recovery) is
+ * exercised through this hook.
+ */
+void midr_dp_backend_test_cold_submit(void);
 
 #endif /* MIDRD_DP_BACKEND_H */
