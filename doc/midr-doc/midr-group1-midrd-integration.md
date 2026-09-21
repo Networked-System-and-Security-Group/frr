@@ -37,6 +37,7 @@ bgpd 对照路径：分支里保留了可运行的 bgpd 版第一组实现（`MI
 | `midrd/midr-context-private.h` | `midr_context` 增加监听端点 `listen` | 上述查询所需的状态 |
 | `midrd/midr-transport.c` | 主动建连前绑定到监听地址 | overlay 会话是多跳的，不绑定时内核选出口链路地址作源，对端认不出这是它请求过的会话（BGP 里对应 update-source） |
 | `midrd/midr-transport.c`、`midrd/midr-transport.h`、`midrd/midr-session.c`、`midrd/transport-test.c`、`midrd/session-test.c` | 移植第三组 `64fd75560e` 的 rendezvous 修复（非第一组原创代码，逐函数移植，保留第一组自己的 `midr_transport_reset()`/`midr_session_manager_reset()` 和 group1 回调） | 第二组 `0920第一组对接.md` 审查要求：accept 到的连接不能按地址猜邻居 |
+| `midrd/Makefile` | 仅文件头加注释，不改任何构建规则 | 说明该入口的 `build/midrd` 不含第一组，避免把第二组组件测试通过当成第一组联合验收通过 |
 | `Makefile.am` | `include midrd/group1/subdir.am`，放在 `include tests/subdir.am` 之后 | 把第一组源文件和组件测试编进来，清单放在第一组自己的目录里；测试程序要追加到 `check_PROGRAMS`，必须排在它的定义之后 |
 | `vtysh/vtysh.h`、`vtysh/vtysh.c` | 新增 `VTYSH_MIDRD` 和 `midrd` 客户端 | midrd 带 CLI 后 vtysh 要能分发 MIDR 命令、下发配置 |
 | `tools/frrcommon.sh.in` | `DAEMONS` 加入 `midrd` | frrinit 按 daemons 文件启动 midrd |
@@ -55,6 +56,17 @@ bgpd 对照路径：分支里保留了可运行的 bgpd 版第一组实现（`MI
 - observer 在 midrd 收包路径里触发，第一组把处理放进事件队列，不在回调中同步 connect/disconnect。
 - 第一组不因 Session Down 撤销 Link：掉线只起断连计时，断开超过 5 分钟仍未恢复才拆边销账；
   PM 判定链路不可达、换群、节点离开、手工拆除、策略拒绝时照常撤销。
+
+构建入口约定（2026-09-21，回应 `0920第一组对接.md` 第 2.3 条）：采用该文档的第二种方案。
+`midrd/Makefile` 只负责第二组组件测试，其 `build/midrd` 按设计不含第一组；第一组的联合验收和
+生产构建一律使用顶层 `make midrd/midrd`。选第二种是因为它不需要改第二组的 Makefile 构建规则，
+符合第一组尽量不动其他组代码的约定。
+
+`midrd.c` 的 `midr_group1_init()`/`midr_group1_terminate()` 是弱符号，缺少第一组时 midrd 照样
+能链接并启动，只是静默地没有第一组——这正是审查所说的“假通过”。因此第一组自备校验脚本
+`midrd/group1/verify-group1-linked.sh`：它要求这两个符号在最终 ELF 里是**已定义**（`T`）而不是
+未解析的弱引用（`w`），并打印所用构建入口和最终二进制路径供验收日志记录（顶层构建的 ELF 实体在
+`midrd/.libs/midrd`，`midrd/midrd` 只是 libtool 包装脚本）。CI/交接测试应在联合验收前调用它。
 
 ## 3. 节点目录（第一组自有协议）
 
