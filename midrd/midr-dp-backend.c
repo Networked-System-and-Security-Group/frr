@@ -237,31 +237,75 @@ dp_installed_lookup(struct hash *h, const struct prefix *p, uint8_t instance)
 	return hash_lookup(h, &key);
 }
 
-static void dp_installed_set(struct hash *h, const struct prefix *p,
-			     const struct midr_path *paths, uint8_t path_count,
-			     uint8_t sid_count, const struct in6_addr *sid_list,
-			     uint8_t instance)
+/* Test-only fault injection for the installed-hash error path (see
+ * midr_dp_backend_test_fail_installed()). */
+static bool dp_test_fail_installed;
+
+/*
+ * Record the state zebra accepted for one (prefix, instance).  This runs only
+ * after dp_zapi_send() succeeded, so a failure here must not leave a
+ * half-built entry in the hash: the whole entry is built first and published
+ * only once every allocation succeeded.  The caller propagates the error and
+ * keeps the operation queued (see dp_process_one_op()), so recovery re-sends
+ * it and converges once the allocation succeeds -- the same retained-batch
+ * semantic as a deferred send failure.
+ */
+static int dp_installed_set(struct hash *h, const struct prefix *p,
+			    const struct midr_path *paths, uint8_t path_count,
+			    uint8_t sid_count,
+			    const struct in6_addr *sid_list, uint8_t instance)
 {
 	struct midr_installed_entry *e;
-
-	e = dp_installed_lookup(h, p, instance);
-	if (e) {
-		hash_release(h, e);
-		free(e->paths);
-		free(e);
-	}
+	struct midr_installed_entry *existing;
 
 	e = calloc(1, sizeof(*e));
 	if (!e)
-		return;
+		return -ENOMEM;
+
 	prefix_copy(&e->prefix, p);
 	e->instance = instance;
 	e->path_count = path_count;
 	e->sid_count = sid_count;
 	if (sid_count)
 		memcpy(e->sid_list, sid_list, sizeof(e->sid_list[0]) * sid_count);
-	e->paths = dp_paths_dup(paths, path_count);
-	hash_get(h, e, hash_alloc_intern);
+
+	if (path_count) {
+		e->paths = dp_paths_dup(paths, path_count);
+		if (!e->paths) {
+			free(e);
+			return -ENOMEM;
+		}
+	}
+
+	/* Simulate a hash insert failure so the partial-free path is testable. */
+	existing = dp_test_fail_installed ? NULL
+					  : hash_get(h, e, hash_alloc_intern);
+	dp_test_fail_installed = false;
+	if (!existing) {
+		free(e->paths);
+		free(e);
+		return -ENOMEM;
+	}
+
+	if (existing != e) {
+		/* The key was already present: replace its payload in place and
+		 * drop the duplicate.  The old payload is never released before
+		 * the new one is complete, so a failure above leaves it intact. */
+		free(existing->paths);
+		existing->paths = e->paths;
+		existing->path_count = e->path_count;
+		existing->sid_count = e->sid_count;
+		memcpy(existing->sid_list, e->sid_list,
+		       sizeof(existing->sid_list));
+		free(e);
+	}
+	return 0;
+}
+
+/* Fault injection hook used by dp-backend-test.c; not for production use. */
+void midr_dp_backend_test_fail_installed(bool enable)
+{
+	dp_test_fail_installed = enable;
 }
 
 static void dp_installed_unset(struct hash *h, const struct prefix *p,
@@ -552,9 +596,14 @@ static int dp_process_one_op(struct midr_dp_backend *b,
 		if (ret)
 			return ret;
 
-		dp_installed_set(b->installed, &op->prefix, op->paths,
-				 op->path_count, op->sid_count, op->sid_list,
-				 op->instance);
+		ret = dp_installed_set(b->installed, &op->prefix, op->paths,
+				       op->path_count, op->sid_count,
+				       op->sid_list, op->instance);
+		if (ret)
+			/* The ADD was accepted by zebra but we could not record
+			 * it.  Leave the operation queued so recovery re-sends
+			 * and re-records it; never pretend it is installed. */
+			return ret;
 		b->route_adds++;
 		return 0;
 

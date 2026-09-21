@@ -98,4 +98,11 @@ void midr_dp_backend_status_get(struct midr_dp_status *status);
 /* One-line runtime summary for the midrd log (shutdown/diagnostic gates). */
 void midr_dp_backend_log_status(const char *tag);
 
+/*
+ * Test-only fault injection: make the next dp_installed_set() insertion fail,
+ * exercising the partial-entry free/error-propagation path.  Not for
+ * production use; the flag self-clears after one use.
+ */
+void midr_dp_backend_test_fail_installed(bool enable);
+
 #endif /* MIDRD_DP_BACKEND_H */

@@ -881,6 +881,53 @@ static void test_recovery_past_cap_rearm(void)
 
 /*
  * =========================================================================
+ *  Installed-hash error path (review 3, bullet 1)
+ * =========================================================================
+ */
+
+static void test_installed_set_failure(void)
+{
+	struct midr_context ctx;
+	struct midr_dp_status dp;
+	struct prefix p = prefix_v4("10.30.0.0", 24);
+	struct midr_path path = {};
+	struct midr_path_result result = {};
+
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-test");
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+
+	path_v4(&path, "192.0.2.1", 5, 10, 0);
+	result.paths = &path;
+	result.path_count = 1;
+	result.instance = MIDR_INSTANCE_SPF;
+
+	/* The ZAPI ADD is accepted but recording it fails: the caller must see
+	 * a real error and the installed hash must stay empty (no fake state). */
+	assert(midr_zebra_route_add(&ctx, &p, &result) == 0);
+	midr_dp_backend_test_fail_installed(true);
+	assert(midr_zebra_route_flush(&ctx) == -ENOMEM);
+	dp = dp_status();
+	assert(dp.installed == 0 && dp.pending == 1);
+	assert(dp.last_error == -ENOMEM);
+	assert(capture_count == 1 && captures[0].cmd == ZEBRA_ROUTE_ADD);
+
+	/* The operation was retained and re-sent; the second attempt records
+	 * the real state. */
+	assert(midr_zebra_route_flush(&ctx) == 0);
+	dp = dp_status();
+	assert(dp.installed == 1 && dp.pending == 0);
+	assert(capture_count == 2 && captures[1].cmd == ZEBRA_ROUTE_ADD);
+
+	midr_dp_backend_stop();
+	assert(midr_dp_backend_get() == NULL);
+	midr_ted_destroy(&ctx.ted);
+}
+
+/*
+ * =========================================================================
  *  GRE provisioning API
  * =========================================================================
  *  Validation paths only: the tunnel itself is created against a real zebra
@@ -953,6 +1000,7 @@ int main(void)
 	test_deferred_failure_across_reconnect();
 	test_recovery_with_new_desired_inflight();
 	test_recovery_past_cap_rearm();
+	test_installed_set_failure();
 	test_gre_api();
 	puts("midrd-dp-test: PASS");
 	return 0;
