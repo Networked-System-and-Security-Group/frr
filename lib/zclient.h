@@ -230,8 +230,6 @@ typedef enum {
 	ZEBRA_GRE_GET,
 	ZEBRA_GRE_UPDATE,
 	ZEBRA_GRE_SOURCE_SET,
-	ZEBRA_GRE_ADD,
-	ZEBRA_GRE_DELETE,
 	ZEBRA_TC_QDISC_INSTALL,
 	ZEBRA_TC_QDISC_UNINSTALL,
 	ZEBRA_TC_CLASS_ADD,
@@ -240,6 +238,8 @@ typedef enum {
 	ZEBRA_TC_FILTER_DELETE,
 	ZEBRA_OPAQUE_NOTIFY,
 	ZEBRA_SRV6_SID_NOTIFY,
+	ZEBRA_GRE_ADD,
+	ZEBRA_GRE_DELETE,
 } zebra_message_types_t;
 /* Zebra message types. Please update the corresponding
  * command_types array with any changes!

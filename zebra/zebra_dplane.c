@@ -948,6 +948,8 @@ static void dplane_ctx_free_internal(struct zebra_dplane_ctx *ctx)
 			list_delete(&ctx->u.iptable.interface_name_list);
 		break;
 	case DPLANE_OP_GRE_SET:
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
 	case DPLANE_OP_INTF_NETCONFIG:
 	case DPLANE_OP_STARTUP_STAGE:
 	case DPLANE_OP_SRV6_ENCAP_SRCADDR_SET:
@@ -1219,6 +1221,12 @@ const char *dplane_op2str(enum dplane_op_e op)
 
 	case DPLANE_OP_GRE_SET:
 		return "GRE_SET";
+
+	case DPLANE_OP_GRE_ADD:
+		return "GRE_ADD";
+
+	case DPLANE_OP_GRE_DELETE:
+		return "GRE_DELETE";
 
 	case DPLANE_OP_INTF_ADDR_ADD:
 		return "INTF_ADDR_ADD";
@@ -7294,6 +7302,14 @@ static void kernel_dplane_log_detail(struct zebra_dplane_ctx *ctx)
 			   ctx->u.gre.link_ifindex);
 		break;
 
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
+		zlog_debug("Dplane gre intf op %s, ifp %s, link %u",
+			   dplane_op2str(dplane_ctx_get_op(ctx)),
+			   dplane_ctx_get_ifname(ctx),
+			   ctx->u.gre.link_ifindex);
+		break;
+
 	case DPLANE_OP_INTF_ADDR_ADD:
 	case DPLANE_OP_INTF_ADDR_DEL:
 		zlog_debug("Dplane incoming op %s, intf %s, addr %pFX",
@@ -7484,6 +7500,18 @@ static void kernel_dplane_handle_result(struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_GRE_SET:
+		if (res != ZEBRA_DPLANE_REQUEST_SUCCESS)
+			atomic_fetch_add_explicit(
+				&zdplane_info.dg_gre_set_errors, 1,
+				memory_order_relaxed);
+		break;
+
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
+		/* The enqueue path already accounts these ops in
+		 * dg_gre_set_errors; mirror it when the queued request
+		 * completes with a failure.
+		 */
 		if (res != ZEBRA_DPLANE_REQUEST_SUCCESS)
 			atomic_fetch_add_explicit(
 				&zdplane_info.dg_gre_set_errors, 1,
