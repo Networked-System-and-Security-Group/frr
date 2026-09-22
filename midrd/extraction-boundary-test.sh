@@ -18,6 +18,10 @@ fi
 
 cc=${CC:-cc}
 flags='-std=gnu11 -O2 -Wall -Wextra -Werror -Wno-pedantic -Wno-missing-field-initializers -Wno-unused-parameter -DHAVE_CONFIG_H -I. -I.. -I../lib'
+# The third-group headers pull libfrr's vrf.h -> vty.h chain, whose anonymous
+# struct members trip GCC's default-on "declaration does not declare anything"
+# warning; that warning has no -W option, so -Werror cannot be kept here.
+libfrr_flags='-std=gnu11 -O2 -Wall -Wextra -Wno-pedantic -Wno-missing-field-initializers -Wno-unused-parameter -DHAVE_CONFIG_H -I. -I.. -I../lib'
 tmp=${TMPDIR:-/tmp}/midrd-boundary.$$
 trap 'rm -rf "$tmp"' EXIT INT TERM
 mkdir -p "$tmp"
@@ -43,4 +47,14 @@ int main(void) { return MIDR_CORE_WIRE_VERSION == 1U ? 0 : 1; }
 EOF
 
 $cc $flags -c "$tmp/contract.c" -o "$tmp/contract.o"
+
+cat >"$tmp/dp-contract.c" <<'EOF'
+#include "midr-dp-backend.h"
+#include "midr-gre.h"
+#include "midr-spf-install.h"
+#include "midr-zebra.h"
+int main(void) { return MIDR_SRV6_MAX_SEGS == 8 ? 0 : 1; }
+EOF
+
+$cc $libfrr_flags -c "$tmp/dp-contract.c" -o "$tmp/dp-contract.o"
 printf '%s\n' 'standalone libfrr boundary scan: PASS'

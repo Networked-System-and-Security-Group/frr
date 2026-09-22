@@ -960,20 +960,6 @@ int midr_transport_disconnect(struct midr_transport *transport,
 	return 0;
 }
 
-int midr_transport_reset(struct midr_transport *transport,
-			 const struct midr_transport_endpoint *endpoint, int reason)
-{
-	struct midr_transport_peer *peer;
-
-	if (!transport || !endpoint || reason >= 0)
-		return -EINVAL;
-	peer = find_peer(transport, endpoint);
-	if (!peer || !peer->desired)
-		return -ENOENT;
-	close_peer(transport, peer, reason);
-	return 0;
-}
-
 /* Give an accepted stream its configured peer identity once that identity is
  * known (from the HELLO frame, see midr-session.c).
  *
@@ -1017,6 +1003,20 @@ int midr_transport_promote(struct midr_transport *transport,
 	if (transport->callbacks.on_established)
 		transport->callbacks.on_established(transport->callbacks.arg,
 						    &inbound->endpoint);
+	return 0;
+}
+
+int midr_transport_reset(struct midr_transport *transport,
+			 const struct midr_transport_endpoint *endpoint, int reason)
+{
+	struct midr_transport_peer *peer;
+
+	if (!transport || !endpoint || reason >= 0)
+		return -EINVAL;
+	peer = find_peer(transport, endpoint);
+	if (!peer || !peer->desired)
+		return -ENOENT;
+	close_peer(transport, peer, reason);
 	return 0;
 }
 

@@ -12,7 +12,9 @@
 
 #include "midr-cost.h"
 #include "midr-context-private.h"
+#include "midr-dp-backend.h"
 #include "midr-engine.h"
+#include "midr-gre.h"
 #include "midr-local-ipc.h"
 #include "midr-local-provider.h"
 #include "midr-prefix-provider.h"
@@ -171,6 +173,7 @@ static const char midrd_help[] =
 	"  --group ID               Development-time local group\n"
 	"  --prefix ADDRESS/LEN     Development-time local Prefix\n"
 	"  --link NODE:COST         Development-time local Link\n"
+	"  --link-addr NODE:ADDR    Neighbour address of --link (SPF nexthop)\n"
 	"  --local-fact-socket PATH External Local Fact Provider\n"
 	"  --prefix-socket PATH     External Prefix Provider\n"
 	"  --sequence-file PATH     Persistent owner sequence file\n"
@@ -178,6 +181,9 @@ static const char midrd_help[] =
 	"  --hold-time MS           Native session Hold Timer\n"
 	"  --runtime SEC            Stop after a bounded runtime\n"
 	"  --takeover-delay MS      Representative takeover delay\n"
+	"  --zserv-path PATH        Zebra ZAPI socket (enables route install)\n"
+	"  --vrf-id N               VRF the installed routes belong to\n"
+	"  --no-zebra               Disable the Zebra/FIB data-plane backend\n"
 	"  --pidfile PATH           Compatibility alias for --pid_file\n";
 
 /* clang-format off */
@@ -200,6 +206,7 @@ enum midrd_option {
 	MIDRD_OPT_GROUP,
 	MIDRD_OPT_PREFIX,
 	MIDRD_OPT_LINK,
+	MIDRD_OPT_LINK_ADDR,
 	MIDRD_OPT_LOCAL_FACT_SOCKET,
 	MIDRD_OPT_PREFIX_SOCKET,
 	MIDRD_OPT_SEQUENCE_FILE,
@@ -207,6 +214,9 @@ enum midrd_option {
 	MIDRD_OPT_HOLD_TIME,
 	MIDRD_OPT_RUNTIME,
 	MIDRD_OPT_TAKEOVER_DELAY,
+	MIDRD_OPT_ZEBRA_PATH,
+	MIDRD_OPT_VRF_ID,
+	MIDRD_OPT_NO_ZEBRA,
 	MIDRD_OPT_PIDFILE,
 };
 
@@ -217,6 +227,7 @@ static const struct option midrd_longopts[] = {
 	{"group", required_argument, NULL, MIDRD_OPT_GROUP},
 	{"prefix", required_argument, NULL, MIDRD_OPT_PREFIX},
 	{"link", required_argument, NULL, MIDRD_OPT_LINK},
+	{"link-addr", required_argument, NULL, MIDRD_OPT_LINK_ADDR},
 	{"local-fact-socket", required_argument, NULL,
 	 MIDRD_OPT_LOCAL_FACT_SOCKET},
 	{"prefix-socket", required_argument, NULL, MIDRD_OPT_PREFIX_SOCKET},
@@ -225,6 +236,9 @@ static const struct option midrd_longopts[] = {
 	{"hold-time", required_argument, NULL, MIDRD_OPT_HOLD_TIME},
 	{"runtime", required_argument, NULL, MIDRD_OPT_RUNTIME},
 	{"takeover-delay", required_argument, NULL, MIDRD_OPT_TAKEOVER_DELAY},
+	{"zserv-path", required_argument, NULL, MIDRD_OPT_ZEBRA_PATH},
+	{"vrf-id", required_argument, NULL, MIDRD_OPT_VRF_ID},
+	{"no-zebra", no_argument, NULL, MIDRD_OPT_NO_ZEBRA},
 	{"pidfile", required_argument, NULL, MIDRD_OPT_PIDFILE},
 	{0},
 };
@@ -2783,6 +2797,49 @@ static int install_local_membership(struct midr_context *daemon, uint32_t group_
 	return 0;
 }
 
+/* Neighbour address attached to a development-time static link.
+ *
+ * It becomes the Link event's remote_address, which is exactly what the SPF
+ * layer hands to the data plane as the route nexthop.  Without it a static
+ * link carries no address, the SPF result has an empty nexthop and the
+ * third-group backend correctly refuses to program a nexthop-less blackhole
+ * (it reports -EHOSTUNREACH instead). */
+struct midrd_link_addr_config {
+	uint32_t remote;
+	struct ipaddr address;
+};
+
+static int parse_link_addr(const char *text,
+			   struct midrd_link_addr_config *out)
+{
+	char copy[128], *separator, *end;
+	unsigned long remote;
+
+	if (!text || !out || strlen(text) >= sizeof(copy))
+		return -EINVAL;
+	strcpy(copy, text);
+	separator = strchr(copy, ':');
+	if (!separator)
+		return -EINVAL;
+	*separator++ = '\0';
+	errno = 0;
+	remote = strtoul(copy, &end, 10);
+	if (errno || *end || !remote || remote > UINT32_MAX)
+		return -EINVAL;
+	memset(&out->address, 0, sizeof(out->address));
+	if (strchr(separator, ':')) {
+		out->address.ipa_type = IPADDR_V6;
+		if (inet_pton(AF_INET6, separator, &out->address.ipaddr_v6) != 1)
+			return -EINVAL;
+	} else {
+		out->address.ipa_type = IPADDR_V4;
+		if (inet_pton(AF_INET, separator, &out->address.ipaddr_v4) != 1)
+			return -EINVAL;
+	}
+	out->remote = (uint32_t)remote;
+	return 0;
+}
+
 static int install_local_link(struct midr_context *daemon,
 			      const struct midrd_link_config *link)
 {
@@ -3110,7 +3167,11 @@ static void midr_context_finish(struct midr_context *daemon)
 
 	if (!daemon)
 		return;
-	(void)midr_zebra_backend_unregister(daemon);
+	/* GRE first: it borrows the data-plane zclient.  The backend then
+	 * unregisters, which withdraws the accepted SPF routes and flushes
+	 * immediately, before its zclient is destroyed. */
+	midr_gre_fini();
+	midr_dp_backend_stop();
 	while ((spf_consumer = daemon->spf_consumers))
 		midr_spf_consumer_unregister(daemon, &spf_consumer);
 	for (size_t i = 0; i < MIDRD_MAX_PEERS; i++)
@@ -3230,6 +3291,11 @@ int main(int argc, char **argv, char **envp)
 	struct midr_transport_config transport_config = {0};
 	const char *listen_text = NULL, *prefix_text = NULL, *prefix_socket = NULL;
 	const char *local_socket = NULL;
+	const char *zserv_path = NULL;
+	struct midrd_link_addr_config link_addrs[MIDRD_MAX_LINKS];
+	size_t link_addr_count = 0;
+	vrf_id_t vrf_id = VRF_DEFAULT;
+	bool zebra_enabled = true;
 	int runtime_sec = 0;
 	int exit_status = 1;
 	int opt;
@@ -3267,6 +3333,13 @@ int main(int argc, char **argv, char **envp)
 		case MIDRD_OPT_GROUP:
 			daemon.group_id = (uint32_t)strtoul(optarg, NULL, 10);
 			break;
+		case MIDRD_OPT_LINK_ADDR:
+			if (link_addr_count == MIDRD_MAX_LINKS ||
+			    parse_link_addr(optarg,
+					    &link_addrs[link_addr_count]))
+				frr_help_exit(2);
+			link_addr_count++;
+			break;
 		case MIDRD_OPT_LOCAL_FACT_SOCKET:
 			local_socket = optarg;
 			break;
@@ -3287,6 +3360,15 @@ int main(int argc, char **argv, char **envp)
 			break;
 		case MIDRD_OPT_RUNTIME:
 			runtime_sec = atoi(optarg);
+			break;
+		case MIDRD_OPT_ZEBRA_PATH:
+			zserv_path = optarg;
+			break;
+		case MIDRD_OPT_VRF_ID:
+			vrf_id = (vrf_id_t)strtoul(optarg, NULL, 10);
+			break;
+		case MIDRD_OPT_NO_ZEBRA:
+			zebra_enabled = false;
 			break;
 		case MIDRD_OPT_PIDFILE:
 			midrd_di.pid_file = optarg;
@@ -3330,10 +3412,54 @@ int main(int argc, char **argv, char **envp)
 				: MIDR_CORE_AF_IPV6;
 		daemon.links[i].last_cost_advertised_ms = mono_ms();
 	}
+	/* Attach the neighbour addresses supplied with --link-addr.  They are
+	 * what makes a development-time static link installable: the SPF result
+	 * carries them as nexthops. */
+	for (size_t i = 0; i < link_addr_count; i++) {
+		bool applied = false;
+
+		for (size_t j = 0; j < daemon.link_count; j++) {
+			bool address_is_v6 =
+				link_addrs[i].address.ipa_type == IPADDR_V6;
+
+			if (daemon.links[j].remote != link_addrs[i].remote)
+				continue;
+			if (address_is_v6 !=
+			    (transport_config.local.family ==
+			     MIDR_TRANSPORT_AF_IPV6)) {
+				fprintf(stderr,
+					"--link-addr %u: address family does not match the transport\n",
+					link_addrs[i].remote);
+				return 2;
+			}
+			daemon.links[j].address_family =
+				address_is_v6 ? MIDR_CORE_AF_IPV6
+					      : MIDR_CORE_AF_IPV4;
+			if (address_is_v6)
+				memcpy(daemon.links[j].remote_address,
+				       &link_addrs[i].address.ipaddr_v6,
+				       sizeof(link_addrs[i].address.ipaddr_v6));
+			else
+				memcpy(daemon.links[j].remote_address,
+				       &link_addrs[i].address.ipaddr_v4,
+				       sizeof(link_addrs[i].address.ipaddr_v4));
+			applied = true;
+		}
+		if (!applied) {
+			fprintf(stderr,
+				"--link-addr %u has no matching --link\n",
+				link_addrs[i].remote);
+			return 2;
+		}
+	}
 	transport_config.hello_interval_ms = daemon.hello_ms;
 	transport_config.hold_time_ms = daemon.hold_time_ms;
 	transport_config.tx_budget_ms = MIDRD_FORWARD_BUDGET_MS;
 	transport_config.max_frame_size = MIDRD_MAX_FRAME + MIDR_WIRE_HEADER_LEN;
+	/* libfrr derives the ZAPI endpoint from frr_zclientpath in frr_init(). */
+	if (zserv_path)
+		snprintf(frr_zclientpath, sizeof(frr_zclientpath), "%s",
+			 zserv_path);
 	daemon.master = frr_init();
 	midrd_vrf_init();
 	transport_config.master = daemon.master;
@@ -3342,6 +3468,20 @@ int main(int argc, char **argv, char **envp)
 		midrd_vrf_terminate();
 		frr_fini();
 		return 1;
+	}
+	/*
+	 * Third-group data plane: open the zclient, register the Zebra backend
+	 * and attach GRE provisioning.  The adapter starts with the backend and
+	 * installs the current committed SPF result once it is READY.
+	 */
+	if (zebra_enabled) {
+		if (midr_dp_backend_start(&daemon, daemon.master, vrf_id)) {
+			fprintf(stderr,
+				"zebra data-plane initialization failed\n");
+			exit_status = 1;
+			goto fail;
+		}
+		midr_gre_init(daemon.master);
 	}
 	if (prefix_socket) {
 		struct midr_prefix_ipc_config ipc_config = {

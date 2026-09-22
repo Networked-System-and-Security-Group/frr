@@ -2,6 +2,7 @@
 #include "midr-zebra.h"
 
 #include <errno.h>
+#include <stdlib.h>
 
 #include "midr-context-private.h"
 #include "midr-spf-install.h"
@@ -31,6 +32,7 @@ int midr_zebra_backend_register(
 	struct midr_context *ctx, const struct midr_zebra_backend_ops *ops,
 	void *arg)
 {
+	struct midr_zebra_backend_ops *copy;
 	int ret;
 
 	if (!ctx || !ops || !ops->route_add || !ops->route_del ||
@@ -38,27 +40,51 @@ int midr_zebra_backend_register(
 		return -EINVAL;
 	if (ctx->zebra_ops)
 		return -EALREADY;
-	ctx->zebra_ops = ops;
+
+	/*
+	 * Never retain the caller's table: the backend may hand us a stack-
+	 * or adapter-scoped ops whose lifetime is shorter than the
+	 * registration.  midrd owns a private copy from here on and releases
+	 * it in midr_zebra_backend_unregister() (or below if registration
+	 * fails).  @arg is an opaque backend handle and is not copied; the
+	 * caller keeps ownership and must keep it valid until unregister.
+	 */
+	copy = calloc(1, sizeof(*copy));
+	if (!copy)
+		return -ENOMEM;
+	*copy = *ops;
+
+	ctx->zebra_ops = copy;
 	ctx->zebra_arg = arg;
 	ret = midr_spf_install_start(ctx);
 	if (ret) {
+		/* No half-registered state, and no owned copy left behind. */
 		ctx->zebra_ops = NULL;
 		ctx->zebra_arg = NULL;
+		free(copy);
 	}
 	return ret;
 }
 
 int midr_zebra_backend_unregister(struct midr_context *ctx)
 {
+	struct midr_zebra_backend_ops *ops;
 	int ret;
 
 	if (!ctx)
 		return -EINVAL;
-	if (!ctx->zebra_ops)
+	ops = ctx->zebra_ops;
+	if (!ops)
 		return 0;
+
+	/*
+	 * midr_spf_install_stop() still calls back through the ops (route
+	 * withdrawal and flush), so keep the copy installed until it returns.
+	 */
 	ret = midr_spf_install_stop(ctx);
 	ctx->zebra_ops = NULL;
 	ctx->zebra_arg = NULL;
+	free(ops);
 	return ret;
 }
 

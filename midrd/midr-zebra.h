@@ -54,9 +54,35 @@ struct midr_zebra_backend_ops {
 	void (*abort_pending)(void *arg);
 };
 
+/*
+ * Register the data-plane backend implementing struct midr_zebra_backend_ops.
+ *
+ * Ownership: @ops is deep-copied into midrd-owned storage.  The caller may
+ * pass a stack-scoped or otherwise short-lived table and is free to discard
+ * or reuse it as soon as this call returns; midrd never dereferences the
+ * caller's table afterwards.  midrd owns the copy until
+ * midr_zebra_backend_unregister() (or a failed registration) frees it.
+ *
+ * @arg is NOT copied: it is an opaque backend handle that is only stored and
+ * forwarded to the ops callbacks.  The caller keeps ownership and must keep
+ * it valid until midr_zebra_backend_unregister(); unlike @ops it cannot be
+ * deep-copied generically.  (The single in-tree caller passes the long-lived
+ * data-plane backend instance, so this is satisfied.)
+ *
+ * Returns 0 on success; -EINVAL when a required callback is missing;
+ * -EALREADY when a backend is already registered; -ENOMEM when the ops copy
+ * cannot be allocated; otherwise the midr_spf_install_start() error.  On any
+ * non-zero return no backend stays registered and no memory is leaked.
+ */
 int midr_zebra_backend_register(
 	struct midr_context *ctx, const struct midr_zebra_backend_ops *ops,
 	void *arg);
+
+/*
+ * Unregister the backend, stopping the SPF installation adapter first (which
+ * may still call back through the ops) and then releasing the midrd-owned
+ * ops copy.  Idempotent: returns 0 when nothing is registered.
+ */
 int midr_zebra_backend_unregister(struct midr_context *ctx);
 bool midr_zebra_backend_ready(const struct midr_context *ctx);
 

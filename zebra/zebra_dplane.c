@@ -948,6 +948,8 @@ static void dplane_ctx_free_internal(struct zebra_dplane_ctx *ctx)
 			list_delete(&ctx->u.iptable.interface_name_list);
 		break;
 	case DPLANE_OP_GRE_SET:
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
 	case DPLANE_OP_INTF_NETCONFIG:
 	case DPLANE_OP_STARTUP_STAGE:
 	case DPLANE_OP_SRV6_ENCAP_SRCADDR_SET:
@@ -1219,6 +1221,12 @@ const char *dplane_op2str(enum dplane_op_e op)
 
 	case DPLANE_OP_GRE_SET:
 		return "GRE_SET";
+
+	case DPLANE_OP_GRE_ADD:
+		return "GRE_ADD";
+
+	case DPLANE_OP_GRE_DELETE:
+		return "GRE_DELETE";
 
 	case DPLANE_OP_INTF_ADDR_ADD:
 		return "INTF_ADDR_ADD";
@@ -6347,6 +6355,96 @@ done:
 }
 
 /*
+ * Common helper for GRE virtual interface create (DPLANE_OP_GRE_ADD) and
+ * delete (DPLANE_OP_GRE_DELETE).
+ *
+ * Unlike dplane_gre_set() above - which reprograms an already existing
+ * GRE netdevice - this path lets a control-plane client name a device and
+ * have the kernel create/remove it.  @ifname identifies the device, and
+ * @ifindex may be zero for a create (the kernel assigns the index).
+ */
+static enum zebra_dplane_result
+dplane_gre_intf_update_internal(const char *ifname, vrf_id_t vrf_id,
+				ifindex_t ifindex, ifindex_t link_ifindex,
+				unsigned int mtu,
+				const struct zebra_l2info_gre *gre_info,
+				enum dplane_op_e op)
+{
+	enum zebra_dplane_result result = ZEBRA_DPLANE_REQUEST_FAILURE;
+	struct zebra_dplane_ctx *ctx = NULL;
+	struct zebra_ns *zns;
+	int ret = EINVAL;
+
+	if (!ifname || ifname[0] == '\0') {
+		zlog_warn("%s: missing GRE interface name", __func__);
+		goto done;
+	}
+
+	ctx = dplane_ctx_alloc();
+
+	zns = zebra_ns_lookup(vrf_id);
+	if (!zns)
+		goto done;
+
+	if (IS_ZEBRA_DEBUG_DPLANE_DETAIL)
+		zlog_debug("init dplane ctx %s: if %s idx %u", dplane_op2str(op),
+			   ifname, ifindex);
+
+	ctx->zd_op = op;
+	ctx->zd_status = ZEBRA_DPLANE_REQUEST_SUCCESS;
+	dplane_ctx_ns_init(ctx, zns, false);
+	dplane_ctx_set_ifname(ctx, ifname);
+	ctx->zd_vrf_id = vrf_id;
+	ctx->zd_ifindex = ifindex;
+	ctx->u.gre.link_ifindex = link_ifindex;
+	ctx->u.gre.mtu = mtu;
+	if (gre_info)
+		memcpy(&ctx->u.gre.info, gre_info, sizeof(ctx->u.gre.info));
+
+	ret = dplane_update_enqueue(ctx);
+
+done:
+	/* Update counter */
+	atomic_fetch_add_explicit(&zdplane_info.dg_gre_set_in, 1,
+				  memory_order_relaxed);
+
+	if (ret == AOK)
+		result = ZEBRA_DPLANE_REQUEST_QUEUED;
+	else {
+		atomic_fetch_add_explicit(&zdplane_info.dg_gre_set_errors, 1,
+					  memory_order_relaxed);
+		if (ctx)
+			dplane_ctx_free(&ctx);
+	}
+
+	return result;
+}
+
+/*
+ * Enqueue a GRE virtual interface create.
+ */
+enum zebra_dplane_result
+dplane_gre_interface_add(const char *ifname, vrf_id_t vrf_id,
+			 const struct zebra_l2info_gre *gre_info,
+			 ifindex_t link_ifindex, unsigned int mtu)
+{
+	return dplane_gre_intf_update_internal(ifname, vrf_id, 0, link_ifindex,
+					       mtu, gre_info,
+					       DPLANE_OP_GRE_ADD);
+}
+
+/*
+ * Enqueue a GRE virtual interface delete.
+ */
+enum zebra_dplane_result
+dplane_gre_interface_delete(const char *ifname, vrf_id_t vrf_id,
+			    ifindex_t ifindex)
+{
+	return dplane_gre_intf_update_internal(ifname, vrf_id, ifindex, 0, 0,
+					       NULL, DPLANE_OP_GRE_DELETE);
+}
+
+/*
  * Common helper api for SRv6 encapsulation source address set
  */
 enum zebra_dplane_result
@@ -7204,6 +7302,14 @@ static void kernel_dplane_log_detail(struct zebra_dplane_ctx *ctx)
 			   ctx->u.gre.link_ifindex);
 		break;
 
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
+		zlog_debug("Dplane gre intf op %s, ifp %s, link %u",
+			   dplane_op2str(dplane_ctx_get_op(ctx)),
+			   dplane_ctx_get_ifname(ctx),
+			   ctx->u.gre.link_ifindex);
+		break;
+
 	case DPLANE_OP_INTF_ADDR_ADD:
 	case DPLANE_OP_INTF_ADDR_DEL:
 		zlog_debug("Dplane incoming op %s, intf %s, addr %pFX",
@@ -7394,6 +7500,18 @@ static void kernel_dplane_handle_result(struct zebra_dplane_ctx *ctx)
 		break;
 
 	case DPLANE_OP_GRE_SET:
+		if (res != ZEBRA_DPLANE_REQUEST_SUCCESS)
+			atomic_fetch_add_explicit(
+				&zdplane_info.dg_gre_set_errors, 1,
+				memory_order_relaxed);
+		break;
+
+	case DPLANE_OP_GRE_ADD:
+	case DPLANE_OP_GRE_DELETE:
+		/* The enqueue path already accounts these ops in
+		 * dg_gre_set_errors; mirror it when the queued request
+		 * completes with a failure.
+		 */
 		if (res != ZEBRA_DPLANE_REQUEST_SUCCESS)
 			atomic_fetch_add_explicit(
 				&zdplane_info.dg_gre_set_errors, 1,
