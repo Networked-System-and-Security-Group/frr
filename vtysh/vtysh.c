@@ -135,6 +135,8 @@ struct vtysh_client vtysh_client[] = {
 	{.name = "vrrpd", .flag = VTYSH_VRRPD},
 	{.name = "pathd", .flag = VTYSH_PATHD},
 	{.name = "pim6d", .flag = VTYSH_PIM6D},
+	/* 第一组新增：midrd 带 CLI，vtysh 需要能连上它。 */
+	{.name = "midrd", .flag = VTYSH_MIDRD},
 	{.name = "watchfrr", .flag = VTYSH_WATCHFRR},
 };
 

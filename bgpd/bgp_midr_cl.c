@@ -31,9 +31,11 @@
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_cl.h"
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
+DEFINE_MTYPE_STATIC(BGPD, MIDR_REP_IDENTITY, "MIDR representative identity");
 
 /* ===========================================================================
  * CL 策略阈值
@@ -55,24 +57,14 @@ DEFINE_MTYPE_STATIC(BGPD, MIDR_NODE_EVIDENCE, "MIDR node evidence");
  * 内部辅助函数
  * =========================================================================*/
 
-/*
- * 在全局视图链路列表中按 IPv4 地址查找链路条目。
- * 用于 REP_PROBE_DONE：群代表的探测 key 是 transport addr（locator），
- * 不一定有对应的 node 条目。
- */
-static struct midr_link_entry *
-cl_find_link_by_ipv4(const struct midr_global_view *gv,
-		     const struct in_addr *addr)
+static void cl_identity_from_rep(struct midr_rep_identity *identity,
+				 const struct midr_rep_entry *rep)
 {
-	struct listnode *n;
-	struct midr_link_entry *link;
-
-	for (ALL_LIST_ELEMENTS_RO(gv->links, n, link)) {
-		if (link->remote_node_id.family == AF_INET &&
-		    IPV4_ADDR_SAME(&link->remote_node_id.u.prefix4, addr))
-			return link;
-	}
-	return NULL;
+	memset(identity, 0, sizeof(*identity));
+	identity->group_id = rep->group_id;
+	identity->node_id.family = AF_INET;
+	identity->node_id.prefixlen = IPV4_MAX_BITLEN;
+	identity->node_id.u.prefix4 = rep->rep_rid;
 }
 
 /*
@@ -131,6 +123,22 @@ static bool cl_metrics_is_better(const struct midr_nds_link_metrics *cand,
 	return cand->bw_score > best->bw_score;
 }
 
+static bool cl_node_is_better(const struct midr_node_entry *candidate,
+			      const struct midr_nds_link_metrics *candidate_metrics,
+			      const struct midr_node_entry *best,
+			      const struct midr_nds_link_metrics *best_metrics)
+{
+	if (!best)
+		return true;
+	if (cl_metrics_is_better(candidate_metrics, best_metrics))
+		return true;
+	if (candidate_metrics->rtt_us != best_metrics->rtt_us ||
+	    candidate_metrics->loss_rate != best_metrics->loss_rate ||
+	    candidate_metrics->bw_score != best_metrics->bw_score)
+		return false;
+	return prefix_cmp(&candidate->node_id, &best->node_id) < 0;
+}
+
 /*
  * 遍历节点表，找出其中最大的 group_id，用于 CREATE 分配新群编号。
  * 若节点表为空，返回 0（CREATE 新群 ID 将为 1）。
@@ -173,15 +181,18 @@ static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
 	       cand_link->long_term.loss_rate ==
 		       best_link->long_term.loss_rate &&
 	       cand_link->long_term.bw_score == best_link->long_term.bw_score &&
-	       cand_r->group_id < best_r->group_id;
+	       (cand_r->group_id < best_r->group_id ||
+		(cand_r->group_id == best_r->group_id &&
+		 ntohl(cand_r->rep_rid.s_addr) <
+			 ntohl(best_r->rep_rid.s_addr)));
 }
 
 /*
- * 从 mi->rep_dir（群代表目录）中，结合 gv->links 的长期探测指标，选出性能最优的
- * 群代表，经 I-7 RECOMMEND 回灌；同时保留第 2、3 名（用于群间锚点连接方案），
- * 随 RECOMMEND 一并回灌给 NDS 供其请求这两个次优群的成员列表。REP_PROBE_DONE
- * 本来就已对目录里每个代表探测过一轮，第 2/3 名不需要任何额外探测代价，只是
- * 原先探完即弃。
+ * 从 mi->rep_dir（群代表目录）中，结合 gv->links 的长期探测指标，按性能给各群
+ * 代表排名（每群取最优的一位），经 I-7 RECOMMEND 回灌排名最靠前、且未被 Tier1
+ * 准入拒绝的代表；同时回灌除它之外排名最靠前的两个群（用于群间锚点连接方案），
+ * 供 NDS 请求这两个次优群的成员列表。锚点群不因其代表被拒而剔除——锚点选的是
+ * 群内成员，被拒成员由 cl_select_anchor_candidates() 单独过滤。
  *
  * 候选筛选条件：链路状态 UP 且已有探测数据（rtt_us > 0）。
  * 排序规则见 cl_rep_is_better()。
@@ -192,43 +203,64 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 				     const struct midr_global_view *gv)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	size_t max = listcount(mi->rep_dir);
+	struct midr_rep_entry **rank_rep;
+	struct midr_link_entry **rank_link;
+	size_t nrank = 0, chosen, i;
 	struct listnode *n;
 	struct midr_rep_entry *r;
-	/* 前 3 名，插入排序维护；[0]=最优（RECOMMEND），[1]/[2]=次优（锚点候选）。 */
-	struct midr_rep_entry *top_rep[3] = { NULL, NULL, NULL };
-	struct midr_link_entry *top_link[3] = { NULL, NULL, NULL };
 	struct midr_cluster_decision d = {};
-	int i, j;
 
-	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
-		struct midr_link_entry *link;
+	rank_rep = XCALLOC(MTYPE_TMP, (max + 1) * sizeof(*rank_rep));
+	rank_link = XCALLOC(MTYPE_TMP, (max + 1) * sizeof(*rank_link));
 
-		/* 探测键 = rid：目录条目恒带真名（REP_LIST 的 rid 栏自协议 v2 起
-		 * 必填）。rid 为 0 = 条目不完整，跳过。
-		 * 〔轮 5 清理：删掉了"查不到就回落按 transport 查"那半——手配目录
-		 *   路径 2026-08-11 已删除，目录只剩从节点表推导这一个来源，rid 恒
-		 *   非 0，回落永不命中。留着反而会在真出现 rid=0 时静默改用另一个
-		 *   键，不如直接跳过来得容易发现。〕 */
-		if (r->rep_rid.s_addr == INADDR_ANY)
-			continue;
-		link = cl_find_link_by_ipv4(gv, &r->rep_rid);
-		if (!cl_link_has_data(link))
-			continue;
+	/* One representative per group, best first. */
+	while (nrank < max) {
+		struct midr_rep_entry *best = NULL;
+		struct midr_link_entry *best_link = NULL;
 
-		for (i = 0; i < 3; i++) {
-			if (!cl_rep_is_better(r, link, top_rep[i], top_link[i]))
+		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r)) {
+			struct midr_link_entry *link;
+			struct midr_rep_identity identity;
+
+			if (r->rep_rid.s_addr == INADDR_ANY)
 				continue;
-			for (j = 2; j > i; j--) {
-				top_rep[j] = top_rep[j - 1];
-				top_link[j] = top_link[j - 1];
+			for (i = 0; i < nrank; i++)
+				if (rank_rep[i]->group_id == r->group_id)
+					break;
+			if (i != nrank)
+				continue;
+
+			cl_identity_from_rep(&identity, r);
+			link = cl_find_link_by_prefix(gv, &identity.node_id);
+			if (!cl_link_has_data(link))
+				continue;
+			if (cl_rep_is_better(r, link, best, best_link)) {
+				best = r;
+				best_link = link;
 			}
-			top_rep[i] = r;
-			top_link[i] = link;
-			break;
 		}
+		if (!best)
+			break;
+		rank_rep[nrank] = best;
+		rank_link[nrank] = best_link;
+		nrank++;
 	}
 
-	if (!top_rep[0]) {
+	/* Performance orders the groups; admission decides which may be joined. */
+	for (chosen = 0; chosen < nrank; chosen++) {
+		if (!midr_admission_candidate_blocked(bgp,
+						      rank_rep[chosen]->rep_transport))
+			break;
+		MIDR_FLOW_LOG(
+			"MIDR CL: REP_PROBE_DONE → 跳过第 %zu 名群 %u 代表 %pI4"
+			"（rtt=%u us）：路径命中 Tier1，准入拒绝",
+			chosen + 1, rank_rep[chosen]->group_id,
+			&rank_rep[chosen]->rep_rid,
+			rank_link[chosen]->long_term.rtt_us);
+	}
+
+	if (chosen == nrank) {
 		uint32_t new_gid = cl_max_group_id(gv) + 1;
 
 		d.decision_type = MIDR_DECISION_CREATE;
@@ -237,34 +269,47 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		MIDR_FLOW_LOG(
 			"MIDR CL: REP_PROBE_DONE → 无可用群代表，CREATE 新群 %u",
 			new_gid);
+		midr_nds_on_cluster_decision(bgp, &d);
 	} else {
-		d.decision_type = MIDR_DECISION_RECOMMEND;
-		d.new_group_id = top_rep[0]->group_id;
-		d.old_group_id = mi->local_group_id;
-		midr_ipaddr_to_host_prefix(&top_rep[0]->rep_transport,
-					   &d.recommended_rep);
+		struct listnode *node, *nnode;
+		struct midr_rep_identity *identity;
 
-		/* 第 2/3 名回灌给 NDS 做锚点候选，候选不足时有几个算几个。 */
+		d.decision_type = MIDR_DECISION_RECOMMEND;
+		d.new_group_id = rank_rep[chosen]->group_id;
+		d.old_group_id = mi->local_group_id;
+		d.recommended_rep_id.family = AF_INET;
+		d.recommended_rep_id.prefixlen = IPV4_MAX_BITLEN;
+		d.recommended_rep_id.u.prefix4 = rank_rep[chosen]->rep_rid;
+
+		/* Pass only stable identities across I-7. */
 		d.anchor_reps = list_new();
-		if (top_rep[1])
-			listnode_add(d.anchor_reps, top_rep[1]);
-		if (top_rep[2])
-			listnode_add(d.anchor_reps, top_rep[2]);
+		for (i = 0; i < nrank && listcount(d.anchor_reps) < 2; i++) {
+			if (i == chosen)
+				continue;
+			identity = XCALLOC(MTYPE_MIDR_REP_IDENTITY,
+					   sizeof(*identity));
+			cl_identity_from_rep(identity, rank_rep[i]);
+			listnode_add(d.anchor_reps, identity);
+		}
 
 		MIDR_FLOW_LOG(
-			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pIA"
+			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pI4"
 			"（rtt=%u us, loss=%.4f, bw=%u），另有 %d 个次优群锚点候选",
-			top_rep[0]->group_id, &top_rep[0]->rep_transport,
-			top_link[0]->long_term.rtt_us,
-			top_link[0]->long_term.loss_rate,
-			top_link[0]->long_term.bw_score,
+			rank_rep[chosen]->group_id, &rank_rep[chosen]->rep_rid,
+			rank_link[chosen]->long_term.rtt_us,
+			rank_link[chosen]->long_term.loss_rate,
+			rank_link[chosen]->long_term.bw_score,
 			listcount(d.anchor_reps));
+
+		midr_nds_on_cluster_decision(bgp, &d);
+
+		for (ALL_LIST_ELEMENTS(d.anchor_reps, node, nnode, identity))
+			XFREE(MTYPE_MIDR_REP_IDENTITY, identity);
+		list_delete(&d.anchor_reps);
 	}
 
-	midr_nds_on_cluster_decision(bgp, &d);
-
-	if (d.anchor_reps)
-		list_delete(&d.anchor_reps); /* 元素是借用指针，只清链表节点 */
+	XFREE(MTYPE_TMP, rank_rep);
+	XFREE(MTYPE_TMP, rank_link);
 }
 
 /* ===========================================================================
@@ -309,7 +354,9 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
 
 		total++;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
-		if (cl_link_is_good_for_join(link)) {
+		if (cl_link_is_good_for_join(link) &&
+		    (!entry->has_transport_addr ||
+		     !midr_admission_candidate_blocked(bgp, entry->transport_addr))) {
 			good++;
 		} else {
 			/* 收集未达标链路数据用于调试日志 */
@@ -420,7 +467,7 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
  * 不看 is_adjacent：锚点候选是 NDS 为评估而临时探测的非本群节点（只探不
  * 连），不是本群邻居，语义上正相反于 cl_count_good_member_links 的过滤条件。
  */
-static void cl_select_anchor_candidates(const struct midr_global_view *gv,
+static void cl_select_anchor_candidates(struct bgp *bgp, const struct midr_global_view *gv,
 					uint32_t target_group_id,
 					struct list *out)
 {
@@ -438,7 +485,8 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry)) {
 		struct midr_link_entry *link;
 
-		if (entry->is_self || entry->group_id != target_group_id)
+		if (entry->is_self || entry->group_id != target_group_id ||
+		    midr_admission_candidate_blocked(bgp, entry->transport_addr))
 			continue;
 		link = cl_find_link_by_prefix(gv, &entry->node_id);
 		MIDR_LOG("MIDR CL: 锚点候选 %pFX group=%u link=%s status=%d rtt=%u loss=%.4f",
@@ -450,13 +498,13 @@ static void cl_select_anchor_candidates(const struct midr_global_view *gv,
 		if (!cl_link_has_data(link))
 			continue;
 
-		if (!top1 || cl_metrics_is_better(&link->long_term, &top1_m)) {
+		if (cl_node_is_better(entry, &link->long_term, top1, &top1_m)) {
 			top2 = top1;
 			top2_m = top1_m;
 			top1 = entry;
 			top1_m = link->long_term;
-		} else if (!top2 ||
-			   cl_metrics_is_better(&link->long_term, &top2_m)) {
+		} else if (cl_node_is_better(entry, &link->long_term, top2,
+					  &top2_m)) {
 			top2 = entry;
 			top2_m = link->long_term;
 		}
@@ -502,8 +550,17 @@ static void cl_handle_anchor_probe_done(struct bgp *bgp,
 	d.new_group_id = mi->local_group_id;
 	d.evidence = list_new();
 
-	cl_select_anchor_candidates(gv, mi->anchor_group_id[0], d.evidence);
-	cl_select_anchor_candidates(gv, mi->anchor_group_id[1], d.evidence);
+	cl_select_anchor_candidates(bgp, gv, mi->anchor_group_id[0], d.evidence);
+	cl_select_anchor_candidates(bgp, gv, mi->anchor_group_id[1], d.evidence);
+	{
+		struct listnode *log_node;
+		struct midr_node_evidence *log_ev;
+		uint32_t index = 0;
+
+		for (ALL_LIST_ELEMENTS_RO(d.evidence, log_node, log_ev))
+			MIDR_FLOW_LOG("MIDR CL: I-7 ANCHOR evidence[%u]=%pI4",
+				      index++, &log_ev->node_id.u.prefix4);
+	}
 
 	MIDR_FLOW_LOG(
 		"MIDR CL: ANCHOR_PROBE_DONE → 群 %u/%u 共选出 %d 个锚点候选，ANCHOR",
@@ -681,6 +738,32 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		 */
 		MIDR_LOG("MIDR CL: CAPABILITY_UPDATE — 稳态能力重评估（stub）");
 		break;
+
+	case MIDR_TRIGGER_ADMISSION_CHANGE: {
+		uint32_t groups[2];
+		size_t count = midr_admission_anchor_groups(bgp, groups, array_size(groups));
+		struct midr_cluster_decision d = {};
+		struct listnode *node, *next;
+		struct midr_node_evidence *ev;
+		d.decision_type = MIDR_DECISION_ANCHOR;
+		d.old_group_id = d.new_group_id = mi->local_group_id;
+		d.evidence = list_new();
+		for (size_t i = 0; i < count; i++)
+			cl_select_anchor_candidates(bgp, gv, groups[i], d.evidence);
+		if (listcount(d.evidence))
+			midr_nds_on_cluster_decision(bgp, &d);
+		for (ALL_LIST_ELEMENTS(d.evidence, node, next, ev))
+			XFREE(MTYPE_MIDR_NODE_EVIDENCE, ev);
+		list_delete(&d.evidence);
+		/* A cached admission result may arrive before PM's warm-up window.
+		 * Only reconsider a phase whose original probe timer has completed. */
+		if (mi->join_phase == MIDR_JOIN_PROBING_REPS && mi->rep_dir &&
+		    !mi->t_rep_probe_done)
+			cl_handle_rep_probe_done(bgp, gv);
+		else if (mi->join_phase == MIDR_JOIN_PROBING_MEMBERS && !mi->t_member_probe_done)
+			cl_handle_member_probe_done(bgp, gv);
+		break;
+	}
 
 	case MIDR_TRIGGER_PERIODIC_SYNC:
 		/*

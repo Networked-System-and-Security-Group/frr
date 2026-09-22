@@ -122,6 +122,7 @@ topology:
         - chmod 640 /etc/frr/frr.conf
         - chmod 777 /etc/frr
         - chown -R frr:frr /etc/frr/logs
+        - sudo -n tc qdisc replace dev eth2 root netem delay 4ms
         - /usr/lib/frr/frrinit.sh start
 
     t3:
@@ -139,6 +140,7 @@ topology:
         - chmod 640 /etc/frr/frr.conf
         - chmod 777 /etc/frr
         - chown -R frr:frr /etc/frr/logs
+        - sudo -n tc qdisc replace dev eth1 root netem delay 4ms
         - /usr/lib/frr/frrinit.sh start
 
     r1:
@@ -233,6 +235,7 @@ topology:
         - configs-backbone/z1/frr.conf:/etc/frr/frr.conf
         - configs-backbone/z1/daemons:/etc/frr/daemons
         - logs-backbone/z1:/etc/frr/logs
+        - configs-backbone/z1/midr-policy:/etc/frr/midr-policy:ro
       exec:
         - ip addr replace 10.99.0.191/32 dev lo
         - mkdir -p /var/lib/frr

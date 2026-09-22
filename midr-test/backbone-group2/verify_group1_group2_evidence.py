@@ -255,7 +255,9 @@ def main() -> int:
         ted_summary = read_output(root, node, "ted-summary")
         ted_text = read_output(root, node, "ted-detail")
 
-        router_id = text_field(self_text, "Router-ID")
+        router_id = text_field(self_text, "BGP Identifier") or text_field(
+            self_text, "Router-ID"
+        )
         group_id = int_field(self_text, "Group-ID")
 
         node_report = re.search(

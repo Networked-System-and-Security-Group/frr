@@ -1,3 +1,9 @@
+# 第一组注释（仅注释，不改构建规则）：本 Makefile 是第二组组件测试入口，
+# 其 build/midrd 不链接 midrd/group1。midrd.c 的 midr_group1_init()/terminate()
+# 是 weak 符号，所以缺少第一组时这里的 midrd 依然能编出来并启动，只是静默地
+# 没有第一组——native-smoke / hardening-smoke 因此只覆盖第二组。
+# 第一组联合验收与生产构建统一走顶层 `make midrd/midrd`，并用
+# midrd/group1/verify-group1-linked.sh 确认最终二进制确实包含第一组。
 CC ?= cc
 CPPFLAGS ?= -I.
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic

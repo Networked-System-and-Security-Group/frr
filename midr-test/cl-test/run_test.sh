@@ -4,9 +4,9 @@
 # Topology: 10 nodes in separate Linux network namespaces, all connected via
 # an ns-hub L3 router.  tc-netem adds one-way delay on hub→node interfaces
 # (see setup.sh for why intra-group RTT is double a node's own delay):
-#   Group 1 (g1a-g1e): 3 ms → RTT from newnode ≈  3 ms, intra-group ≈  6 ms — best, chosen
-#   Group 3 (g3a-g3b): 6 ms → RTT from newnode ≈  6 ms, intra-group ≈ 12 ms — 2nd, 1st anchor group
-#   Group 2 (g2a-g2b): 50 ms → RTT from newnode ≈ 50 ms, intra-group ≈ 100 ms — 3rd, 2nd anchor group
+#   Group 1 members: 2/4/6/8 ms -- best, chosen in stable node order
+#   Group 3 members: 9/10 ms -- second, first anchor group
+#   Group 2 members: 50/55 ms -- third, second anchor group
 #
 # Expected result: newnode JOINs group 1 after ≈125 seconds, and — as a side
 # effect of the same RECOMMEND event (doc/change-reply.md B2/疑2) — anchor-
@@ -17,8 +17,8 @@
 #   t≈5    BGP-LS sessions establish; g1a builds full group-1 member list and
 #          learns g2a/g3a (cross-group BGP-LS neighbors) for its rep directory.
 #   t≈3    g1a replies to REP_LIST_REQ (or retry at t≈3 if g1a not ready yet).
-#   t≈63   REP_PROBE_DONE fires (60 s EWMA warm-up): ranks g1a(≈2.9ms) <
-#          g3a(≈5.8ms) < g2a(≈48ms) → CL RECOMMEND group 1, anchor_reps=[g3a,g2a].
+#   t≈63   REP_PROBE_DONE fires after EWMA warm-up and ranks the best
+#          representative from each group: group 1 < group 3 < group 2.
 #   t≈63   NDS sends MEMBER_LIST_REQ to g1a (main) and to g3a/g2a (anchors).
 #   t≈123  MEMBER_PROBE_DONE fires: 5 group-1 members × RTT < 20 ms → CL JOIN group 1.
 #   t≈123  ANCHOR_PROBE_DONE fires (~same time, own independent timer): CL
@@ -27,7 +27,7 @@
 #
 # Usage: sudo ./run_test.sh [--no-setup] [--timeout SECS]
 
-set -e
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -37,10 +37,14 @@ LIBDIR="$REPO_ROOT/lib/.libs"
 TESTDIR="$SCRIPT_DIR"
 TIMEOUT=150   # seconds to wait for JOIN decision
 DO_SETUP=1
+ADDRESS_FAMILY="ipv4"
+KEEP_RUNNING=0
 ANCHOR_ESTABLISH_TIMEOUT="${MIDR_ANCHOR_ESTABLISH_TIMEOUT:-60}"
 POST_CONVERGENCE_TIMEOUT="${MIDR_POST_CONVERGENCE_TIMEOUT:-120}"
 CAPTURE_RUN_ID="${MIDR_CAPTURE_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}"
 CAPTURE_ROOT="${MIDR_CAPTURE_ROOT:-$TESTDIR/artifacts/$CAPTURE_RUN_ID}"
+CONFIG_DIR="$CAPTURE_ROOT/configs"
+DB_DIR="$CAPTURE_ROOT/db"
 export MIDR_CAPTURE_RUN_ID="$CAPTURE_RUN_ID"
 export MIDR_CAPTURE_ROOT="$CAPTURE_ROOT"
 
@@ -60,6 +64,35 @@ archive_logs() {
     fi
 }
 
+while (( $# > 0 )); do
+    case "$1" in
+        --address-family)
+            ADDRESS_FAMILY="${2:-}"
+            shift 2
+            ;;
+        --no-setup)
+            DO_SETUP=0
+            shift
+            ;;
+        --timeout)
+            TIMEOUT="${2:-}"
+            shift 2
+            ;;
+        --keep-running)
+            KEEP_RUNNING=1
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+if [[ "$ADDRESS_FAMILY" != "ipv4" && "$ADDRESS_FAMILY" != "ipv6" ]]; then
+    echo "--address-family must be ipv4 or ipv6." >&2
+    exit 2
+fi
+
 if [[ $EUID -ne 0 ]]; then
     echo "[run_test] This test must run as root: sudo ./run_test.sh" >&2
     exit 2
@@ -78,8 +111,8 @@ if [[ -n "$MISSING_LIBS" ]]; then
     echo "$MISSING_LIBS" >&2
     exit 2
 fi
-if ! strings "$VTYSH" | grep -qF 'show midr self' ||
-   ! strings "$VTYSH" | grep -qF 'show midr ted detail'; then
+if ! grep -aFq 'show midr self' "$VTYSH" ||
+   ! grep -aFq 'show midr ted detail' "$VTYSH"; then
     echo "[run_test] vtysh has a stale command table; run: make -j\$(nproc) vtysh/vtysh" >&2
     exit 2
 fi
@@ -87,17 +120,27 @@ fi
 # bgpd config files use log paths relative to TESTDIR (e.g. "logs/bgpd-g1a.log"),
 # so bgpd must be launched with TESTDIR as its cwd.
 cd "$TESTDIR"
-mkdir -p "$CAPTURE_ROOT"
+mkdir -p "$CAPTURE_ROOT" "$DB_DIR"
 exec > >(tee "$CAPTURE_ROOT/console.log") 2>&1
 
-for arg in "$@"; do
-    case "$arg" in
-        --no-setup) DO_SETUP=0 ;;
-        --timeout)  shift; TIMEOUT="$1" ;;
-    esac
-done
-
-trap 'echo "[run_test] Interrupted."; capture_state interrupted; archive_logs; exit 1' INT TERM
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    archive_logs
+    if [[ "$status" -ne 0 || "$KEEP_RUNNING" -eq 0 ]]; then
+        bash "$TESTDIR/teardown.sh" || true
+    fi
+    exit "$status"
+}
+interrupted() {
+    trap - EXIT INT TERM
+    capture_state interrupted
+    archive_logs
+    bash "$TESTDIR/teardown.sh" || true
+    exit 130
+}
+trap cleanup EXIT
+trap interrupted INT TERM
 
 # ---- 0. Reap any stale bgpd instances left running by a previous, ----------
 #         incomplete run (timed out, Ctrl-C'd, or teardown.sh skipped).
@@ -123,7 +166,7 @@ sleep 1
 # ---- 1. Network setup -------------------------------------------------------
 if [[ "$DO_SETUP" -eq 1 ]]; then
     echo "[run_test] Setting up network namespaces..."
-    bash "$TESTDIR/setup.sh"
+    bash "$TESTDIR/setup.sh" --address-family "$ADDRESS_FAMILY"
 fi
 
 # ---- 2. Create log and VTY dirs ---------------------------------------------
@@ -138,10 +181,12 @@ done
 shopt -u nullglob
 rm -rf /tmp/midr-cl-vty && mkdir -p /tmp/midr-cl-vty
 mkdir -p "$CAPTURE_ROOT"
+bash "$TESTDIR/render_configs.sh" "$ADDRESS_FAMILY" "$CONFIG_DIR"
 {
     echo "run_id=$CAPTURE_RUN_ID"
     echo "started_at=$(date --iso-8601=seconds)"
     echo "git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "address_family=$ADDRESS_FAMILY"
     echo "timeout_seconds=$TIMEOUT"
     echo "anchor_establish_timeout_seconds=$ANCHOR_ESTABLISH_TIMEOUT"
     echo "post_convergence_timeout_seconds=$POST_CONVERGENCE_TIMEOUT"
@@ -158,7 +203,8 @@ start_node() {
 
     mkdir -p "/tmp/midr-cl-vty/$node"
     ip netns exec "ns-$node" "$BGPD" \
-        -f "$TESTDIR/configs/bgpd-${node}.conf" \
+        -f "$CONFIG_DIR/bgpd-${node}.conf" \
+        --db_file "$DB_DIR/bgpd-${node}.db" \
         -Z -S \
         -i "/tmp/bgpd-cl-${node}.pid" \
         --vty_socket "/tmp/midr-cl-vty/$node" \
@@ -173,11 +219,23 @@ start_node() {
     fi
 }
 
+assert_nodes_alive() {
+    local node pid
+
+    for node in "$@"; do
+        pid=$(cat "/tmp/bgpd-cl-${node}.pid" 2>/dev/null || true)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "[run_test] bgpd for $node exited unexpectedly." >&2
+            return 1
+        fi
+    done
+}
+
 wait_bootstrap_ready() {
     local node="$1" timeout=90 elapsed=0
     echo "[run_test] Waiting for $node's remote-view callback registration..."
     while [[ $elapsed -lt $timeout ]]; do
-        if grep -q "已向第二组注册 node/link 回调" \
+        if grep -q "已向第二组注册 node/link.*回调" \
              "$TESTDIR/logs/bgpd-${node}.log" 2>/dev/null; then
             echo "  ✓ $node ready at t=${elapsed}s"
             return 0
@@ -194,7 +252,8 @@ wait_rep_directory() {
     echo "[run_test] Waiting for $node's rep directory to list $want rep(s)..."
     while [[ $elapsed -lt $timeout ]]; do
         got=$("$VTYSH" --vty_socket "/tmp/midr-cl-vty/$node" \
-                  -c 'show midr reps' 2>/dev/null | grep -c '^10\.0\.' || true)
+                  -c 'show midr reps' 2>/dev/null \
+                  | awk '$1 ~ /^10\.0\./ {count++} END {print count + 0}')
         if [[ "$got" -ge "$want" ]]; then
             echo "  ✓ $node's directory lists $got rep(s) at t=${elapsed}s"
             return 0
@@ -327,12 +386,14 @@ capture_state after-bootstrap
 echo "[run_test] Stage 2/4: group representatives (g1b, g2a, g3a)..."
 for node in g1b g2a g3a; do start_node "$node" || exit 1; sleep 1; done
 wait_rep_directory g1a 3 || true
+assert_nodes_alive g1a g1b g2a g3a
 capture_state after-representatives
 
 echo "[run_test] Stage 3/4: members (g1c g1d g1e g2b g3b)..."
 for node in g1c g1d g1e g2b g3b; do start_node "$node" || exit 1; sleep 1; done
 # 群 1 该有 4 台（g1b 代表 + g1c/g1d/g1e）；群 2/3 各 2 台
 wait_group_members g1b 1 4 || true
+assert_nodes_alive g1a g1b g1c g1d g1e g2a g2b g3a g3b
 capture_state after-members
 
 # ---- 4. Start newnode (bootstrap command in config fires immediately) --------
@@ -372,6 +433,8 @@ fi
 # either runner-up group's member list arrives), so it can land a few seconds
 # after JOIN. Give it up to 30 s before declaring it missing.
 anchor_decision_detected=0
+anchor_sessions_ready=0
+post_convergence_ready=0
 if [[ $elapsed -lt $TIMEOUT ]]; then
     echo "[run_test] Waiting up to 30s for the ANCHOR decision (group-3/group-2 anchor connections)..."
     anchor_elapsed=0
@@ -391,12 +454,14 @@ fi
 
 if [[ $join_detected -eq 1 && $anchor_decision_detected -eq 1 ]]; then
     if wait_anchor_sessions 4 "$ANCHOR_ESTABLISH_TIMEOUT"; then
+        anchor_sessions_ready=1
         capture_state after-anchor-sessions
     else
         capture_state anchor-session-timeout
     fi
 
     if wait_post_convergence "$POST_CONVERGENCE_TIMEOUT"; then
+        post_convergence_ready=1
         capture_state post-convergence
     else
         capture_state post-convergence-timeout
@@ -411,4 +476,15 @@ echo ""
 bash "$TESTDIR/check_result.sh"
 capture_state final
 archive_logs
+python3 "$TESTDIR/extract_decisions.py" \
+    --log "$LOG" \
+    --output "$CAPTURE_ROOT/decisions.json" \
+    --address-family "$ADDRESS_FAMILY"
+ln -sfn "$CAPTURE_ROOT" "$TESTDIR/artifacts/latest-$ADDRESS_FAMILY"
 echo "[run_test] State artifacts: $CAPTURE_ROOT"
+if [[ "$join_detected" -ne 1 || "$anchor_decision_detected" -ne 1 ||
+      "$anchor_sessions_ready" -ne 1 || "$post_convergence_ready" -ne 1 ]]; then
+    echo "[run_test] FAIL: JOIN, ANCHOR, or convergence gate did not pass." >&2
+    exit 1
+fi
+echo "[run_test] PASS: $ADDRESS_FAMILY CL decision gate completed"

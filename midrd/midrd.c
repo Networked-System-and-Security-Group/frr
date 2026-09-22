@@ -89,6 +89,44 @@ struct midr_context *midr_context_get_default(void)
 
 static FRR_NORETURN void midrd_terminate(int status);
 
+/* 第一组新增：第一组（发现/测量/选群）与第二组同进程运行，midrd 在运行时就绪后调它
+ * 初始化、退出前调它收尾。弱符号让不含第一组的独立构建和组件测试照常链接。 */
+int midr_group1_init(struct event_loop *master, struct midr_context *ctx)
+	__attribute__((weak));
+void midr_group1_terminate(void) __attribute__((weak));
+
+/* 第一组新增：第一组填 Node/Link 需要本节点 node_id，建连需要 MIDR 端口，
+ * 准入校验需要会话源地址（即监听地址），公共接口里没有这两项查询。 */
+uint32_t midr_context_node_id(const struct midr_context *daemon)
+{
+	return daemon ? daemon->node_id : 0;
+}
+
+bool midr_context_listen_endpoint(const struct midr_context *daemon,
+				  struct ipaddr *address, uint16_t *port)
+{
+	const struct midr_transport_endpoint *local;
+
+	if (!daemon || !daemon->listen.family)
+		return false;
+	local = &daemon->listen;
+	if (address) {
+		memset(address, 0, sizeof(*address));
+		if (local->family == MIDR_TRANSPORT_AF_IPV4) {
+			SET_IPADDR_V4(address);
+			memcpy(&address->ipaddr_v4, local->address,
+			       sizeof(address->ipaddr_v4));
+		} else {
+			SET_IPADDR_V6(address);
+			memcpy(&address->ipaddr_v6, local->address,
+			       sizeof(address->ipaddr_v6));
+		}
+	}
+	if (port)
+		*port = local->port;
+	return true;
+}
+
 static void midrd_sighup(void)
 {
 	zlog_info("SIGHUP received and ignored");
@@ -3150,6 +3188,9 @@ static FRR_NORETURN void midrd_terminate(int status)
 	if (daemon && !daemon->terminating) {
 		daemon->terminating = true;
 		event_cancel(&daemon->poll_event);
+		/* 第一组修改：先让第一组停下，再撤销对象、关闭会话。 */
+		if (midr_group1_terminate)
+			midr_group1_terminate();
 		shutdown_withdraw(daemon);
 		printf("midrd node=%" PRIu32 " final-objects=%zu\n",
 		       daemon->node_id, midr_engine_count(daemon->engine));
@@ -3370,6 +3411,14 @@ int main(int argc, char **argv, char **envp)
 	       transport_config.local.port);
 	drain_events(&daemon, NULL);
 	midrd_runtime = &daemon;
+	/* 第一组修改：记下监听端点供身份查询使用，并在读配置前初始化第一组；
+	 * 第一组依赖的公共服务注册失败时不进入运行状态。 */
+	daemon.listen = transport_config.local;
+	if (midr_group1_init && midr_group1_init(daemon.master, &daemon)) {
+		fprintf(stderr, "midrd group 1 initialization failed\n");
+		midrd_runtime = NULL;
+		goto fail;
+	}
 	(void)fflush(NULL);
 	frr_config_fork();
 	event_add_timer_msec(daemon.master, midrd_poll, &daemon, 0,

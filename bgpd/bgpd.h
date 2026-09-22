@@ -1478,6 +1478,8 @@ enum connection_direction {
 };
 
 struct peer_connection {
+	/* Permit for this TCP attempt only, cleared by bgp_stop(). */
+	uint64_t midr_admission_permit;
 	struct peer *peer;
 	enum connection_direction dir;
 

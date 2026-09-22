@@ -168,6 +168,8 @@ struct midr_context {
 	bool shutdown_active;
 	uint64_t shutdown_write_failures;
 	bool terminating;
+	/* 第一组新增：midr_context_listen_endpoint() 返回的监听端点。 */
+	struct midr_transport_endpoint listen;
 };
 
 #endif /* MIDRD_CONTEXT_PRIVATE_H */

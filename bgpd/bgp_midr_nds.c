@@ -26,6 +26,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_nlri.h"
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_nds_facts.h"
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_cl.h"
@@ -436,6 +437,7 @@ void midr_nds_ledger_drop(struct bgp *bgp, struct ipaddr transport)
 	if (!bgp || !bgp->midr_nds_info || !bgp->midr_nds_info->session_ledger)
 		return;
 	mi = bgp->midr_nds_info;
+	midr_admission_forget(bgp, transport);
 
 	for (ALL_LIST_ELEMENTS(mi->session_ledger, node, nnode, e)) {
 		if (!midr_ipaddr_same(&e->transport, &transport))
@@ -905,6 +907,7 @@ void midr_nds_learn_member(struct bgp *bgp, struct in_addr rid, as_t asn,
 	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
 	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
+	midr_admission_screen(bgp, entry);
 }
 
 /*
@@ -952,6 +955,7 @@ void midr_nds_learn_anchor_candidate(struct bgp *bgp, struct in_addr rid,
 	/* I-1: probe by node_id; PM resolves transport_addr from global_view. */
 	midr_pm_add_target(bgp, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 			   entry->capabilities);
+	midr_admission_screen(bgp, entry);
 }
 
 /*
@@ -1526,6 +1530,11 @@ void midr_nds_anchor_ctx_clear(struct bgp *bgp)
 		return;
 	mi = bgp->midr_nds_info;
 
+	/* ANCHOR consumes the probe context before asynchronous admission
+	 * completes. Cancel its retained owners even when the slots are already
+	 * empty, so an abandoned join round cannot establish a late edge. */
+	midr_admission_forget_reason(bgp, MIDR_SESSION_CL_ANCHOR);
+
 	if (!mi->anchor_group_id[0] && !mi->anchor_group_id[1] &&
 	    !mi->t_anchor_probe_done)
 		return; /* 没有残留，静默 */
@@ -2083,6 +2092,9 @@ void midr_originate_group_update(struct bgp *bgp, uint32_t new_group_id,
 	if (!bgp || !bgp->midr_nds_info)
 		return;
 
+	if (new_group_id != old_group_id)
+		midr_admission_forget_reason(bgp, MIDR_SESSION_SAME_GROUP);
+
 	/* A group-0 node has no publishable topology membership.  Retire all
 	 * previously active Link facts before refreshing/withdrawing its Node fact. */
 	if (!new_group_id)
@@ -2186,6 +2198,45 @@ static void midr_join_settle_group(struct bgp *bgp, uint32_t gid)
  */
 static void midr_join_round_start(struct bgp *bgp); /* forward */
 
+static bool midr_rep_identity_resolve(
+	struct bgp *bgp, const struct midr_rep_identity *identity,
+	struct ipaddr *transport)
+{
+	struct bgp_midr_nds *mi;
+	struct midr_rep_entry *entry;
+	struct listnode *node;
+	struct ipaddr local;
+	struct ipaddr resolved;
+	bool found = false;
+
+	if (!bgp || !bgp->midr_nds_info || !identity || !transport ||
+	    identity->group_id == 0 || identity->node_id.family != AF_INET ||
+	    identity->node_id.prefixlen != IPV4_MAX_BITLEN ||
+	    identity->node_id.u.prefix4.s_addr == INADDR_ANY ||
+	    !midr_nds_local_transport_get(bgp, &local))
+		return false;
+
+	mi = bgp->midr_nds_info;
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, entry)) {
+		if (entry->group_id != identity->group_id ||
+		    !IPV4_ADDR_SAME(&entry->rep_rid,
+				    &identity->node_id.u.prefix4))
+			continue;
+		if (!midr_ipaddr_valid_locator(&entry->rep_transport) ||
+		    ipaddr_family(&entry->rep_transport) != ipaddr_family(&local))
+			return false;
+		if (found &&
+		    !midr_ipaddr_same(&resolved, &entry->rep_transport))
+			return false;
+		resolved = entry->rep_transport;
+		found = true;
+	}
+
+	if (found)
+		*transport = resolved;
+	return found;
+}
+
 void midr_nds_on_cluster_decision(struct bgp *bgp,
 				  const struct midr_cluster_decision *decision)
 {
@@ -2211,13 +2262,19 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 	switch (decision->decision_type) {
 	case MIDR_DECISION_RECOMMEND: {
 		uint32_t target_gid = decision->new_group_id;
+		struct midr_rep_identity recommended = {
+			.group_id = decision->new_group_id,
+			.node_id = decision->recommended_rep_id,
+		};
+		struct ipaddr recommended_transport;
 		struct ipaddr rep_transport;
 
-		if (!midr_ipaddr_from_prefix(&decision->recommended_rep,
-					       &rep_transport)) {
-			zlog_warn("MIDR I-7: RECOMMEND has no valid representative locator");
+		if (!midr_rep_identity_resolve(bgp, &recommended,
+					       &recommended_transport)) {
+			zlog_warn("MIDR I-7: RECOMMEND representative identity cannot be resolved to a unique same-family locator");
 			break;
 		}
+		rep_transport = recommended_transport;
 
 		/*
 		 * §1.1 第一段产物：CL 选定群代表。幂等 guard——只在"探群代表"阶段
@@ -2240,6 +2297,7 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		if (mi->config_group_id != 0) {
 			struct midr_rep_entry *r = midr_rep_dir_find_group(
 				bgp, mi->config_group_id);
+			struct midr_rep_identity configured;
 
 			if (!r) {
 				/*
@@ -2255,8 +2313,16 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 				midr_join_settle_group(bgp, mi->config_group_id);
 				break;
 			}
+			configured.group_id = r->group_id;
+			configured.node_id.family = AF_INET;
+			configured.node_id.prefixlen = IPV4_MAX_BITLEN;
+			configured.node_id.u.prefix4 = r->rep_rid;
+			if (!midr_rep_identity_resolve(bgp, &configured,
+						       &rep_transport)) {
+				zlog_warn("MIDR I-7: configured group representative identity cannot be resolved to a unique same-family locator");
+				break;
+			}
 			target_gid = mi->config_group_id;
-			rep_transport = r->rep_transport;
 			MIDR_FLOW_LOG("MIDR I-7：不采纳 RECOMMEND 群 %u——按配置群 %u 走，向其代表 %pIA 要成员表",
 				      decision->new_group_id, target_gid,
 				      &rep_transport);
@@ -2301,20 +2367,26 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 
 			/* 第 1 名：CL 推荐的群及其代表。 */
 			pool_gid[npool] = decision->new_group_id;
-			pool_transport[npool] = rep_transport;
+			pool_transport[npool] = recommended_transport;
 			npool++;
 
-			/* 第 2/3 名：CL 回灌的次优代表（借用指针，仅本次调用有效）。 */
+			/* Resolve the second- and third-ranked stable identities. */
 			if (decision->anchor_reps) {
 				struct listnode *an;
-				struct midr_rep_entry *ar;
+				struct midr_rep_identity *ar;
+				struct ipaddr anchor_transport;
 
 				for (ALL_LIST_ELEMENTS_RO(decision->anchor_reps,
 							  an, ar)) {
 					if (npool >= 3)
 						break;
+					if (!midr_rep_identity_resolve(
+						    bgp, ar, &anchor_transport)) {
+						zlog_warn("MIDR I-7: anchor representative identity cannot be resolved to a unique same-family locator");
+						continue;
+					}
 					pool_gid[npool] = ar->group_id;
-					pool_transport[npool] = ar->rep_transport;
+					pool_transport[npool] = anchor_transport;
 					npool++;
 				}
 			}
@@ -2606,10 +2678,11 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 				 * should_peer 推不出来，清理时全靠账认。
 				 * 【我方改动，需知会 zhc】本行原为两参调用，
 				 * 现为四参（末参 = 发 nudge，发起类传 true）。 */
-				midr_ctrl_connect(bgp, entry,
+				enum midr_admission_result admission = midr_ctrl_connect(bgp, entry,
 						  MIDR_SESSION_CL_ANCHOR,
 						  true);
-				connected++;
+				if (admission == MIDR_ADMISSION_READY || admission == MIDR_ADMISSION_PENDING)
+					connected++; /* Accepted intents, not Established peers. */
 			}
 		zlog_info("MIDR I-7：ANCHOR 处理 %u 个锚点候选，尝试建连 %u 个",
 			  decision->evidence
@@ -3016,6 +3089,7 @@ bool midr_nds_manual_session_del(struct bgp *bgp, struct ipaddr transport)
 	if (!bgp || !bgp->midr_nds_info)
 		return false;
 	mi = bgp->midr_nds_info;
+	midr_admission_forget(bgp, transport);
 	if (!mi->manual_sessions)
 		return false;
 
@@ -3046,6 +3120,21 @@ void midr_nds_manual_sessions_restore(struct bgp *bgp)
 	for (ALL_LIST_ELEMENTS_RO(mi->manual_sessions, node, session)) {
 		struct midr_node_entry target = {};
 		struct in_addr resolved_rid;
+		union sockunion su;
+		struct peer *peer;
+		const struct midr_session_ledger_entry *ledger;
+
+		/* Another owner at this locator does not yet own the persisted manual
+		 * demand. Merge MANUAL into its admission entry before skipping it. */
+		if (midr_admission_is_manual(bgp, session->transport))
+			continue;
+		if (midr_ipaddr_to_sockunion(&session->transport, &su)) {
+			peer = peer_lookup(bgp, &su);
+			ledger = midr_nds_ledger_lookup(bgp, session->transport);
+			if (peer && peer->connection && peer->connection->status == Established &&
+			    ledger && ledger->reason == MIDR_SESSION_MANUAL)
+				continue;
+		}
 
 		if (!midr_ipaddr_valid_locator(&session->transport) ||
 		    ipaddr_family(&session->transport) != ipaddr_family(&local))
@@ -3372,6 +3461,7 @@ static void midr_join_round_start(struct bgp *bgp)
  * 标 SEED 来源（排手配之后）。midr_store_seed_load 逐条调本函数。
  * last_seen 本路用不上（候选次序由 MANUAL/SEED 分组决定，不按时间排）——库里
  * 的行本就按 last_seen 新→旧吐出，同组内自然新的在前。 */
+#ifdef HAVE_SQLITE3
 static void midr_bootstrap_seed_load_cb(const char *transport, uint32_t asn,
 					const char *rid, time_t last_seen,
 					void *arg)
@@ -3391,6 +3481,7 @@ static void midr_bootstrap_seed_load_cb(const char *transport, uint32_t asn,
 	midr_bootstrap_list_add(bgp->midr_nds_info, locator, (as_t)asn,
 				rid_addr, MIDR_BOOTSTRAP_SEED);
 }
+#endif /* HAVE_SQLITE3 */
 
 /*
  * §8.31 种子自举定时器（启动后延迟 MIDR_BOOTSTRAP_SELF_BOOT_SECS 触发一次）：
@@ -3675,12 +3766,12 @@ static unsigned int midr_shutdown_teardown_sessions(struct bgp *bgp,
 		}
 		if (target->reason == MIDR_SESSION_MANUAL) {
 			manual++;
-			zlog_warn("MIDR 退网：拆除运维手配会话 %pIA（台账 MANUAL）——重入后如仍需要，请重敲 midr session",
+			zlog_warn("MIDR 退网：拆除运维手配会话 %pIA（台账 MANUAL）——配置意图保留，重入后自动恢复",
 				  &target->transport);
 		}
-			midr_ctrl_detach_transport(bgp, target->transport,
-					 target->remote_rid, true,
-					 MIDR_STOP_GRACEFUL_SHUTDOWN);
+		midr_ctrl_detach_transport(bgp, target->transport,
+					   target->remote_rid, true,
+					   MIDR_STOP_GRACEFUL_SHUTDOWN);
 		n++;
 	}
 
@@ -3860,6 +3951,7 @@ unsigned int midr_nds_shutdown_enter(struct bgp *bgp)
 	 * NODE_CHANGE、拆会话会引来重建。
 	 */
 	mi->shutdown = true;
+	midr_admission_reset(bgp);
 	mi->shutdown_owned_complete = false;
 	if (bgp->midr_info)
 		midr_sync_shutdown_begin(&bgp->midr_info->ctx);
@@ -4219,7 +4311,7 @@ static void midr_nds_attach_ensure(struct bgp *bgp, const char *why)
 	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP))
 		return;
 
-	live = midr_nds_attach_count(bgp);
+	live = midr_nds_attach_count(bgp) + midr_admission_attach_pending(bgp);
 	if (live >= MIDR_ATTACH_K)
 		return;
 
@@ -4287,7 +4379,7 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		 * （第二批）第一次仍会被撞一次——只是死心只花 6s。名单报了它活着
 		 * 却连不上，才是真该慢慢试的（第一批 15s）。
 		 */
-		if (cand->attach_failed)
+		if (cand->attach_failed || midr_admission_unavailable(bgp, cand->transport))
 			continue;
 
 		led = midr_nds_ledger_lookup(bgp, cand->transport);
@@ -4310,7 +4402,8 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 		 * `midr session` 对称配上，要么在本机 `no midr session` 让它回到
 		 * 普通候选）。
 		 */
-		if (led && led->reason == MIDR_SESSION_MANUAL) {
+		if ((led && led->reason == MIDR_SESSION_MANUAL) ||
+		    midr_admission_is_manual(bgp, cand->transport)) {
 			zlog_info("MIDR 挂靠：跳过引导 %pIA（rid %pI4）——该地址上已有运维手配的会话（台账 MANUAL），挂靠不占用运维的边；要让它参与挂靠请在本机 no midr session %pIA",
 				  &cand->transport, &cand->rid,
 				  &cand->transport);
@@ -4333,7 +4426,10 @@ static unsigned int midr_attach_pick_pass(struct bgp *bgp,
 			  second ? "第二批：不在最新活引导名单里"
 				 : "第一批：在最新活引导名单里",
 			  (start + i) % n, n, start);
-		midr_ctrl_connect(bgp, &e, MIDR_SESSION_ATTACH, true);
+		enum midr_admission_result admission =
+			midr_ctrl_connect(bgp, &e, MIDR_SESSION_ATTACH, true);
+		if (admission == MIDR_ADMISSION_BLOCKED || admission == MIDR_ADMISSION_INVALID)
+			continue;
 		/*
 		 * 第二批压重传预算（批 6 的 A-2）。放在 connect **之后**：预算改的是
 		 * connect 刚入队的那条 pending；若 connect 因去重没入队（不该发生
@@ -4371,7 +4467,7 @@ void midr_nds_attach_pick_from(struct bgp *bgp, enum midr_attach_batch from)
 	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP))
 		return;
 
-	live = midr_nds_attach_count(bgp);
+	live = midr_nds_attach_count(bgp) + midr_admission_attach_pending(bgp);
 	if (live >= MIDR_ATTACH_K)
 		return; /* 已够 K 台，不必再挑 */
 	want = MIDR_ATTACH_K - live;
@@ -4740,6 +4836,7 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		midr_ctrl_send_announce(bgp, r->rep_transport);
 
 		midr_pm_add_target(bgp, &locator, MIDR_SRC_BOOTSTRAP, 0);
+		midr_admission_screen(bgp, entry);
 		MIDR_FLOW_LOG("MIDR 加入：I-1 探测群代表 %pIA（群 %u）",
 			      &r->rep_transport, r->group_id);
 	}
@@ -5320,6 +5417,7 @@ static void midr_nds_remote_restore_intent(
 	bool send_nudge;
 
 	if (!intent->present || intent->reason == MIDR_SESSION_MANUAL ||
+	    intent->reason == MIDR_SESSION_PEER_REQ_REPLY ||
 	    !entry->has_transport_addr ||
 	    !midr_ipaddr_valid_locator(&entry->transport_addr) ||
 	    !midr_nds_locator_unique(bgp, &entry->node_id,
@@ -5381,6 +5479,10 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 
 	midr_nds_remote_node_decode(node, &rid, &caps, &transport,
 				    &has_transport);
+	if (node->has_transport_address && !has_transport) {
+		zlog_warn("MIDR remote view: ignoring Node with invalid locator");
+		return;
+	}
 	/* Reject a mixed-family update before touching identity or metadata. */
 	if (has_transport && bgp->midr_nds_info->transport_addr_set &&
 	    ipaddr_family(&transport) !=
@@ -5581,6 +5683,7 @@ static void midr_nds_remote_link_update(const struct midr_remote_link_info *link
 {
 	struct bgp *bgp = midr_nds_remote_bgp();
 	struct in_addr local, remote;
+	struct ipaddr local_transport;
 
 	if (!bgp || !link)
 		return;
@@ -5590,6 +5693,16 @@ static void midr_nds_remote_link_update(const struct midr_remote_link_info *link
 	 * 洞就张开了。 */
 	if (bgp->midr_nds_info->shutdown) {
 		MIDR_LOG("MIDR 退网：丢弃收到的远端 Link 事实（本机已退网）");
+		return;
+	}
+	if (!midr_nds_local_transport_get(bgp, &local_transport) ||
+	    !midr_ipaddr_valid_locator(&link->link_local_address) ||
+	    !midr_ipaddr_valid_locator(&link->link_remote_address) ||
+	    ipaddr_family(&link->link_local_address) !=
+		    ipaddr_family(&local_transport) ||
+	    ipaddr_family(&link->link_remote_address) !=
+		    ipaddr_family(&local_transport)) {
+		zlog_warn("MIDR remote view: ignoring Link with invalid or mixed-family endpoints");
 		return;
 	}
 
@@ -5715,8 +5828,8 @@ static void midr_nds_transport_clear_measurements(struct bgp_midr_nds *mi)
 }
 
 /* Reconcile configured transport with runtime state as one fail-closed
- * transaction.  Ledger/config intent survives; old sockets, async requests,
- * probes, measurements and NDS-owned peers do not. */
+ * transaction. Local ledger/config intent survives; remote-only request
+ * leases and old sockets, probes, measurements and peers do not. */
 int midr_nds_transport_reconcile(struct bgp *bgp)
 {
 	struct bgp_midr_nds *mi;
@@ -5724,7 +5837,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	struct peer **doomed = NULL;
 	struct peer *peer;
 	struct midr_node_entry *view_entry;
-	struct listnode *node;
+	struct listnode *node, *nnode;
 	struct midr_session_ledger_entry *ledger;
 	struct ipaddr desired = midr_ipaddr_none();
 	bool want_transport, desired_unique = true, restart_join;
@@ -5754,6 +5867,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	restart_join = mi->join_intent || mi->join_in_progress ||
 		       mi->join_phase != MIDR_JOIN_IDLE;
 	mi->transport_reconfiguring = true;
+	midr_admission_reset(bgp);
 
 	/* Withdraw endpoints while the old active locator is still available. */
 	midr_nds_facts_withdraw_all_links(bgp);
@@ -5816,10 +5930,16 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 	if (mi->transport_active) {
 		/* Restore durable edge intent without carrying old peer objects or
 		 * measurements across the locator generation. */
-		for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, ledger)) {
+		for (ALL_LIST_ELEMENTS(mi->session_ledger, node, nnode, ledger)) {
 			struct midr_node_entry target = {};
 			bool send_nudge;
 
+			/* A reply-only ledger is a past remote request. The requester
+			 * must renew it after our transport generation changes. */
+			if (ledger->reason == MIDR_SESSION_PEER_REQ_REPLY) {
+				midr_nds_ledger_drop(bgp, ledger->transport);
+				continue;
+			}
 			if (!midr_ipaddr_valid_locator(&ledger->transport) ||
 			    ipaddr_family(&ledger->transport) !=
 				    ipaddr_family(&mi->active_transport_addr))
@@ -5832,8 +5952,7 @@ int midr_nds_transport_reconcile(struct bgp *bgp)
 			target.asn = ledger->remote_asn;
 			target.group_id = ledger->remote_group;
 			ledger->down_since = 0;
-			send_nudge = ledger->reason != MIDR_SESSION_MANUAL &&
-				      ledger->reason != MIDR_SESSION_PEER_REQ_REPLY;
+			send_nudge = ledger->reason != MIDR_SESSION_MANUAL;
 			midr_ctrl_connect(bgp, &target, ledger->reason,
 					  send_nudge);
 		}
@@ -5946,6 +6065,7 @@ void bgp_midr_nds_init(struct bgp *bgp)
 	SET_IPADDR_NONE(&mi->active_transport_addr);
 
 	bgp->midr_nds_info = mi;
+	midr_admission_init(bgp);
 
 	/* 对接第二组 topology 接口：取一次 context 句柄存下（Q7 透传约定），
 	 * 再建本地事实表（轮 1 起由 midr_nds_report_node 写入并上报）。 */
@@ -5990,6 +6110,7 @@ void bgp_midr_nds_finish(struct bgp *bgp)
 		return;
 
 	mi = bgp->midr_nds_info;
+	midr_admission_finish(bgp);
 
 	event_cancel(&mi->t_periodic_sync);
 	event_cancel(&mi->t_probe_timeout);

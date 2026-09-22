@@ -313,6 +313,32 @@ void midr_nds_report_node(struct bgp *bgp, enum midr_origin_reason reason)
 		return;
 	}
 
+	/* A configured group without an active transport is not a publishable
+	 * node.  Withdraw the previous generation instead of replacing it with a
+	 * membership object that has no usable endpoint. */
+	if (!f->node.has_transport_address ||
+	    !midr_ipaddr_valid_locator(&f->node.transport_address)) {
+		if (f->node_reported && f->node.node_id) {
+			if (facts_version_exhausted(bgp, f->node.version, why))
+				return;
+			f->node.version++;
+			ret = midr_topology_node_withdraw(ctx, f->node.node_id,
+						  f->node.version);
+			if (ret) {
+				FACTS_FAIL_LOG(
+					facts_fail_prio(ret, false),
+					"MIDR facts: node withdraw without active transport failed ret=%d (%s)",
+					ret, why);
+				return;
+			}
+			f->node_reported = false;
+		}
+		f->node_pending = false;
+		MIDR_LOG("MIDR facts: node report suppressed without active transport (%s)",
+			 why);
+		return;
+	}
+
 	/*
 	 * 引导节点及尚未入群（运行群号 0）的普通节点不上报自己。前者是专职化：
 	 * 只转发、不自产；后者尚不具备进入权威拓扑的成员身份。

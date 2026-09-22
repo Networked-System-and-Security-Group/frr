@@ -35,6 +35,8 @@ extern struct event_loop *master;
 #define VTYSH_PATHD     0x80000
 #define VTYSH_PIM6D     0x100000
 #define VTYSH_MGMTD 0x200000
+/* 第一组新增：midrd 带 CLI 后需要 vtysh 能把 MIDR 命令分发给它。 */
+#define VTYSH_MIDRD 0x400000
 
 #define VTYSH_RCV_BUF_MAX 16777216
 
@@ -177,6 +179,6 @@ struct vtysh_client {
 	uint32_t lost_msgs;
 };
 
-extern struct vtysh_client vtysh_client[22];
+extern struct vtysh_client vtysh_client[23]; /* 第一组修改：加入 midrd */
 
 #endif /* VTYSH_H */

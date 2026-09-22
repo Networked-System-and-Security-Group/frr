@@ -23,6 +23,7 @@
 #include "zclient.h"
 #include "lib/json.h"
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_attr.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_errors.h"
@@ -2108,6 +2109,7 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 	struct bgp *bgp = peer->bgp;
 
 	peer->nsf_af_count = 0;
+	connection->midr_admission_permit = 0;
 
 	if (peer_dynamic_neighbor_no_nsf(peer) &&
 	    !(CHECK_FLAG(peer->flags, PEER_FLAG_DELETE))) {
@@ -2587,6 +2589,8 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 	enum connect_result status;
 
 	bgp_peer_conf_if_to_su_update(connection);
+	if (!midr_admission_peer_ready(peer))
+		return BGP_FSM_DEFERRED;
 
 	if (connection->su.sa.sa_family == AF_UNSPEC) {
 		frrtrace(2, frr_bgp, session_state_change, peer, 7);
@@ -2875,6 +2879,10 @@ bgp_establish(struct peer_connection *connection)
 	struct peer *peer = connection->peer;
 	struct bgp *bgp = peer->bgp;
 	struct vrf *vrf = NULL;
+
+	/* Check before peer transfer and before publishing Established. */
+	if (!midr_admission_check(connection))
+		return BGP_FSM_DEFERRED;
 
 	other = peer->doppelganger;
 	hash_release(bgp->connectionhash, connection);
@@ -3327,6 +3335,14 @@ int bgp_event_update(struct peer_connection *connection,
 			connection);
 
 	switch (ret) {
+	case BGP_FSM_DEFERRED:
+		/* stop deletes an unconfigured incoming clone. Do not touch its
+		 * connection after that; configured peers wait in Idle. */
+		if (bgp_stop(connection) != BGP_FSM_FAILURE_AND_DELETE)
+			bgp_fsm_change_status(connection, Idle);
+		/* No start timer: the admission manager wakes this peer. */
+		fsm_result = FSM_PEER_STOPPED;
+		break;
 	case BGP_FSM_SUCCESS:
 	case BGP_FSM_SUCCESS_STATE_TRANSFER:
 		if (ret == BGP_FSM_SUCCESS_STATE_TRANSFER &&

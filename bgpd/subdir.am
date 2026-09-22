@@ -79,6 +79,7 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/bgp_midr_pm.c \
 	bgpd/bgp_midr_cl.c \
 	bgpd/bgp_midr_ctrl.c \
+	bgpd/bgp_midr_admission.c \
 	bgpd/bgp_midr_ctrl_tcp.c \
 	bgpd/bgp_midr_store.c \
 	bgpd/bgp_midr_nds_vty.c \
@@ -93,7 +94,9 @@ bgpd_libbgp_a_SOURCES = \
 	bgpd/midr_ip2asn.c \
 	bgpd/midr_tier1.c \
 	bgpd/midr_tier1_vty.c \
-	bgpd/midr_trace_exec.c \
+	bgpd/midr_trace_engine.c \
+	bgpd/midr_trace_udp.c \
+	bgpd/midr_tier1_list.c \
 	bgpd/midr_trace_observer.c \
 	bgpd/midr_trace_scheduler.c \
 	bgpd/bgp_open.c \
@@ -203,6 +206,7 @@ noinst_HEADERS += \
 	bgpd/bgp_midr_pm.h \
 	bgpd/bgp_midr_cl.h \
 	bgpd/bgp_midr_ctrl.h \
+	bgpd/bgp_midr_admission.h \
 	bgpd/bgp_midr_store.h \
 	bgpd/bgp_midr_nds_vty.h \
 	bgpd/bgp_mac.h \
@@ -236,7 +240,10 @@ noinst_HEADERS += \
 	bgpd/midr_ip2asn.h \
 	bgpd/midr_tier1.h \
 	bgpd/midr_tier1_vty.h \
-	bgpd/midr_trace_exec.h \
+	bgpd/midr_trace_engine.h \
+	bgpd/midr_trace_udp.h \
+	bgpd/midr_trace_types.h \
+	bgpd/midr_tier1_list.h \
 	bgpd/midr_trace_observer.h \
 	bgpd/midr_trace_scheduler.h \
 	bgpd/bgp_nhg.h \

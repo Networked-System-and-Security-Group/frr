@@ -24,6 +24,7 @@
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_vty.h" /* bgp_config_inprocess()：引导角色收尾的时机判断 */
 #include "bgpd/bgp_midr_nds.h"
+#include "bgpd/bgp_midr_admission.h"
 #include "bgpd/bgp_midr_nds_facts.h" /* midr_nds_report_node（轮 1 node 上报线） */
 #include "bgpd/bgp_midr_ctrl.h"
 #include "bgpd/bgp_midr_pm.h"
@@ -331,7 +332,13 @@ accepted:
 	target.transport_addr = transport;
 	target.has_transport_addr = true;
 	target.asn = asn;
-	midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+	enum midr_admission_result admission =
+		midr_ctrl_connect(bgp, &target, MIDR_SESSION_MANUAL, false);
+	if (admission == MIDR_ADMISSION_PENDING || admission == MIDR_ADMISSION_BLOCKED) {
+		vty_out(vty, "MIDR session %s configured; Tier1 admission %s (show midr admission)\n",
+			argv[2]->arg, admission == MIDR_ADMISSION_BLOCKED ? "blocked" : "pending");
+		return CMD_SUCCESS;
+	}
 
 	peer = peer_lookup(bgp, &su);
 	if (!peer || !midr_nds_peer_is_overlay(peer)) {
@@ -393,7 +400,8 @@ DEFUN(no_midr_session,
 	ledger = midr_nds_ledger_lookup(bgp, transport);
 	peer = peer_lookup(bgp, &su);
 	operator_peer = peer && !midr_nds_peer_is_overlay(peer);
-	if (!manual && !ledger && (!peer || operator_peer)) {
+	if (!manual && !ledger && (!peer || operator_peer) &&
+	    !midr_admission_has_intent(bgp, transport)) {
 		vty_out(vty, "%% MIDR session %s is not configured\n",
 			argv[3]->arg);
 		return CMD_WARNING;
@@ -1046,6 +1054,62 @@ DEFUN(show_midr_nodes,
 	return CMD_SUCCESS;
 }
 
+static const char *midr_link_status_str(enum midr_link_status status)
+{
+	switch (status) {
+	case MIDR_LINK_UP:
+		return "up";
+	case MIDR_LINK_DEGRADED:
+		return "degraded";
+	case MIDR_LINK_DOWN:
+		return "down";
+	}
+	return "?";
+}
+
+DEFUN(show_midr_links,
+      show_midr_links_cmd,
+      "show midr links",
+      SHOW_STR
+      "MIDR information\n"
+      "Show PM measurements towards each probed node\n")
+{
+	struct bgp *bgp = bgp_get_default();
+	struct midr_link_entry *link;
+	struct listnode *node;
+
+	if (!bgp || !bgp->midr_nds_info) {
+		vty_out(vty, "%% MIDR not initialized\n");
+		return CMD_WARNING;
+	}
+
+	vty_out(vty, "%-15s %-39s %-8s %-10s %-10s %-9s %s\n", "Router-ID",
+		"Transport-Addr", "Status", "LT-RTT(us)", "ST-RTT(us)",
+		"LT-Loss", "Admission");
+	for (ALL_LIST_ELEMENTS_RO(bgp->midr_nds_info->global_view->links, node,
+				  link)) {
+		struct ipaddr transport;
+		char taddr[IPADDR_STRING_SIZE] = "-";
+		const char *admission = "-";
+
+		if (midr_nds_node_transport_get(bgp, &link->remote_node_id,
+						&transport)) {
+			ipaddr2str(&transport, taddr, sizeof(taddr));
+			if (midr_admission_candidate_blocked(bgp, transport))
+				admission = "blocked";
+			else if (midr_admission_has_intent(bgp, transport))
+				admission = "tracked";
+		}
+		vty_out(vty, "%-15pI4 %-39s %-8s %-10u %-10u %-9.4f %s\n",
+			&link->remote_node_id.u.prefix4, taddr,
+			midr_link_status_str(link->status),
+			link->long_term.rtt_us, link->short_term.rtt_us,
+			link->long_term.loss_rate, admission);
+	}
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(show_midr_reps,
       show_midr_reps_cmd,
       "show midr reps",
@@ -1512,14 +1576,24 @@ DEFUN(show_midr_self,
 	struct bgp *bgp = bgp_get_default();
 	struct bgp_midr_nds *mi;
 	char caps_buf[64];
+	const char *family;
 
 	if (!bgp || !bgp->midr_nds_info) {
 		vty_out(vty, "%% MIDR not initialized\n");
 		return CMD_WARNING;
 	}
 	mi = bgp->midr_nds_info;
+	if (!mi->transport_addr_set)
+		family = "unset";
+	else if (IS_IPADDR_V4(&mi->local_transport_addr))
+		family = "IPv4";
+	else if (IS_IPADDR_V6(&mi->local_transport_addr))
+		family = "IPv6";
+	else
+		family = "invalid";
 
 	vty_out(vty, "BGP Identifier    : %pI4\n", &bgp->router_id);
+	vty_out(vty, "Address family    : %s\n", family);
 	if (mi->transport_addr_set)
 		vty_out(vty, "Configured locator: %pIA\n",
 			&mi->local_transport_addr);
@@ -2094,6 +2168,40 @@ DEFUN(midr_help,
 
 /* Persist only explicit operator intent.  Runtime ledger entries, learned
  * seeds and dynamically derived roles/groups must never leak into frr.conf. */
+DEFUN(midr_avoid_tier1,
+      midr_avoid_tier1_cmd,
+      "[no] midr avoid-tier1",
+      NO_STR
+      "MIDR configuration\n"
+      "Reject new MIDR sessions when traceroute observes Tier1\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	if (!bgp->midr_nds_info)
+		return CMD_WARNING_CONFIG_FAILED;
+	midr_admission_set(bgp, !strmatch(argv[0]->text, "no"));
+	vty_out(vty, "MIDR Tier1 admission %s; existing Established sessions retained\n",
+		bgp->midr_nds_info->avoid_tier1 ? "enabled" : "disabled");
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_midr_admission,
+      show_midr_admission_cmd,
+      "show midr admission",
+      SHOW_STR
+      "MIDR information\n"
+      "Show Tier1 admission for all BGP instances\n")
+{
+	struct bgp *bgp;
+	struct listnode *node;
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		if (!bgp->midr_nds_info)
+			continue;
+		vty_out(vty, "BGP %s AS %u\n", bgp->name_pretty, bgp->as);
+		midr_admission_show(bgp, vty);
+	}
+	return CMD_SUCCESS;
+}
+
 static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 {
 	struct bgp_midr_nds *mi;
@@ -2105,6 +2213,8 @@ static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 		return 0;
 	mi = bgp->midr_nds_info;
 
+	if (mi->avoid_tier1)
+		vty_out(vty, " midr avoid-tier1\n");
 	if (mi->config_group_id)
 		vty_out(vty, " midr group-id %u\n", mi->config_group_id);
 	if (mi->transport_addr_set &&
@@ -2139,6 +2249,8 @@ static int midr_nds_config_write(struct bgp *bgp, struct vty *vty)
 void bgp_midr_nds_vty_init(void)
 {
 	hook_register(bgp_inst_config_write, midr_nds_config_write);
+	install_element(BGP_NODE, &midr_avoid_tier1_cmd);
+	install_element(VIEW_NODE, &show_midr_admission_cmd);
 	install_element(BGP_NODE, &midr_group_id_cmd);
 	install_element(BGP_NODE, &midr_session_cmd);
 	install_element(BGP_NODE, &no_midr_session_cmd);
@@ -2165,6 +2277,7 @@ void bgp_midr_nds_vty_init(void)
 	install_element(VIEW_NODE, &show_midr_self_cmd);
 	install_element(VIEW_NODE, &show_midr_group2_cmd);
 	install_element(VIEW_NODE, &show_midr_nodes_cmd);
+	install_element(VIEW_NODE, &show_midr_links_cmd);
 	install_element(VIEW_NODE, &show_midr_reps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstraps_cmd);
 	install_element(VIEW_NODE, &show_midr_bootstrap_seeds_cmd);

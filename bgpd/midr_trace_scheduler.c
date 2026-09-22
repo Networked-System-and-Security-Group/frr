@@ -7,8 +7,6 @@
 
 #include <errno.h>
 #include <limits.h>
-#include <signal.h>
-#include <sys/wait.h>
 
 #include "frrevent.h"
 #include "hash.h"
@@ -21,43 +19,29 @@
 
 #include "bgpd/bgp_memory.h"
 #include "bgpd/midr_ip2asn.h"
-#include "bgpd/midr_trace_exec.h"
+#include "bgpd/midr_trace_engine.h"
 #include "bgpd/midr_trace_observer.h"
 #include "bgpd/midr_trace_scheduler.h"
+#include "vrf.h"
 
 #define MIDR_TRACE_DEFAULT_CONCURRENCY 4U
 #define MIDR_TRACE_DEFAULT_QUEUE_LIMIT 128U
 #define MIDR_TRACE_DEFAULT_REQUESTS_PER_JOB 64U
 #define MIDR_TRACE_DEFAULT_PENDING_REQUESTS 4096U
 #define MIDR_TRACE_DEFAULT_QUEUE_TIMEOUT_MSEC 5000U
-#define MIDR_TRACE_DEFAULT_EXEC_TIMEOUT_MSEC 35000U
-#define MIDR_TRACE_DEFAULT_KILL_GRACE_MSEC 500U
-#define MIDR_TRACE_DEFAULT_DRAIN_MSEC 100U
-#define MIDR_TRACE_DEFAULT_OUTPUT_LIMIT (64U * 1024U)
+#define MIDR_TRACE_DEFAULT_EXEC_TIMEOUT_MSEC 95000U
 #define MIDR_TRACE_DEFAULT_CACHE_TTL_MSEC (300U * 1000U)
 #define MIDR_TRACE_DEFAULT_NEGATIVE_TTL_MSEC (15U * 1000U)
 #define MIDR_TRACE_DEFAULT_CACHE_CAPACITY 1024U
 #define MIDR_TRACE_DEFAULT_HISTORY_TTL_MSEC (300U * 1000U)
 #define MIDR_TRACE_DEFAULT_HISTORY_CAPACITY 1024U
-#define MIDR_TRACE_REAP_SAFETY_MSEC 1000U
 #define MIDR_TRACE_CLEANUP_INTERVAL_MSEC 30000U
-#define MIDR_TRACE_READ_BUFFER_SIZE 4096U
-#define MIDR_TRACE_FINAL_REAP_TIMEOUT_MSEC 2000U
-#define MIDR_TRACE_FINAL_REAP_POLL_NSEC (10U * 1000U * 1000U)
 
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TRACE_SCHEDULER, "MIDR traceroute scheduler");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TRACE_JOB, "MIDR traceroute job");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TRACE_REQUEST, "MIDR traceroute request");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TRACE_CACHE, "MIDR traceroute cache entry");
 DEFINE_MTYPE_STATIC(BGPD, MIDR_TRACE_HISTORY, "MIDR traceroute history entry");
-
-enum midr_trace_termination_reason {
-	MIDR_TRACE_TERM_NONE,
-	MIDR_TRACE_TERM_TIMEOUT,
-	MIDR_TRACE_TERM_OUTPUT_LIMIT,
-	MIDR_TRACE_TERM_PARSE,
-	MIDR_TRACE_TERM_SHUTDOWN,
-};
 
 enum midr_trace_delivery_kind {
 	MIDR_TRACE_DELIVER_JOB_RESULT,
@@ -75,6 +59,7 @@ enum midr_trace_request_state {
 struct midr_trace_key {
 	struct prefix target;
 	uint32_t profile_version;
+	struct midr_trace_net_context context;
 };
 
 struct midr_trace_delivery_seed {
@@ -109,30 +94,19 @@ struct midr_trace_job {
 	bool retain_for_poll;
 	bool slot_owned;
 	bool start_attempted;
-	bool stdout_eof;
-	bool stderr_eof;
-	bool parser_finished;
-	bool drain_complete;
-	bool defer_finalize;
 	bool finalize_started;
 	bool result_published;
 	bool suppress_publication;
-	enum midr_trace_termination_reason termination_reason;
 	enum midr_trace_status terminal_status;
 	struct list *requests;
 	struct timeval queued_at;
 	struct timeval started_at;
-	struct midr_trace_exec exec;
-	struct midr_trace_parser parser;
-	uint64_t output_bytes;
+	struct midr_trace_engine *engine;
+	struct midr_trace_job_result measurement;
+	struct event *finish_event;
 	struct event *start_event;
-	struct event *read_stdout;
-	struct event *read_stderr;
 	struct event *queue_timer;
 	struct event *execution_timer;
-	struct event *kill_timer;
-	struct event *final_drain_timer;
-	struct event *reap_safety_timer;
 };
 
 struct midr_trace_cache_entry {
@@ -176,15 +150,8 @@ static struct midr_trace_scheduler *midr_trace_scheduler;
 
 static void midr_trace_schedule_pump(struct midr_trace_scheduler *scheduler);
 static void midr_trace_job_finalize(struct midr_trace_job *job);
-static void midr_trace_job_reaped(void *arg);
 static void midr_trace_job_start_event(struct event *event);
 static void midr_trace_job_queue_timeout(struct event *event);
-static void midr_trace_job_read_stream(
-	struct midr_trace_job *job, enum midr_trace_exec_stream stream);
-static void midr_trace_job_begin_termination(
-	struct midr_trace_job *job,
-	enum midr_trace_termination_reason reason);
-
 static struct midr_trace_scheduler_config midr_trace_default_config(void)
 {
 	return (struct midr_trace_scheduler_config){
@@ -198,9 +165,6 @@ static struct midr_trace_scheduler_config midr_trace_default_config(void)
 			MIDR_TRACE_DEFAULT_QUEUE_TIMEOUT_MSEC,
 		.execution_timeout_msec =
 			MIDR_TRACE_DEFAULT_EXEC_TIMEOUT_MSEC,
-		.kill_grace_msec = MIDR_TRACE_DEFAULT_KILL_GRACE_MSEC,
-		.post_exit_drain_msec = MIDR_TRACE_DEFAULT_DRAIN_MSEC,
-		.output_limit_bytes = MIDR_TRACE_DEFAULT_OUTPUT_LIMIT,
 		.success_cache_ttl_msec =
 			MIDR_TRACE_DEFAULT_CACHE_TTL_MSEC,
 		.negative_cache_ttl_msec =
@@ -239,7 +203,7 @@ static bool midr_trace_target_normalize(const struct prefix *target,
 {
 	if (!target || !normalized)
 		return false;
-	if (target->family != AF_INET && target->family != AF_INET6)
+	if (!midr_trace_engine_target_valid(target))
 		return false;
 
 	prefix_copy(normalized, target);
@@ -253,13 +217,24 @@ static bool midr_trace_key_same(const struct midr_trace_key *a,
 				const struct midr_trace_key *b)
 {
 	return a->profile_version == b->profile_version
+	       && a->context.instance_cookie == b->context.instance_cookie
+	       && a->context.vrf_id == b->context.vrf_id
+	       && a->context.source.family == b->context.source.family
+	       && (!a->context.source.family ||
+		   prefix_same(&a->context.source, &b->context.source))
 	       && prefix_same(&a->target, &b->target);
 }
 
 static unsigned int midr_trace_key_hash(const struct midr_trace_key *key)
 {
-	return jhash_1word(key->profile_version,
-			   prefix_hash_key(&key->target));
+	unsigned int hash = jhash_3words(key->profile_version,
+		(uint32_t)key->context.instance_cookie,
+		(uint32_t)(key->context.instance_cookie >> 32),
+		prefix_hash_key(&key->target));
+
+	return jhash_2words(key->context.vrf_id,
+		key->context.source.family ? prefix_hash_key(&key->context.source) : 0,
+		hash);
 }
 
 static unsigned int midr_trace_job_key_hash(const void *data)
@@ -440,9 +415,9 @@ static bool midr_trace_status_negative_cacheable(
 	enum midr_trace_status status)
 {
 	return status == MIDR_TRACE_ERR_EXEC_TIMEOUT
-	       || status == MIDR_TRACE_ERR_SPAWN
-	       || status == MIDR_TRACE_ERR_PARSE
-	       || status == MIDR_TRACE_ERR_EXIT_STATUS;
+	       || status == MIDR_TRACE_ERR_SOCKET
+	       || status == MIDR_TRACE_ERR_SEND
+	       || status == MIDR_TRACE_ERR_RECEIVE;
 }
 
 static void midr_trace_cache_insert(struct midr_trace_scheduler *scheduler,
@@ -601,24 +576,6 @@ static int midr_trace_config_validate(
 				     "execution timeout must be in 1000..120000 ms");
 		return ERANGE;
 	}
-	if (config->kill_grace_msec < 100
-	    || config->kill_grace_msec > 5000) {
-		midr_trace_set_error(errmsg, errmsg_len,
-				     "kill grace must be in 100..5000 ms");
-		return ERANGE;
-	}
-	if (config->post_exit_drain_msec < 10
-	    || config->post_exit_drain_msec > 1000) {
-		midr_trace_set_error(errmsg, errmsg_len,
-				     "post-exit drain must be in 10..1000 ms");
-		return ERANGE;
-	}
-	if (config->output_limit_bytes < 4096
-	    || config->output_limit_bytes > 1024U * 1024U) {
-		midr_trace_set_error(errmsg, errmsg_len,
-				     "output limit must be in 4096..1048576 bytes");
-		return ERANGE;
-	}
 	if (config->success_cache_ttl_msec > 86400U * 1000U
 	    || config->negative_cache_ttl_msec > 300U * 1000U) {
 		midr_trace_set_error(errmsg, errmsg_len,
@@ -700,7 +657,7 @@ static void midr_trace_request_build_delivery(
 	}
 
 	if (!request->seed.has_job_result) {
-		delivery->status = MIDR_TRACE_ERR_PARSE;
+		delivery->status = MIDR_TRACE_ERR_INVALID;
 		return;
 	}
 	delivery->has_cache_metadata = true;
@@ -754,47 +711,6 @@ static void midr_trace_request_completion_event(struct event *event)
 	midr_trace_request_deliver(request, true);
 }
 
-static void midr_trace_job_schedule_read(struct midr_trace_job *job,
-					 enum midr_trace_exec_stream stream);
-
-static void midr_trace_job_parser_finish(struct midr_trace_job *job)
-{
-	enum midr_trace_parse_rc parse_rc;
-	struct midr_trace_raw_path path;
-
-	if (job->parser_finished)
-		return;
-	parse_rc = midr_trace_parser_finish(&job->parser, &path);
-	job->parser_finished = true;
-	if (parse_rc == MIDR_TRACE_PARSE_OK) {
-		job->parser.path = path;
-		return;
-	}
-	if (parse_rc == MIDR_TRACE_PARSE_OUTPUT_LIMIT) {
-		job->parser.path = path;
-		job->parser.path.output_truncated = true;
-		midr_trace_job_begin_termination(
-			job, MIDR_TRACE_TERM_OUTPUT_LIMIT);
-		return;
-	}
-	midr_trace_job_begin_termination(job, MIDR_TRACE_TERM_PARSE);
-}
-
-static void midr_trace_job_close_stream(
-	struct midr_trace_job *job, enum midr_trace_exec_stream stream)
-{
-	if (stream == MIDR_TRACE_EXEC_STDOUT) {
-		event_cancel(&job->read_stdout);
-		midr_trace_exec_close_stream(&job->exec, stream);
-		job->stdout_eof = true;
-		midr_trace_job_parser_finish(job);
-	} else {
-		event_cancel(&job->read_stderr);
-		midr_trace_exec_close_stream(&job->exec, stream);
-		job->stderr_eof = true;
-	}
-}
-
 static struct midr_trace_job *
 midr_trace_job_new(struct midr_trace_scheduler *scheduler,
 		   const struct midr_trace_key *key, uint64_t job_id,
@@ -809,10 +725,8 @@ midr_trace_job_new(struct midr_trace_scheduler *scheduler,
 	job->retain_for_poll = retain_for_poll;
 	job->state = MIDR_TRACE_JOB_QUEUED;
 	job->requests = list_new();
-	job->terminal_status = MIDR_TRACE_ERR_PARSE;
+	job->terminal_status = MIDR_TRACE_ERR_INVALID;
 	monotime(&job->queued_at);
-	midr_trace_exec_init(&job->exec);
-	midr_trace_parser_init(&job->parser);
 	return job;
 }
 
@@ -894,20 +808,35 @@ static void midr_trace_scheduler_cleanup(struct event *event)
 
 static enum midr_trace_submit_rc
 midr_trace_submit_precheck(const struct prefix *target,
+			   const struct midr_trace_request_options *options,
 			   struct midr_trace_key *key)
 {
 	struct midr_trace_scheduler *scheduler = midr_trace_scheduler;
 
+	if (key) {
+		memset(key, 0, sizeof(*key));
+		if (options)
+			key->context = options->context;
+	}
 	if (!target || !key
 	    || !midr_trace_target_normalize(target, &key->target))
 		return MIDR_TRACE_SUBMIT_INVALID;
 	key->profile_version = MIDR_TRACE_PROFILE_VERSION;
+	if (key->context.vrf_id != VRF_DEFAULT)
+		return MIDR_TRACE_SUBMIT_UNSUPPORTED;
+	if (key->context.source.family &&
+	    (key->context.source.family != target->family ||
+	     !midr_trace_target_normalize(&key->context.source,
+					 &key->context.source)))
+		return MIDR_TRACE_SUBMIT_INVALID;
 	if (!scheduler)
-		return midr_trace_exec_supported()
+		return midr_trace_engine_supported(target->family)
 			       ? MIDR_TRACE_SUBMIT_NOT_READY
 			       : MIDR_TRACE_SUBMIT_UNSUPPORTED;
 	if (!scheduler->accepting)
 		return MIDR_TRACE_SUBMIT_SHUTDOWN;
+	if (!midr_trace_engine_supported(target->family))
+		return MIDR_TRACE_SUBMIT_UNSUPPORTED;
 	if (!midr_ip2asn_is_loaded())
 		return MIDR_TRACE_SUBMIT_NOT_READY;
 	return MIDR_TRACE_SUBMIT_ACCEPTED;
@@ -934,7 +863,7 @@ enum midr_trace_submit_rc midr_trace_request_async(
 		*request_id = 0;
 	if (!done || !request_id)
 		return MIDR_TRACE_SUBMIT_INVALID;
-	rc = midr_trace_submit_precheck(target, &key);
+	rc = midr_trace_submit_precheck(target, options, &key);
 	if (rc != MIDR_TRACE_SUBMIT_ACCEPTED)
 		return rc;
 
@@ -1032,7 +961,7 @@ bool midr_trace_cancel(uint64_t request_id)
 	if (job && job->state == MIDR_TRACE_JOB_QUEUED
 	    && !listcount(job->requests) && !job->retain_for_poll) {
 		job->suppress_publication = true;
-		job->drain_complete = true;
+
 		midr_trace_job_finalize(job);
 	}
 	return true;
@@ -1051,10 +980,10 @@ enum midr_trace_cache_lookup_rc midr_trace_cache_lookup(
 		*cache_age_msec = 0;
 	if (!midr_ip2asn_is_loaded())
 		return MIDR_TRACE_LOOKUP_NO_SNAPSHOT;
-	if (!scheduler || !target || !view
-	    || !midr_trace_target_normalize(target, &key.target))
+	if (!scheduler || !view ||
+	    midr_trace_submit_precheck(target, options, &key) !=
+		MIDR_TRACE_SUBMIT_ACCEPTED)
 		return MIDR_TRACE_LOOKUP_MISS;
-	key.profile_version = MIDR_TRACE_PROFILE_VERSION;
 	if (options && options->force_refresh)
 		return MIDR_TRACE_LOOKUP_MISS;
 
@@ -1089,7 +1018,7 @@ enum midr_trace_submit_rc midr_trace_ensure_job(
 		*job_id = 0;
 	if (!job_id || !state)
 		return MIDR_TRACE_SUBMIT_INVALID;
-	rc = midr_trace_submit_precheck(target, &key);
+	rc = midr_trace_submit_precheck(target, options, &key);
 	if (rc != MIDR_TRACE_SUBMIT_ACCEPTED)
 		return rc;
 
@@ -1182,7 +1111,8 @@ int midr_trace_scheduler_init(struct event_loop *master)
 		return EALREADY;
 	if (!master)
 		return EINVAL;
-	if (!midr_trace_exec_supported())
+	if (!midr_trace_engine_supported(AF_INET)
+	    && !midr_trace_engine_supported(AF_INET6))
 		return ENOTSUP;
 
 	scheduler =
@@ -1225,13 +1155,6 @@ int midr_trace_scheduler_init(struct event_loop *master)
 bool midr_trace_scheduler_is_ready(void)
 {
 	return midr_trace_scheduler != NULL;
-}
-
-void midr_trace_scheduler_sigchld(void)
-{
-	if (!midr_trace_scheduler)
-		return;
-	midr_trace_exec_sigchld();
 }
 
 void midr_trace_scheduler_config_get(
@@ -1370,15 +1293,11 @@ unsigned int midr_trace_cache_clear(const struct prefix *target)
 	if (target) {
 		if (!midr_trace_target_normalize(target, &key.target))
 			return 0;
-		key.profile_version = MIDR_TRACE_PROFILE_VERSION;
-		entry = midr_trace_cache_find(scheduler, &key);
-		if (!entry)
-			return 0;
-		midr_trace_cache_remove(scheduler, entry);
-		return 1;
 	}
 
 	for (ALL_LIST_ELEMENTS(scheduler->cache_lru, node, next, entry)) {
+		if (target && !prefix_same(&entry->key.target, &key.target))
+			continue;
 		midr_trace_cache_remove(scheduler, entry);
 		removed++;
 	}
@@ -1435,17 +1354,8 @@ void midr_trace_scheduler_quiesce(void)
 	job_snapshot = hash_to_list(scheduler->active_jobs_by_id);
 	for (ALL_LIST_ELEMENTS_RO(job_snapshot, node, job)) {
 		job->suppress_publication = true;
-		if (!job->exec.spawned) {
-			job->termination_reason =
-				MIDR_TRACE_TERM_SHUTDOWN;
-			job->terminal_status =
-				MIDR_TRACE_ERR_SHUTDOWN;
-			job->drain_complete = true;
-			midr_trace_job_finalize(job);
-			continue;
-		}
-		midr_trace_job_begin_termination(
-			job, MIDR_TRACE_TERM_SHUTDOWN);
+		job->terminal_status = MIDR_TRACE_ERR_SHUTDOWN;
+		midr_trace_job_finalize(job);
 	}
 	list_delete(&job_snapshot);
 
@@ -1457,59 +1367,9 @@ void midr_trace_scheduler_quiesce(void)
 		midr_trace_scheduler_fini();
 }
 
-static bool
-midr_trace_job_reap_for_fini(struct midr_trace_job *job,
-			     const struct timeval *teardown_started)
-{
-	enum midr_trace_exec_reap_rc reap_rc;
-
-	for (;;) {
-		struct timespec pause = {
-			.tv_sec = 0,
-			.tv_nsec = MIDR_TRACE_FINAL_REAP_POLL_NSEC,
-		};
-
-		reap_rc = midr_trace_exec_reap_one(&job->exec);
-		if (reap_rc == MIDR_TRACE_EXEC_REAP_DONE)
-			return true;
-		if (reap_rc == MIDR_TRACE_EXEC_REAP_ERROR) {
-			zlog_err(
-				"MIDR traceroute job %ju: final waitpid failed: %s",
-				(uintmax_t)job->job_id,
-				safe_strerror(errno));
-			return false;
-		}
-
-		(void)midr_trace_exec_signal(&job->exec, SIGKILL);
-
-		if (midr_trace_age_msec(teardown_started)
-		    >= MIDR_TRACE_FINAL_REAP_TIMEOUT_MSEC)
-			break;
-		while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
-			;
-	}
-
-	reap_rc = midr_trace_exec_reap_one(&job->exec);
-	if (reap_rc == MIDR_TRACE_EXEC_REAP_DONE)
-		return true;
-	zlog_err(
-		"MIDR traceroute job %ju: child did not exit within %u ms after SIGKILL",
-		(uintmax_t)job->job_id, MIDR_TRACE_FINAL_REAP_TIMEOUT_MSEC);
-	return false;
-}
-
 void midr_trace_scheduler_fini(void)
 {
 	struct midr_trace_scheduler *scheduler = midr_trace_scheduler;
-	struct list *jobs;
-	struct listnode *node;
-	struct midr_trace_job *job;
-	struct timeval teardown_started;
-	sigset_t block_mask;
-	sigset_t old_mask;
-	bool mask_blocked = false;
-	bool reap_failed = false;
-	int rc;
 
 	if (!scheduler)
 		return;
@@ -1521,64 +1381,6 @@ void midr_trace_scheduler_fini(void)
 		return;
 	scheduler->finalizing = true;
 	midr_trace_scheduler_quiesce();
-
-	sigemptyset(&block_mask);
-	sigaddset(&block_mask, SIGCHLD);
-	rc = pthread_sigmask(SIG_BLOCK, &block_mask, &old_mask);
-	if (!rc)
-		mask_blocked = true;
-	else
-		zlog_err("MIDR traceroute: cannot block SIGCHLD for teardown: %s",
-			 safe_strerror(rc));
-
-	jobs = hash_to_list(scheduler->active_jobs_by_id);
-	monotime(&teardown_started);
-	for (ALL_LIST_ELEMENTS_RO(jobs, node, job)) {
-		int signal_rc;
-
-		event_cancel_event(scheduler->master, job);
-		job->suppress_publication = true;
-		if (!job->exec.spawned || job->exec.child_reaped)
-			continue;
-		signal_rc = midr_trace_exec_signal(&job->exec, SIGKILL);
-		if (signal_rc && signal_rc != ESRCH)
-			zlog_err(
-				"MIDR traceroute job %ju: teardown SIGKILL failed: %s",
-				(uintmax_t)job->job_id,
-				safe_strerror(signal_rc));
-		midr_trace_exec_close_streams(&job->exec);
-	}
-	for (ALL_LIST_ELEMENTS_RO(jobs, node, job)) {
-		if (job->exec.spawned && !job->exec.child_reaped
-		    && !midr_trace_job_reap_for_fini(
-			    job, &teardown_started)) {
-			reap_failed = true;
-			continue;
-		}
-		job->termination_reason = MIDR_TRACE_TERM_SHUTDOWN;
-		job->terminal_status = MIDR_TRACE_ERR_SHUTDOWN;
-		midr_trace_exec_close_streams(&job->exec);
-		job->stdout_eof = true;
-		job->stderr_eof = true;
-		job->drain_complete = true;
-		midr_trace_job_finalize(job);
-	}
-	list_delete(&jobs);
-
-	if (reap_failed) {
-		/*
-		 * Never free a job still referenced by the PID registry.  The
-		 * daemon's caller is in its final process-exit path, so make late
-		 * SIGCHLD dispatch a no-op and intentionally retain this bounded
-		 * teardown state until process exit instead of hanging forever.
-		 */
-		midr_trace_scheduler = NULL;
-		scheduler->finalizing = false;
-		if (mask_blocked)
-			pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
-		return;
-	}
-
 	event_cancel_event(scheduler->master, scheduler);
 	list_delete(&scheduler->queued_jobs);
 	list_delete(&scheduler->cache_lru);
@@ -1592,8 +1394,6 @@ void midr_trace_scheduler_fini(void)
 	hash_clean_and_free(&scheduler->active_jobs_by_id, NULL);
 	midr_trace_scheduler = NULL;
 	XFREE(MTYPE_MIDR_TRACE_SCHEDULER, scheduler);
-	if (mask_blocked)
-		pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
 }
 
 const char *midr_trace_status_name(enum midr_trace_status status)
@@ -1614,15 +1414,20 @@ const char *midr_trace_status_name(enum midr_trace_status status)
 	case MIDR_TRACE_ERR_QUEUE_TIMEOUT:
 		return "queue-timeout";
 	case MIDR_TRACE_ERR_SPAWN:
-		return "spawn-error";
+	case MIDR_TRACE_ERR_OUTPUT_LIMIT:
+	case MIDR_TRACE_ERR_PARSE:
+	case MIDR_TRACE_ERR_EXIT_STATUS:
+		return "obsolete-backend-error";
+	case MIDR_TRACE_ERR_SOCKET:
+		return "socket-error";
 	case MIDR_TRACE_ERR_EXEC_TIMEOUT:
 		return "timeout";
-	case MIDR_TRACE_ERR_OUTPUT_LIMIT:
-		return "output-limit";
-	case MIDR_TRACE_ERR_PARSE:
-		return "parse-error";
-	case MIDR_TRACE_ERR_EXIT_STATUS:
-		return "exit-status";
+	case MIDR_TRACE_ERR_RESOURCE:
+		return "resource-error";
+	case MIDR_TRACE_ERR_SEND:
+		return "send-error";
+	case MIDR_TRACE_ERR_RECEIVE:
+		return "receive-error";
 	case MIDR_TRACE_ERR_CANCELED:
 		return "canceled";
 	case MIDR_TRACE_ERR_SHUTDOWN:
@@ -1648,33 +1453,6 @@ const char *midr_trace_cache_state_name(enum midr_trace_cache_state state)
 	return "unknown";
 }
 
-static enum midr_trace_status midr_trace_job_status(
-	const struct midr_trace_job *job)
-{
-	switch (job->termination_reason) {
-	case MIDR_TRACE_TERM_TIMEOUT:
-		return MIDR_TRACE_ERR_EXEC_TIMEOUT;
-	case MIDR_TRACE_TERM_OUTPUT_LIMIT:
-		return MIDR_TRACE_ERR_OUTPUT_LIMIT;
-	case MIDR_TRACE_TERM_PARSE:
-		return MIDR_TRACE_ERR_PARSE;
-	case MIDR_TRACE_TERM_SHUTDOWN:
-		return MIDR_TRACE_ERR_SHUTDOWN;
-	case MIDR_TRACE_TERM_NONE:
-		break;
-	}
-
-	if (!job->exec.wait_status_valid
-	    || job->exec.reap_consistency_error)
-		return MIDR_TRACE_ERR_EXIT_STATUS;
-	if (!WIFEXITED(job->exec.wait_status)
-	    || WEXITSTATUS(job->exec.wait_status) != 0)
-		return MIDR_TRACE_ERR_EXIT_STATUS;
-	if (!job->parser_finished || job->parser.path.hop_count == 0)
-		return MIDR_TRACE_ERR_PARSE;
-	return MIDR_TRACE_OK;
-}
-
 static void midr_trace_job_record_result_stats(
 	struct midr_trace_scheduler *scheduler,
 	enum midr_trace_status status)
@@ -1686,19 +1464,38 @@ static void midr_trace_job_record_result_stats(
 	case MIDR_TRACE_ERR_EXEC_TIMEOUT:
 		scheduler->stats.execution_timeouts++;
 		break;
+	case MIDR_TRACE_ERR_SOCKET:
+		scheduler->stats.socket_errors++;
+		break;
+	case MIDR_TRACE_ERR_SEND:
+		scheduler->stats.send_errors++;
+		break;
+	case MIDR_TRACE_ERR_RECEIVE:
+		scheduler->stats.receive_errors++;
+		break;
+	case MIDR_TRACE_ERR_RESOURCE:
+		scheduler->stats.resource_errors++;
+		break;
+	case MIDR_TRACE_OK:
+		/* Published jobs, including successes, are counted by finalize. */
+		break;
+	case MIDR_TRACE_ERR_INVALID:
+	case MIDR_TRACE_ERR_NO_SNAPSHOT:
+	case MIDR_TRACE_ERR_UNSUPPORTED:
+	case MIDR_TRACE_ERR_QUEUE_FULL:
+	case MIDR_TRACE_ERR_REQUEST_LIMIT:
+		/* Submission failures have no job-result error counter here. */
+		break;
 	case MIDR_TRACE_ERR_SPAWN:
-		scheduler->stats.spawn_errors++;
-		break;
-	case MIDR_TRACE_ERR_PARSE:
-		scheduler->stats.parse_errors++;
-		break;
-	case MIDR_TRACE_ERR_EXIT_STATUS:
-		scheduler->stats.exit_errors++;
-		break;
 	case MIDR_TRACE_ERR_OUTPUT_LIMIT:
-		scheduler->stats.output_limit_errors++;
+	case MIDR_TRACE_ERR_PARSE:
+	case MIDR_TRACE_ERR_EXIT_STATUS:
+		/* Reserved statuses from the removed external-process backend. */
 		break;
-	default:
+	case MIDR_TRACE_ERR_CANCELED:
+	case MIDR_TRACE_ERR_SHUTDOWN:
+		/* Lifecycle termination is not a probe failure. Cancellation is
+		 * counted per request by midr_trace_cancel(), not per job here. */
 		break;
 	}
 }
@@ -1708,16 +1505,15 @@ static void midr_trace_job_build_result(
 {
 	struct timeval now;
 
-	memset(result, 0, sizeof(*result));
+	*result = job->measurement;
 	monotime(&now);
 	result->job_id = job->job_id;
 	result->status = job->terminal_status;
 	result->target = job->key.target;
-	result->raw_path = job->parser.path;
 	if (job->start_attempted) {
 		result->queue_msec = midr_trace_elapsed_msec(
 			&job->queued_at, &job->started_at);
-		if (job->exec.spawned)
+		if (job->engine)
 			result->execution_msec = midr_trace_elapsed_msec(
 				&job->started_at, &now);
 	} else {
@@ -1725,14 +1521,6 @@ static void midr_trace_job_build_result(
 			midr_trace_elapsed_msec(&job->queued_at, &now);
 	}
 
-	result->has_wait_status = job->exec.wait_status_valid;
-	if (!result->has_wait_status)
-		return;
-	result->exited_normally = WIFEXITED(job->exec.wait_status);
-	if (result->exited_normally)
-		result->child_exit_code = WEXITSTATUS(job->exec.wait_status);
-	else if (WIFSIGNALED(job->exec.wait_status))
-		result->child_signal = WTERMSIG(job->exec.wait_status);
 }
 
 static void midr_trace_job_finalize(struct midr_trace_job *job)
@@ -1745,9 +1533,6 @@ static void midr_trace_job_finalize(struct midr_trace_job *job)
 	bool publish;
 
 	if (!job || job->finalize_started)
-		return;
-	if (job->exec.spawned
-	    && (!job->exec.child_reaped || !job->drain_complete))
 		return;
 
 	job->finalize_started = true;
@@ -1767,8 +1552,6 @@ static void midr_trace_job_finalize(struct midr_trace_job *job)
 
 	publish = !job->suppress_publication;
 	if (publish) {
-		if (job->exec.spawned)
-			job->terminal_status = midr_trace_job_status(job);
 		midr_trace_job_build_result(job, &result);
 		job->result_published = true;
 		midr_trace_cache_insert(scheduler, &job->key, &result);
@@ -1790,318 +1573,97 @@ static void midr_trace_job_finalize(struct midr_trace_job *job)
 		midr_trace_request_claim_terminal(request, &seed);
 	}
 	list_delete(&job->requests);
-	midr_trace_exec_reset(&job->exec);
+	midr_trace_engine_destroy(&job->engine);
 	XFREE(MTYPE_MIDR_TRACE_JOB, job);
 	midr_trace_schedule_pump(scheduler);
 }
 
-static void midr_trace_job_kill_timeout(struct event *event)
+static void midr_trace_job_finish_event(struct event *event)
 {
 	struct midr_trace_job *job = EVENT_ARG(event);
-	int signal_rc;
 
-	if (!job || job->finalize_started || job->exec.child_reaped)
-		return;
-	if (job->state != MIDR_TRACE_JOB_TERM_SENT)
-		return;
-	signal_rc = midr_trace_exec_signal(&job->exec, SIGKILL);
-	if (signal_rc && signal_rc != ESRCH)
-		zlog_err("MIDR traceroute job %ju: SIGKILL failed: %s",
-			 (uintmax_t)job->job_id,
-			 safe_strerror(signal_rc));
-	job->state = MIDR_TRACE_JOB_KILL_SENT;
+	midr_trace_job_finalize(job);
 }
 
-static void midr_trace_job_begin_termination(
-	struct midr_trace_job *job,
-	enum midr_trace_termination_reason reason)
+static void midr_trace_job_engine_done(
+	const struct midr_trace_job_result *result, void *arg)
 {
-	if (!job || job->finalize_started)
-		return;
-	if (reason == MIDR_TRACE_TERM_SHUTDOWN)
-		job->suppress_publication = true;
-	if (job->termination_reason == MIDR_TRACE_TERM_NONE)
-		job->termination_reason = reason;
+	struct midr_trace_job *job = arg;
 
+	if (job->state != MIDR_TRACE_JOB_RUNNING)
+		return;
+	job->measurement = *result;
+	job->terminal_status = result->status;
+	job->state = MIDR_TRACE_JOB_FINALIZING;
 	event_cancel(&job->execution_timer);
-	if (!job->exec.spawned) {
-		job->terminal_status = reason == MIDR_TRACE_TERM_SHUTDOWN
-					       ? MIDR_TRACE_ERR_SHUTDOWN
-					       : MIDR_TRACE_ERR_PARSE;
-		job->drain_complete = true;
-		midr_trace_job_finalize(job);
-		return;
-	}
-	if (job->exec.child_reaped)
-		return;
-	if (job->state != MIDR_TRACE_JOB_TERM_SENT
-	    && job->state != MIDR_TRACE_JOB_KILL_SENT) {
-		(void)midr_trace_exec_signal(&job->exec, SIGTERM);
-		job->state = MIDR_TRACE_JOB_TERM_SENT;
-	}
-	if (!job->kill_timer)
-		event_add_timer_msec(
-			job->scheduler->master,
-			midr_trace_job_kill_timeout, job,
-			job->scheduler->config.kill_grace_msec,
-			&job->kill_timer);
+	/* Engine callback owns its stack until return; defer destruction. */
+	event_add_event(job->scheduler->master, midr_trace_job_finish_event,
+			job, 0, &job->finish_event);
 }
 
 static void midr_trace_job_execution_timeout(struct event *event)
 {
 	struct midr_trace_job *job = EVENT_ARG(event);
 
-	if (!job || job->finalize_started
-	    || job->state != MIDR_TRACE_JOB_RUNNING
-	    || job->exec.child_reaped
-	    || job->termination_reason != MIDR_TRACE_TERM_NONE)
+	if (job->state != MIDR_TRACE_JOB_RUNNING)
 		return;
-	midr_trace_job_begin_termination(job, MIDR_TRACE_TERM_TIMEOUT);
-}
-
-static void midr_trace_job_final_drain_timeout(struct event *event)
-{
-	struct midr_trace_job *job = EVENT_ARG(event);
-
-	if (!job || job->finalize_started
-	    || job->state != MIDR_TRACE_JOB_FINALIZING
-	    || !job->exec.child_reaped)
-		return;
-	midr_trace_job_close_stream(job, MIDR_TRACE_EXEC_STDOUT);
-	midr_trace_job_close_stream(job, MIDR_TRACE_EXEC_STDERR);
-	job->drain_complete = true;
-	midr_trace_job_finalize(job);
-}
-
-static void midr_trace_job_reap_safety(struct event *event)
-{
-	struct midr_trace_job *job = EVENT_ARG(event);
-	enum midr_trace_exec_reap_rc reap_rc;
-	int signal_rc;
-
-	if (!job || job->finalize_started || job->exec.child_reaped)
-		return;
-	reap_rc = midr_trace_exec_reap_one(&job->exec);
-	if (reap_rc == MIDR_TRACE_EXEC_REAP_DONE) {
-		midr_trace_job_reaped(job);
-		return;
-	}
-	if (reap_rc == MIDR_TRACE_EXEC_REAP_ERROR)
-		zlog_warn("MIDR traceroute job %ju: safety waitpid failed: %s",
-			  (uintmax_t)job->job_id, safe_strerror(errno));
-	if (job->state == MIDR_TRACE_JOB_KILL_SENT) {
-		signal_rc = midr_trace_exec_signal(&job->exec, SIGKILL);
-		if (signal_rc && signal_rc != ESRCH)
-			zlog_err(
-				"MIDR traceroute job %ju: repeated SIGKILL failed: %s",
-				(uintmax_t)job->job_id,
-				safe_strerror(signal_rc));
-	}
-	event_add_timer_msec(job->scheduler->master,
-			     midr_trace_job_reap_safety, job,
-			     MIDR_TRACE_REAP_SAFETY_MSEC,
-			     &job->reap_safety_timer);
-}
-
-static void midr_trace_job_reaped(void *arg)
-{
-	struct midr_trace_job *job = arg;
-
-	if (!job || job->finalize_started || !job->exec.child_reaped)
-		return;
-
-	event_cancel(&job->execution_timer);
-	event_cancel(&job->kill_timer);
-	event_cancel(&job->reap_safety_timer);
-	job->state = MIDR_TRACE_JOB_FINALIZING;
-	job->defer_finalize = true;
-	midr_trace_job_read_stream(job, MIDR_TRACE_EXEC_STDOUT);
-	midr_trace_job_read_stream(job, MIDR_TRACE_EXEC_STDERR);
-	job->defer_finalize = false;
-
-	if (job->stdout_eof && job->stderr_eof) {
-		job->drain_complete = true;
-		midr_trace_job_finalize(job);
-		return;
-	}
-	if (!job->final_drain_timer)
-		event_add_timer_msec(
-			job->scheduler->master,
-			midr_trace_job_final_drain_timeout, job,
-			job->scheduler->config.post_exit_drain_msec,
-			&job->final_drain_timer);
-}
-
-static void midr_trace_job_maybe_finish_drain(struct midr_trace_job *job)
-{
-	if (!job->exec.child_reaped || job->defer_finalize)
-		return;
-	if (!job->stdout_eof || !job->stderr_eof)
-		return;
-	job->drain_complete = true;
+	midr_trace_engine_snapshot(job->engine, &job->measurement);
+	job->measurement.stop_reason = MIDR_TRACE_STOP_ERROR;
+	job->terminal_status = MIDR_TRACE_ERR_EXEC_TIMEOUT;
 	midr_trace_job_finalize(job);
 }
 
 static void midr_trace_job_start_event(struct event *event)
 {
 	struct midr_trace_job *job = EVENT_ARG(event);
-	struct midr_trace_scheduler *scheduler;
+	struct midr_trace_scheduler *scheduler = job->scheduler;
 	int rc;
 
-	if (!job || job->finalize_started
-	    || job->state != MIDR_TRACE_JOB_STARTING)
+	if (job->state != MIDR_TRACE_JOB_STARTING)
 		return;
-	scheduler = job->scheduler;
 	if (!scheduler->accepting) {
 		job->suppress_publication = true;
 		job->terminal_status = MIDR_TRACE_ERR_SHUTDOWN;
-		job->drain_complete = true;
 		midr_trace_job_finalize(job);
 		return;
 	}
-
 	job->start_attempted = true;
 	monotime(&job->started_at);
-	rc = midr_trace_exec_start(&job->exec, &job->key.target, job,
-				   midr_trace_job_reaped);
+	rc = midr_trace_engine_start(scheduler->master, &job->key.target,
+				     &job->key.context,
+				     midr_trace_job_engine_done, job,
+				     &job->engine);
 	if (rc) {
-		job->terminal_status = MIDR_TRACE_ERR_SPAWN;
-		job->drain_complete = true;
+		job->terminal_status = MIDR_TRACE_ERR_SOCKET;
+		job->measurement.system_errno = rc;
+		job->measurement.stop_reason = MIDR_TRACE_STOP_ERROR;
 		midr_trace_job_finalize(job);
 		return;
 	}
-
 	job->state = MIDR_TRACE_JOB_RUNNING;
-	midr_trace_job_schedule_read(job, MIDR_TRACE_EXEC_STDOUT);
-	midr_trace_job_schedule_read(job, MIDR_TRACE_EXEC_STDERR);
-	event_add_timer_msec(scheduler->master,
-			     midr_trace_job_execution_timeout, job,
-			     scheduler->config.execution_timeout_msec,
+	event_add_timer_msec(scheduler->master, midr_trace_job_execution_timeout,
+			     job, scheduler->config.execution_timeout_msec,
 			     &job->execution_timer);
-	event_add_timer_msec(scheduler->master,
-			     midr_trace_job_reap_safety, job,
-			     MIDR_TRACE_REAP_SAFETY_MSEC,
-			     &job->reap_safety_timer);
 }
 
 static void midr_trace_job_queue_timeout(struct event *event)
 {
 	struct midr_trace_job *job = EVENT_ARG(event);
 
-	if (!job || job->finalize_started
-	    || job->state != MIDR_TRACE_JOB_QUEUED)
+	if (job->state != MIDR_TRACE_JOB_QUEUED)
 		return;
-	listnode_delete(job->scheduler->queued_jobs, job);
 	job->terminal_status = MIDR_TRACE_ERR_QUEUE_TIMEOUT;
-	job->drain_complete = true;
 	midr_trace_job_finalize(job);
 }
 
-static void midr_trace_job_read_stream(
-	struct midr_trace_job *job, enum midr_trace_exec_stream stream)
+const char *midr_trace_stop_reason_name(enum midr_trace_stop_reason reason)
 {
-	unsigned char buf[MIDR_TRACE_READ_BUFFER_SIZE];
-
-	while (midr_trace_exec_stream_fd(&job->exec, stream) >= 0) {
-		ssize_t nread =
-			midr_trace_exec_read(&job->exec, stream, buf,
-					     sizeof(buf));
-
-		if (nread > 0) {
-			enum midr_trace_parse_rc parse_rc;
-			uint64_t limit =
-				job->scheduler->config.output_limit_bytes;
-
-			if ((uint64_t)nread > limit - MIN(limit,
-							 job->output_bytes)) {
-				job->parser.path.output_truncated = true;
-				midr_trace_job_begin_termination(
-					job,
-					MIDR_TRACE_TERM_OUTPUT_LIMIT);
-				midr_trace_job_close_stream(
-					job, MIDR_TRACE_EXEC_STDOUT);
-				midr_trace_job_close_stream(
-					job, MIDR_TRACE_EXEC_STDERR);
-				break;
-			}
-			job->output_bytes += (uint64_t)nread;
-			if (stream == MIDR_TRACE_EXEC_STDERR
-			    || job->termination_reason
-				       != MIDR_TRACE_TERM_NONE)
-				continue;
-
-			parse_rc = midr_trace_parser_feed(&job->parser, buf,
-							  (size_t)nread);
-			if (parse_rc == MIDR_TRACE_PARSE_OK)
-				continue;
-			if (parse_rc == MIDR_TRACE_PARSE_OUTPUT_LIMIT) {
-				job->parser.path.output_truncated = true;
-				midr_trace_job_begin_termination(
-					job,
-					MIDR_TRACE_TERM_OUTPUT_LIMIT);
-				midr_trace_job_close_stream(
-					job, MIDR_TRACE_EXEC_STDOUT);
-				midr_trace_job_close_stream(
-					job, MIDR_TRACE_EXEC_STDERR);
-			} else {
-				midr_trace_job_begin_termination(
-					job, MIDR_TRACE_TERM_PARSE);
-			}
-			break;
-		}
-		if (nread == 0) {
-			midr_trace_job_close_stream(job, stream);
-			break;
-		}
-		if (errno == EINTR)
-			continue;
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			midr_trace_job_schedule_read(job, stream);
-			break;
-		}
-
-		midr_trace_job_close_stream(job, stream);
-		midr_trace_job_begin_termination(job,
-						 MIDR_TRACE_TERM_PARSE);
-		break;
+	switch (reason) {
+	case MIDR_TRACE_STOP_NONE: return "none";
+	case MIDR_TRACE_STOP_REACHED: return "reached";
+	case MIDR_TRACE_STOP_MAX_HOPS: return "max-hops";
+	case MIDR_TRACE_STOP_UNREACHABLE: return "unreachable";
+	case MIDR_TRACE_STOP_ERROR: return "error";
 	}
-
-	midr_trace_job_maybe_finish_drain(job);
-}
-
-static void midr_trace_job_read_stdout(struct event *event)
-{
-	struct midr_trace_job *job = EVENT_ARG(event);
-
-	if (!job || job->finalize_started)
-		return;
-	midr_trace_job_read_stream(job, MIDR_TRACE_EXEC_STDOUT);
-}
-
-static void midr_trace_job_read_stderr(struct event *event)
-{
-	struct midr_trace_job *job = EVENT_ARG(event);
-
-	if (!job || job->finalize_started)
-		return;
-	midr_trace_job_read_stream(job, MIDR_TRACE_EXEC_STDERR);
-}
-
-static void midr_trace_job_schedule_read(struct midr_trace_job *job,
-					 enum midr_trace_exec_stream stream)
-{
-	int fd = midr_trace_exec_stream_fd(&job->exec, stream);
-
-	if (fd < 0 || job->finalize_started)
-		return;
-	if (stream == MIDR_TRACE_EXEC_STDOUT) {
-		if (!job->read_stdout)
-			event_add_read(job->scheduler->master,
-				       midr_trace_job_read_stdout, job, fd,
-				       &job->read_stdout);
-	} else if (!job->read_stderr) {
-		event_add_read(job->scheduler->master,
-			       midr_trace_job_read_stderr, job, fd,
-			       &job->read_stderr);
-	}
+	return "unknown";
 }
