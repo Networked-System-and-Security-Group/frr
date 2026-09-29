@@ -14,7 +14,7 @@ ZAPI/FIB 链路，**不依赖第二组会话层**（见第 4.1 节）。
 - `midrd/Makefile` 的 `test` 目标（25 个程序 + 边界扫描）。
 - `midr-test/dp-backend-test.c`（包裹 `zclient_route_send`，无需真实 zebra）。
 - harness 构建产物 `midrd-gre-tool`（`gre-link-tool.c`）与
-  `midrd-dp-e2e-tool`（`dp-e2e-tool.c`）。
+  `midrd-dp-e2e-tool`（`midr-test/dp-e2e-tool.c`）。
 - 第三组 ZAPI/FIB smoke `midr-test/r7-dp-fib-smoke.sh`（构建容器内 root，真实 zebra +
   真实内核 FIB）。
 - 容器内源码同步与构建命令。
@@ -80,6 +80,21 @@ peer discovery / session observer，因此本组**有意不**把这类 bgpd 改�
 `midrd_midrd_SOURCES` 中列出 `midrd/midr-dp-backend.{c,h}`、
 `midrd/midr-gre.{c,h}`（第 157-158 行）；`midrd_midrd_CPPFLAGS = -Imidrd`、
 `midrd_midrd_LDADD = lib/libfrr.la $(LIBCAP)`。
+
+### 3.2 运行 midrd / CLI 验证的前置条件（本轮实测补充）
+
+- **必须用同源 `libfrr`**：`midrd` 依赖 `lib/zclient.c` 新增的 3 个 ZAPI 发送助手
+  （`zclient_send_interface_address_set` / `_unset`、`zclient_send_interface_admin_up`），
+  因此对同源 `libfrr` 形成**硬运行期依赖**。直接运行顶层 `midrd` 会报
+  `symbol lookup error: undefined symbol: zclient_send_interface_address_set`（动态加载器解析到
+  系统安装的旧 libfrr）；加 `LD_LIBRARY_PATH=<tree>/lib/.libs` 后正常。
+- **CLI 端到端验证要用树内 `vtysh`**：容器内安装版 `vtysh` 不认识 `midrd` 这个 daemon
+  （报 `no daemons match name midrd!`），需用 `<tree>/vtysh/vtysh`。
+- **树内构建的前缀目录需存在**：该树以 `--localstatedir=/usr/local/var`、
+  `--sysconfdir=/usr/local/etc/frr` 配置，daemon 需要可写的 pid 目录，否则以
+  `Can't create pid lock file ... (No such file or directory)` 退出；`vtysh` 需要
+  `vtysh.conf` / `frr.conf` 存在。
+
 
 ## 4. midrd 组件套件
 

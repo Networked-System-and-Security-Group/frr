@@ -57,7 +57,7 @@
 | `midrd/midr-gre.c` | 709 | 新增 | GRE 下发（bgpd→midrd 移植），复用后端 zclient |
 | `midrd/midr-gre.h` | 220 | 新增 | `struct midr_gre_tunnel`、`struct midr_gre_status`、`midr_gre_interface_*`、`midr_gre_init/fini` |
 | `midr-test/dp-backend-test.c` | 602 | 新增 | 包裹 `zclient_route_send` 的单测 |
-| `midrd/dp-e2e-tool.c` | 423 | 新增 | group-3 路由安装 harness（`midrd-dp-e2e-tool`），驱动公开 facade；模式见 `dp-03` 第 2 节 |
+| `midr-test/dp-e2e-tool.c` | 423 | 新增 | group-3 路由安装 harness（`midrd-dp-e2e-tool`），驱动公开 facade；模式见 `dp-03` 第 2 节 |
 | `midrd/gre-link-tool.c` | 238 | 新增 | GRE 连通性测试用微型 midrd 宿主（`midrd-gre-tool`），见 `dp-04` 第 5 节 |
 | `midr-test/r7-dp-zapi-fib.sh` | 369 | 新增 | group-3 隔离真实 ZAPI/zebra-rib/Linux-FIB 测试（PASS=29） |
 | `midr-test/midr-gre-connectivity-test.sh` | 263 | 新增 | 双容器 GRE/ip6gre 连通性测试（PASS=24） |

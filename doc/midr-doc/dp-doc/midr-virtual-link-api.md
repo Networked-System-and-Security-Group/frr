@@ -436,6 +436,13 @@ zclient_send_interface_admin_up(struct zclient *client, vrf_id_t vrf_id,
 `if_no_shutdown/if_shutdown` 均已具备幂等性（`connected_check_ptp` 复用既有连接项、
 `if_set_flags`/`if_unset_flags` 幂等），无需额外去重。
 
+> **授权面声明（本轮补记）**：这 3 个 handler 沿用 FRR ZAPI 的既有信任模型——**不区分发起方**：
+> 任何已连接到同一 zserv socket 的客户端都可以对任意（存在的）接口装卸地址或设置
+> admin up/down。这与既有 ZAPI 原语（例如路由安装）同一性质，**不是本组新引入的特权面**；
+> 此处显式写明，避免后续被误判为缺陷。工程上的约束由 socket 的文件权限（FRR daemon 与 root）
+> 承担，本 API 不做 per-client 鉴权。若将来需要鉴别发起方，属 ZAPI 层整体议题。
+
+
 ### 6.4 编号与门禁更新（**必须做，否则门禁会 FAIL**）
 
 `lib/log.c` 的 `command_types[]` 尾部追加 3 条 `DESC_ENTRY`，顺序与 enum 一致。

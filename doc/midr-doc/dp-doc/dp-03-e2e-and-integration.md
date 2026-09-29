@@ -27,7 +27,7 @@
 | `midr-test/r7-dp-e2e-zapi.sh` | 单容器 3×midrd + zebra 端到端（loopback） | 容器 | 完成（group-2 传输层修复后，见 3.3 C2） |
 
 辅助 harness：
-- `midrd/dp-e2e-tool.c`（构建产物 `midrd-dp-e2e-tool`）：驱动第三组公开 facade
+- `midr-test/dp-e2e-tool.c`（构建产物 `midrd-dp-e2e-tool`）：驱动第三组公开 facade
   `midr_zebra_route_add/del/flush`，模式含 `add4/add6`、`add4-ecmp`、`add4-ucmp`、
   `add6-srv6`、`add4-te`、`del`、`status`、`serve-ted`；每条动作打印机器可读行
   `DP action=... prefix=... rc=... installed=... adds=... dels=... fails=...`。
@@ -309,7 +309,7 @@ bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh
 | GRE 双容器 | `midr-test/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |
 | P7 收尾（真实 zebra + 真实内核 FIB） | `tests/bgpd/test_midr_proto199.c` `=== ALL CHECKS PASSED (proto 199 = midr verified) ===`；双实例 TE 内核 FIB `10.60.0.0/24 nhid 33 via 192.168.200.3 dev midr-dp0 metric 20`（TE 胜出；`DP action=add4-te ... rc=0 installed=1 adds=1`）；SRv6 H.Insert 内核 FIB `fd00:60::/64 nhid 35 encap seg6 mode inline segs 2 [ 2001:db8:100::1 2001:db8:100::2 ] via fd00:200::2 dev midr-dp6 metric 20 pref medium`（`DP action=add6-srv6 ... rc=0 installed=1 adds=1`）；容器 `frr-ubuntu24-ymy`，日志 `/tmp/closeout.log` |
 | ENOBUFS 类发送失败真实环境注入 | **待验证**：真实环境仅覆盖 zebra stop/restart 重连 replay 与 SIGTERM 撤销（`r7-dp-fib-smoke.sh` case B 与集成撤销检查）；`-ENOBUFS` 注入仅由单测 `midr-test/dp-backend-test.c` 覆盖 |
-| harness | `midrd/dp-e2e-tool.c`、`midrd/gre-link-tool.c` |
+| harness | `midr-test/dp-e2e-tool.c`、`midrd/gre-link-tool.c` |
 | FIB 断言（group-aware） | `midr-test/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
 | 单容器 loopback E2E | `midr-test/r7-dp-e2e-zapi.sh`：三节点 `routes=3`，3 个远端前缀中 2 个带 MIDR underlay nexthop 入 proto-199 FIB，peer loss 撤销并重收敛 `routes=2`，zebra 重启 replay；日志 `/tmp/tp-e2e4.log` |
 | group-2 传输层修复 | `midrd/midr-transport.c` 第 203-229 行 `find_peer_by_address()` 歧义返回 NULL、`midr_transport_promote()` 第 959 行；`midrd/midr-session.c` provisional 处理第 249-251/330-357 行、identity mismatch 第 281-287 行；`midr-test/transport-test.c` `test_shared_address_promote()` |

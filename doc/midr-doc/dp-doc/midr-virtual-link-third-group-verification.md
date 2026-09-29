@@ -36,6 +36,41 @@ GRE（51）与 stage E（34）的 `FAIL=0` 见各自日志。
 - 唯一的 `warning:` 是**既有的** `lib/mgmt_msg_native.h` 噪声（**不含**本轮改动的任何文件），见 §2.1。
 - 本轮新增实测证据：GRE 工具的 overlay 交接行与脚本新增断言，见 §4.3。
 
+### 0.2 W4 增量：结构迁移后的补充实测（同日第三批）
+
+W3 之后又做了一次**测试目录结构迁移**：`midrd/` 的 26 个 `*-test.c` 与 12 个测试脚本迁入
+`midr-test/`，`dp-e2e-tool.c` 随后一并迁入；构建规则仍留在 `midrd/Makefile`（新增 `TESTDIR`
+指向新位置），`midr-test/Makefile` 是可用的转发入口。同时补做了 W3 明确留空的几项。
+以下数值均为**该批实测**，与 §0 的 W3 表并列有效。
+
+| # | 项 | 命令 / 对象 | 结果 | 判定 | 证据 |
+|---|---|---|---|---|---|
+| 1 | 迁移后组件套件 | 干净构建目录内 build + suite（`make -C midr-test test` 亦可用） | `EXIT=0`、**PASS=27 FAIL=0**、0 error、末行 `standalone libfrr boundary scan: PASS`（门禁在新位置正确扫描 `midrd/`） | PASS | 本轮组件套件日志 |
+| 2 | 双容器 GRE（新增用例 F） | `midr-test/midr-gre-connectivity-test.sh`（迁移后路径） | **PASS=58 FAIL=0**（W3 为 51；新增 7 条 = 用例 F） | PASS | 本轮 GRE 日志 |
+| 3 | 用例 F：外来活隧道（真实内核） | GRE 层建 `foreign0`（端点对 10.1.1.31/32）→ vlink 请求同端点对换名 | F.1/F.3/F.4/F.7 PASS：请求被**拒绝**、未创建新设备、`foreign0` 的 ifindex 与地址**未被改动**、内核 GRE 设备数不变；F.5 PASS：删掉 `foreign0` 后**同一请求成功 READY**；F.6 PASS：清理干净 | PASS（含一条语义修正，见下） | 本轮 GRE 日志 F 段 |
+| 4 | zebra 侧两处 NIT 修复 | `zebra/zapi_msg.c`：陈旧注释 `masked struct prefix`；unset handler 以 `STREAM_GET`+强制 NUL 取代 `STREAM_FORWARD_GETP` | `make -j112 zebra/zebra` `EXIT=0`、`warning:` **0**；staged zebra md5 由 `0aca362d…` 变为 **`3deebbf5…`** | PASS | 本轮 zebra 构建日志 |
+| 5 | `vtysh` → midrd CLI 端到端（W3 的 U-2） | 容器内隔离 vty socket + `--no-zebra` 运行**树内** `midrd`（树内 libfrr），用**树内** `vtysh/vtysh` | `clear midr traceroute cache` → `Cleared 0 MIDR traceroute cache entries`（rc=0）；`show midr spf` → `SPF generation 1, 0 routes`（rc=0），与 daemon stdout 的 `node=7 spf generation=1 routes=0` **一致**；反向对照（未知命令、daemon 未运行）均 rc=1 | **PASS（本轮已补跑，见 §6 U-2）** | 本轮 vtysh 日志 |
+| 6 | 编号门禁自检 | `midr-test/check-zapi-numbering.sh --self-test` | 临时 worktree 内：干净 HEAD PASS、交换 `ZEBRA_GRE_ADD/_DELETE` 后 **FAIL**、调用方工作树未被改动 → self-test PASS；门禁本身仍 PASS | PASS | 本地终端（本轮） |
+
+**实测中新发现的两条事实（不是缺陷，但必须登记）**
+
+1. **EEXIST 守卫是进程内的**：GRE/vlink 注册表都在 `midrd` 进程内，而 `midrd-gre-tool` 每次调用
+   都是独立进程。用例 F 证明：**跨进程**由别处创建的活隧道，本进程的守卫看不到它，请求最终以
+   `DEVICE_CONFIRM` 超时（`err=110`）被拒绝，而**不是** `err=17(EEXIST)`。两种结果都满足
+   "不静默改绑、不损坏外来设备、不给调用方假 READY"，但调用方**无法**从 110 直接看出"端点对
+   被外来隧道占用"。因此用例 F 的断言写成「必须是拒绝（17 或 110）」并打印实际码，同时保留
+   诊断输出（内核 GRE 设备数不变 + node1 zebra 日志尾部）。若需要更精确的诊断，得新增"按端点
+   对查询 GRE 设备"的接口（扩大 ZAPI 面），属第一/二组与契约的决定。
+2. **`midrd` 现在需要同源的 `libfrr`**：新增的 3 个 ZAPI 发送助手位于 `lib/zclient.c`，因此
+   `midrd` 对 `zclient_send_interface_address_set/_unset`、`zclient_send_interface_admin_up`
+   形成**硬运行期依赖**。实测中顶层 `midrd` 直接运行报
+   `symbol lookup error: undefined symbol: zclient_send_interface_address_set`——动态加载器解析到
+   了**系统安装的旧 libfrr**（不含新符号）；加 `LD_LIBRARY_PATH=<tree>/lib/.libs` 后正常。
+   同理，容器内**安装版** `vtysh` 不认识 `midrd` 这个 daemon，CLI 验证必须用树内 `vtysh/vtysh`。
+   部署含义：安装 `midrd` 时必须同时提供同源 `libfrr`（或按本仓库既有做法用 `LD_LIBRARY_PATH`
+   指向树内 lib）。另：树内构建的前缀目录（pid lock 的 `var/run`、vtysh 的 sysconfdir）需存在，
+   否则 daemon 以 `Can't create pid lock file` 退出。
+
 ### 0.1 上一轮（旧源码）记录与两处勘误（**勿用于本轮判定**）
 
 下表是 W3 **之前**那一轮的实测记录，对应**旧源码/旧二进制**；W3 的对应项见 §0 上表。
@@ -554,9 +589,9 @@ midrrtr eth0: 10.20.1.254/24   eth1: 10.20.2.254/24
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
 | U-1 | 顶层 `make -j112 -k` | **本轮（W3）已执行，PASS** | 容器内 `EXIT=0`，`warning:` = **0**；日志 本轮顶层构建日志（§2.4）。更早一轮的从零 `make clean && make -j112` 记录在案（11 条告警，全部为既有 `bgpd/` 告警，OUT OF SCOPE）。 |
-| U-2 | `vtysh` 的 **CLI 端到端功能**验证 | **上一轮（旧源码）已执行 PASS；本轮（W3）未重跑** | 上一轮方式（对照，勿作本轮证据）：容器 `frr-ubuntu24-ymy` 内以 `--vty_socket vtysh 隔离 socket 目录 --no-zebra` 隔离运行 midrd，`vtysh --vty_socket vtysh 隔离 socket 目录 -d midrd -E -c 'clear midr traceroute cache'` 返回 **daemon 侧**输出 `Cleared 0 MIDR traceroute cache entries`（exit 0）；`-c 'show midr spf'` 返回 `SPF generation 1, 0 routes`（exit 0），与 midrd 自身 stdout 的 `node=7 spf generation=1 routes=0` **一致**（证明输出来自 midrd 而非 vtysh 回显）。反向对照：midrd 未运行时 `Exiting: failed to connect to any daemons.`（exit 1）；`-c 'clear midr traceroute banana'` 返回 `% Unknown command`（exit 1）。前置物证：`nm midrd/.libs/midrd` 含 `clear_midr_traceroute_cache`、`vtysh_cmd.c:3298` 为 `DEFSH (VTYSH_BGPD\|VTYSH_MIDRD, …)`、vty socket 名 `midrd.vty` 与 `vtysh_client[].name="midrd"` 匹配。**未发现源码缺陷**。证据：`上一轮 vtysh 运行日志`、`上一轮 vtysh 下 midrd 侧日志`。本轮 midrd 侧源码已变（§1.1），该 CLI 路径**不在**本轮三套实测内，故仍标「本轮未重跑」。 |
-| U-3 | 缺陷 3 的 **真实内核 EEXIST 拒绝**路径 | **未执行（本轮 W3 仍未执行）** | stage E 只用单一 `gre1`，未构造「同 outer endpoint 对 + 新设备名」。该规则的组件级覆盖由本轮新增 **case 16b**（外来 LIVE 隧道拒绝）承担（§3.4）；真实内核场景本组未构造。 |
-| U-4 | 缺陷 1 的**隔离实验原始日志** | **上一轮已保留** | 原始日志在测试容器 `node1:测试容器内的隔离实验输出`（2798 B，2026-09-29 08:43），已回拷宿主为 `上一轮缺陷 1 隔离实验日志`。含根因证据行：`37: t1    inet 192.168.100.0/30 brd 192.168.100.3 scope global t1`（应为 `192.168.100.1/30`），以及同窗口的 `t1@NONE: <POINTOPOINT,UP,LOWER_UP> link/gre 10.1.1.11 peer 10.1.1.12` 与随后设备被回滚删除的记录。 |
+| U-2 | `vtysh` 的 **CLI 端到端功能**验证 | **本轮（W4）已补跑 PASS** | 容器 `frr-ubuntu24-ymy` 内以 `--vty_socket <隔离目录> --no-zebra --node-id 7 --listen 127.0.0.1:47123 --lifetime 4000` 运行**树内** `midrd`（`LD_LIBRARY_PATH` 指向树内 libfrr），用**树内** `vtysh/vtysh`：`-c 'clear midr traceroute cache'` → `Cleared 0 MIDR traceroute cache entries`（rc=0）；`-c 'show midr spf'` → `SPF generation 1, 0 routes`（rc=0），与 daemon stdout 的 `node=7 spf generation=1 routes=0` **一致**；反向对照：`clear midr traceroute banana` → `% Unknown command`（rc=1）、daemon 停止后 → `Exiting: failed to connect to any daemons.`（rc=1）。物证：`nm midrd/.libs/midrd` 含 `clear_midr_traceroute_cache`。**未发现源码缺陷**。前置条件（本轮实测发现）：必须用树内 libfrr + 树内 vtysh，且树内前缀目录存在，见 §0.2 第 5 项与「新发现 2」。 |
+| U-3 | 缺陷 3 的 **真实内核 EEXIST 拒绝**路径 | **本轮（W4）已构造并通过** | 在 `midr-test/midr-gre-connectivity-test.sh` 新增用例 F：先用 GRE 层（不经 vlink）建 `foreign0`（端点对 10.1.1.31/32，真实内核 + 真实 zebra），再用 vlink 请求**同一端点对换名** → 被拒绝、未创建新设备、外来设备 ifindex/地址未变、内核 GRE 设备数不变；删掉外来隧道后同一请求**成功 READY**。**语义修正**：跨进程场景的实际错误码是 `110(DEVICE_CONFIRM 超时)` 而非 `17(EEXIST)`——EEXIST 守卫是进程内的（§0.2「新发现 1」）；断言按「必须是拒绝」编写并打印实际码。组件级覆盖仍为 case 16b。 |
+| U-4 | 缺陷 1 的**隔离实验原始日志** | **容器内原件已失效；测试机副本尚存** | 该实验的原始输出（2 798 B，2026-09-29 08:43）原在测试容器内并回拷到测试机；本轮复核：**容器内的原件已不存在**，测试机上的副本仍在（**未随仓库分发**）。本行保留根因证据行：`37: t1    inet 192.168.100.0/30 brd 192.168.100.3 scope global t1`（应为 `192.168.100.1/30`），以及同窗口的 `t1@NONE: <POINTOPOINT,UP,LOWER_UP> link/gre 10.1.1.11 peer 10.1.1.12` 与随后设备被回滚删除的记录。若要长期可核查，应把该副本入库或重做一次隔离实验（本轮按「只修正措辞」处理，未入库）。 |
 | U-5 | MIDR Session / EOR / SPF 闭环 | **本组边界外** | 契约 §1：本组只做设备/地址/状态与 ifindex 可用性；Session/SPF 由一/二组联合验证。 |
 | U-6 | stage E 容器与网络 | **本轮（W3）已复核：无残留** | 本轮 W3 的 stage E 跑完后已复核：`docker ps -a` 中无 `midra`/`midrb`/`midrrtr`，`docker network ls` 中无 `midr-stagee-*`；`node1`/`node2` 内 `gre1`/`gre2`/`gre6` 均不存在且 zebra 已停（`pgrep -x zebra` 无结果）。上一轮同项亦已清理。仍残留的仅 `测试机上的 stage E 临时配置目录` 目录与 `测试机上的 zserv socket 路径` socket（脚本不清理，见 U-9）。 |
 | U-7 | 门禁 `midr-test/check-zapi-numbering.sh` | **本轮（W3）已补跑：PASS（`EXIT=0`）** | 在本地工作树执行，输出 `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`；脚本与被测 ZAPI 文件 md5 本轮均未变（§1.1、§2.3）。作为**独立门禁项**记录，不并入「三套实测」的 112。门禁有效性（更早一轮的 mutation-teeth 检查：人为破坏编号应 FAIL）仍成立（§2.3）。 |
@@ -572,6 +607,8 @@ midrrtr eth0: 10.20.1.254/24   eth1: 10.20.2.254/24
 因此第一组把 overlay 下一跳连同前缀交给第二组时，**可能需要在第一组/第二组一侧新增一个
 prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二组之间的接口，不在本组设备 API 范围内；
 第三组只负责把 `overlay_prefix_len` 如实交付给调用方。同一提示已写入契约 §11 第 5 条与会签包 §8 末行。
+
+> **第三组结论（不改第一/二组接口）**：按现状**不需要**补 prefix length。全链路都把这两个字段当 **locator（主机地址）**使用：TED 以定长拷贝/比较（`midrd/midr-ted.c`）；SPF nexthop 只用 `(family, ifindex, address)`（`midrd/midr-spf.h`、`midrd/midr-spf-install.c`）；midrd→bgpd 的 LS 编码把地址写进 `MIDR_LS_TLV_LINK_LOCAL/REMOTE_ADDRESS`，其值就是 `AFI + 地址`（`bgpd/bgp_midr_codec.c`），与 BGP-LS 的 interface/neighbor address 子 TLV 一致——那类子 TLV 本身不带前缀。只有当第一/二组引入「前缀语义」（on-link 判定、overlay 子网广告/比较、按前缀最长匹配）时才需要，且应作为**新增属性/TLV**（而不是改既有地址 TLV 的值长度），并同时考虑节点层 `transport_address` 的对称性。第三组侧无需改动：`overlay_prefix_len` 已随 `midr_virtual_link_status` 与每次通知交付。决定权在第一/二组。
 
 **需上报 lead 的一个观察（非失败）**：顶层 `make` 的 xref 阶段输出
 `[VIEW_NODE] …: help string mismatch`，指出 `midrd/group1/midr_nds_vty.c:2088` 与
