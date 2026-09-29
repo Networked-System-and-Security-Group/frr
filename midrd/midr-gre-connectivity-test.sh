@@ -23,8 +23,26 @@ NODE2=${MIDRD_GRE_NODE2:-node2}
 BUILD=${MIDRD_BUILD_CONTAINER:-frr-ubuntu24-ymy}
 U1=10.1.1.11
 U2=10.1.1.12
+# Second underlay pair used by case B.  The GRE layer keys a tunnel by its
+# outer endpoint pair as well as by its device name, so a second IPv4 GRE
+# tunnel may not reuse the same pair while the first one still exists (the
+# virtual-link API rejects that silent rename with EEXIST).
+U1B=10.1.1.21
+U2B=10.1.1.22
 U6_1=fd00:1::11
 U6_2=fd00:1::12
+# Overlay addressing handed to the virtual-link API (no more manual
+# `ip addr add`):  A) IPv4 overlay over IPv4 GRE, B) IPv6 overlay over an
+# IPv4 GRE with its own underlay pair (U1B/U2B), C) IPv6 overlay over an
+# IPv6 GRE (ip6gre) device.
+OV4_1=192.168.100.1
+OV4_2=192.168.100.2
+OV4_PLEN=30
+OV6_1=fd00:100::1
+OV6_2=fd00:100::2
+OV6_PLEN=64
+OV6B_1=fd00:200::1
+OV6B_2=fd00:200::2
 SOCK=/tmp/zserv_midr.api
 LD=/opt/midr-dp/lib
 LINK=/opt/midr-dp/midrd-gre-tool
@@ -155,17 +173,83 @@ ping6_ok() { docker exec -u root "$1" ping6 -c 3 -W 2 "$2" >/dev/null 2>&1; }
 state_of() { echo "$1" | grep -E '^MIDR_GRE ' | grep -oE 'state=[a-z]+' | head -1 | cut -d= -f2; }
 idx_of()   { echo "$1" | grep -E '^MIDR_GRE ' | grep -oE 'ifindex=[0-9]+' | head -1 | cut -d= -f2; }
 
+# --- virtual-link API helpers (third group) ---------------------------------
+
+# vlink1/vlink2 <name> <outer-local> <outer-remote> <ov-local> <ov-remote> <plen>
+vlink1() {
+	link1 vlink-setup --sock "$SOCK" --name "$1" --local "$2" --remote "$3" \
+		--mtu 1400 --wait-ms 8000 \
+		--overlay-local "$4" --overlay-remote "$5" --overlay-prefix "$6"
+}
+vlink2() {
+	link2 vlink-setup --sock "$SOCK" --name "$1" --local "$2" --remote "$3" \
+		--mtu 1400 --wait-ms 8000 \
+		--overlay-local "$4" --overlay-remote "$5" --overlay-prefix "$6"
+}
+
+vlink_state_of()   { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'state=[a-z_]+' | head -1 | cut -d= -f2; }
+vlink_idx_of()     { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'ifindex=[0-9]+' | head -1 | cut -d= -f2; }
+vlink_iftype_of()  { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'iftype=[0-9]+' | head -1 | cut -d= -f2; }
+
+# The READY transition notification is the only line that carries event=ready:
+# the final MIDR_VLINK status line is a pure query and reports event=none.
+# `|| true` keeps `set -e`/pipefail from aborting when no READY line exists,
+# so the caller can report a [FAIL] instead of dying.
+vlink_ready_line_of() { echo "$1" | grep -E 'state=ready .*event=ready' | head -1 || true; }
+vlink_ready_field_of() { vlink_ready_line_of "$1" | grep -oE "$2=[^ ]+" | head -1 | cut -d= -f2 || true; }
+
+# assert_vlink_overlay <label> <status-line> <ov-local> <ov-remote> <plen>
+# Asserts the READY notification reports the configured overlay triple plus
+# event=ready, i.e. the group-1 -> group-2 handoff data is visible.
+assert_vlink_overlay() {
+	local label=$1 out=$2 ovl=$3 ovr=$4 plen=$5 line
+	line=$(vlink_ready_line_of "$out")
+	if [[ -n "$line" \
+	   && "$(vlink_ready_field_of "$out" overlay_local)" == "$ovl" \
+	   && "$(vlink_ready_field_of "$out" overlay_remote)" == "$ovr" \
+	   && "$(vlink_ready_field_of "$out" overlay_plen)" == "$plen" \
+	   && "$(vlink_ready_field_of "$out" event)" == ready ]]; then
+		ok "$label READY overlay_local=$ovl overlay_remote=$ovr plen=$plen event=ready"
+	else
+		bad "$label READY overlay/event mismatch (${line:-no ready event line})"
+	fi
+}
+
+# assert_vlink_ready <label> <status-line> <expected-kernel-ifindex>
+assert_vlink_ready() {
+	local label=$1 out=$2 kidx=$3 vidx
+	vidx=$(vlink_idx_of "$out")
+	if [[ "$(vlink_state_of "$out")" == ready && -n "$vidx" && "$vidx" -gt 0 ]]; then
+		ok "$label state=READY via API (ifindex=$vidx)"
+	else
+		bad "$label not READY via API ($(vlink_state_of "$out"))"
+	fi
+	if [[ -n "$vidx" && "$vidx" == "$kidx" && "$kidx" -gt 0 ]]; then
+		ok "$label returned ifindex $vidx matches kernel $kidx"
+	else
+		bad "$label ifindex mismatch (api=${vidx:-none} kernel=${kidx:-none})"
+	fi
+}
+
+# iface has an address prefix (either family) configured on it?
+iface_has_addr() {
+	docker exec -u root "$1" bash -c "ip -o addr show dev '$2' 2>/dev/null | grep -q '$3'" 2>/dev/null
+}
+
+
 cleanup() {
 	if docker exec -u root "$NODE1" bash -c "test -S $SOCK" 2>/dev/null; then
 		link1 teardown --sock $SOCK --name gre1 >/dev/null 2>&1 || true
+		link1 teardown --sock $SOCK --name gre2 >/dev/null 2>&1 || true
 		link1 teardown --sock $SOCK --name gre6 >/dev/null 2>&1 || true
 	fi
 	if docker exec -u root "$NODE2" bash -c "test -S $SOCK" 2>/dev/null; then
 		link2 teardown --sock $SOCK --name gre1 >/dev/null 2>&1 || true
+		link2 teardown --sock $SOCK --name gre2 >/dev/null 2>&1 || true
 		link2 teardown --sock $SOCK --name gre6 >/dev/null 2>&1 || true
 	fi
-	ex1 "ip link del gre1 2>/dev/null; ip link del gre6 2>/dev/null; true"
-	ex2 "ip link del gre1 2>/dev/null; ip link del gre6 2>/dev/null; true"
+	ex1 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; true"
+	ex2 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; true"
 	zebra_stop "$NODE1"
 	zebra_stop "$NODE2"
 	if [[ -n "$STAGE" && -d "$STAGE" ]]; then
@@ -200,86 +284,104 @@ else
 	bad "underlay IPv6 unreachable (ip6gre test will fail)"
 fi
 
-hdr "A. IPv4 GRE tunnel (gre) + IPv4 overlay"
-R1=$(link1 setup --sock $SOCK --name gre1 --local $U1 --remote $U2 --mtu 1400 || true)
-R2=$(link2 setup --sock $SOCK --name gre1 --local $U2 --remote $U1 --mtu 1400 || true)
-echo "$R1"; echo "$R2"
+# Extra IPv4 alias pair for case B's second GRE tunnel (see U1B/U2B).
+ex1 "ip addr add $U1B/24 dev eth0 2>/dev/null || true"
+ex2 "ip addr add $U2B/24 dev eth0 2>/dev/null || true"
+if ping4_ok "$NODE1" "$U2B"; then
+	ok "underlay IPv4 $U1B -> $U2B"
+else
+	bad "underlay IPv4 (case B pair) unreachable"
+fi
 
-if [[ "$(state_of "$R1")" == up ]]; then
-	ok "node1 gre1 established (ifindex $(idx_of "$R1"))"
-else
-	bad "node1 gre1 not established"
-fi
-if [[ "$(state_of "$R2")" == up ]]; then
-	ok "node2 gre1 established (ifindex $(idx_of "$R2"))"
-else
-	bad "node2 gre1 not established"
-fi
+hdr "A. IPv4 GRE tunnel (gre) + IPv4 overlay via virtual-link API"
+R1=$(vlink1 gre1 "$U1" "$U2" "$OV4_1" "$OV4_2" "$OV4_PLEN" || true); echo "$R1"
+R2=$(vlink2 gre1 "$U2" "$U1" "$OV4_2" "$OV4_1" "$OV4_PLEN" || true); echo "$R2"
+K1=$(ex1 "cat /sys/class/net/gre1/ifindex" 2>/dev/null || true)
+K2=$(ex2 "cat /sys/class/net/gre1/ifindex" 2>/dev/null || true)
+assert_vlink_ready "node1 gre1" "$R1" "$K1"
+assert_vlink_ready "node2 gre1" "$R2" "$K2"
+assert_vlink_overlay "node1 gre1" "$R1" "$OV4_1" "$OV4_2" "$OV4_PLEN"
+assert_vlink_overlay "node2 gre1" "$R2" "$OV4_2" "$OV4_1" "$OV4_PLEN"
 [[ "$(iface_kind "$NODE1" gre1)" == gre ]] && ok "node1 gre1 is a gre device" || bad "node1 gre1 kind wrong"
 [[ "$(iface_kind "$NODE2" gre1)" == gre ]] && ok "node2 gre1 is a gre device" || bad "node2 gre1 kind wrong"
-
-ex1 "ip addr add 192.168.100.1/30 dev gre1 2>/dev/null || true; ip link set gre1 up"
-ex2 "ip addr add 192.168.100.2/30 dev gre1 2>/dev/null || true; ip link set gre1 up"
+if iface_has_addr "$NODE1" gre1 "$OV4_1/$OV4_PLEN"; then ok "node1 gre1 overlay $OV4_1/$OV4_PLEN configured"
+						 else bad "node1 gre1 overlay address missing"; fi
+if iface_has_addr "$NODE2" gre1 "$OV4_2/$OV4_PLEN"; then ok "node2 gre1 overlay $OV4_2/$OV4_PLEN configured"
+						 else bad "node2 gre1 overlay address missing"; fi
 sleep 2
-if ping4_ok "$NODE1" 192.168.100.2; then ok "IPv4 connectivity node1 -> node2 over gre1"
-				    else bad "IPv4 connectivity over gre1 FAILED"; fi
-if ping4_ok "$NODE2" 192.168.100.1; then ok "IPv4 connectivity node2 -> node1 over gre1"
-				    else bad "IPv4 connectivity (reverse) over gre1 FAILED"; fi
+if ping4_ok "$NODE1" "$OV4_2"; then ok "IPv4 connectivity node1 -> node2 over gre1"
+			      else bad "IPv4 connectivity over gre1 FAILED"; fi
+if ping4_ok "$NODE2" "$OV4_1"; then ok "IPv4 connectivity node2 -> node1 over gre1"
+			      else bad "IPv4 connectivity (reverse) over gre1 FAILED"; fi
 
-hdr "B. IPv6 overlay over the IPv4 GRE tunnel"
-ex1 "ip addr add fd00:100::1/64 dev gre1 2>/dev/null || true; ip link set gre1 up"
-ex2 "ip addr add fd00:100::2/64 dev gre1 2>/dev/null || true; ip link set gre1 up"
+hdr "B. IPv6 overlay over the IPv4 GRE tunnel (gre) via virtual-link API"
+R3=$(vlink1 gre2 "$U1B" "$U2B" "$OV6_1" "$OV6_2" "$OV6_PLEN" || true); echo "$R3"
+R4=$(vlink2 gre2 "$U2B" "$U1B" "$OV6_2" "$OV6_1" "$OV6_PLEN" || true); echo "$R4"
+KB1=$(ex1 "cat /sys/class/net/gre2/ifindex" 2>/dev/null || true)
+KB2=$(ex2 "cat /sys/class/net/gre2/ifindex" 2>/dev/null || true)
+assert_vlink_ready "node1 gre2" "$R3" "$KB1"
+assert_vlink_ready "node2 gre2" "$R4" "$KB2"
+assert_vlink_overlay "node1 gre2" "$R3" "$OV6_1" "$OV6_2" "$OV6_PLEN"
+assert_vlink_overlay "node2 gre2" "$R4" "$OV6_2" "$OV6_1" "$OV6_PLEN"
+[[ "$(iface_kind "$NODE1" gre2)" == gre ]] && ok "node1 gre2 is a gre device" || bad "node1 gre2 kind wrong"
+[[ "$(iface_kind "$NODE2" gre2)" == gre ]] && ok "node2 gre2 is a gre device" || bad "node2 gre2 kind wrong"
+if iface_has_addr "$NODE1" gre2 "$OV6_1/$OV6_PLEN"; then ok "node1 gre2 overlay $OV6_1/$OV6_PLEN configured"
+						 else bad "node1 gre2 overlay address missing"; fi
+if iface_has_addr "$NODE2" gre2 "$OV6_2/$OV6_PLEN"; then ok "node2 gre2 overlay $OV6_2/$OV6_PLEN configured"
+						 else bad "node2 gre2 overlay address missing"; fi
 sleep 2
-if ping6_ok "$NODE1" fd00:100::2; then ok "IPv6 connectivity node1 -> node2 over gre1"
-				     else bad "IPv6 connectivity over gre1 FAILED"; fi
-if ping6_ok "$NODE2" fd00:100::1; then ok "IPv6 connectivity node2 -> node1 over gre1"
-				     else bad "IPv6 connectivity (reverse) over gre1 FAILED"; fi
+if ping6_ok "$NODE1" "$OV6_2"; then ok "IPv6 connectivity node1 -> node2 over gre2"
+			       else bad "IPv6 connectivity over gre2 FAILED"; fi
+if ping6_ok "$NODE2" "$OV6_1"; then ok "IPv6 connectivity node2 -> node1 over gre2"
+			       else bad "IPv6 connectivity (reverse) over gre2 FAILED"; fi
 
-hdr "C. IPv6 GRE tunnel (ip6gre) + IPv6 overlay"
-R3=$(link1 setup --sock $SOCK --name gre6 --local $U6_1 --remote $U6_2 --mtu 1400 || true)
-R4=$(link2 setup --sock $SOCK --name gre6 --local $U6_2 --remote $U6_1 --mtu 1400 || true)
-echo "$R3"; echo "$R4"
-
-if [[ "$(state_of "$R3")" == up ]]; then
-	ok "node1 gre6 established (ifindex $(idx_of "$R3"))"
-else
-	bad "node1 gre6 not established"
-fi
-if [[ "$(state_of "$R4")" == up ]]; then
-	ok "node2 gre6 established (ifindex $(idx_of "$R4"))"
-else
-	bad "node2 gre6 not established"
-fi
+hdr "C. IPv6 GRE tunnel (ip6gre) + IPv6 overlay via virtual-link API"
+R5=$(vlink1 gre6 "$U6_1" "$U6_2" "$OV6B_1" "$OV6B_2" "$OV6_PLEN" || true); echo "$R5"
+R6=$(vlink2 gre6 "$U6_2" "$U6_1" "$OV6B_2" "$OV6B_1" "$OV6_PLEN" || true); echo "$R6"
+KC1=$(ex1 "cat /sys/class/net/gre6/ifindex" 2>/dev/null || true)
+KC2=$(ex2 "cat /sys/class/net/gre6/ifindex" 2>/dev/null || true)
+assert_vlink_ready "node1 gre6" "$R5" "$KC1"
+assert_vlink_ready "node2 gre6" "$R6" "$KC2"
+assert_vlink_overlay "node1 gre6" "$R5" "$OV6B_1" "$OV6B_2" "$OV6_PLEN"
+assert_vlink_overlay "node2 gre6" "$R6" "$OV6B_2" "$OV6B_1" "$OV6_PLEN"
 [[ "$(iface_kind "$NODE1" gre6)" == ip6gre ]] && ok "node1 gre6 is an ip6gre device" || bad "node1 gre6 kind wrong"
 [[ "$(iface_kind "$NODE2" gre6)" == ip6gre ]] && ok "node2 gre6 is an ip6gre device" || bad "node2 gre6 kind wrong"
-
-ex1 "ip addr add fd00:200::1/64 dev gre6 2>/dev/null || true; ip link set gre6 up"
-ex2 "ip addr add fd00:200::2/64 dev gre6 2>/dev/null || true; ip link set gre6 up"
+if iface_has_addr "$NODE1" gre6 "$OV6B_1/$OV6_PLEN"; then ok "node1 gre6 overlay $OV6B_1/$OV6_PLEN configured"
+						  else bad "node1 gre6 overlay address missing"; fi
+if iface_has_addr "$NODE2" gre6 "$OV6B_2/$OV6_PLEN"; then ok "node2 gre6 overlay $OV6B_2/$OV6_PLEN configured"
+						  else bad "node2 gre6 overlay address missing"; fi
 sleep 2
-if ping6_ok "$NODE1" fd00:200::2; then ok "IPv6 connectivity node1 -> node2 over gre6"
-				     else bad "IPv6 connectivity over gre6 FAILED"; fi
-if ping6_ok "$NODE2" fd00:200::1; then ok "IPv6 connectivity node2 -> node1 over gre6"
-				     else bad "IPv6 connectivity (reverse) over gre6 FAILED"; fi
+if ping6_ok "$NODE1" "$OV6B_2"; then ok "IPv6 connectivity node1 -> node2 over gre6"
+				else bad "IPv6 connectivity over gre6 FAILED"; fi
+if ping6_ok "$NODE2" "$OV6B_1"; then ok "IPv6 connectivity node2 -> node1 over gre6"
+				else bad "IPv6 connectivity (reverse) over gre6 FAILED"; fi
 
 hdr "D. establishment-status API (idempotent re-add)"
-R5=$(link1 setup --sock $SOCK --name gre1 --local $U1 --remote $U2 --mtu 1400 || true)
-echo "$R5"
-if [[ "$(state_of "$R5")" == up && "$(idx_of "$R5")" == "$(idx_of "$R1")" ]]; then
-	ok "node1 gre1 re-query state=up ifindex=$(idx_of "$R5")"
+R7=$(vlink1 gre1 "$U1" "$U2" "$OV4_1" "$OV4_2" "$OV4_PLEN" || true); echo "$R7"
+if [[ "$(vlink_state_of "$R7")" == ready && "$(vlink_idx_of "$R7")" == "$(vlink_idx_of "$R1")" ]]; then
+	ok "node1 gre1 re-add state=READY ifindex=$(vlink_idx_of "$R7")"
 else
-	bad "node1 gre1 re-query inconsistent (state $(state_of "$R5"))"
+	bad "node1 gre1 re-add inconsistent (state $(vlink_state_of "$R7"))"
 fi
 
 hdr "E. Teardown"
 T1=$(link1 teardown --sock $SOCK --name gre1 || true); echo "$T1"
 T2=$(link2 teardown --sock $SOCK --name gre1 || true); echo "$T2"
-T3=$(link1 teardown --sock $SOCK --name gre6 || true); echo "$T3"
-T4=$(link2 teardown --sock $SOCK --name gre6 || true); echo "$T4"
+T3=$(link1 teardown --sock $SOCK --name gre2 || true); echo "$T3"
+T4=$(link2 teardown --sock $SOCK --name gre2 || true); echo "$T4"
+T5=$(link1 teardown --sock $SOCK --name gre6 || true); echo "$T5"
+T6=$(link2 teardown --sock $SOCK --name gre6 || true); echo "$T6"
 sleep 2
-if iface_exists "$NODE1" gre1; then bad "node1 gre1 still present"; else ok "node1 gre1 removed"; fi
-if iface_exists "$NODE2" gre1; then bad "node2 gre1 still present"; else ok "node2 gre1 removed"; fi
-if iface_exists "$NODE1" gre6; then bad "node1 gre6 still present"; else ok "node1 gre6 removed"; fi
-if iface_exists "$NODE2" gre6; then bad "node2 gre6 still present"; else ok "node2 gre6 removed"; fi
+for n in "$NODE1" "$NODE2"; do
+	for dev in gre1 gre2 gre6; do
+		if iface_exists "$n" "$dev"; then bad "$n $dev still present"; else ok "$n $dev removed"; fi
+	done
+done
+# the overlay addresses must have been cleaned up together with the devices
+if iface_has_addr "$NODE1" gre1 "$OV4_1/$OV4_PLEN"; then bad "node1 gre1 overlay address not cleaned"
+							   else ok "node1 gre1 overlay address cleaned"; fi
+if iface_has_addr "$NODE2" gre1 "$OV4_2/$OV4_PLEN"; then bad "node2 gre1 overlay address not cleaned"
+							   else ok "node2 gre1 overlay address cleaned"; fi
 
 echo
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="
