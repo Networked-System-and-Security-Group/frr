@@ -20,7 +20,7 @@
   - 验证容器：`frr-ubuntu24-ymy`，源码树 `/home/frr/frr-midrd3`。
 - **当前总体状态**：数据面迁移与验收已完成（P0-P8 完成）。三节点
   containerlab 联合测试（第二组 + 第三组，IPv4 + IPv6，`PASS=31 FAIL=0`）与单容器 loopback 形式
-  `midrd/r7-dp-e2e-zapi.sh` 均已通过。此前阻塞单容器形式的 group-2 传输层
+  `midr-test/r7-dp-e2e-zapi.sh` 均已通过。此前阻塞单容器形式的 group-2 传输层
   缺陷已由队友修复（`midrd/midr-transport.c` 的 `find_peer_by_address()` 不再
   在多个 peer 共用同一地址时猜测，改由 HELLO 经 `midr_transport_promote()`
   重新绑定；`midrd/midr-session.c` 先将其持有为 provisional peer）。修复后
@@ -65,11 +65,11 @@
 | P1 | 数据面分支 `f8f4e81f2f` 的 GRE 支撑复制进 `lib/log.c`、`lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c`；FRR 顶层构建 | 完成 |
 | P2 | `midrd/midr-dp-backend.{c,h}`（五 ops、BASIC/ECMP/UCMP/SRv6 编码、双 instance、installed-hash 仅发成功后才更新、100 ms 批、有界重试 + resync、重连清 hash + replay） | 完成 |
 | P3 | `midrd/midr-gre.{c,h}`（bgpd→midrd 移植，复用后端 zclient）+ 双容器 GRE/ip6gre 连通性 | 完成 |
-| P4 | `midrd/dp-backend-test.c`、`midrd/Makefile`（`DP_OBJECTS` + 三个 harness/test 目标）、`Makefile.am`、`midrd/midrd.c` 接线 | 完成 |
-| P5 | group-3 隔离真实 ZAPI/zebra-rib/Linux-FIB（`midrd/r7-dp-zapi-fib.sh`） | 完成 |
-| P6 | 双容器 GRE/ip6gre 连通性（`midrd/midr-gre-connectivity-test.sh` + `midrd/gre-link-tool.c`） | 完成 |
+| P4 | `midr-test/dp-backend-test.c`、`midrd/Makefile`（`DP_OBJECTS` + 三个 harness/test 目标）、`Makefile.am`、`midrd/midrd.c` 接线 | 完成 |
+| P5 | group-3 隔离真实 ZAPI/zebra-rib/Linux-FIB（`midr-test/r7-dp-zapi-fib.sh`） | 完成 |
+| P6 | 双容器 GRE/ip6gre 连通性（`midr-test/midr-gre-connectivity-test.sh` + `midrd/gre-link-tool.c`） | 完成 |
 | P7 | 集成/功能验收 | 完成：组件套件、group-3 FIB smoke、三节点 containerlab 集成（IPv4 + IPv6）、GRE 双容器均通过；真实 zebra + 内核 FIB 收尾（proto-199 隔离、双实例 TE、SRv6 H.Insert）见 5.8 |
-| P8 | 三节点 LS 洪泛 + SPF 收敛（`midrd/r7-dp-integration-smoke.sh`、`midrd/r7-dp-e2e-zapi.sh`） | 完成：containerlab 形式（IPv4 + IPv6，PASS=31）与单容器 loopback 形式均通过（group-2 传输层修复后，见第 6 节） |
+| P8 | 三节点 LS 洪泛 + SPF 收敛（`midr-test/r7-dp-integration-smoke.sh`、`midr-test/r7-dp-e2e-zapi.sh`） | 完成：containerlab 形式（IPv4 + IPv6，PASS=31）与单容器 loopback 形式均通过（group-2 传输层修复后，见第 6 节） |
 | P9 | 文档与提交 | 进行中 |
 
 > 说明：`r7-dp-integration-smoke.sh`（containerlab，每节点独立地址）与单容器
@@ -117,14 +117,14 @@ cd /home/frr/frr-midrd3/midrd && make -j112 BUILD_DIR=/tmp/midrd-build test
 该单测发现并修复了 deferred-batch 发送失败恢复缺陷：`update_deferred()` 返回
 成功后批仍可能在定时器里发送失败，而 adapter 已推进 generation，故单纯的
 `midr_spf_install_resync()` 是 no-op；修复为先重试保留的 pending 批、成功后再调
-resync。覆盖见 `midrd/dp-backend-test.c` 的
+resync。覆盖见 `midr-test/dp-backend-test.c` 的
 `test_adapter_pipeline_and_recovery()`。
 
 ### 5.3 GRE 双容器连通性（P3/P6）
 
 ```sh
 # docker 宿主上执行
-bash midrd/midr-gre-connectivity-test.sh
+bash midr-test/midr-gre-connectivity-test.sh
 ```
 
 摘要：**`=== summary: PASS=24 FAIL=0 ===`**。新 harness（真实 zebra + 真实
@@ -139,7 +139,7 @@ IPv6 GRE 建立并承载 IPv6 流量；重复 add / 状态查询幂等；teardow
 
 ```sh
 # 容器 frr-ubuntu24-ymy 内执行
-bash midrd/r7-dp-zapi-fib.sh
+bash midr-test/r7-dp-zapi-fib.sh
 ```
 
 摘要：**PASS=29 FAIL=0 EXIT=0**。日志 `/tmp/fib-final.log`，分步日志
@@ -162,7 +162,7 @@ ZAPI → zebra → FIB（含 zebra 重启 replay 与确定性 shutdown 撤销、
 
 ```sh
 # 容器 frr-ubuntu24-ymy 内，root
-bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
+bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh
 ```
 
 摘要：**`=== summary: PASS=15 FAIL=0 ===`**，末行
@@ -189,14 +189,14 @@ bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
 
 > **FIB 断言必须同时解析两种安装形式**：zebra 可能内联安装（`via N`）或经
 > nexthop group（`nhid N`）安装，故断言须用 `ip nexthop show id <nhid>` 并跟随
-> `group` 列表展开（`midrd/r7-dp-fib-smoke.sh` 第 80-101 行）。只匹配单一形式曾
+> `group` 列表展开（`midr-test/r7-dp-fib-smoke.sh` 第 80-101 行）。只匹配单一形式曾
 > 造成多次误报失败。
 
 ### 5.6 三节点 containerlab 联合测试（group 2 + group 3，IPv4 + IPv6，P8）
 
 ```sh
 # docker 宿主，root（containerlab + docker）
-bash midrd/r7-dp-integration-smoke.sh
+bash midr-test/r7-dp-integration-smoke.sh
 ```
 
 摘要：**`=== summary: PASS=31 FAIL=0 ===`**（IPv4 14 + IPv6 17），**EXIT=0**。
@@ -239,7 +239,7 @@ replays=1`。测试设计要点（绑定源、`-u 0`、`--link-addr`）见
 - **延迟批失败恢复**：先重试保留的 pending 批（它正是 diff 的未应用余量），成功
   后再调用 `midr_spf_install_resync()`。原因是延迟失败时 adapter 已推进 desired
   generation，仅靠 resync 是 no-op、会留下陈旧 FIB 状态——该缺陷由
-  `midrd/dp-backend-test.c` 实际发现并覆盖。
+  `midr-test/dp-backend-test.c` 实际发现并覆盖。
 
 ### 5.8 P7 收尾：真实 zebra + 真实内核 FIB 复验（proto-199、双实例 TE、SRv6）
 
@@ -257,7 +257,7 @@ replays=1`。测试设计要点（绑定源、`-u 0`、`--link-addr`）见
   inline segs 2 [ 2001:db8:100::1 2001:db8:100::2 ] via fd00:200::2 dev midr-dp6
   metric 20 pref medium`，工具报告 `DP action=add6-srv6 ... rc=0 installed=1 adds=1`。
 - **真实环境未覆盖（待验证）**：`-ENOBUFS` 类发送失败注入仅由单测
-  `midrd/dp-backend-test.c` 覆盖（被包裹（wrap）的 `zclient_route_send` 返回失败
+  `midr-test/dp-backend-test.c` 覆盖（被包裹（wrap）的 `zclient_route_send` 返回失败
   ⇒ installed hash 不更新、保留批重试/重同步）；真实环境已覆盖的失败路径是 zebra
   stop/restart 重连 replay 与 SIGTERM 撤销（`r7-dp-fib-smoke.sh` case B 与集成撤销
   检查）。
@@ -265,7 +265,7 @@ replays=1`。测试设计要点（绑定源、`-u 0`、`--link-addr`）见
 ## 6. 单容器 loopback E2E 的根因与修复（已验证）
 
 三节点 **containerlab** 联合测试（每节点独立地址）已通过（见 5.6），单容器
-形式 `midrd/r7-dp-e2e-zapi.sh`（三个 midrd 进程共用 loopback `127.0.0.1`，两侧
+形式 `midr-test/r7-dp-e2e-zapi.sh`（三个 midrd 进程共用 loopback `127.0.0.1`，两侧
 `--peer`）此前在本环境中**无法收敛**，曾标记为待验证并归属第二组。该缺陷现已
 修复并复验通过。
 
@@ -285,7 +285,7 @@ replays=1`。测试设计要点（绑定源、`-u 0`、`--link-addr`）见
 - `find_peer_by_address()` 在多个已配置 peer 共用同一地址时**返回 NULL、不再
   猜测**（第 203-229 行，`if (match) return NULL; /* ambiguous: do not guess */`）；
   未绑定的入向流保持 unbound，其身份稍后由 HELLO 帧经新增的
-  `midr_transport_promote()` 解析（第 959 行起；由 `midrd/transport-test.c`
+  `midr_transport_promote()` 解析（第 959 行起；由 `midr-test/transport-test.c`
   `test_shared_address_promote()` 覆盖）。
 - `midrd/midr-session.c` 将这类流先持有为 **provisional peer** 直到 HELLO 指明
   对端（`transport_established()` 第 249-251 行、`hello_identify()` 第 330-357
@@ -298,7 +298,7 @@ replays=1`。测试设计要点（绑定源、`-u 0`、`--link-addr`）见
 | IPv4 + IPv6 native smoke | PASS，EXIT=0 | `MIDRD_BIN=/tmp/midrd-build/midrd bash r7-native-smoke.sh` |
 | native smoke（`--no-zebra`） | PASS | `MIDRD_BIN=/tmp/midrd-nozebra bash r7-native-smoke.sh` |
 | distinct loopback alias 探针 | `node=202 established remote=201 ... generation=1`，无 `closed` 风暴，SPF 收敛 | `bash /tmp/dp-probe3.sh`（`127.0.0.11`/`127.0.0.12`） |
-| 单容器 loopback E2E | 三节点 `spf generation=... routes=3`；3 个远端前缀中 2 个装入 proto-199 FIB 且带 MIDR underlay nexthop（`10.0.2.2`/`10.0.3.3`）；`ip route get` 经 underlay 解析；peer loss 撤销其路由、其余重收敛到 `routes=2`；zebra 重启 replay 回 FIB | `midrd/r7-dp-e2e-zapi.sh`（三 midrd + 真实 zebra，共用 `127.0.0.1`）；日志 `/tmp/tp-e2e4.log` |
+| 单容器 loopback E2E | 三节点 `spf generation=... routes=3`；3 个远端前缀中 2 个装入 proto-199 FIB 且带 MIDR underlay nexthop（`10.0.2.2`/`10.0.3.3`）；`ip route get` 经 underlay 解析；peer loss 撤销其路由、其余重收敛到 `routes=2`；zebra 重启 replay 回 FIB | `midr-test/r7-dp-e2e-zapi.sh`（三 midrd + 真实 zebra，共用 `127.0.0.1`）；日志 `/tmp/tp-e2e4.log` |
 | 组件套件 | 25 程序 PASS + 边界扫描 PASS | 修复后复验 |
 
 修复后同样复验：native smoke、FIB smoke（15/15）、containerlab 联合测试（14/14）、
@@ -306,10 +306,10 @@ GRE（24/24）均通过。
 
 **共享命名空间注意事项**：单容器形式中三个守护进程共用**同一个内核
 namespace**，且 MIDR representative takeover 可能合法地把某个 group 前缀判定为
-本地（因此不下发路由）。故脚本 `midrd/r7-dp-e2e-zapi.sh` 改为断言
+本地（因此不下发路由）。故脚本 `midr-test/r7-dp-e2e-zapi.sh` 改为断言
 “**至少一个远端前缀以 MIDR underlay nexthop 装入 FIB**”（第 254-265 行）以及
 后续的撤销/重收敛/replay/shutdown 不变量，而**严格的逐前缀、逐 nexthop 断言保留
-在三命名空间 containerlab 测试**（`midrd/r7-dp-integration-smoke.sh`，14/14）。
+在三命名空间 containerlab 测试**（`midr-test/r7-dp-integration-smoke.sh`，14/14）。
 
 **MIDR 链路地址必须是真实、可解析的 underlay 地址**：若用 `127.0.0.1` 作 nexthop，
 zebra 会经默认路由解析它（loopback 不在 zebra RIB 中），实测产生
@@ -327,19 +327,19 @@ cd /home/frr/frr-midrd3/midrd
 make -j112 BUILD_DIR=/tmp/midrd-build test                  # 期望 25 程序 + boundary scan 全 PASS
 
 # 3) group-3 隔离真实 ZAPI/FIB（容器内）
-bash /home/frr/frr-midrd3/midrd/r7-dp-zapi-fib.sh           # 期望 PASS=29 FAIL=0
+bash /home/frr/frr-midrd3/midr-test/r7-dp-zapi-fib.sh           # 期望 PASS=29 FAIL=0
 
 # 4) 第三组 ZAPI/FIB smoke（容器内，root；不依赖会话层）
-bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh          # 期望 PASS=15 FAIL=0
+bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh          # 期望 PASS=15 FAIL=0
 
 # 5) 三节点 containerlab 联合测试（docker 宿主，root；containerlab + docker）
-bash midrd/r7-dp-integration-smoke.sh                       # 期望 PASS=31 FAIL=0（IPv4 14 + IPv6 17）
+bash midr-test/r7-dp-integration-smoke.sh                       # 期望 PASS=31 FAIL=0（IPv4 14 + IPv6 17）
 
 # 6) GRE 双容器连通性（docker 宿主；node1/node2 已就绪）
-bash midrd/midr-gre-connectivity-test.sh                    # 期望 PASS=24 FAIL=0
+bash midr-test/midr-gre-connectivity-test.sh                    # 期望 PASS=24 FAIL=0
 
 # 7) 单容器 loopback E2E（容器内，root；三 midrd + 真实 zebra）
-bash midrd/r7-dp-e2e-zapi.sh                                # 三节点 routes=3；至少一个远端前缀经 MIDR underlay 入 FIB
+bash midr-test/r7-dp-e2e-zapi.sh                                # 三节点 routes=3；至少一个远端前缀经 MIDR underlay 入 FIB
 ```
 
 `midrd/Makefile` 另提供显式验收目标 `fib-smoke`、`integration-smoke`、
@@ -360,7 +360,7 @@ bash midrd/r7-dp-e2e-zapi.sh                                # 三节点 routes=3
 | group-3 隔离 ZAPI/FIB | PASS=29 FAIL=0 EXIT=0 | 容器 `/tmp/fib-final.log`、`/tmp/midrd-dp-zapi-fib/run/` |
 | GRE 双容器连通性 | PASS=24 FAIL=0 | 宿主 `/tmp/gre-test.log` |
 | P7 收尾（proto-199 隔离 / 双实例 TE / SRv6 H.Insert） | `=== ALL CHECKS PASSED (proto 199 = midr verified) ===`；TE 内核 FIB `10.60.0.0/24 nhid 33 via 192.168.200.3 dev midr-dp0 metric 20`；SRv6 `fd00:60::/64 nhid 35 ... inline segs 2 [ 2001:db8:100::1 2001:db8:100::2 ] via fd00:200::2 dev midr-dp6` | 容器 `frr-ubuntu24-ymy`，`/tmp/closeout.log` |
-| ENOBUFS 类发送失败真实环境注入 | **待验证**（仅单测覆盖 `dp-backend-test.c`；真实环境覆盖 zebra 重连 replay 与 SIGTERM 撤销） | `midrd/r7-dp-fib-smoke.sh` case B；集成撤销检查 |
+| ENOBUFS 类发送失败真实环境注入 | **待验证**（仅单测覆盖 `dp-backend-test.c`；真实环境覆盖 zebra 重连 replay 与 SIGTERM 撤销） | `midr-test/r7-dp-fib-smoke.sh` case B；集成撤销检查 |
 | 单容器 loopback E2E | 已通过（group-2 传输层修复后）；三节点 `routes=3`，至少一个远端前缀经 MIDR underlay 入 FIB | `r7-dp-e2e-zapi.sh`；`/tmp/tp-e2e4.log` |
-| group-2 传输层修复 | `find_peer_by_address()` 不再猜测 + `midr_transport_promote()` | `midrd/midr-transport.c`、`midrd/midr-session.c`、`midrd/transport-test.c` `test_shared_address_promote()` |
-| deferred-batch 恢复缺陷 | 已修复并覆盖 | `midrd/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
+| group-2 传输层修复 | `find_peer_by_address()` 不再猜测 + `midr_transport_promote()` | `midrd/midr-transport.c`、`midrd/midr-session.c`、`midr-test/transport-test.c` `test_shared_address_promote()` |
+| deferred-batch 恢复缺陷 | 已修复并覆盖 | `midr-test/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |

@@ -69,7 +69,7 @@ F6 (third-group Zebra/FIB data plane) additionally uses libfrr's public
 `zebra/{zapi_msg.c,zebra_dplane.c,zebra_dplane.h,if_netlink.c,kernel_netlink.c}`.
 Those are allowed by the boundary above; zebra daemon-private headers and
 in-process zebra state are still forbidden. Because `zclient.h` pulls in
-`vrf.h -> vty.h`, `midrd/extraction-boundary-test.sh` compiles the third-group
+`vrf.h -> vty.h`, `midr-test/extraction-boundary-test.sh` compiles the third-group
 headers in a second step that keeps `-Wall -Wextra` but cannot keep `-Werror`
 (the libfrr headers use the anonymous-struct-member idiom GCC warns about, a
 default-on warning with no `-W` option). The include/type scan itself is

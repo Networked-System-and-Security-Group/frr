@@ -20,6 +20,7 @@ make clean && make test
   Prefix IPC/owned：全部 PASS
   standalone boundary scan：PASS
 
+（脚本现位于 midr-test/）
 ./r7-restart-smoke.sh
   owner 进程强制退出后使用同一 sequence file 重启；远端收到更高
   sequence 的 ACTIVE，脚本 PASS

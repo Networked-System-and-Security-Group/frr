@@ -9,7 +9,7 @@
 # including zebra-restart replay and shutdown withdrawal.
 #
 # Run as root inside the frr-ubuntu24-ymy build container:
-#   docker exec -u 0 frr-ubuntu24-ymy bash /home/frr/frr-midrd3/midrd/r7-dp-zapi-fib.sh
+#   docker exec -u 0 frr-ubuntu24-ymy bash /home/frr/frr-midrd3/midr-test/r7-dp-zapi-fib.sh
 # Logs: /tmp/midrd-dp-zapi-fib
 set -euo pipefail
 

@@ -56,17 +56,17 @@
 | `midrd/midr-dp-backend.h` | 76 | 新增 | `midr_dp_backend_start/stop`、`midr_dp_backend_zclient/vrf_id`、`struct midr_dp_status` |
 | `midrd/midr-gre.c` | 709 | 新增 | GRE 下发（bgpd→midrd 移植），复用后端 zclient |
 | `midrd/midr-gre.h` | 220 | 新增 | `struct midr_gre_tunnel`、`struct midr_gre_status`、`midr_gre_interface_*`、`midr_gre_init/fini` |
-| `midrd/dp-backend-test.c` | 602 | 新增 | 包裹 `zclient_route_send` 的单测 |
+| `midr-test/dp-backend-test.c` | 602 | 新增 | 包裹 `zclient_route_send` 的单测 |
 | `midrd/dp-e2e-tool.c` | 423 | 新增 | group-3 路由安装 harness（`midrd-dp-e2e-tool`），驱动公开 facade；模式见 `dp-03` 第 2 节 |
 | `midrd/gre-link-tool.c` | 238 | 新增 | GRE 连通性测试用微型 midrd 宿主（`midrd-gre-tool`），见 `dp-04` 第 5 节 |
-| `midrd/r7-dp-zapi-fib.sh` | 369 | 新增 | group-3 隔离真实 ZAPI/zebra-rib/Linux-FIB 测试（PASS=29） |
-| `midrd/midr-gre-connectivity-test.sh` | 263 | 新增 | 双容器 GRE/ip6gre 连通性测试（PASS=24） |
-| `midrd/r7-dp-e2e-zapi.sh` | 309 | 新增 | 单容器 3×midrd + zebra 端到端；**阻塞（第二组会话层）** |
-| `midrd/r7-dp-integration-smoke.sh` | 275 | 新增 | 三节点 containerlab 集成；**阻塞（第二组会话层）** |
+| `midr-test/r7-dp-zapi-fib.sh` | 369 | 新增 | group-3 隔离真实 ZAPI/zebra-rib/Linux-FIB 测试（PASS=29） |
+| `midr-test/midr-gre-connectivity-test.sh` | 263 | 新增 | 双容器 GRE/ip6gre 连通性测试（PASS=24） |
+| `midr-test/r7-dp-e2e-zapi.sh` | 309 | 新增 | 单容器 3×midrd + zebra 端到端；**阻塞（第二组会话层）** |
+| `midr-test/r7-dp-integration-smoke.sh` | 275 | 新增 | 三节点 containerlab 集成；**阻塞（第二组会话层）** |
 | `midrd/Makefile` | 309+ | 修改 | 新增 `DP_OBJECTS`、三个 harness/test 目标（`midrd-dp-test`/`midrd-gre-tool`/`midrd-dp-e2e-tool`）与 libfrr 头的 `-Wno-error` 说明 |
 | `Makefile.am` | — | 修改 | `midrd_midrd_SOURCES` 增列 `midrd/midr-dp-backend.{c,h}`、`midrd/midr-gre.{c,h}`（第 157-158 行） |
 | `midrd/midrd.c` | 3364 | 修改 | `--zserv-path/--vrf-id/--no-zebra`、context 初始化后启动后端、shutdown 顺序 |
-| `midrd/extraction-boundary-test.sh` | 60 | 修改 | 两阶段边界编译 |
+| `midr-test/extraction-boundary-test.sh` | 60 | 修改 | 两阶段边界编译 |
 
 > 按任务约束，本文档只描述上述文件；第三组不修改第二组的 SPF/diff/generation 代码。
 
@@ -123,9 +123,9 @@ Zebra 连接重建
 `MIDR_DP_RECOVERY_MS = 100` ms）。zebra 不可达时恢复回调不再重排，收敛交给
 zebra 重连路径（清 installed hash + `midr_spf_install_replay()`）。依据：
 `midr-dp-backend.c` 第 21-32、657-722 行；缺陷与修复覆盖见
-`midrd/dp-backend-test.c` 的 `test_adapter_pipeline_and_recovery()`。
+`midr-test/dp-backend-test.c` 的 `test_adapter_pipeline_and_recovery()`。
 
-`midrd/dp-backend-test.c` 的 `test_adapter_pipeline_and_recovery()` 断言：
+`midr-test/dp-backend-test.c` 的 `test_adapter_pipeline_and_recovery()` 断言：
 `capture_count == 4`（captures[2] DELETE、captures[3] ADD）、
 `send_failures == 1`、`pending == 0`、`installed == 1`、`last_error == 0`、
 `resyncs == 1`（第 481-512 行）。
@@ -137,7 +137,7 @@ zebra 重连路径（清 installed hash + `midr_spf_install_replay()`）。依�
 - 禁止出现 `bgpd` 私有头、`struct bgp`/`struct peer`/`struct
   bgp_path_info`、BGP OPEN/UPDATE/FSM/Capability、AFI/SAFI 状态、zebra
   daemon 私有头或进程内 zebra 状态。
-- 边界门禁 `midrd/extraction-boundary-test.sh`（60 行）对 `midrd/*.c`、`midrd/*.h`
+- 边界门禁 `midr-test/extraction-boundary-test.sh`（60 行）对 `midrd/*.c`、`midrd/*.h`
   执行两阶段扫描（第 8-17、49、59 行）：
   1. 源级 grep 禁止 `#include <bgpd|bgp_|zebra/>` 及 BGP 类型；
   2. `contract.c` 用严格 `-Werror` 编译纯 MIDR 公开头；
@@ -152,5 +152,5 @@ zebra 重连路径（清 installed hash + `midr_spf_install_replay()`）。依�
 | --- | --- |
 | 旧实现行数与入口 | 兄弟检出 `frr/frr`（分支 `feat/te-dp-interface`，HEAD `f8f4e81f2f`）的 `bgpd/bgp_midr_zebra.{c,h}`、`bgpd/bgp_midr_gre.{c,h}` |
 | 公共层 GRE 支撑 | 同上仓库 `lib/log.c`、`lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c` |
-| 新实现 | `midrd/midr-dp-backend.{c,h}`、`midrd/midr-gre.{c,h}`、`midrd/dp-backend-test.c`、`midrd/Makefile`、`Makefile.am`、`midrd/midrd.c` |
+| 新实现 | `midrd/midr-dp-backend.{c,h}`、`midrd/midr-gre.{c,h}`、`midr-test/dp-backend-test.c`、`midrd/Makefile`、`Makefile.am`、`midrd/midrd.c` |
 | 接口契约 | `doc/midr-doc/14_midrd与第三组输出接口交接.md`、`doc/midr-doc/MIDR-TED路径计算接口规范.md` |

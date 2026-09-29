@@ -72,9 +72,9 @@ md5 `07a7acefa7eee7e24af11d2b1d2c8f9a`（1187 行）。本报告一切以 §1.1 
 ```text
 07a7acefa7eee7e24af11d2b1d2c8f9a  midrd/midr-virtual-link.c              1187 行（上一轮（旧源码）907 行）
 92667d15cbe668d101dbded397e1588b  midrd/midr-virtual-link.h               250 行（上一轮（旧源码）213 行）
-e8d0161c674211a811956a38af21e0bb  midrd/virtual-link-test.c              1393 行（上一轮（旧源码）747 行）
+e8d0161c674211a811956a38af21e0bb  midr-test/virtual-link-test.c              1393 行（上一轮（旧源码）747 行）
 e2646a2b0f8f07daaf73dbf546b41fd0  midrd/gre-link-tool.c                   386 行（本轮因注释块修复而变，§3.5）
-8cf57126d3798ed8af44e1668f3d77a7  midrd/midr-gre-connectivity-test.sh     388 行（上一轮 md5 739de8439c21a9c1785be284275dd68b）
+8cf57126d3798ed8af44e1668f3d77a7  midr-test/midr-gre-connectivity-test.sh     388 行（上一轮 md5 739de8439c21a9c1785be284275dd68b）
 0dbb7b7e36db5b33dd46a79a216adb86  doc/midr-doc/dp-doc/midr-virtual-link-api.md  644 行（上一轮（旧源码）482 行）
 ```
 
@@ -148,12 +148,12 @@ standalone libfrr boundary scan: PASS
 - 用例数说明：**程序数不变**——W3 新增用例 13–19 位于**同一测试程序**
   `midrd-virtual-link-test` 内（§3.4），因此 `: PASS` 行数仍为 27。
 - 用例明细（新增部分）：**case 13/14/15/16a/16b/17/18**（D1–D4 回归）与 **case 19**（D1a 订阅）
-  共 **8 个测试函数**，均位于 `midrd/virtual-link-test.c`，runner `main()` 见 `:1372-1379`，映射见 §3.4。
+  共 **8 个测试函数**，均位于 `midr-test/virtual-link-test.c`，runner `main()` 见 `:1372-1379`，映射见 §3.4。
 - 唯一的 `warning:` 是**既有的** `lib/mgmt_msg_native.h: declaration does not declare anything`
-  （`dp-contract.c` 阶段刻意放宽 `-Werror` 的预期噪声，见 `midrd/extraction-boundary-test.sh`
+  （`dp-contract.c` 阶段刻意放宽 `-Werror` 的预期噪声，见 `midr-test/extraction-boundary-test.sh`
   第 21-24 行注释），**没有任何告警提及本轮改动的 6 个文件**。
 
-### 2.2 门禁（a）`midrd/extraction-boundary-test.sh`
+### 2.2 门禁（a）`midr-test/extraction-boundary-test.sh`
 
 ```text
 standalone libfrr boundary scan: PASS
@@ -279,7 +279,7 @@ $ grep -c 'warning:' topmake.log
   > （§3.4），`VALIDATE/EEXIST` **仅剩外来 LIVE 隧道**（同 endpoint 对、由别的模块持有、名字不同）。
 - **测试侧适配**：双容器 GRE 的 **case B**（IPv6 over IPv4 GRE）使用**独立 underlay 对**
   `10.1.1.21/22`（脚本变量 `U1B/U2B`），不再与 case A 复用同一 outer endpoint 对。
-  > 本轮行号实测：脚本 `midrd/midr-gre-connectivity-test.sh:30-31` 定义 `U1B/U2B`。
+  > 本轮行号实测：脚本 `midr-test/midr-gre-connectivity-test.sh:30-31` 定义 `U1B/U2B`。
 - **本组未复现该拒绝路径**：stage E 只用了单一 `gre1`，未触发 EEXIST。该分支的组件级覆盖
   由 `midrd-virtual-link-test` 承担（本轮：`EXIT=0`、`PASS=27`，§2.1；新增 **case 16b** 覆盖
   外来 LIVE 隧道拒绝，见 §3.4）。**如实标注：真实内核下的 EEXIST 拒绝场景上一轮未构造，
@@ -292,14 +292,14 @@ $ grep -c 'warning:' topmake.log
 > （契约 §11 / 会签包 **C7**），W0 为「通知事件枚举 + status 新字段 + `ADDRESS_SET` 里程碑通知」
 > 这一新增对外可观察面（会签包 **C6**）。
 
-| 项 | 修复点（本轮实测行号） | 组件用例覆盖（`midrd/virtual-link-test.c`） | GRE 脚本断言覆盖 |
+| 项 | 修复点（本轮实测行号） | 组件用例覆盖（`midr-test/virtual-link-test.c`） | GRE 脚本断言覆盖 |
 |---|---|---|---|
 | **D1a** `midr_vlink_gre_notify` 订阅 | 回调 `midrd/midr-virtual-link.c:546`；在 `midr_virtual_link_init()`（`:1153`）内注册 `:1158`，在 `midr_virtual_link_fini()`（`:1161`）内注销 `:1167` | **case 19** `test_case19_autonomous_gre_notify_failure`（`:1296`，runner `:1379`） | — |
 | **D1b** 模块级 reconcile 定时器 | `#define MIDR_VLINK_RECONCILE_INTERVAL_MS 1000`（`:40`）；前置声明 `:100`；`midr_vlink_reconcile_entry()` `:508`、`midr_vlink_reconcile_cb()` `:570`、`midr_vlink_reconcile_sync()` `:590`；定时器（重）挂载 `:614-615` | **case 13** `test_case13_autonomous_device_loss`（`:871`，runner `:1372`） | — |
 | **D2** `FAILED` 的 ifindex 规则（保留 `last_ifindex`） | 字段 `last_ifindex` 声明 `:52`；规则在 `midr_vlink_fill_status()`（`:173`）内 `:206-208`：`stage == MIDR_VLINK_STAGE_DEVICE_CONFIRM` → `0`，否则 `last_ifindex` | **case 15** `test_case15_failed_ifindex_retention`（`:1005`，runner `:1374`） | — |
 | **D3** `add()` 重建路径先 `del()` + 收窄 `VALIDATE/EEXIST` | 重建前彻底拆除：说明注释 `:825-835`、调用 `midr_virtual_link_del(NULL, e->ifname, NULL)` 在 **`:837`**；收窄后的拒绝注释块 `:846-865`，判定条件 `:866-878`（`EEXIST` 在 `:877`） | **case 16a** `test_case16a_empty_name_rebuild_no_stale_overlay`（`:1053`，runner `:1375`）、**case 16b** `test_case16b_empty_name_live_foreign_pair_refused`（`:1139`，runner `:1376`） | — |
 | **D4** `midr_vlink_lost()` 内对账 `gre_created`/`addr_set` | `midr_vlink_lost()` `:476`；对账块 `:492-497`（`midr_gre_interface_get_state()` `:493` → `gre_created` `:494`，随后 `addr_set = false` `:497`） | **case 18** `test_case18_no_stale_bookkeeping_after_loss`（`:1239`，runner `:1378`） | — |
-| **W0** 事件枚举 + status 新字段 + `ADDRESS_SET` 里程碑通知 | `midrd/midr-virtual-link.h`：`MIDR_VLINK_STAGE_ADDRESS_SET` `:91`；`enum midr_virtual_link_event` `:105-112`（`MIDR_VLINK_EV_ADDRESS_SET` `:108`）；status 的 `event` `:147`、`overlay_local` `:153`、`overlay_remote` `:154`、`overlay_prefix_len` `:155`、`overlay_ready` `:156`；回调签名不变（`midr_vlink_notify_cb` `:161-162`）。发出点：`midrd/midr-virtual-link.c:710-711` | **case 14** `test_case14_event_ordering_and_overlay_payload`（`:932`，runner `:1373`）、**case 17** `test_case17_query_paths_do_not_notify`（`:1183`，runner `:1377`） | **6 条新断言**：`midrd/midr-gre-connectivity-test.sh:303`（node1 gre1 v4）、`:304`（node2 gre1 v4）、`:324`（node1 gre2 v6）、`:325`（node2 gre2 v6）、`:345`（node1 gre6 ip6gre）、`:346`（node2 gre6 ip6gre）；断言器 `assert_vlink_overlay()` `:201-215` |
+| **W0** 事件枚举 + status 新字段 + `ADDRESS_SET` 里程碑通知 | `midrd/midr-virtual-link.h`：`MIDR_VLINK_STAGE_ADDRESS_SET` `:91`；`enum midr_virtual_link_event` `:105-112`（`MIDR_VLINK_EV_ADDRESS_SET` `:108`）；status 的 `event` `:147`、`overlay_local` `:153`、`overlay_remote` `:154`、`overlay_prefix_len` `:155`、`overlay_ready` `:156`；回调签名不变（`midr_vlink_notify_cb` `:161-162`）。发出点：`midrd/midr-virtual-link.c:710-711` | **case 14** `test_case14_event_ordering_and_overlay_payload`（`:932`，runner `:1373`）、**case 17** `test_case17_query_paths_do_not_notify`（`:1183`，runner `:1377`） | **6 条新断言**：`midr-test/midr-gre-connectivity-test.sh:303`（node1 gre1 v4）、`:304`（node2 gre1 v4）、`:324`（node1 gre2 v6）、`:325`（node2 gre2 v6）、`:345`（node1 gre6 ip6gre）、`:346`（node2 gre6 ip6gre）；断言器 `assert_vlink_overlay()` `:201-215` |
 
 **契约影响（对第一组＝调用方）**：W0 属**追加字段**（回调签名 `midr_vlink_notify_cb` **不变**，源码兼容），
 因此不破坏调用方编译；但语义上要求调用方**按 `status->event` 分支**，不能只看 `state`——
@@ -329,7 +329,7 @@ $ grep -c 'warning:' topmake.log
 
 ## 4. 双容器 GRE 连通性（交付项 3）
 
-脚本：`midrd/midr-gre-connectivity-test.sh`（**本轮** md5 `8cf57126d3798ed8af44e1668f3d77a7`，
+脚本：`midr-test/midr-gre-connectivity-test.sh`（**本轮** md5 `8cf57126d3798ed8af44e1668f3d77a7`，
 388 行；上一轮 md5 `739de8439c21a9c1785be284275dd68b`），在**宿主**以 root 运行，通过**新虚链路 API**
 （`midrd-gre-tool vlink-setup`，零手工 `ip addr add` / `ip link set up`）在 `node1`/`node2` 间建
 GRE over docker bridge。本轮执行器为从零构建的 `midrd-gre-tool`
@@ -383,7 +383,7 @@ MIDR_VLINK name=gre1 state=ready ifindex=58 iftype=8 err=0 overlay_local=192.168
 [PASS] node1 gre1 READY overlay_local=192.168.100.1 overlay_remote=192.168.100.2 plen=30 event=ready
 ```
 
-- 断言器 `assert_vlink_overlay()`：`midrd/midr-gre-connectivity-test.sh:201-215`；
+- 断言器 `assert_vlink_overlay()`：`midr-test/midr-gre-connectivity-test.sh:201-215`；
   调用点 `:303`/`:304`（`gre1`，node1/node2）、`:324`/`:325`（`gre2`，node1/node2）、
   `:345`/`:346`（`gre6`，node1/node2）。
 - 实现依据：`midr_vlink_notify()` 发出的 `MIDR_VLINK_EV_READY` 通知携带
@@ -410,12 +410,12 @@ MIDR_VLINK name=gre1 state=ready ifindex=58 iftype=8 err=0 overlay_local=192.168
 - 全部 `docker exec` 均 `-u root`；`ip route del default` 清掉 docker 网桥默认路由，
   保证 outer 可达性**只能**来自 BGP。
 
-脚本（此前几轮新建于宿主，**本轮已入库**）：`midrd/r7-dp-stagee-bgp-underlay.sh`。
+脚本（此前几轮新建于宿主，**本轮已入库**）：`midr-test/r7-dp-stagee-bgp-underlay.sh`。
 本轮（W3）沿用同一流程复跑，输出日志改为本轮 stage E 日志：
 
 ```sh
 # 宿主；$SUDO 见 §7.2
-$SUDO bash midrd/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1
+$SUDO bash midr-test/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1
 ```
 
 ### 5.2 结果（本轮 W3）
@@ -561,7 +561,7 @@ midrrtr eth0: 10.20.1.254/24   eth1: 10.20.2.254/24
 | U-6 | stage E 容器与网络 | **本轮（W3）已复核：无残留** | 本轮 W3 的 stage E 跑完后已复核：`docker ps -a` 中无 `midra`/`midrb`/`midrrtr`，`docker network ls` 中无 `midr-stagee-*`；`node1`/`node2` 内 `gre1`/`gre2`/`gre6` 均不存在且 zebra 已停（`pgrep -x zebra` 无结果）。上一轮同项亦已清理。仍残留的仅 `测试机上的 stage E 临时配置目录` 目录与 `测试机上的 zserv socket 路径` socket（脚本不清理，见 U-9）。 |
 | U-7 | 门禁 `midr-test/check-zapi-numbering.sh` | **本轮（W3）已补跑：PASS（`EXIT=0`）** | 在本地工作树执行，输出 `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`；脚本与被测 ZAPI 文件 md5 本轮均未变（§1.1、§2.3）。作为**独立门禁项**记录，不并入「三套实测」的 112。门禁有效性（更早一轮的 mutation-teeth 检查：人为破坏编号应 FAIL）仍成立（§2.3）。 |
 | U-8 | **第一组（调用方）会签** | **仍待会签（未取得回签）** | 会签材料 `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（§3 变更清单 C1–C7 及对调用方的影响、§4 九问、§7 回签表）**尚无第一组签名/日期**；与契约 §11 第 1 条一致。本报告 §3.4 已把 W0/C6 与 D1–D4/C7 的对调用方影响逐条复述，供回签引用。 |
-| U-9 | 测试脚本的**环境清理** | **未处理（须做 housekeeping）** | 两个测试脚本**都不**清理运行时残留：`midrd/midr-gre-connectivity-test.sh` 的 `cleanup()` 只 `rm -rf "$STAGE"`（`:256`），其 `SOCK`（`:46`）在退出后仍可能留在测试机上；宿主侧 stage E 脚本产生的临时配置目录同样不在任何脚本的清理范围内（本轮 grep：仓库内无 `stageE-conf` 命中）。属 housekeeping，**不影响**任何断言结果，但会随轮次累积。 |
+| U-9 | 测试脚本的**环境清理** | **未处理（须做 housekeeping）** | 两个测试脚本**都不**清理运行时残留：`midr-test/midr-gre-connectivity-test.sh` 的 `cleanup()` 只 `rm -rf "$STAGE"`（`:256`），其 `SOCK`（`:46`）在退出后仍可能留在测试机上；宿主侧 stage E 脚本产生的临时配置目录同样不在任何脚本的清理范围内（本轮 grep：仓库内无 `stageE-conf` 命中）。属 housekeeping，**不影响**任何断言结果，但会随轮次累积。 |
 
 **跨组提示（第一组 → 第二组，属他人接口，本组不实现）**：第一组从 `READY` 通知/状态中拿到的是
 `overlay_local` + `overlay_remote` + `overlay_prefix_len` 三件套；但 `midrd/midr-topology.h` 的
@@ -602,7 +602,7 @@ prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二�
 | GRE 执行器（**本轮 W3**） | 从零构建的 `midrd-gre-tool` | md5 `7c3bf35fea958e31d417315d24e3ad02` |
 | 组件测试程序（**本轮 W3**） | 从零构建的 `midrd-virtual-link-test` | md5 `4f4ace0e88dede3ca6ddbc8d7c7e1b52` |
 | stage E 日志（**本轮 W3**） | 宿主侧本轮 stage E 日志 | `=== stage E summary: PASS=34 FAIL=0 ===`；staged zebra md5 `0aca362d964891d7a5c118069fbbc197`（文件大小/行数未记录 / not measured） |
-| stage E 脚本 | 仓库内 `midrd/r7-dp-stagee-bgp-underlay.sh`（`make stagee-smoke` 亦可） | 完整拓扑搭建 + 34 条断言 |
+| stage E 脚本 | 仓库内 `midr-test/r7-dp-stagee-bgp-underlay.sh`（`make stagee-smoke` 亦可） | 完整拓扑搭建 + 34 条断言 |
 | 上一轮（旧源码）日志（**对照，勿作本轮证据**） | 组件 `上一轮组件套件日志`（660657 B）、`上一轮组件套件日志`；双容器 GRE `上一轮 GRE 日志`（10809 B）、`上一轮 GRE 日志（seam 删除后复跑）`；顶层 `上一轮顶层全量构建日志`；stage E `上一轮 stage E 日志`（186 行）；缺陷 1 根因 `上一轮缺陷 1 隔离实验日志`；vtysh `上一轮 vtysh 运行日志` | PASS = 27 / 45 / 34；缺陷与 CLI 证据 |
 | ZAPI 编号门禁输出 | 本地终端（**本轮 W3 补跑**，§2.3） | `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`，`EXIT=0` |
 | 源码修复点（行号为本轮 `grep -n` 实测） | `zebra/zapi_msg.c:4278-4285`（不掩码说明，缺陷 1）<br>`midrd/midr-dp-backend.c:1131-1142`（`midr_dp_handlers` 注册地址通知，缺陷 2）<br>`midrd/midr-virtual-link.c:825-837`、`:846-878`（重建先拆 + `VALIDATE/EEXIST` 收窄，缺陷 3/D3）<br>D1a `:546`/`:1153`/`:1158`/`:1167`；D1b `:40`/`:100`/`:508`/`:570`/`:590`/`:614-615`；D2 `:52`/`:173`/`:206-208`；D4 `:476`/`:492-497`；W0 `:710-711` + `midrd/midr-virtual-link.h:91/105-112/147/153-156/161-162` | 本轮修复点与 D1–D4/W0 映射（§3.4、§3.5） |
@@ -621,7 +621,7 @@ $SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd
 # GRE（宿主；用本轮新构建的 midrd-gre-tool；确切调用式本轮未记录，见下注）
 $SSH "$SUDO bash <宿主上的>midr-gre-connectivity-test.sh > 本轮 GRE 日志 2>&1"
 # stage E（宿主；脚本已在仓库内，也可用 make stagee-smoke）
-$SSH "$SUDO bash midrd/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1"
+$SSH "$SUDO bash midr-test/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1"
 # stage E 清理（如需）
 $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stagee-a midr-stagee-b"
 ```
@@ -629,7 +629,7 @@ $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stage
 > 注：GRE 一步在宿主上运行脚本（本轮用的执行器为
 > 从零构建的 `midrd-gre-tool`，md5 `7c3bf35fea958e31d417315d24e3ad02`）；
 > 脚本在宿主的**确切路径/调用参数本轮未记录**，标为 待实测 / not measured，
-> 复现时可参考上一轮的调用形式（`midrd/midr-gre-connectivity-test.sh` 的用法说明）。
+> 复现时可参考上一轮的调用形式（`midr-test/midr-gre-connectivity-test.sh` 的用法说明）。
 
 ---
 

@@ -14,7 +14,7 @@ IPC 使用固定长度、带 magic/version/generation/originator 的帧，承载
 
 ## 证据
 
-`make -C midrd clean test` 通过 contract、core、Prefix Provider、wire、双地址族 transport、Consumer committed snapshot、SPF、engine batch、Prefix IPC 和 standalone boundary scan。Prefix IPC daemon smoke 验证 IPv6 Prefix 经 Unix stream 输入后产生 Consumer/SPF route result，并在 runtime 到期后清理 pidfile。`./midrd/r7-smoke.sh` 的 IPv4 convergence、IPv6 convergence 和 IPv4 expiry 继续通过，所有场景不启动 `bgpd`。
+`make -C midrd clean test` 通过 contract、core、Prefix Provider、wire、双地址族 transport、Consumer committed snapshot、SPF、engine batch、Prefix IPC 和 standalone boundary scan。Prefix IPC daemon smoke 验证 IPv6 Prefix 经 Unix stream 输入后产生 Consumer/SPF route result，并在 runtime 到期后清理 pidfile。`./midr-test/r7-smoke.sh` 的 IPv4 convergence、IPv6 convergence 和 IPv4 expiry 继续通过，所有场景不启动 `bgpd`。
 
 ## 清理闸门
 

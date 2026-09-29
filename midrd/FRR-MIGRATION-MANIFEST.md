@@ -92,7 +92,7 @@ test PASS=29/FAIL=0 (`/tmp/fib-final.log`).
 
 Known open item: zebra kept the SPF instance selected in the kernel FIB after
 the TE instance was added (dual-instance coexistence is verified at the ZAPI
-level and by `midrd/dp-backend-test.c`, but the FIB promotion needs a zebra-side
+level and by `midr-test/dp-backend-test.c`, but the FIB promotion needs a zebra-side
 follow-up).
 
 

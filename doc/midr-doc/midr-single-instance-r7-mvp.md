@@ -34,7 +34,7 @@ midr-prefix-provider-test: PASS
 ## Containerlab smoke
 
 ```sh
-cd midrd
+cd midr-test
 ./r7-smoke.sh
 ```
 

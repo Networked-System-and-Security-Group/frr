@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-BIN=${MIDRD_BIN:-"$ROOT/build/midrd"}
-SCALE_BIN=${MIDRD_SCALE_BIN:-"$ROOT/build/midrd-scale-test"}
+BIN=${MIDRD_BIN:-"$ROOT/../midrd/build/midrd"}
+SCALE_BIN=${MIDRD_SCALE_BIN:-"$ROOT/../midrd/build/midrd-scale-test"}
 IMAGE=${MIDRD_IMAGE:-frr-midr-p6:f9beedd0d653}
 RUN_ROOT=${MIDRD_HARDENING_RUN_ROOT:-}
 ACTIVE_TOPO=

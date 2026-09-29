@@ -54,7 +54,7 @@ outer endpoint 可达
 | P2 | `midrd/midrd.c` | init/fini 接线 |
 | P2 | `midrd/midr-dp-backend.c` | **MF-1**：注册 `[ZEBRA_INTERFACE_ADDRESS_ADD/DELETE]` handler（见 §5.4 勘误） |
 | P2 | `midrd/Makefile`、`Makefile.am` | 源文件与目标登记 |
-| P3 | `midrd/virtual-link-test.c`、`midrd/midr-gre-connectivity-test.sh` | 测试与脚本改造 |
+| P3 | `midr-test/virtual-link-test.c`、`midr-test/midr-gre-connectivity-test.sh` | 测试与脚本改造 |
 
 `midrd/midr-gre.{c,h}` **不修改语义**，仅作为底层设备接口被 P2 复用。
 
@@ -312,7 +312,7 @@ DEVICE_UP  ->  ADDRESS_SET  ->  READY
   接口 `IFF_UP`」三者同时成立；
 - **不在 API 内做主动探测**：midrd 无 ICMP 探针，且新增 route-get/nexthop-lookup
   ZAPI 会显著扩大本组 ABI 面。真正的端到端连通性由
-  ①`midrd/midr-gre-connectivity-test.sh` 的 overlay 双向 ping，以及
+  ①`midr-test/midr-gre-connectivity-test.sh` 的 overlay 双向 ping，以及
   ②P4 在容器内执行的 `ip route get <overlay_remote>` 命中虚接口 来独立验证。
 
 若 `overlay_remote` 不在 `overlay_local` 前缀内（任务文档 §5.1 注的第二种地址规划），
@@ -555,7 +555,7 @@ zclient_send_interface_admin_up(struct zclient *client, vrf_id_t vrf_id,
 
 ## 9. 测试接缝（P3 必须覆盖）
 
-### 9.1 组件测试（无真实 zebra，沿用 `midrd/gre-registry-test.c` 模式）
+### 9.1 组件测试（无真实 zebra，沿用 `midr-test/gre-registry-test.c` 模式）
 
 测试程序骨架：`#define main midrd_program_main` + `#include "midrd.c"`；
 用 `-Wl,--wrap=` 注入。所需接缝：
@@ -602,7 +602,7 @@ zclient_send_interface_admin_up(struct zclient *client, vrf_id_t vrf_id,
 
 ### 9.3 脚本改造（任务文档 §9.2）
 
-`midrd/midr-gre-connectivity-test.sh` 中现有手工
+`midr-test/midr-gre-connectivity-test.sh` 中现有手工
 `ip addr add ... dev greX` / `ip link set greX up` 必须替换为经新 API 完成，
 并断言：设备类型（gre/ip6gre）、`state=READY`、overlay 地址已在接口上、
 overlay 双向 ping 成功、返回 `ifindex` 有效、删除后设备与地址均被清理。
@@ -613,7 +613,7 @@ overlay 双向 ping 成功、返回 `ifindex` 有效、删除后设备与地址�
 - `midrd/Makefile`：把 `midr-virtual-link.o` 加入 `DP_OBJECTS`（或新建
   `VLINK_OBJECTS` 并在 `midrd` 与 `midrd-gre-tool` 目标中链接）；
 - `midrd/Makefile` 新增 `virtual-link-test` 目标并纳入 `test`；
-- `midrd/extraction-boundary-test.sh` 的 `dp-contract.c` 阶段头文件列表加入
+- `midr-test/extraction-boundary-test.sh` 的 `dp-contract.c` 阶段头文件列表加入
   `midr-virtual-link.h`。
 
 ## 11. 待第一组会签与开放问题

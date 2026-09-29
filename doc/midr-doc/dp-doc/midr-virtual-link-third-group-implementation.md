@@ -62,7 +62,7 @@ midr_gre_register_notify()
 - 支持 `link_ifindex`、GRE key、封装标志和 MTU；
 - 通过 Zebra interface 视图取得虚接口 ifindex；
 - 支持 `PENDING/UP/FAILED/DOWN` 的基础注册表状态；
-- 已有 `midrd/gre-link-tool.c` 和 `midrd/midr-gre-connectivity-test.sh`。
+- 已有 `midrd/gre-link-tool.c` 和 `midr-test/midr-gre-connectivity-test.sh`。
 
 当前 `struct midr_gre_tunnel` 主要描述外层隧道：
 
@@ -352,7 +352,7 @@ midrd 监听地址是否覆盖 overlay 地址；
 
 ### 9.2 GRE/IP 隧道测试
 
-现有 `midrd/midr-gre-connectivity-test.sh` 中手工执行的：
+现有 `midr-test/midr-gre-connectivity-test.sh` 中手工执行的：
 
 ```bash
 ip addr add ... dev greX

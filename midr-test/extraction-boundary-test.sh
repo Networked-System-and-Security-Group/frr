@@ -2,16 +2,19 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The gate itself lives in midr-test/ but the sources it guards are the
+# daemon sources in midrd/ (one level up).
+src=$(CDPATH= cd -- "$root/../midrd" && pwd)
 
 # The daemon may use common libfrr facilities, but it must not regain a
 # dependency on bgpd, the zebra daemon internals, or BGP protocol types.
 if grep -RInE '#[[:space:]]*include[[:space:]]+[<"](bgpd|bgp_|zebra/)' \
-    "$root"/*.c "$root"/*.h; then
+    "$src"/*.c "$src"/*.h; then
 	printf '%s\n' 'standalone boundary scan: forbidden include' >&2
 	exit 1
 fi
 if grep -RInE '\b(struct[[:space:]]+(bgp|peer|bgp_path_info)|AFI_BGP|SAFI_MIDR_LS|BGP_(OPEN|UPDATE|FSM|CAPABILITY))\b' \
-    "$root"/*.c "$root"/*.h; then
+    "$src"/*.c "$src"/*.h; then
 	printf '%s\n' 'standalone boundary scan: forbidden BGP dependency' >&2
 	exit 1
 fi
@@ -25,7 +28,7 @@ libfrr_flags='-std=gnu11 -O2 -Wall -Wextra -Wno-pedantic -Wno-missing-field-init
 tmp=${TMPDIR:-/tmp}/midrd-boundary.$$
 trap 'rm -rf "$tmp"' EXIT INT TERM
 mkdir -p "$tmp"
-cd "$root"
+cd "$src"
 
 cat >"$tmp/contract.c" <<'EOF'
 #include "midr-context.h"

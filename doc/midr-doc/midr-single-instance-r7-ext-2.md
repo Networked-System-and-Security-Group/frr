@@ -14,7 +14,7 @@ Consumer 同时保留两类接口：事件队列用于观察和传输调试，co
 
 ## 证据
 
-独立门禁 `make -C midrd clean test` 通过以下目标：contract、core、Prefix Provider、wire、双地址族 transport、Consumer committed snapshot、SPF route-result、engine batch/withdraw 以及 standalone boundary scan。`./midrd/r7-smoke.sh` 的 IPv4 convergence、IPv6 convergence 和 IPv4 expiry 三项 containerlab smoke 均通过，运行时不启动 `bgpd`。
+独立门禁 `make -C midrd clean test` 通过以下目标：contract、core、Prefix Provider、wire、双地址族 transport、Consumer committed snapshot、SPF route-result、engine batch/withdraw 以及 standalone boundary scan。`./midr-test/r7-smoke.sh` 的 IPv4 convergence、IPv6 convergence 和 IPv4 expiry 三项 containerlab smoke 均通过，运行时不启动 `bgpd`。
 
 ## 后续闸门
 

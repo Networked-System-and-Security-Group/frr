@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-BIN=${MIDRD_BIN:-"$ROOT/build/midrd"}
+BIN=${MIDRD_BIN:-"$ROOT/../midrd/build/midrd"}
 BASE_PORT=${MIDRD_SMOKE_BASE_PORT:-44100}
 RUNTIME=${MIDRD_SMOKE_RUNTIME:-4}
 PIDS=

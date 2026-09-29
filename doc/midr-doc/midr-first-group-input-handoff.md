@@ -84,6 +84,6 @@ snapshot 之后的每个 `MIDR_PREFIX_UPSERT` 或 `MIDR_PREFIX_WITHDRAW` 增量�
 | --- | --- | --- |
 | Prefix/Local IPC 与事务 | Prefix Provider、Prefix IPC、Prefix transaction、Local IPC、Local transaction 组件测试 PASS | `/home/guest/yhy/midr-gate-runs/r7-second-group-close-20260916/component-final.log` |
 | 无 BGP 双栈预验证 | IPv4/IPv6 收敛和 IPv4 graceful withdraw PASS | `/home/guest/yhy/midr-gate-runs/r7-second-group-close-20260916/containerlab.log` |
-| 边界门禁 | Provider/IPC 公开头可独立编译，`midrd` 无 BGP/Zebra 依赖 | `midrd/extraction-boundary-test.sh` |
+| 边界门禁 | Provider/IPC 公开头可独立编译，`midrd` 无 BGP/Zebra 依赖 | `midr-test/extraction-boundary-test.sh` |
 
 `bgpd` 旧 MIDR 实现暂作对照保留，但不是新输入接口的运行依赖。第二组分支当前提交未 push。

@@ -5,17 +5,17 @@
 数据面迁移后的构建分三档：FRR 顶层 autotools 构建（权威严格构建）、
 `midrd` 独立组件套件（含数据面单测与边界扫描）、以及容器内同步/构建流程。
 顶层构建与组件套件均已在本周期验证通过；此外新增第三组 ZAPI/FIB smoke
-（`midrd/r7-dp-fib-smoke.sh`），在构建容器内用真实 zebra + 真实内核 FIB 验证完整
+（`midr-test/r7-dp-fib-smoke.sh`），在构建容器内用真实 zebra + 真实内核 FIB 验证完整
 ZAPI/FIB 链路，**不依赖第二组会话层**（见第 4.1 节）。
 
 ## 2. 范围
 
 - FRR 顶层 `make`（含 `lib/`、`zebra/` 的 GRE 支撑与新 `midrd` 目标）。
 - `midrd/Makefile` 的 `test` 目标（25 个程序 + 边界扫描）。
-- `midrd/dp-backend-test.c`（包裹 `zclient_route_send`，无需真实 zebra）。
+- `midr-test/dp-backend-test.c`（包裹 `zclient_route_send`，无需真实 zebra）。
 - harness 构建产物 `midrd-gre-tool`（`gre-link-tool.c`）与
   `midrd-dp-e2e-tool`（`dp-e2e-tool.c`）。
-- 第三组 ZAPI/FIB smoke `midrd/r7-dp-fib-smoke.sh`（构建容器内 root，真实 zebra +
+- 第三组 ZAPI/FIB smoke `midr-test/r7-dp-fib-smoke.sh`（构建容器内 root，真实 zebra +
   真实内核 FIB）。
 - 容器内源码同步与构建命令。
 
@@ -92,8 +92,8 @@ make -j112 BUILD_DIR=/tmp/midrd-build test
 - `DP_OBJECTS = $(BUILD_DIR)/midr-dp-backend.o $(BUILD_DIR)/midr-gre.o`（第 36 行）；
 - `all` 目标包含三个数据面 harness/test 目标：`$(BUILD_DIR)/midrd-dp-test`、
   `$(BUILD_DIR)/midrd-gre-tool`、`$(BUILD_DIR)/midrd-dp-e2e-tool`（第 55-58 行）；
-- `test` 目标（第 285-310 行）顺序执行全部组件程序，最后运行
-  `./extraction-boundary-test.sh`；
+- `test` 目标顺序执行全部组件程序，最后运行
+  `midr-test/extraction-boundary-test.sh`（也可 `make boundary` 单独跑）；
 - `midrd` 二进制依赖 `$(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS)`
   （第 268 行）；
 - `FRR_CFLAGS` 对第三组翻译单元设 `-Wno-error`（第 8-14 行）：libfrr 公开头经
@@ -129,11 +129,11 @@ make -j112 BUILD_DIR=/tmp/midrd-build test
   no-op、zebra 重连 replay、deferred 失败两步恢复；
 - `test_gre_api()`：GRE API 的校验路径（NULL/族不一致/无 zclient/无后端）。
 
-### 4.1 第三组 ZAPI/FIB smoke（`midrd/r7-dp-fib-smoke.sh`）
+### 4.1 第三组 ZAPI/FIB smoke（`midr-test/r7-dp-fib-smoke.sh`）
 
 ```sh
 # 容器 frr-ubuntu24-ymy 内，root
-bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
+bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh
 ```
 
 该脚本在构建容器内启动真实、新构建的 zebra 于私有 ZAPI socket，用
@@ -142,7 +142,7 @@ bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh
 
 | 项 | 值 |
 | --- | --- |
-| 命令 | `bash /home/frr/frr-midrd3/midrd/r7-dp-fib-smoke.sh` |
+| 命令 | `bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh` |
 | 结果 | `=== summary: PASS=15 FAIL=0 ===`，末行 `third-group ZAPI/FIB smoke: PASS`，EXIT=0 |
 | 日志 | 容器 `/tmp/fib-smoke.log` |
 | 状态 | 已验证 |
@@ -155,7 +155,7 @@ zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 �
 > **FIB 断言须同时解析两种安装形式（group-aware）**：zebra 既可能内联安装
 > （路由行含 `via N`），也可能经 nexthop group 安装（路由行含 `nhid N`）。断言
 > 必须先取 `nhid`，再用 `ip nexthop show id <nhid>` 展开，并跟随 `group` 列表继续
-> 展开成员 nexthop（`midrd/r7-dp-fib-smoke.sh` 第 80-101 行的 `fib_nhid()`/
+> 展开成员 nexthop（`midr-test/r7-dp-fib-smoke.sh` 第 80-101 行的 `fib_nhid()`/
 > `fib_nh_list()`）。只匹配单一形式曾造成多次误报失败。
 
 ### 4.2 ZAPI 编号门禁的覆盖范围（断言 1–5）
@@ -176,7 +176,7 @@ zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 �
 
 ## 5. 两阶段边界扫描
 
-`midrd/extraction-boundary-test.sh`（60 行）是 `midrd` 组件的独立边界门禁：
+`midr-test/extraction-boundary-test.sh`（60 行）是 `midrd` 组件的独立边界门禁：
 
 ```text
 阶段 1  源级扫描（第 8-17 行）
@@ -203,7 +203,7 @@ not declare anything”，该警告默认开启且没有 `-W` 开关，故无法
 命令与预期末行：
 
 ```sh
-cd /home/frr/frr-midrd3/midrd && ./extraction-boundary-test.sh
+cd /home/frr/frr-midrd3/midrd && make boundary
 # 期望末行: standalone libfrr boundary scan: PASS
 ```
 
@@ -258,8 +258,8 @@ docker exec -u root frr-ubuntu24-ymy bash -lc '
 | --- | --- | --- |
 | FRR 顶层构建（从零重建） | EXIT=0；**11 行 `warning:`（非 0）**，全部为既有 bgpd（OUT OF SCOPE）；2 条 DPLANE_OP_GRE_* 已由 T9 消除（T9 前 13） | `/tmp/verify-clean-T10.log`、`/tmp/verify-build-T10.log`（容器 `frr-ubuntu24-ymy`） |
 | midrd 组件套件 | 25 程序 PASS，含 `midrd-dp-test: PASS`、`standalone libfrr boundary scan: PASS`，EXIT=0 | `/tmp/verify-comp.log`、`/tmp/final-comp.log`（容器 `frr-ubuntu24-ymy`） |
-| 第三组 ZAPI/FIB smoke | `PASS=15 FAIL=0`，`third-group ZAPI/FIB smoke: PASS`，EXIT=0 | `midrd/r7-dp-fib-smoke.sh`；`/tmp/fib-smoke.log`（容器 `frr-ubuntu24-ymy`） |
-| FIB 断言（group-aware） | 同时解析内联 `via N` 与 `nhid N` | `midrd/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
-| deferred-batch 恢复 | 缺陷已修复；先重试保留批再 resync | `midrd/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
-| 单测覆盖 | 编码模式、失败 abort、adapter 恢复、GRE 校验路径 | `midrd/dp-backend-test.c` |
-| 边界门禁 | 两阶段编译 + 源扫描 | `midrd/extraction-boundary-test.sh` |
+| 第三组 ZAPI/FIB smoke | `PASS=15 FAIL=0`，`third-group ZAPI/FIB smoke: PASS`，EXIT=0 | `midr-test/r7-dp-fib-smoke.sh`；`/tmp/fib-smoke.log`（容器 `frr-ubuntu24-ymy`） |
+| FIB 断言（group-aware） | 同时解析内联 `via N` 与 `nhid N` | `midr-test/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
+| deferred-batch 恢复 | 缺陷已修复；先重试保留批再 resync | `midr-test/dp-backend-test.c` `test_adapter_pipeline_and_recovery()` |
+| 单测覆盖 | 编码模式、失败 abort、adapter 恢复、GRE 校验路径 | `midr-test/dp-backend-test.c` |
+| 边界门禁 | 两阶段编译 + 源扫描 | `midr-test/extraction-boundary-test.sh` |

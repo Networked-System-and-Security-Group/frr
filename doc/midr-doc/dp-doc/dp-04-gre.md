@@ -144,11 +144,11 @@ stage/midrd-gre-tool teardown --sock /tmp/zserv.api --name midr0
 > 覆盖路由——这些由 CP 负责。旧 `test_midr_gre_link` 的 `--ip/--ip6` 选项
 > 在新工具中不存在；overlay 地址须在脚本里用 `ip addr add` 配置。
 
-脚本 `midrd/midr-gre-connectivity-test.sh`（263 行）在 docker 宿主上执行：
+脚本 `midr-test/midr-gre-connectivity-test.sh`（263 行）在 docker 宿主上执行：
 
 ```sh
 # 前置：node1/node2 已存在并运行 frr-ubuntu24-ymy:init，且在同一 bridge
-bash midrd/midr-gre-connectivity-test.sh
+bash midr-test/midr-gre-connectivity-test.sh
 ```
 
 **实测结果（验收执行）：`=== summary: PASS=24 FAIL=0 ===`。** 日志
@@ -163,7 +163,7 @@ kind 正确）；IPv4 与 IPv6 overlay 流量经该隧道双向 ping 通；IPv6 
 | 项 | 值 |
 | --- | --- |
 | 前置 | 两容器各运行 zebra；`/opt/midr-dp` 含 zebra + libfrr + `midrd-gre-tool`；root 在 `frrvty` 组；IPv6 用例前 `sysctl net.ipv6.conf.eth0.disable_ipv6=0` |
-| 命令 | `bash midrd/midr-gre-connectivity-test.sh`（docker 宿主，root） |
+| 命令 | `bash midr-test/midr-gre-connectivity-test.sh`（docker 宿主，root） |
 | 结果 | `=== summary: PASS=24 FAIL=0 ===`（旧版同类脚本为 PASS=21） |
 | 日志 | 宿主 `/tmp/gre-test.log` |
 | 状态 | 已验证 |
@@ -193,5 +193,5 @@ kind 正确）；IPv4 与 IPv6 overlay 流量经该隧道双向 ping 通；IPv6 
 | ZAPI 路径 | `lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c` |
 | 旧版本 | 兄弟检出 `frr/frr`（HEAD `f8f4e81f2f`）的 `bgpd/bgp_midr_gre.{c,h}` |
 | 旧测试基线 | `frr/frr/doc/midr-doc/midr-gre-test-report.md`（21/21 PASS）、`frr/frr/doc/midr-doc/midr-gre-interface-api.md` |
-| 新测试（组件层） | `midrd/dp-backend-test.c` `test_gre_api()`（校验路径） |
-| 新测试（真实双容器） | `midrd/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |
+| 新测试（组件层） | `midr-test/dp-backend-test.c` `test_gre_api()`（校验路径） |
+| 新测试（真实双容器） | `midr-test/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |

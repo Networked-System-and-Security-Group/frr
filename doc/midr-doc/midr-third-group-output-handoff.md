@@ -79,8 +79,8 @@ ZAPI 部分失败时，adapter 不得将 candidate generation 标记为已安装
 | 验证 | 结果 | 证据 |
 | --- | --- | --- |
 | TED/SPF 组件 | Consumer、LSDB、TED、engine、SPF、Local transaction 测试 PASS | `/home/guest/yhy/midr-gate-runs/r7-second-group-close-20260916/component-final.log` |
-| SPF 场景 | IPv4/IPv6 nexthop、ifindex、ECMP、分层 intra/inter-group 和 unreachable 已覆盖 | `midrd/spf-test.c`、`midrd/engine-test.c` |
+| SPF 场景 | IPv4/IPv6 nexthop、ifindex、ECMP、分层 intra/inter-group 和 unreachable 已覆盖 | `midr-test/spf-test.c`、`midr-test/engine-test.c` |
 | 无 BGP 双栈预验证 | IPv4/IPv6 收敛、triangle、partition/recovery 和 owner expiry PASS | `/home/guest/yhy/midr-gate-runs/r7-hardening-20260916-phase1*`、`phase2*`、`phase3-spf` |
-| 边界门禁 | Consumer/TED/SPF 公开头可独立编译，`midrd` 无 Zebra/BGP 依赖 | `midrd/extraction-boundary-test.sh` |
+| 边界门禁 | Consumer/TED/SPF 公开头可独立编译，`midrd` 无 Zebra/BGP 依赖 | `midr-test/extraction-boundary-test.sh` |
 
 `bgpd` 旧 MIDR/Zebra 实现暂作对照保留，但不是新输出接口的运行依赖。第二组分支当前提交未 push。
