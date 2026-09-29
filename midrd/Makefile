@@ -378,6 +378,20 @@ gre-smoke: $(BUILD_DIR)/midrd-gre-tool
 	MIDRD_GRE_TOOL=$(abspath $(BUILD_DIR)/midrd-gre-tool) \
 		exec ./midr-gre-connectivity-test.sh
 
+# stagee-smoke: third-group acceptance for delivery item 4 - the virtual link
+# must work across a *BGP-only* underlay.  Like integration-smoke/gre-smoke it
+# runs on the docker HOST as root, not inside the build container (the
+# container has no docker CLI).  The script builds its own three-container
+# topology (midra/midrb/midrrtr) on two independent bridges so the outer
+# endpoint is only reachable via BGP, then asserts READY/ifindex/overlay
+# reachability/FIB use plus teardown, rebuild, zebra-restart and
+# deleted-device recovery (34 assertions).  It pulls its binaries out of
+# $(MIDRD_BUILD_CONTAINER) (default frr-ubuntu24-ymy) and deliberately leaves
+# the containers and bridges behind; the summary prints the cleanup command.
+stagee-smoke: $(BUILD_DIR)/midrd-gre-tool
+	MIDRD_GRE_TOOL=$(abspath $(BUILD_DIR)/midrd-gre-tool) \
+		exec ./r7-dp-stagee-bgp-underlay.sh
+
 clean:
 	rm -rf $(BUILD_DIR)
 
