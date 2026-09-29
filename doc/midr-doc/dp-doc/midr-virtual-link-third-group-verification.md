@@ -10,6 +10,11 @@
 > **阅读约定（重要）**：本报告的计数与 md5 **只对标注「W3 / 本轮」的段落有效**。
 > 凡标注「上一轮（旧源码）」的表格与摘录，均为 W3 **之前**的源码与二进制所产，
 > **不得**当作当前树的证据；受影响的旧值已逐处更正（见 §1.1 勘误）。
+>
+> **升级指针（当前权威）**：本轮（W3/W4 之后）的最新独立实测见
+> `doc/midr-doc/dp-doc/midr-virtual-link-runtime-evidence.md`（**PASS=179 / FAIL=3**，
+> 3 个 FAIL 已逐一归因、与 overlay 逻辑无关）。本报告的计数（106 / 112 等）**只对其标注的轮次有效**；
+> 读者请以 runtime-evidence 为当前权威。
 
 ---
 
@@ -112,6 +117,10 @@ e2646a2b0f8f07daaf73dbf546b41fd0  midrd/gre-link-tool.c                   386 �
 8cf57126d3798ed8af44e1668f3d77a7  midr-test/midr-gre-connectivity-test.sh     388 行（上一轮 md5 739de8439c21a9c1785be284275dd68b）
 0dbb7b7e36db5b33dd46a79a216adb86  doc/midr-doc/dp-doc/midr-virtual-link-api.md  644 行（上一轮（旧源码）482 行）
 ```
+
+> **注记（行数口径，2026-09-29 补）**：上表 `midr-virtual-link-api.md` 的 **644 行**是 **W3 当轮值**
+> （对应该轮 md5 `0dbb7b7e36db5b33dd46a79a216adb86`），属历史事实，**不改为当前值**；
+> 当前树为 **651 行**（`wc -l` 当场实测），见 `midr-virtual-link-api-countersign.md` §7.1。
 
 本轮**未改动**（md5 与上一轮一致）：
 

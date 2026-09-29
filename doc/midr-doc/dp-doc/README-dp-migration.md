@@ -32,13 +32,91 @@
 
 ## 2. 文档清单
 
-| 文档 | 内容 |
-| --- | --- |
-| `README-dp-migration.md` | 本索引、阶段状态、责任划分、已核实证据、单容器形式修复说明、快速开始 |
-| `dp-01-migration-overview.md` | 旧→新映射表、文件清单、边界规则 |
-| `dp-02-build-and-test.md` | FRR 顶层与 midrd 组件构建、边界扫描、容器同步流程、日志 |
-| `dp-03-e2e-and-integration.md` | 三个端到端场景与验收标准、覆盖对照 |
-| `dp-04-gre.md` | GRE API、ZAPI 线格式路径、工具/脚本流程、与旧版差异 |
+本目录共 22 份 `.md`，按用途分为四组（§2.1–§2.4）。
+**权威性**一列给出争议时的采信顺序：权威签名（代码）> 准一来源（契约）> 本轮结论 > 历史记录。
+
+### 2.1 索引与总览
+
+| 文档 | 角色 | 权威性 | 内容一句话 |
+| --- | --- | --- | --- |
+| `README-dp-migration.md` | 本文件，目录索引与总览 | 本目录入口（索引本身不含验收结论） | 阶段状态、责任划分、已核实证据、单容器形式修复说明、快速开始；§2.5 给出虚链路主线阅读顺序 |
+| `dp-01-migration-overview.md` | 迁移总览 | 迁移范围的说明性权威 | 旧 `bgpd` → 新 `midrd` 映射表、文件清单、边界规则（旧实现保留为差分对照） |
+
+### 2.2 构建 / 端到端 / 迁移分册
+
+| 文档 | 角色 | 权威性 | 内容一句话 |
+| --- | --- | --- | --- |
+| `dp-02-build-and-test.md` | 构建与测试分册 | 构建口径的说明性权威 | 三档构建（FRR 顶层严构建 / `midrd` 组件套件 / 容器同步）、边界扫描、第三组 ZAPI/FIB smoke、日志位置 |
+| `dp-03-e2e-and-integration.md` | 端到端与集成场景分册 | E2E 口径的说明性权威 | 三类验收（group-3 隔离真实 ZAPI/zebra-rib/FIB、双容器 GRE/ip6gre、三节点 group2+group3 集成）与覆盖对照 |
+| `dp-04-gre.md` | GRE 虚拟接口分册 | **设备层（底层）**说明性权威 | `midrd/midr-gre.{c,h}` API、ZAPI 线格式路径、工具/脚本流程、与旧版差异 |
+
+### 2.3 虚链路（GRE overlay）主线
+
+`dp-04` 讲的是**设备层**（`midr-gre.h`，谁来建 netdevice）；本节是**虚链路 overlay 主线**
+（第一组可直接调用的高层服务，权威签名为 `midrd/midr-virtual-link.h`），共 8 份。
+
+| 文档 | 角色 | 权威性 | 内容一句话 |
+| --- | --- | --- | --- |
+| `midr-virtual-link-third-group-implementation.md` | 需求（上游任务说明） | **需求权威**（C 签名最终以会签为准） | 定义第三组要补齐的虚链路设备服务与接口边界（§1–§10）；不决定第一组邻接选择策略 |
+| `midr-virtual-link-api.md` | 接口契约（P0 冻结） | **唯一准一来源** | 虚链路设备服务 API 契约；W3 修订在**回调签名不变**前提下新增 `event` / `overlay_prefix_len` / `overlay_ready` |
+| `midr-virtual-link-api-countersign.md` | 会签包 | 第一组 ↔ 第三组逐条确认的载体 | 请第一组对契约逐条回签（C1–C7 + 九问 + 会签表），逐条列变更及对调用方的影响 |
+| `midr-virtual-link-requirement-conformance.md` | 需求符合性审计（本轮新增） | 本轮结论（**静态，不实测**） | 53 行需求矩阵：符合 48 / 部分符合 5 / 缺失 0，符合度 ≈95%；需实测项另列 |
+| `midr-virtual-link-runtime-evidence.md` | 运行时实测证据（本轮新增） | **当前权威实测** | 本轮（2026-09-29）在容器 `frr-ubuntu24-ymy` 亲眼观察到的原始输出快照 |
+| `midr-gre-overlay-interface-design.md` | 接口裁决与层次设计（本轮新增） | 本轮结论（纯裁决，**无代码变更**） | 裁决 overlay 四件套只归 `struct midr_virtual_link_status`，绝不进 `struct midr_gre_status` |
+| `midr-group1-reply-overlay-fields.md` | 对第一组回应稿（本轮新增） | 可直接发送的答复稿 | 回应第一组「overlay 字段与通知」诉求：四字段已存在，只是不在 `midr_gre_status` |
+| `midr-virtual-link-third-group-verification.md` | 历史实测报告 | **已被取代**（计数仅对 W3 轮有效） | W3 轮（D1–D4 修复 + W0 通知合入后）再从零重建的实测记录 |
+
+### 2.4 设计 / 历史报告
+
+以下文档或属 `bgpd` 时代（迁入 `midrd` 之前）的设计，或为更早轮次的进展/测试报告，
+**不作为当前验收依据**，仅作背景与差分对照。
+
+| 文档 | 角色 | 权威性 | 内容一句话 |
+| --- | --- | --- | --- |
+| `midr-cp-dp-interface.md` | 接口设计 | 历史（`bgpd` 时代） | 控制平面 → 数据平面路由安装接口：**单向**、CP → DP 的唯一正式通道 |
+| `midr-dataplane-design-and-implementation.md` | 设计规范 + 实现说明（v2.0） | 历史（整合稿） | 融合 `midr-cp-dp-interface.md` + `traffic-engineering.md` + RFC 9815 的数据平面设计与实现 |
+| `midr-dataplane-dev-doc.md` | 开发文档 | 历史（`bgpd` 时代） | 数据平面模块职责与核心文件（`bgpd/bgp_midr_zebra.{c,h}` 等）的职责/规模 |
+| `midr-dataplane-progress-report.md` | 进展汇报 | 历史（汇报稿） | 模块定位、结构体关系图、函数调用流、Dual-Instance TE、100 ms 批处理、质量指标、演进规划 |
+| `midr-gre-interface.md` | 设计说明 | 历史（分支 `feat/te-dp-interface`） | `bgpd/bgp_midr_gre.{c,h}` 的 GRE 虚拟接口创建/消除设计与改动总览 |
+| `midr-gre-interface-api.md` | 接口说明与使用文档 | 历史（`bgpd` 时代） | `midr_gre_interface_add()` / `midr_gre_interface_del()` 的用法（头文件 `bgpd/bgp_midr_gre.h`） |
+| `midr-gre-test-report.md` | 测试报告 | 历史（`bgpd` 时代） | 两容器间 GRE/ip6gre 创建、承载 IPv4/IPv6 业务、消除的连通性报告 |
+| `midr-test-report-20260709.md` | 测试报告（v5.0，2026-07-09） | 历史（更早轮次） | `tests/bgpd/scripts/test01-06_*.sh` 六项概览（编译 / proto-199 / 单测 / E2E / 批量压力 / containerlab） |
+| `traffic-engineering.md` | 设计方案 | 历史（范围与主线重叠） | 基于 SRv6 的 TE 设计：组间分工、与第二组接口、CP-DP 路由下发接口 |
+
+### 2.5 虚链路主线：阅读顺序（推荐）
+
+按下面顺序读：前一步解决「要什么」，后一步回答「满足了没有、怎么确认」。
+
+1. **需求** → `midr-virtual-link-third-group-implementation.md`（408 行）。
+   为什么放第一：它是本轮全部工作的上游，定义「要做到什么」和第三组的接口边界；
+   后面所有文档都在回答「需求满足了没有、怎么满足的」。
+2. **契约** → `midr-virtual-link-api.md`（651 行）。**唯一准一来源，P0 冻结**。
+   为什么放第二：需求里的 C 签名到此才成为可编码、可会签的正式接口；凡与其它文档冲突，
+   以本文为准。W3 修订新增 `event` / `overlay_prefix_len` / `overlay_ready`，但**回调签名不变**
+   （调用方源码兼容）。
+3. **会签** → `midr-virtual-link-api-countersign.md`。
+   为什么放第三：契约生效需要第一组回签；本文逐条（C1–C7 + 九问 + 会签表）列出变更点及
+   **对调用方的影响**，是契约与调用方之间的桥梁。
+4. **本轮结论（三份并读，同一基线）** → 分别回答「静态是否满足 / 实测是否通过 / 接口怎么归层」：
+   - `midr-virtual-link-requirement-conformance.md` —— 符合性：53 行矩阵（符合 48 / 部分符合 5 / 缺失 0，≈95%）。
+   - `midr-virtual-link-runtime-evidence.md` —— **实测：当前权威**。
+   - `midr-gre-overlay-interface-design.md` —— 接口裁决与层次归属（无代码变更）。
+   为什么三份并读：单看任一份都会偏——静态审计不实测、实测不判需求覆盖、裁决不管测试。
+5. **发给第一组** → `midr-group1-reply-overlay-fields.md`。
+   为什么放第五：第 1–4 步是第三组内部结论的整理，本文才是**对外口径**，把「overlay 四件套
+   只在 `struct midr_virtual_link_status`」这一裁决变成第一组可直接照做的答复。
+6. **历史背景（非当前权威）** → `midr-virtual-link-third-group-verification.md`。
+   为什么放最后：它记录 W3 轮（D1–D4 修复 + W0 通知合入后）的读数，是理解「契约为何修订成
+   现在这样」的背景，但**计数只对 W3 轮有效**。
+
+> **时效性（务必注意，引用数字时必须标注轮次）**：
+> - **当前权威实测 = `midr-virtual-link-runtime-evidence.md`**（本轮，2026-09-29）。脚本自带计数
+>   汇总 **PASS=179 / FAIL=3**，3 个 FAIL 已归因为 manifest / root / fixtures 类问题，
+>   与 GRE overlay 能力无关。
+> - `midr-virtual-link-third-group-verification.md` 的 **106 / 112** 计数**仅对 W3 轮有效**
+>   （W3 轮 = 组件 27 + GRE 51 + stage E 34 = 112 PASS，FAIL=0）；其中更早的 106 PASS
+>   只对应**修正前**源码，不得当作当前树的证据。
+> - 二者**不是同一轮**：179/3（本轮）与 112（W3 轮）不可互相比较、不可混用。
 
 ## 3. 责任划分
 
@@ -350,6 +428,13 @@ bash midr-test/r7-dp-e2e-zapi.sh                                # 三节点 rout
 详细构建、日志位置与容器同步步骤见 `dp-02-build-and-test.md`。
 
 ## 8. 证据索引
+
+> **时效性声明（阅读本节数字前必读）**：下表的计数与日志是 **P0–P9 早期迁移轮**
+> （第三组数据面迁入 `midrd` 的验收周期，容器 `frr-ubuntu24-ymy`）的**证据快照**，
+> 只在那一轮的基线与脚本下有效，本节**保留历史数字不改**。
+> **虚链路（GRE overlay）主线是其后独立的一轮，其最新实测以
+> `midr-virtual-link-runtime-evidence.md` 为准**（见 §2.5 的时效性说明）。
+> 两处的计数**适用轮次不同**，不可互相比较、不可混用。
 
 | 验证 | 结果摘要 | 日志 |
 | --- | --- | --- |

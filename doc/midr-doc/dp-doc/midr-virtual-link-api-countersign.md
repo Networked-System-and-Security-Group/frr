@@ -2,7 +2,7 @@
 
 > 用途：第三组（数据面）请第一组（控制面/调用方）对虚链路设备服务接口**逐条确认并回签**。
 > 基线：分支 `feat/midr-three-way-integration`，HEAD `443c51474b`。
-> 会签对象（唯一准一来源）：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（**644 行**，本轮 `wc -l` 实测）。
+> 会签对象（唯一准一来源）：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（**651 行**；口径：以回签当场 `wc -l` 实测为准，出包日 2026-09-29 实测 = 651）。
 > 实现（权威签名）：`midrd/midr-virtual-link.h`。
 > 上游任务说明：`doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md`。
 > 出包日期：2026-09-29。
@@ -13,22 +13,42 @@
 
 任务文档 §4 明确要求：**「建议的概念接口如下，具体 C 签名由第一组和第三组联合确认」**。
 
-第三组按该草案冻结了实现（上一轮已通过组件套件 + 双容器 GRE + 跨 BGP-only underlay
-全部实测，合计 106 PASS / 0 FAIL，见验证报告），但**第一组是本 API 的调用方**，
+第三组按该草案冻结了实现（**W3 之前一轮**已通过组件套件 + 双容器 GRE + 跨 BGP-only underlay
+全部实测，合计 **106 PASS / 0 FAIL（该轮值，仅作历史对照）**，见验证报告 §0.1），但**第一组是本 API 的调用方**，
 因此下列语义必须由第一组确认，否则会出现编译期不一致，或更危险的**语义错配**
 （例如把 `DEVICE_UP` 当作可以建邻、或复用同一 outer endpoint 对时不先 `del`）。会签即为此。
 
 > **本轮（W3，2026-09-29）新增面**：新增 `enum midr_virtual_link_event` 与 status 的
 > `event`/`overlay_prefix_len`/`overlay_ready` 字段，并按 D1-D4 修正自主检测与重建语义
 > （见 §3 的 **C6 / C7**）。**回调签名不变，调用方源码兼容。**
-> 本轮扩展后的**实测计数尚未产生（待实测）**：上一轮的 106 PASS 只对应修正前的源码，
-> 不得当作本轮新面的证据。
+> **本轮扩展后的实测已完成**：W3 当轮为 **112 PASS / 0 FAIL**（见
+> `doc/midr-doc/dp-doc/midr-virtual-link-third-group-verification.md` §0）；**最新独立实测（当前权威）见
+> `doc/midr-doc/dp-doc/midr-virtual-link-runtime-evidence.md`：PASS=179 / FAIL=3**，
+> 3 个 FAIL 均已归因（① 出厂 manifest 与 `tests/bgpd/subdir.am` 不同步 → exit=2；
+> ② 以 root 跑组件套件时 `test_midr_sequence` 的 `-EACCES` 断言失败，换 `-u frr` 即 PASS；
+> ③ fixture 二进制当时未构建，构建后 PASS），**与 overlay 逻辑无关**；
+> 核心套件全绿：编号门禁 4/0、非特权组件套件 30/0、midrd 套件 27/0、双容器 GRE 58/0、
+> stage E 34/0、ZAPI/FIB smoke 26/0。
+> 上一轮的 **106 PASS（W3 之前）**只对应修正前的源码，**不得**当作本轮扩展面的证据。
 
 **回签方式（二选一）**：
 - 对本文 §5 的 9 个问题在「第一组回答」列填写 `同意` / `改为：____`；
 - 或直接对 `midr-virtual-link-api.md` 给出「照此批准」或「字段/签名修改清单」。
 
 回签后由第三组在**同一次提交**内更新文档与代码（`midrd/midr-virtual-link.{c,h}` + 契约文件）。
+
+### 1.1 计数轮次与当前权威（更正块）
+
+本包出现**三个不同轮次**的计数；历史值**保留不改**，此处只明确其轮次、证据与适用性：
+
+| 计数 | 轮次 | 证据文档 | 适用性 / 定位 |
+|---|---|---|---|
+| **106 PASS / 0 FAIL**（组件 27 + GRE 45 + stage E 34） | **W3 之前**一轮（修正前源码） | `midr-virtual-link-third-group-verification.md` §0.1（「上一轮（旧源码）记录」） | **仅历史**；§1 与 §3 引用的即此值，不代表 W3 及以后 |
+| **112 PASS / 0 FAIL**（组件 27 + GRE 51 + stage E 34） | **W3**（2026-09-29，D1–D4 修正后） | `midr-virtual-link-third-group-verification.md` §0（§0.2：结构迁移后 GRE 升为 58） | 对 W3 树有效；≠ 106（GRE 51 vs 45），也 ≠ 当前树 |
+| **PASS=179 / FAIL=3** | **本轮最新独立实测**（2026-09-29 之后） | `midr-virtual-link-runtime-evidence.md`（987 行） | **当前权威**；3 个 FAIL 已逐一归因，与 overlay 逻辑无关 |
+
+**当前权威实测 = `midr-virtual-link-runtime-evidence.md`（PASS=179 / FAIL=3，3 个 FAIL 已归因、与 overlay 无关）。**
+回签核对以该文为准；§7.1 的行数以**当场 `wc -l` 实测**为准，上表 106 / 112 只作历史对照。
 
 ---
 
@@ -118,12 +138,14 @@ void midr_virtual_link_fini(void);
 | C6 | **新增对外可观察面（追加字段，不改签名）**：`enum midr_virtual_link_event` + `struct midr_virtual_link_status` 的 `event` / `overlay_prefix_len` / `overlay_ready`；成功路径固定三条有序通知 `DEVICE_UP -> ADDRESS_SET -> READY`；查询路径 `get_state()`/`wait_ready()` **不发通知**且 `event == MIDR_VLINK_EV_NONE` | 第一组需要从通知里直接拿到 overlay 三件套（否则要额外查询，且无法区分「地址已配置」与「接口已 UP」）；`ADDRESS_SET` 单列出来避免把 READY 语义折叠。overlay 字段**刻意不放在 `midr_gre_status`**：`midr-gre` 无 overlay 概念；设备可已 UP 而地址未配，若放 `overlay_ready` 会制造假就绪；契约 §2 同时冻结 `midr-gre` 语义。备选方案（vlink 层镜像/回填到 GRE 层）本契约不采纳；**若第一组要求，必须先由契约显式写明字段/时机/责任方再改实现** | **源码兼容**：回调签名 `midr_vlink_notify_cb` 不变，新信息经 `status->event` 等传递。第一组可在 `READY` 通知里直接读取 `overlay_local`/`overlay_remote`/`overlay_prefix_len` 后调 `midr_session_connect()`，无需额外查询；**必须按 `event` 分支，不能只看 `state`** |
 | C7 | **语义修正 D1-D4**：(D1) **自主检测**：订阅 GRE 层通知 + 模块级 reconcile 定时器（**1000 ms**，只要存在任一非 `DOWN` 条目（含 `READY`）就保持 armed），设备消失、或 `READY` 后丢失 overlay 地址/`IFF_UP` 时**自主**置 `FAILED` 并发通知，**无需调用方轮询**；(D2) `FAILED` 的 `ifindex`：`stage=DEVICE_CONFIRM`（设备消失）→ 0，**其他任何失败阶段** → 最后一次已确认的 ifindex；(D3) 重建（`MIDR_VLINK_F_REBIND` / `FAILED` 重试 / 空 ifname 复用同一 outer endpoint 对）先**彻底拆除**（overlay 地址 `_unset` + GRE 设备删除 + 定时器取消）再建；`VALIDATE/EEXIST` 只留给「GRE 层仍为该 endpoint 对持有 **LIVE** 设备且名字不同/为自动生成名」的外来隧道；(D4) 进入 `FAILED` 时用 `midr_gre_interface_get_state()` 对账 `gre_created`/`addr_set`，避免过期视图 | 静态评审 D1-D4（T1 报告）。D1 前设备丢失只能靠调用方轮询 `get_state()` 发现，且 `READY` 后 per-entry poll 被取消 → 失败可能永远不被感知；D2 前 `FAILED` 恒为 `ifindex==0`，第一组无法定位设备；D3 前空名/rebind 分支只释放条目、不撤地址不删设备 → 新地址叠加在旧地址上（静默覆盖）；D4 前惰性对账留下过期 `gre_created`/`addr_set` | (D1) **行为变更**：第一组现在会**异步收到**自主 `FAILED`（设备丢失，或 `READY` 后地址/`IFF_UP` 丢失），不再需要轮询；但**必须注册 `midr_virtual_link_register_notify()`** 才能收到；(D2) `FAILED` 时 `ifindex` **不总是 0**：只有设备消失类为 0，配置类失败是最后确认的 ifindex；(D3) **收窄 C1**：本模块自己旧条目的 endpoint 对复用改为自动先拆后建，`EEXIST` 仅剩外来 LIVE 隧道；第一组不再需要为「同 endpoint 对换名」先手动 `del()`（显式 `del()` 仍是干净做法）；(D4) 无直接接口影响，保证后续 `add()`/`del()` 设备 create/delete 计数准确 |
 
-> C1–C5 对应的实测轮结果：组件套件 **27 PASS / 0 FAIL**、双容器 GRE **45 PASS / 0 FAIL**、
+> C1–C5 对应的实测轮结果（**W3 之前一轮**；该轮值仅作历史对照，当前权威见 §1.1）：组件套件 **27 PASS / 0 FAIL**、双容器 GRE **45 PASS / 0 FAIL**、
 > 跨 BGP-only underlay **34 PASS / 0 FAIL**，合计 **106 PASS / 0 FAIL**。
 >
-> **C6/C7 对应本轮（W3）扩展后的实测计数：待实测 / not measured。**
-> 组件用例扩到 18 项（新增 13-18，见契约 §9.2）后需重跑；在验证报告给出计数前，
-> 本条不得写作通过。
+> **C6/C7 对应 W3 扩展后的实测计数（更正，2026-09-29）**：W3 当轮已实测 = 组件套件 27 / 双容器 GRE 51 / stage E 34，
+> **合计 112 PASS / 0 FAIL**（`midr-virtual-link-third-group-verification.md` §0）；
+> 最新权威实测 = `midr-virtual-link-runtime-evidence.md`（**PASS=179 / FAIL=3**，3 个 FAIL 已归因，与 overlay 无关）。
+> 组件用例扩到 18 项（新增 13-18，见契约 §9.2）后**已重跑**；原「待实测 / not measured」表述**已作废**。
+> 纪律不变：未复跑、未归因的项**不得写作通过**；本条的实测口径以 §1.1 的权威指针为准。
 
 ---
 
@@ -276,7 +298,7 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 | 项 | 内容 |
 |---|---|
 | 会签对象 | `doc/midr-doc/dp-doc/midr-virtual-link-api.md`（行数见 §7.1）+ 本包 §3 变更清单（C1–C7）+ §4 九问 |
-| 第三组（数据面） | 接口已冻结。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另 ZAPI 编号门禁 PASS**；可核查摘要见  —— 签名：__________ 日期：__________ |
+| 第三组（数据面） | 接口已冻结。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另 ZAPI 编号门禁 PASS**；**可核查摘要见 `midr-virtual-link-runtime-evidence.md`（本轮最新独立实测 PASS=179 / FAIL=3，3 个 FAIL 已归因、与 overlay 无关；W3 的 112 见 `midr-virtual-link-third-group-verification.md` §0）** —— 签名：__________ 日期：__________ |
 | 第一组（控制面/调用方） | 结论：☐ 照此批准　☐ 需修改（见下） —— 签名：__________ 日期：__________ |
 | 修改清单（若需修改） | 1. ____________________　2. ____________________　3. ____________________ |
 | 备注 | 本轮新增字段为**追加式**，回调签名不变，调用方源码兼容；若第一组要求把 overlay 字段镜像到 GRE 层，需先在本契约显式写明（见 C6）。 |
@@ -285,8 +307,8 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 
 | 文件 | 行数 | 测量命令 |
 |---|---|---|
-| `doc/midr-doc/dp-doc/midr-virtual-link-api.md` | **644** | `wc -l`（本轮实测） |
-| `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（本包） | **306** | `wc -l`（本轮实测） |
+| `doc/midr-doc/dp-doc/midr-virtual-link-api.md` | **651**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
+| `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（本包） | **328**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
 
 ---
 
@@ -302,5 +324,5 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 | 新增 ZAPI | `lib/zclient.{c,h}`（`ZEBRA_INTERFACE_ADDRESS_SET/_UNSET/SET_ADMIN_UP`，追加在 enum 末尾）、`zebra/zapi_msg.c` |
 | 实测证据日志 | 组件套件、双容器 GRE、stage E、vtysh 与缺陷 1 根因的原始日志（本轮与上一轮的运行记录，均在本组测试机上，未随仓库分发） |
 | 编号门禁 | `midr-test/check-zapi-numbering.sh`（基线 `1adb4c92d0`，PASS） |
-| 本轮（W3）新增面 | 契约 §3.1（event/overlay 字段）、§7.2/§7.3（D2/D3）、§8.2（D1/D4）、§9.2 用例 13-19；会签 §3 的 C6/C7。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另编号门禁 PASS**；|
+| W3 轮新增面（历史轮；当前权威实测见 `midr-virtual-link-runtime-evidence.md`） | 契约 §3.1（event/overlay 字段）、§7.2/§7.3（D2/D3）、§8.2（D1/D4）、§9.2 用例 13-19；会签 §3 的 C6/C7。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS，W3 当轮值），另编号门禁 PASS**；|
 | 跨组提示 | 契约 §11 第 5 条：`midrd/midr-topology.h` 的 `struct midr_link_update` 无 prefix-length 字段（本轮 grep：`midrd/midr-topology.{h,c}` 无 `prefix_len`/`prefixlen`/`overlay`），第一组→第二组的 overlay nexthop+prefix 交接可能需在第一组/第二组侧补字段 |
