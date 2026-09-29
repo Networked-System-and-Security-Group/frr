@@ -410,12 +410,12 @@ MIDR_VLINK name=gre1 state=ready ifindex=58 iftype=8 err=0 overlay_local=192.168
 - 全部 `docker exec` 均 `-u root`；`ip route del default` 清掉 docker 网桥默认路由，
   保证 outer 可达性**只能**来自 BGP。
 
-脚本（上一轮在宿主新建，路径为上一轮记录）：`/home/yangmy/midr-stageE-bgp-underlay.sh`。
+脚本（此前几轮新建于宿主，**本轮已入库**）：`midrd/r7-dp-stagee-bgp-underlay.sh`。
 本轮（W3）沿用同一流程复跑，输出日志改为本轮 stage E 日志：
 
 ```sh
 # 宿主；$SUDO 见 §7.2
-$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > stagee.log 2>&1
+$SUDO bash midrd/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1
 ```
 
 ### 5.2 结果（本轮 W3）
@@ -602,7 +602,7 @@ prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二�
 | GRE 执行器（**本轮 W3**） | 从零构建的 `midrd-gre-tool` | md5 `7c3bf35fea958e31d417315d24e3ad02` |
 | 组件测试程序（**本轮 W3**） | 从零构建的 `midrd-virtual-link-test` | md5 `4f4ace0e88dede3ca6ddbc8d7c7e1b52` |
 | stage E 日志（**本轮 W3**） | 宿主侧本轮 stage E 日志 | `=== stage E summary: PASS=34 FAIL=0 ===`；staged zebra md5 `0aca362d964891d7a5c118069fbbc197`（文件大小/行数未记录 / not measured） |
-| stage E 脚本 | 宿主 `/home/yangmy/midr-stageE-bgp-underlay.sh`（上一轮记录路径） | 完整拓扑搭建 + 34 条断言 |
+| stage E 脚本 | 仓库内 `midrd/r7-dp-stagee-bgp-underlay.sh`（`make stagee-smoke` 亦可） | 完整拓扑搭建 + 34 条断言 |
 | 上一轮（旧源码）日志（**对照，勿作本轮证据**） | 组件 `上一轮组件套件日志`（660657 B）、`上一轮组件套件日志`；双容器 GRE `上一轮 GRE 日志`（10809 B）、`上一轮 GRE 日志（seam 删除后复跑）`；顶层 `上一轮顶层全量构建日志`；stage E `上一轮 stage E 日志`（186 行）；缺陷 1 根因 `上一轮缺陷 1 隔离实验日志`；vtysh `上一轮 vtysh 运行日志` | PASS = 27 / 45 / 34；缺陷与 CLI 证据 |
 | ZAPI 编号门禁输出 | 本地终端（**本轮 W3 补跑**，§2.3） | `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`，`EXIT=0` |
 | 源码修复点（行号为本轮 `grep -n` 实测） | `zebra/zapi_msg.c:4278-4285`（不掩码说明，缺陷 1）<br>`midrd/midr-dp-backend.c:1131-1142`（`midr_dp_handlers` 注册地址通知，缺陷 2）<br>`midrd/midr-virtual-link.c:825-837`、`:846-878`（重建先拆 + `VALIDATE/EEXIST` 收窄，缺陷 3/D3）<br>D1a `:546`/`:1153`/`:1158`/`:1167`；D1b `:40`/`:100`/`:508`/`:570`/`:590`/`:614-615`；D2 `:52`/`:173`/`:206-208`；D4 `:476`/`:492-497`；W0 `:710-711` + `midrd/midr-virtual-link.h:91/105-112/147/153-156/161-162` | 本轮修复点与 D1–D4/W0 映射（§3.4、§3.5） |
@@ -620,8 +620,8 @@ $SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd
 ./midr-test/check-zapi-numbering.sh
 # GRE（宿主；用本轮新构建的 midrd-gre-tool；确切调用式本轮未记录，见下注）
 $SSH "$SUDO bash <宿主上的>midr-gre-connectivity-test.sh > 本轮 GRE 日志 2>&1"
-# stage E（宿主，沿用上一轮脚本）
-$SSH "$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > stagee.log 2>&1"
+# stage E（宿主；脚本已在仓库内，也可用 make stagee-smoke）
+$SSH "$SUDO bash midrd/r7-dp-stagee-bgp-underlay.sh > stagee.log 2>&1"
 # stage E 清理（如需）
 $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stagee-a midr-stagee-b"
 ```
