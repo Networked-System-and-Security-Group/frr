@@ -42,6 +42,11 @@
 #       Pass WORKTREE to compare the working tree against itself (smoke).
 #   midr-test/check-zapi-numbering.sh --dump [REV]
 #       Print "ordinal<TAB>name" for REV (default HEAD) and exit.
+#   midr-test/check-zapi-numbering.sh --self-test
+#       Prove the gate still has teeth without touching the working tree: check
+#       out HEAD into a scratch worktree, confirm the pristine commit passes,
+#       swap ZEBRA_GRE_ADD/ZEBRA_GRE_DELETE in that copy and confirm the gate
+#       then fails, then verify the real working tree is unchanged.
 #
 # Set ZAPI_NUMBERING_VERBOSE=1 to also print the full enum dumps and the
 # baseline-vs-working-tree diff (diagnostics for a failing run).
@@ -116,12 +121,75 @@ rev_file() { # $1=rev $2=path
 	esac
 }
 
+# --- self-test ---------------------------------------------------------------
+# The gate is only worth trusting if it still rejects a mutation.  Verify that
+# in a throwaway worktree so the caller's tree is never touched.
+self_test() {
+	command -v git >/dev/null 2>&1 || { echo "self-test: git is required" >&2; exit 2; }
+
+	before=$(git status --porcelain)
+	scratch=$(mktemp -d "${TMPDIR:-/tmp}/zapi-self-test.XXXXXX")
+	wt="$scratch/wt"
+	cleanup() {
+		git worktree remove --force "$wt" >/dev/null 2>&1 || true
+		git worktree prune >/dev/null 2>&1 || true
+		rm -rf "$scratch"
+	}
+	trap cleanup EXIT INT TERM
+
+	if ! git worktree add -f --detach "$wt" HEAD >/dev/null 2>&1; then
+		echo "check-zapi-numbering: self-test FAIL: cannot create a scratch worktree" >&2
+		exit 1
+	fi
+
+	# 1. control: the pristine commit must pass.
+	mut_rc=0
+	( cd "$wt" && ./midr-test/check-zapi-numbering.sh ) >/dev/null 2>&1 || mut_rc=$?
+	if [ "$mut_rc" -ne 0 ]; then
+		echo "check-zapi-numbering: self-test FAIL: gate rejects a clean HEAD (rc=$mut_rc)" >&2
+		exit 1
+	fi
+
+	# 2. swap the two GRE messages in the enum tail; the gate must now fail.
+	awk '
+		/^[ \t]*ZEBRA_GRE_ADD,$/    { swap = $0; next }
+		/^[ \t]*ZEBRA_GRE_DELETE,$/ { print; if (swap != "") { print swap; swap = "" }; next }
+		{ print }
+	' "$wt/$HEADER" > "$scratch/mutated.h" \
+		|| { echo "check-zapi-numbering: self-test FAIL: cannot build the mutation" >&2; exit 1; }
+	if cmp -s "$wt/$HEADER" "$scratch/mutated.h"; then
+		echo "check-zapi-numbering: self-test FAIL: the mutation did not apply" >&2
+		exit 1
+	fi
+	cp "$scratch/mutated.h" "$wt/$HEADER"
+
+	mut_rc=0
+	( cd "$wt" && ./midr-test/check-zapi-numbering.sh ) >/dev/null 2>&1 || mut_rc=$?
+	if [ "$mut_rc" -eq 0 ]; then
+		echo "check-zapi-numbering: self-test FAIL: gate accepted a swapped enum tail" >&2
+		exit 1
+	fi
+
+	# 3. the caller's working tree must be byte-for-byte unchanged.
+	after=$(git status --porcelain)
+	if [ "$before" != "$after" ]; then
+		echo "check-zapi-numbering: self-test FAIL: the working tree changed" >&2
+		exit 1
+	fi
+
+	echo "check-zapi-numbering: self-test PASS (clean HEAD passes, swapped $GRE_ADD/$GRE_DEL fails)"
+	exit 0
+}
+
 # --- argument handling ------------------------------------------------------
 case "${1:-}" in
 --dump)
 	rev=${2:-HEAD}
 	rev_file "$rev" "$HEADER" | enum_dump
 	exit 0
+	;;
+--self-test)
+	self_test
 	;;
 -h|--help)
 	usage

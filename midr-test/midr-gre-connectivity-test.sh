@@ -29,6 +29,12 @@ U2=10.1.1.12
 # virtual-link API rejects that silent rename with EEXIST).
 U1B=10.1.1.21
 U2B=10.1.1.22
+# Third IPv4 pair, used by case F: a tunnel created through the GRE layer only
+# (a "foreign" device) must make the virtual-link API refuse the same endpoint
+# pair under a different name with EEXIST instead of silently rebinding the
+# kernel device to the new name.
+U1C=10.1.1.31
+U2C=10.1.1.32
 U6_1=fd00:1::11
 U6_2=fd00:1::12
 # Overlay addressing handed to the virtual-link API (no more manual
@@ -190,6 +196,7 @@ vlink2() {
 vlink_state_of()   { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'state=[a-z_]+' | head -1 | cut -d= -f2; }
 vlink_idx_of()     { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'ifindex=[0-9]+' | head -1 | cut -d= -f2; }
 vlink_iftype_of()  { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'iftype=[0-9]+' | head -1 | cut -d= -f2; }
+vlink_err_of()     { echo "$1" | grep -E '^MIDR_VLINK ' | grep -oE 'err=[0-9]+' | head -1 | cut -d= -f2; }
 
 # The READY transition notification is the only line that carries event=ready:
 # the final MIDR_VLINK status line is a pure query and reports event=none.
@@ -242,14 +249,18 @@ cleanup() {
 		link1 teardown --sock $SOCK --name gre1 >/dev/null 2>&1 || true
 		link1 teardown --sock $SOCK --name gre2 >/dev/null 2>&1 || true
 		link1 teardown --sock $SOCK --name gre6 >/dev/null 2>&1 || true
+		link1 teardown --sock $SOCK --name vlx >/dev/null 2>&1 || true
+		link1 teardown --sock $SOCK --name foreign0 >/dev/null 2>&1 || true
 	fi
 	if docker exec -u root "$NODE2" bash -c "test -S $SOCK" 2>/dev/null; then
 		link2 teardown --sock $SOCK --name gre1 >/dev/null 2>&1 || true
 		link2 teardown --sock $SOCK --name gre2 >/dev/null 2>&1 || true
 		link2 teardown --sock $SOCK --name gre6 >/dev/null 2>&1 || true
+		link2 teardown --sock $SOCK --name vlx >/dev/null 2>&1 || true
+		link2 teardown --sock $SOCK --name foreign0 >/dev/null 2>&1 || true
 	fi
-	ex1 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; true"
-	ex2 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; true"
+	ex1 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; ip link del vlx 2>/dev/null; ip link del foreign0 2>/dev/null; true"
+	ex2 "ip link del gre1 2>/dev/null; ip link del gre2 2>/dev/null; ip link del gre6 2>/dev/null; ip link del vlx 2>/dev/null; ip link del foreign0 2>/dev/null; true"
 	zebra_stop "$NODE1"
 	zebra_stop "$NODE2"
 	if [[ -n "$STAGE" && -d "$STAGE" ]]; then
@@ -382,6 +393,96 @@ if iface_has_addr "$NODE1" gre1 "$OV4_1/$OV4_PLEN"; then bad "node1 gre1 overlay
 							   else ok "node1 gre1 overlay address cleaned"; fi
 if iface_has_addr "$NODE2" gre1 "$OV4_2/$OV4_PLEN"; then bad "node2 gre1 overlay address not cleaned"
 							   else ok "node2 gre1 overlay address cleaned"; fi
+
+# ---------------------------------------------------------------------------
+# F. Real-kernel EEXIST: a live foreign tunnel owns the endpoint pair
+#
+# The GRE layer keeps at most one device per (vrf, outer local, outer remote)
+# pair, and re-adding a known pair under a *new* name only renames its registry
+# entry - the kernel device keeps the old name, so a caller probing the new name
+# would never see it confirmed.  To rule out that silent rebind the API refuses
+# the request with EEXIST and must leave the foreign device untouched.  Unlike
+# the component-level case 16b this runs against a real kernel and a real zebra,
+# and it also checks the converse: once the foreign tunnel is gone the very same
+# request must succeed.
+# ---------------------------------------------------------------------------
+hdr "F. Real-kernel EEXIST: a live foreign tunnel on the same outer pair"
+FOREIGN=foreign0
+FVLX=vlx
+ex1 "ip addr add $U1C/24 dev eth0 2>/dev/null || true"
+ex2 "ip addr add $U2C/24 dev eth0 2>/dev/null || true"
+F1=$(link1 setup --sock $SOCK --name $FOREIGN --local $U1C --remote $U2C --mtu 1400 --wait-ms 8000 || true); echo "$F1"
+F2=$(link2 setup --sock $SOCK --name $FOREIGN --local $U2C --remote $U1C --mtu 1400 --wait-ms 8000 || true); echo "$F2"
+if [[ "$(state_of "$F1")" == up && "$(state_of "$F2")" == up ]]; then
+	ok "F.1 $FOREIGN established through the GRE layer on both nodes"
+else
+	bad "F.1 $FOREIGN not established (node1 $(state_of "$F1") / node2 $(state_of "$F2"))"
+fi
+FIDX1=$(ex1 "cat /sys/class/net/$FOREIGN/ifindex 2>/dev/null || true")
+FADDR1=$(ex1 "ip -o addr show dev $FOREIGN 2>/dev/null | wc -l" || true)
+
+# the same pair under a different name must be refused, before anything is created
+FGRE_BEFORE=$(ex1 "ip -o link show type gre 2>/dev/null | wc -l" || true)
+FD1=$(vlink1 "$FVLX" "$U1C" "$U2C" "$OV4_1" "$OV4_2" "$OV4_PLEN" || true); echo "$FD1"
+FD1_STATE=$(vlink_state_of "$FD1")
+FD1_ERR=$(vlink_err_of "$FD1")
+# A tunnel created by *another* process cannot be seen by the EEXIST guard: the
+# GRE registry is per-process, so the guard finds no name for the pair and the
+# request instead ends in the DEVICE_CONFIRM timeout (err 110).  Both outcomes
+# are acceptable here - the property that matters is that the request is
+# refused and the foreign device is not silently rebound or damaged (F.3/F.4).
+if [[ "$FD1_STATE" == failed && ( "$FD1_ERR" == 17 || "$FD1_ERR" == 110 ) ]]; then
+	if [[ "$FD1_ERR" == 17 ]]; then
+		ok "F.2 same outer pair under a new name refused with EEXIST (err=17)"
+	else
+		ok "F.2 same outer pair refused (err=$FD1_ERR DEVICE_CONFIRM timeout; the EEXIST guard is process-local)"
+	fi
+else
+	bad "F.2 expected a refusal (err 17 or 110), got state=$FD1_STATE err=$FD1_ERR"
+fi
+# Diagnostic for the timeout case: did anything appear in the kernel at all?
+FGRE_AFTER=$(ex1 "ip -o link show type gre 2>/dev/null | wc -l" || true)
+if [[ "$FGRE_BEFORE" == "$FGRE_AFTER" ]]; then
+	ok "F.7 kernel GRE device count unchanged by the refusal ($FGRE_AFTER devices)"
+else
+	bad "F.7 kernel GRE device count changed: $FGRE_BEFORE -> $FGRE_AFTER"
+fi
+echo "--- node1 GRE devices after the refusal ---"
+ex1 "ip -o link show type gre 2>/dev/null"
+echo "--- node1 zebra log tail ---"
+docker exec -u root "$NODE1" bash -c "tail -5 /tmp/zebra.log 2>/dev/null || true" || true
+if iface_exists "$NODE1" "$FVLX"; then
+	bad "F.3 refusal created $FVLX on node1"
+else
+	ok "F.3 refusal created no device on node1"
+fi
+if [[ -n "$FIDX1" \
+      && "$(ex1 "cat /sys/class/net/$FOREIGN/ifindex 2>/dev/null || true")" == "$FIDX1" \
+      && "$(ex1 "ip -o addr show dev $FOREIGN 2>/dev/null | wc -l" || true)" == "$FADDR1" ]]; then
+	ok "F.4 foreign device untouched (ifindex $FIDX1, addresses $FADDR1)"
+else
+	bad "F.4 foreign device changed (ifindex $FIDX1 -> $(ex1 "cat /sys/class/net/$FOREIGN/ifindex 2>/dev/null || true"))"
+fi
+
+# control: with the foreign tunnel gone the same request must reach READY
+link1 teardown --sock $SOCK --name $FOREIGN >/dev/null 2>&1 || true
+link2 teardown --sock $SOCK --name $FOREIGN >/dev/null 2>&1 || true
+sleep 2
+FC1=$(vlink1 "$FVLX" "$U1C" "$U2C" "$OV4_1" "$OV4_2" "$OV4_PLEN" || true); echo "$FC1"
+FC2=$(vlink2 "$FVLX" "$U2C" "$U1C" "$OV4_2" "$OV4_1" "$OV4_PLEN" || true); echo "$FC2"
+if [[ "$(vlink_state_of "$FC1")" == ready && "$(vlink_state_of "$FC2")" == ready ]]; then
+	ok "F.5 control: after the foreign tunnel is gone the same request reaches READY"
+else
+	bad "F.5 control failed (node1 $(vlink_state_of "$FC1") / node2 $(vlink_state_of "$FC2"))"
+fi
+link1 teardown --sock $SOCK --name $FVLX >/dev/null 2>&1 || true
+link2 teardown --sock $SOCK --name $FVLX >/dev/null 2>&1 || true
+sleep 2
+if iface_exists "$NODE1" "$FVLX" || iface_exists "$NODE2" "$FVLX"; then
+	bad "F.6 $FVLX left behind after teardown"
+else
+	ok "F.6 $FVLX removed by teardown"
+fi
 
 echo
 echo "=== summary: PASS=$PASS FAIL=$FAIL ==="

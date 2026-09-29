@@ -307,8 +307,8 @@ $(BUILD_DIR)/midrd-gre-tool.o: gre-link-tool.c midrd.c midr-context.h midr-conte
 $(BUILD_DIR)/midrd-gre-tool: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-gre-tool.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
-$(BUILD_DIR)/midrd-dp-e2e-tool.o: dp-e2e-tool.c midrd.c midr-context.h midr-context-private.h midr-consumer.h midr-dp-backend.h midr-gre.h midr-spf.h midr-spf-install.h midr-ted.h midr-zebra.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c dp-e2e-tool.c -o $@
+$(BUILD_DIR)/midrd-dp-e2e-tool.o: $(TESTDIR)/dp-e2e-tool.c midrd.c midr-context.h midr-context-private.h midr-consumer.h midr-dp-backend.h midr-gre.h midr-spf.h midr-spf-install.h midr-ted.h midr-zebra.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c $(TESTDIR)/dp-e2e-tool.c -o $@
 
 $(BUILD_DIR)/midrd-dp-e2e-tool: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-dp-e2e-tool.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@

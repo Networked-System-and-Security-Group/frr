@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # group-3 isolated real ZAPI / zebra RIB / Linux FIB test.
 #
-# Drives the third-group facade through midrd/dp-e2e-tool.c against a real,
+# Drives the third-group facade through midr-test/dp-e2e-tool.c against a real,
 # freshly built zebra, and verifies the kernel FIB (proto 199).  It does NOT
 # depend on group-2 LS flooding, so it validates the third-group migration on
 # its own.  The serve-ted phase additionally exercises the full midrd chain
