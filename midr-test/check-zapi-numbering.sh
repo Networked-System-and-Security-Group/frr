@@ -11,10 +11,12 @@
 #
 # This gate fails if:
 #   * a pre-existing member of the enum changed ordinal, or
-#   * the working tree appended anything other than ZEBRA_GRE_ADD and
-#     ZEBRA_GRE_DELETE (which must land at the very end of the enum), or
+#   * the working tree appended anything outside the whitelist
+#     (ZEBRA_GRE_ADD, ZEBRA_GRE_DELETE, ZEBRA_INTERFACE_ADDRESS_SET,
+#     ZEBRA_INTERFACE_ADDRESS_UNSET, ZEBRA_INTERFACE_SET_ADMIN_UP), which
+#     must all land at the very end of the enum, or
 #   * lib/log.c command_types[] is no longer ordered consistently with the
-#     enum, or gained/lost/reordered non-GRE entries.
+#     enum, or gained/lost/reordered non-new entries.
 #
 # Why the baseline is normalised: this branch's baseline (default
 # 1adb4c92d0) already carries ZEBRA_GRE_ADD/ZEBRA_GRE_DELETE *inside* the
@@ -22,7 +24,7 @@
 # names are therefore removed from the baseline before the ordinal comparison,
 # so that the remaining members are the genuine "pre-existing" set.  A correct
 # fix keeps every one of them at its original ordinal and simply appends the
-# two GRE names, and this gate must not false-positive on that.
+# whitelisted names, and this gate must not false-positive on that.
 #
 # On the command_types[] positional check: the table is built with designated
 # initialisers `[(T)] = {...}`, so array[T] is correct regardless of source
@@ -54,6 +56,13 @@ LOGFILE=lib/log.c
 DEFAULT_BASELINE=1adb4c92d0
 GRE_ADD=ZEBRA_GRE_ADD
 GRE_DEL=ZEBRA_GRE_DELETE
+IFACE_ADDR_SET=ZEBRA_INTERFACE_ADDRESS_SET
+IFACE_ADDR_UNSET=ZEBRA_INTERFACE_ADDRESS_UNSET
+IFACE_ADMIN_UP=ZEBRA_INTERFACE_SET_ADMIN_UP
+# Messages that may legitimately be appended after the baseline enum tail.
+NEW_MESSAGES="$GRE_ADD $GRE_DEL $IFACE_ADDR_SET"
+NEW_MESSAGES="$NEW_MESSAGES $IFACE_ADDR_UNSET $IFACE_ADMIN_UP"
+NEW_COUNT=5
 
 usage() {
 	sed -n '2,8p;/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
@@ -135,12 +144,19 @@ err() { echo "check-zapi-numbering: FAIL: $*" >&2; fail=1; }
 rev_file "$BASELINE" "$HEADER" | enum_dump > "$TMP/base.enum"
 enum_dump < "$HEADER" > "$TMP/work.enum"
 
-# Reference = baseline with the two GRE members stripped and re-indexed so
-# that it represents the members that existed before the GRE feature.
-awk -F'\t' -v a="$GRE_ADD" -v d="$GRE_DEL" '
-	$2 == a || $2 == d { next }
-	{ printf "%d\t%s\n", n, $2; n++ }
-' "$TMP/base.enum" > "$TMP/ref.enum"
+# Names that are legitimately appended by this branch.  They are excluded
+# from the baseline reference and from the ordering/positional comparisons
+# below, because their source position in the partial command_types[] table
+# cannot be assumed to line up with their newly appended enum ordinal.
+printf '%s\n' $NEW_MESSAGES | sort > "$TMP/new.messages"
+
+# Reference = baseline with every appended member stripped and re-indexed so
+# that it represents the members that existed before this feature.  On the
+# real baseline only the two GRE names are present, so this is equivalent to
+# removing exactly those; under the WORKTREE smoke mode all five are removed.
+awk -F'\t' 'NR == FNR { skip[$1] = 1; next }
+	!($2 in skip) { printf "%d\t%s\n", n, $2; n++ }
+' "$TMP/new.messages" "$TMP/base.enum" > "$TMP/ref.enum"
 
 # Full dumps are diagnostics for a failing run; keep the gate quiet by default.
 if [ -n "${ZAPI_NUMBERING_VERBOSE:-}" ]; then
@@ -163,24 +179,26 @@ while IFS="$(printf '\t')" read -r ord name; do
 		|| err "pre-existing member $name changed ordinal: baseline=$ord working=$work_ord"
 done < "$TMP/ref.enum"
 
-# --- assertion 2: only the two GRE members were appended, at the tail -------
+# --- assertion 2: only the whitelisted members were appended, at the tail ---
 ref_n=$(wc -l < "$TMP/ref.enum" | tr -d ' ')
 work_n=$(wc -l < "$TMP/work.enum" | tr -d ' ')
 awk -F'\t' 'NR == FNR { ref[$2] = 1; next } !($2 in ref) { print $2 }' \
 	"$TMP/ref.enum" "$TMP/work.enum" | sort > "$TMP/extra"
-printf '%s\n%s\n' "$GRE_ADD" "$GRE_DEL" | sort > "$TMP/extra.ok"
+printf '%s\n' $NEW_MESSAGES | sort > "$TMP/extra.ok"
 if ! diff -u "$TMP/extra.ok" "$TMP/extra" > "$TMP/extra.diff"; then
-	err "working tree appended members other than $GRE_ADD/$GRE_DEL:"
+	err "working tree appended members outside the whitelist ($NEW_MESSAGES):"
 	sed 's/^/    /' "$TMP/extra.diff" >&2
 fi
-[ "$work_n" -eq $((ref_n + 2)) ] \
-	|| err "working-tree enum has $work_n members, expected $((ref_n + 2))"
-gre_add_ord=$(awk -F'\t' -v n="$GRE_ADD" '$2 == n { print $1 }' "$TMP/work.enum")
-gre_del_ord=$(awk -F'\t' -v n="$GRE_DEL" '$2 == n { print $1 }' "$TMP/work.enum")
-[ "$gre_add_ord" = "$ref_n" ] \
-	|| err "$GRE_ADD ordinal is $gre_add_ord, expected $ref_n (must be appended)"
-[ "$gre_del_ord" = "$((ref_n + 1))" ] \
-	|| err "$GRE_DEL ordinal is $gre_del_ord, expected $((ref_n + 1)) (must be appended)"
+[ "$work_n" -eq $((ref_n + NEW_COUNT)) ] \
+	|| err "working-tree enum has $work_n members, expected $((ref_n + NEW_COUNT))"
+# Every whitelisted name must land, in order, at the very end of the enum.
+expected=$ref_n
+for name in $NEW_MESSAGES; do
+	ord=$(awk -F'\t' -v n="$name" '$2 == n { print $1 }' "$TMP/work.enum")
+	[ "$ord" = "$expected" ] \
+		|| err "$name ordinal is $ord, expected $expected (must be appended)"
+	expected=$((expected + 1))
+done
 
 # --- assertion 3: command_types[] still mirrors the enum --------------------
 rev_file "$BASELINE" "$LOGFILE" | desc_dump > "$TMP/base.desc"
@@ -200,18 +218,28 @@ if ! awk -F'\t' 'BEGIN { bad = 0; p = -1 }
 	err "command_types[] source order does not follow the enum ordinal order"
 fi
 
-if ! tail -n 2 "$TMP/work.desc" | awk -F'\t' -v a="$GRE_ADD" -v d="$GRE_DEL" \
-	'{ n[NR] = $2 } END { exit !(NR == 2 && n[1] == a && n[2] == d) }'; then
-	err "$GRE_ADD/$GRE_DEL DESC_ENTRY lines are not the appended tail of command_types[]"
+if ! tail -n "$NEW_COUNT" "$TMP/work.desc" \
+	| awk -F'\t' '{ print $2 }' > "$TMP/work.desc.tail"; then
+	: > "$TMP/work.desc.tail"
+fi
+printf '%s\n' $NEW_MESSAGES > "$TMP/extra.ok.ordered"
+if ! diff -q "$TMP/extra.ok.ordered" "$TMP/work.desc.tail" > /dev/null; then
+	err "appended DESC_ENTRY lines are not the tail of command_types[]:"
+	diff -u "$TMP/extra.ok.ordered" "$TMP/work.desc.tail" | sed 's/^/    /' >&2
 fi
 
 # Positional mismatches ("the Nth DESC_ENTRY must describe the enum value at
 # the Nth slot") are compared as a set against the baseline to tolerate the
 # pre-existing partial-table gap and to catch any *new* positional breakage.
-awk -F'\t' '$3 != "?" && ($3 + 0) != $1 { print $2 }' "$TMP/work.desc.ord" | sort > "$TMP/work.posmm"
+# Newly appended names are excluded: their appended enum ordinal need not
+# equal their source index in the partial table.
+awk -F'\t' '$3 != "?" && ($3 + 0) != $1 { print $2 }' "$TMP/work.desc.ord" \
+	| sort > "$TMP/work.posmm.raw"
+grep -vFxf "$TMP/new.messages" "$TMP/work.posmm.raw" > "$TMP/work.posmm" || true
 awk -F'\t' 'NR == FNR { ord[$2] = $1 + 0; next }
 	($2 in ord) && (ord[$2] + 0) != $1 { print $2 }' \
-	"$TMP/base.enum" "$TMP/base.desc" | sort > "$TMP/base.posmm"
+	"$TMP/base.enum" "$TMP/base.desc" | sort > "$TMP/base.posmm.raw"
+grep -vFxf "$TMP/new.messages" "$TMP/base.posmm.raw" > "$TMP/base.posmm" || true
 if ! diff -q "$TMP/base.posmm" "$TMP/work.posmm" > /dev/null; then
 	err "command_types[] positional mismatches changed versus baseline (new positional breakage):"
 	diff -u "$TMP/base.posmm" "$TMP/work.posmm" | sed 's/^/    /' >&2
@@ -220,9 +248,11 @@ else
 	echo "note: $ref_n reference enum members; $posmm_n tolerated pre-existing positional gap(s) (unchanged vs baseline, e.g. ZEBRA_INTERFACE_SET_ARP has no DESC_ENTRY)"
 fi
 
-# Non-GRE DESC_ENTRY entries must not be reordered.
-awk -F'\t' -v a="$GRE_ADD" -v d="$GRE_DEL" '$2 != a && $2 != d { print $2 }' "$TMP/work.desc" > "$TMP/work.desc.nongre"
-awk -F'\t' -v a="$GRE_ADD" -v d="$GRE_DEL" '$2 != a && $2 != d { print $2 }' "$TMP/base.desc" > "$TMP/base.desc.nongre"
+# Newly appended DESC_ENTRY entries must not disturb pre-existing ones.
+awk -F'\t' 'NR == FNR { skip[$1] = 1; next } !($2 in skip) { print $2 }' \
+	"$TMP/new.messages" "$TMP/work.desc" > "$TMP/work.desc.nongre"
+awk -F'\t' 'NR == FNR { skip[$1] = 1; next } !($2 in skip) { print $2 }' \
+	"$TMP/new.messages" "$TMP/base.desc" > "$TMP/base.desc.nongre"
 if ! diff -q "$TMP/base.desc.nongre" "$TMP/work.desc.nongre" > /dev/null; then
 	err "pre-existing command_types[] entries were reordered versus baseline:"
 	diff -u "$TMP/base.desc.nongre" "$TMP/work.desc.nongre" | sed 's/^/    /' >&2

@@ -40,7 +40,10 @@ INSTALL_OBJECTS = $(BUILD_DIR)/midr-spf-install.o \
 
 # Third-group data plane: zclient backed route installation plus GRE
 # virtual-interface provisioning.  Requires the common libfrr zclient.
-DP_OBJECTS = $(BUILD_DIR)/midr-dp-backend.o $(BUILD_DIR)/midr-gre.o
+# midr-virtual-link.o is the high-level virtual-link service on top of
+# midr-gre.o; it also needs the P1 overlay-address / admin-up primitives.
+DP_OBJECTS = $(BUILD_DIR)/midr-dp-backend.o $(BUILD_DIR)/midr-gre.o \
+	$(BUILD_DIR)/midr-virtual-link.o
 
 all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midr-prefix-provider-test $(BUILD_DIR)/midrd-wire-test \
@@ -61,6 +64,7 @@ all: $(BUILD_DIR)/midrd-contract-test $(BUILD_DIR)/midrd-core-test \
 	$(BUILD_DIR)/midrd-spf-install-test \
 	$(BUILD_DIR)/midrd-dp-test \
 	$(BUILD_DIR)/midrd-gre-registry-test \
+	$(BUILD_DIR)/midrd-virtual-link-test \
 	$(BUILD_DIR)/midrd-sync-test $(BUILD_DIR)/midrd-scale-test \
 	$(BUILD_DIR)/midrd-gre-tool \
 	$(BUILD_DIR)/midrd-dp-e2e-tool \
@@ -159,7 +163,7 @@ $(BUILD_DIR)/midrd-consumer-test.o: consumer-test.c midr-consumer.h | $(BUILD_DI
 $(BUILD_DIR)/midrd-consumer-test: $(BUILD_DIR)/midr-core.o $(BUILD_DIR)/midr-consumer.o $(BUILD_DIR)/midrd-consumer-test.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@
 
-$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd.o: midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h midr-virtual-link.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midrd.c -o $@
 
 $(BUILD_DIR)/midr-prefix-provider.o: midr-prefix-provider.c midr-prefix-provider.h midr-core.h | $(BUILD_DIR)
@@ -221,6 +225,15 @@ $(BUILD_DIR)/midr-dp-backend.o: midr-dp-backend.c midr-dp-backend.h midr-zebra.h
 
 $(BUILD_DIR)/midr-gre.o: midr-gre.c midr-gre.h midr-dp-backend.h midr-context.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-gre.c -o $@
+
+$(BUILD_DIR)/midr-virtual-link.o: midr-virtual-link.c midr-virtual-link.h midr-gre.h midr-dp-backend.h midr-context.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c midr-virtual-link.c -o $@
+
+$(BUILD_DIR)/midrd-virtual-link-test.o: virtual-link-test.c midrd.c midr-context.h midr-context-private.h midr-dp-backend.h midr-gre.h midr-virtual-link.h midr-ted.h midr-zebra.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c virtual-link-test.c -o $@
+
+$(BUILD_DIR)/midrd-virtual-link-test: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-virtual-link-test.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wl,--wrap=zclient_send_gre_add -Wl,--wrap=zclient_send_gre_delete -Wl,--wrap=zclient_send_interface_address_set -Wl,--wrap=zclient_send_interface_address_unset -Wl,--wrap=zclient_send_interface_admin_up -Wl,--wrap=calloc $^ $(FRR_LDFLAGS) $(FRR_LIB) -o $@
 
 $(BUILD_DIR)/midrd-dp-test.o: dp-backend-test.c midrd.c midr-context.h midr-context-private.h midr-spf.h midr-spf-install.h midr-zebra.h midr-dp-backend.h midr-gre.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c dp-backend-test.c -o $@
@@ -284,7 +297,7 @@ $(BUILD_DIR)/midrd: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR
 
 # Standalone GRE link provisioning tool for the two-container connectivity
 # test.  It reuses the midrd translation unit, so it links the same objects.
-$(BUILD_DIR)/midrd-gre-tool.o: gre-link-tool.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h midr-dp-backend.h midr-gre.h | $(BUILD_DIR)
+$(BUILD_DIR)/midrd-gre-tool.o: gre-link-tool.c midrd.c midr-context.h midr-context-private.h midr-topology.h midr-cost.h midr-engine.h midr-core.h midr-local-ipc.h midr-local-provider.h midr-prefix-provider.h midr-prefix-ipc.h midr-session.h midr-session-private.h midr-spf.h midr-spf-install.h midr-ted.h midr-owned.h midr-scope.h midr-transport.h midr-wire.h midr-zebra.h midr-dp-backend.h midr-gre.h midr-virtual-link.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(FRR_CPPFLAGS) $(CFLAGS) $(FRR_CFLAGS) -c gre-link-tool.c -o $@
 
 $(BUILD_DIR)/midrd-gre-tool: $(CORE_OBJECTS) $(INSTALL_OBJECTS) $(DP_OBJECTS) $(BUILD_DIR)/midrd-gre-tool.o
@@ -320,6 +333,7 @@ test: all
 	$(BUILD_DIR)/midrd-spf-install-test
 	$(BUILD_DIR)/midrd-dp-test
 	$(BUILD_DIR)/midrd-gre-registry-test
+	$(BUILD_DIR)/midrd-virtual-link-test
 	$(BUILD_DIR)/midrd-sync-test
 	$(BUILD_DIR)/midrd-scale-test
 	./extraction-boundary-test.sh

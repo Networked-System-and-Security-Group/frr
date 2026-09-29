@@ -240,6 +240,10 @@ typedef enum {
 	ZEBRA_SRV6_SID_NOTIFY,
 	ZEBRA_GRE_ADD,
 	ZEBRA_GRE_DELETE,
+	/* MIDR virtual-link overlay address / admin-state provisioning. */
+	ZEBRA_INTERFACE_ADDRESS_SET,
+	ZEBRA_INTERFACE_ADDRESS_UNSET,
+	ZEBRA_INTERFACE_SET_ADMIN_UP,
 } zebra_message_types_t;
 /* Zebra message types. Please update the corresponding
  * command_types array with any changes!
@@ -1470,6 +1474,44 @@ zclient_send_gre_add(struct zclient *client, vrf_id_t vrf_id,
 extern enum zclient_send_status
 zclient_send_gre_delete(struct zclient *client, vrf_id_t vrf_id,
 			const char *ifname);
+
+/*
+ * MIDR virtual-link overlay address / admin-state provisioning.
+ *
+ * ZEBRA_INTERFACE_ADDRESS_SET / _UNSET ask zebra to install or remove an
+ * overlay address on an existing interface; ZEBRA_INTERFACE_SET_ADMIN_UP
+ * asks zebra to bring the interface administratively up or down.  zebra
+ * resolves the interface by ifindex when non-zero, otherwise by
+ * ifname + vrf_id.  Addresses are encoded with the same (family, address)
+ * scheme as the GRE tunnel endpoints.
+ */
+struct zclient_interface_address {
+	/* Netdevice name (IFNAMSIZ bytes, NUL-terminated). */
+	char ifname[IFNAMSIZ];
+
+	/* Interface index; 0 => let zebra resolve by ifname + vrf_id. */
+	ifindex_t ifindex;
+
+	/* Overlay address and its prefix length. */
+	struct ipaddr addr;
+	uint8_t prefixlen;
+
+	/* Optional peer address; IPADDR_NONE means "no peer". */
+	struct ipaddr peer;
+
+	/* Optional address label; empty string means "no label". */
+	char label[IFNAMSIZ];
+};
+
+extern enum zclient_send_status
+zclient_send_interface_address_set(struct zclient *client, vrf_id_t vrf_id,
+				   const struct zclient_interface_address *addr);
+extern enum zclient_send_status
+zclient_send_interface_address_unset(struct zclient *client, vrf_id_t vrf_id,
+				     const struct zclient_interface_address *addr);
+extern enum zclient_send_status
+zclient_send_interface_admin_up(struct zclient *client, vrf_id_t vrf_id,
+				const char *ifname, bool up);
 
 #ifdef __cplusplus
 }

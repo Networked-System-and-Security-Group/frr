@@ -25,6 +25,7 @@
 #include "midr-ted.h"
 #include "midr-owned.h"
 #include "midr-transport.h"
+#include "midr-virtual-link.h"
 #include "midr-wire.h"
 #include "midr-zebra.h"
 
@@ -3167,9 +3168,11 @@ static void midr_context_finish(struct midr_context *daemon)
 
 	if (!daemon)
 		return;
-	/* GRE first: it borrows the data-plane zclient.  The backend then
-	 * unregisters, which withdraws the accepted SPF routes and flushes
-	 * immediately, before its zclient is destroyed. */
+	/* GRE and the virtual-link service borrow the data-plane zclient;
+	 * tear them down first.  The backend then unregisters, which
+	 * withdraws the accepted SPF routes and flushes immediately, before
+	 * its zclient is destroyed. */
+	midr_virtual_link_fini();
 	midr_gre_fini();
 	midr_dp_backend_stop();
 	while ((spf_consumer = daemon->spf_consumers))
@@ -3482,6 +3485,7 @@ int main(int argc, char **argv, char **envp)
 			goto fail;
 		}
 		midr_gre_init(daemon.master);
+		midr_virtual_link_init(daemon.master);
 	}
 	if (prefix_socket) {
 		struct midr_prefix_ipc_config ipc_config = {

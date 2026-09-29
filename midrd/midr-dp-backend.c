@@ -1109,6 +1109,38 @@ static void dp_cold_submit(struct midr_dp_backend *b)
 	dp_schedule_recovery(b, ret);
 }
 
+/*
+ * Zebra broadcasts address add/delete for the interfaces it manages, but
+ * unlike the device level notifications (ZEBRA_INTERFACE_ADD/DELETE/UP/DOWN,
+ * which lib_handlers[] in lib/zclient.c decodes for *every* client) the
+ * address notifications are NOT part of that shared library handler table.
+ * A client that needs to observe the addresses of an interface it provisioned
+ * must therefore register them itself -- which is exactly what the MIDR
+ * virtual link overlay needs: midr_virtual_link_overlay_reachable() confirms
+ * READY by looking the overlay prefix up in this daemon's interface view
+ * (connected_lookup_prefix_exact()).  Without these handlers that view never
+ * receives the overlay address and the virtual link can never reach READY.
+ *
+ * lib_handlers[] still runs first (see zclient_read() in lib/zclient.c), so
+ * the device level notifications the GRE module relies on are unaffected;
+ * these handlers only add the address notifications on top.
+ *
+ * Decoding is delegated to libfrr's zebra_interface_address_read(), which
+ * creates/updates the connected entry on the interface object.
+ */
+static int midr_dp_interface_address_update(ZAPI_CALLBACK_ARGS)
+{
+	if (!zebra_interface_address_read(cmd, zclient->ibuf, vrf_id))
+		return -1;
+
+	return 0;
+}
+
+static zclient_handler *const midr_dp_handlers[] = {
+	[ZEBRA_INTERFACE_ADDRESS_ADD] = midr_dp_interface_address_update,
+	[ZEBRA_INTERFACE_ADDRESS_DELETE] = midr_dp_interface_address_update,
+};
+
 int midr_dp_backend_start(struct midr_context *ctx, struct event_loop *master,
 			  vrf_id_t vrf_id)
 {
@@ -1133,8 +1165,11 @@ int midr_dp_backend_start(struct midr_context *ctx, struct event_loop *master,
 	midr_dp_current = b;
 
 	/* zclient_init() schedules the connect event; zebra_connected performs
-	 * the replay once the socket is up. */
-	b->zc = zclient_new(master, &zclient_options_default, NULL, 0);
+	 * the replay once the socket is up.  The custom handler table adds the
+	 * interface address notifications (see midr_dp_handlers above); the
+	 * shared lib_handlers[] still decodes the device level notifications. */
+	b->zc = zclient_new(master, &zclient_options_default, midr_dp_handlers,
+			    array_size(midr_dp_handlers));
 	if (!b->zc) {
 		midr_dp_current = NULL;
 		dp_backend_destroy(b);

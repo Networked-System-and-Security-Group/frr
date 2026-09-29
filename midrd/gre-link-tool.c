@@ -15,6 +15,15 @@
  *
  * Usage:
  *   midrd-gre-tool setup|teardown [options]
+ *   midrd-gre-tool vlink-setup [options]
+ *
+ * The plain setup/teardown pair only creates/removes the GRE device
+ * (midr-gre.c).  vlink-setup drives the high-level virtual-link API
+ * (midr-virtual-link.c): device + overlay address + admin-up + READY, i.e.
+ * the same sequence the connectivity test used to script by hand with
+ * `ip addr add` / `ip link set up`.  Teardown reuses the plain `teardown`
+ * (the virtual-link registry is process-local, and deleting the GRE device
+ * removes its overlay addresses with it).
  *
  * Options:
  *   --sock    PATH  zebra ZAPI socket      (default /tmp/zserv.api)
@@ -23,12 +32,23 @@
  *   --remote  ADDR  tunnel destination     (setup, required)
  *   --mtu     N     tunnel MTU             (default 1400)
  *   --wait-ms N     establishment budget   (default 3000)
+ *   --overlay-local  ADDR   overlay local  (vlink-setup, required)
+ *   --overlay-remote ADDR   overlay peer   (vlink-setup, required)
+ *   --overlay-prefix N      overlay prefix (vlink-setup, required)
  *
  * Machine-readable status line on stdout:
- *   MIDR_GRE name=<n> state=<up|down|pending|failed> ifindex=<n> err=<n>
+ *   MIDR_GRE  name=<n> state=<up|down|pending|failed> ifindex=<n> err=<n>
+ *   MIDR_VLINK name=<n> state=<down|creating|device_up|configuring|ready|
+ *                              failed> ifindex=<n> iftype=<n> err=<n>
+ *                              overlay_local=<addr|none> overlay_remote=<addr|none>
+ *                              overlay_plen=<n> overlay_ready=<0|1>
+ *                              event=<none|device_up|address_set|ready|failed|down>
+ * The overlay_* and event tokens are appended so the existing name/state/ifindex/
+ * iftype/err parsers keep working; event is the transition that fired the
+ * notification (the query/status path reports event=none).
  *
  * Exit status: 0 when the requested action reached the expected state
- * (UP for setup, DOWN for teardown), non-zero otherwise.
+ * (UP/READY for setup, DOWN for teardown), non-zero otherwise.
  */
 
 #define main midrd_program_main
@@ -48,6 +68,7 @@
 #include "midr-context.h"
 #include "midr-dp-backend.h"
 #include "midr-gre.h"
+#include "midr-virtual-link.h"
 
 /* Wake-up-only callback: keeps the event loop honest while we block. */
 static void gre_tool_tick_cb(struct event *t)
@@ -95,6 +116,23 @@ static void gre_tool_fill_endpoint(struct ipaddr *ia, const char *addr)
 	}
 }
 
+/*
+ * Render an overlay address for the machine-readable status lines.
+ * ipaddr2str() is the tree-wide convention, but it yields an empty string
+ * for IPADDR_NONE (AF_UNSPEC); print an explicit "none" instead so a
+ * status/notify line that has no overlay yet stays deterministic and
+ * parsable instead of ending in a bare "overlay_local=".
+ */
+static const char *gre_tool_ipaddr_str(const struct ipaddr *ia, char *buf,
+				       size_t buflen)
+{
+	if (!ia || IS_IPADDR_NONE(ia)) {
+		snprintf(buf, buflen, "none");
+		return buf;
+	}
+	return ipaddr2str(ia, buf, (int)buflen);
+}
+
 static void gre_tool_notify_cb(const struct midr_gre_status *st, void *arg)
 {
 	(void)arg;
@@ -111,29 +149,99 @@ static void gre_tool_status_line(const char *name,
 	fflush(stdout);
 }
 
+static void gre_tool_vlink_notify_cb(
+	const struct midr_virtual_link_status *st, void *arg)
+{
+	char obuf[IPADDR_STRING_SIZE], rbuf[IPADDR_STRING_SIZE];
+
+	(void)arg;
+	printf("    [notify] %s: state=%s ifindex=%u iftype=%u err=%d "
+	       "overlay_local=%s overlay_remote=%s overlay_plen=%u "
+	       "overlay_ready=%u event=%s\n",
+	       st->ifname, midr_virtual_link_state_str(st->state), st->ifindex,
+	       st->iftype, st->last_error,
+	       gre_tool_ipaddr_str(&st->overlay_local, obuf, sizeof(obuf)),
+	       gre_tool_ipaddr_str(&st->overlay_remote, rbuf, sizeof(rbuf)),
+	       st->overlay_prefix_len, st->overlay_ready ? 1u : 0u,
+	       midr_virtual_link_event_str(st->event));
+	fflush(stdout);
+}
+
+static void gre_tool_vlink_status_line(
+	const char *name, const struct midr_virtual_link_status *st)
+{
+	char obuf[IPADDR_STRING_SIZE], rbuf[IPADDR_STRING_SIZE];
+
+	printf("MIDR_VLINK name=%s state=%s ifindex=%u iftype=%u err=%d "
+	       "overlay_local=%s overlay_remote=%s overlay_plen=%u "
+	       "overlay_ready=%u event=%s\n",
+	       name, midr_virtual_link_state_str(st->state), st->ifindex,
+	       st->iftype, st->last_error,
+	       gre_tool_ipaddr_str(&st->overlay_local, obuf, sizeof(obuf)),
+	       gre_tool_ipaddr_str(&st->overlay_remote, rbuf, sizeof(rbuf)),
+	       st->overlay_prefix_len, st->overlay_ready ? 1u : 0u,
+	       midr_virtual_link_event_str(st->event));
+	fflush(stdout);
+}
+
+/* One-line failure report in whichever machine-readable format the caller
+ * asked for, so the connectivity script always has a parsable status. */
+static void gre_tool_fail(const char *name, bool vlink, int err)
+{
+	if (vlink)
+		printf("MIDR_VLINK name=%s state=failed ifindex=0 iftype=0 "
+		       "err=%d\n",
+		       name, err);
+	else
+		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
+		       err);
+	fflush(stdout);
+}
+
+
 int main(int argc, char **argv)
 {
 	const char *sock = "/tmp/zserv.api";
 	const char *name = "midr0";
 	const char *local = NULL, *remote = NULL;
+	const char *overlay_local = NULL, *overlay_remote = NULL;
 	uint32_t mtu = 1400, wait_ms = 3000;
+	uint32_t overlay_prefix = 0;
+	bool has_overlay_prefix = false;
 	struct midr_ted_config ted_config = {
 		.max_events = 16,
 	};
 	struct midr_context ctx;
 	struct midr_gre_status st;
+	struct midr_virtual_link_status vst;
+	enum {
+		MODE_SETUP,
+		MODE_TEARDOWN,
+		MODE_VLINK_SETUP,
+	} mode;
 	bool setup;
+	bool vlink;
 	int rc = 1;
 
-	if (argc < 2 ||
-	    (strcmp(argv[1], "setup") != 0 &&
-	     strcmp(argv[1], "teardown") != 0)) {
-		printf("usage: %s setup|teardown [--sock P] [--name N] "
-		       "--local A --remote B [--mtu N] [--wait-ms N]\n",
+	if (argc < 2 || (!strcmp(argv[1], "setup") != 0 &&
+			  !strcmp(argv[1], "teardown") != 0 &&
+			  !strcmp(argv[1], "vlink-setup") != 0)) {
+		printf("usage: %s setup|teardown|vlink-setup [--sock P] "
+		       "[--name N] --local A --remote B [--mtu N] "
+		       "[--wait-ms N] [--overlay-local A --overlay-remote B "
+		       "--overlay-prefix N]\n",
 		       argv[0]);
 		return 2;
 	}
-	setup = strcmp(argv[1], "setup") == 0;
+	if (!strcmp(argv[1], "setup"))
+		mode = MODE_SETUP;
+	else if (!strcmp(argv[1], "teardown"))
+		mode = MODE_TEARDOWN;
+	else
+		mode = MODE_VLINK_SETUP;
+
+	setup = (mode == MODE_SETUP || mode == MODE_VLINK_SETUP);
+	vlink = (mode == MODE_VLINK_SETUP);
 
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--sock") && i + 1 < argc)
@@ -148,7 +256,14 @@ int main(int argc, char **argv)
 			mtu = strtoul(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "--wait-ms") && i + 1 < argc)
 			wait_ms = strtoul(argv[++i], NULL, 10);
-		else {
+		else if (!strcmp(argv[i], "--overlay-local") && i + 1 < argc)
+			overlay_local = argv[++i];
+		else if (!strcmp(argv[i], "--overlay-remote") && i + 1 < argc)
+			overlay_remote = argv[++i];
+		else if (!strcmp(argv[i], "--overlay-prefix") && i + 1 < argc) {
+			overlay_prefix = strtoul(argv[++i], NULL, 10);
+			has_overlay_prefix = true;
+		} else {
 			printf("unknown/incomplete option: %s\n", argv[i]);
 			return 2;
 		}
@@ -157,19 +272,23 @@ int main(int argc, char **argv)
 		printf("setup requires --local and --remote\n");
 		return 2;
 	}
+	if (mode == MODE_VLINK_SETUP &&
+	    (!overlay_local || !overlay_remote || !has_overlay_prefix)) {
+		printf("vlink-setup requires --overlay-local, --overlay-remote "
+		       "and --overlay-prefix\n");
+		return 2;
+	}
 
 	/* Minimal MIDR host bootstrap, mirroring midrd's data-plane path. */
 	memset(&ctx, 0, sizeof(ctx));
 	snprintf(frr_zclientpath, sizeof(frr_zclientpath), "%s", sock);
 	if (!frr_zclient_addr(&zclient_addr, &zclient_addr_len, sock)) {
-		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
-		       EINVAL);
+		gre_tool_fail(name, vlink, EINVAL);
 		return 1;
 	}
 	ctx.master = event_master_create("midr-gre-tool");
 	if (!ctx.master) {
-		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
-		       ENOMEM);
+		gre_tool_fail(name, vlink, ENOMEM);
 		return 1;
 	}
 
@@ -177,23 +296,50 @@ int main(int argc, char **argv)
 	vrf_get(VRF_DEFAULT, VRF_DEFAULT_NAME);
 
 	if (midr_ted_create(&ted_config, &ctx.ted)) {
-		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
-		       ENOMEM);
+		gre_tool_fail(name, vlink, ENOMEM);
 		goto out;
 	}
 	if (midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT)) {
-		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
-		       ENOTCONN);
+		gre_tool_fail(name, vlink, ENOTCONN);
 		goto out;
 	}
 	midr_gre_init(ctx.master);
+	midr_virtual_link_init(ctx.master);
 
 	if (!gre_tool_wait_zebra(ctx.master, 5000)) {
-		printf("MIDR_GRE name=%s state=failed ifindex=0 err=%d\n", name,
-		       ENOTCONN);
+		gre_tool_fail(name, vlink, ENOTCONN);
 		goto out;
 	}
 	midr_gre_register_notify(gre_tool_notify_cb, NULL);
+
+	/* vlink-setup: device + overlay address + admin-up, confirmed by READY. */
+	if (vlink) {
+		struct midr_virtual_link_desc d = {};
+
+		memset(&vst, 0, sizeof(vst));
+		strlcpy(d.ifname, name, sizeof(d.ifname));
+		d.vrf_id = VRF_DEFAULT;
+		gre_tool_fill_endpoint(&d.outer_local, local);
+		gre_tool_fill_endpoint(&d.outer_remote, remote);
+		d.mtu = mtu;
+		gre_tool_fill_endpoint(&d.overlay_local, overlay_local);
+		gre_tool_fill_endpoint(&d.overlay_remote, overlay_remote);
+		d.overlay_prefix_len = (uint8_t)overlay_prefix;
+
+		midr_virtual_link_register_notify(gre_tool_vlink_notify_cb,
+						  NULL);
+		if (midr_virtual_link_add(&ctx, &d, &vst) != 0) {
+			gre_tool_vlink_status_line(name, &vst);
+			goto out;
+		}
+		if (!midr_virtual_link_wait_ready(&ctx, name, wait_ms, &vst)) {
+			gre_tool_vlink_status_line(name, &vst);
+			goto out;
+		}
+		gre_tool_vlink_status_line(name, &vst);
+		rc = vst.state == MIDR_VLINK_READY ? 0 : 1;
+		goto out;
+	}
 
 	if (!setup) {
 		if (midr_gre_interface_del(&ctx, name, &st) != 0) {
@@ -228,7 +374,9 @@ int main(int argc, char **argv)
 	}
 
 out:
+	midr_virtual_link_unregister_notify(gre_tool_vlink_notify_cb);
 	midr_gre_unregister_notify(gre_tool_notify_cb);
+	midr_virtual_link_fini();
 	midr_dp_backend_log_status("gre-tool");
 	midr_dp_backend_stop();
 	midr_gre_fini();

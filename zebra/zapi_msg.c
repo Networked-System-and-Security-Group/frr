@@ -4222,6 +4222,256 @@ static inline void zebra_gre_delete(ZAPI_HANDLER_ARGS)
 	return;
 }
 
+/*
+ * Decode a (family, address) pair written by zclient_gre_encode_addr() /
+ * zclient_encode_opt_addr().  AF_UNSPEC is accepted and yields IPADDR_NONE
+ * (used for the optional peer address).  Returns false on a malformed
+ * request; the caller stream_failure-returns in that case.
+ */
+static bool zebra_midr_decode_addr(struct stream *s, struct ipaddr *ia)
+{
+	uint8_t family;
+
+	STREAM_GETC(s, family);
+	if (family == AF_UNSPEC) {
+		SET_IPADDR_NONE(ia);
+		return true;
+	} else if (family == AF_INET) {
+		SET_IPADDR_V4(ia);
+		STREAM_GET(&ia->ipaddr_v4, s, sizeof(struct in_addr));
+	} else if (family == AF_INET6) {
+		SET_IPADDR_V6(ia);
+		STREAM_GET(&ia->ipaddr_v6, s, sizeof(struct in6_addr));
+	} else
+		return false;
+
+	return true;
+
+stream_failure:
+	return false;
+}
+
+/*
+ * Turn an ipaddr + prefix length into a masked struct prefix.  Returns
+ * false when the prefix length is out of range for the address family.
+ */
+static bool zebra_midr_ipaddr_to_prefix(const struct ipaddr *ia,
+					uint8_t prefixlen, struct prefix *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	if (IS_IPADDR_V4(ia)) {
+		if (prefixlen > 32)
+			return false;
+		p->family = AF_INET;
+		p->prefixlen = prefixlen;
+		p->u.prefix4 = ia->ipaddr_v4;
+	} else if (IS_IPADDR_V6(ia)) {
+		if (prefixlen > 128)
+			return false;
+		p->family = AF_INET6;
+		p->prefixlen = prefixlen;
+		p->u.prefix6 = ia->ipaddr_v6;
+	} else
+		return false;
+
+	/*
+	 * Do NOT mask the address.  An interface address keeps its host bits
+	 * (e.g. 192.168.100.1/30); prefixlen only describes the connected
+	 * route that will be derived from it.  Masking here installed the
+	 * network address in the kernel (192.168.100.0/30) and, because the
+	 * control plane confirms the overlay by an exact prefix match on the
+	 * address it asked for, the virtual link could never reach READY.
+	 */
+	return true;
+}
+
+/*
+ * Resolve the target interface of a MIDR overlay request.  A non-zero
+ * ifindex takes precedence; the ifname is used as a fallback.  Returns NULL
+ * when the interface is unknown.
+ */
+static struct interface *zebra_midr_lookup_if(struct zebra_vrf *zvrf,
+					      const char *ifname,
+					      ifindex_t ifindex)
+{
+	struct interface *ifp = NULL;
+
+	if (ifindex != 0)
+		ifp = if_lookup_by_index(ifindex, zvrf->vrf->vrf_id);
+	if (!ifp && ifname[0] != '\0')
+		ifp = if_lookup_by_name(ifname, zvrf->vrf->vrf_id);
+
+	return ifp;
+}
+
+/*
+ * Install an overlay address on an existing interface on behalf of a
+ * MIDR control-plane client.  See zclient_send_interface_address_set() in
+ * lib/zclient.c for the wire format of the request.
+ */
+static void zebra_interface_address_set(ZAPI_HANDLER_ARGS)
+{
+	struct stream *s = msg;
+	char ifname[IFNAMSIZ] = {};
+	char label[IFNAMSIZ] = {};
+	struct ipaddr addr, peer;
+	struct interface *ifp;
+	struct prefix p, pp;
+	ifindex_t ifindex;
+	uint8_t prefixlen;
+	bool has_peer;
+
+	STREAM_GET(ifname, s, IFNAMSIZ);
+	/* The wire field is a fixed IFNAMSIZ byte run; force termination so
+	 * later %s uses of a malformed request cannot read past the buffer.
+	 */
+	ifname[IFNAMSIZ - 1] = '\0';
+	STREAM_GETL(s, ifindex);
+	if (!zebra_midr_decode_addr(s, &addr))
+		goto stream_failure;
+	STREAM_GETC(s, prefixlen);
+	if (!zebra_midr_decode_addr(s, &peer))
+		goto stream_failure;
+	STREAM_GET(label, s, IFNAMSIZ);
+	label[IFNAMSIZ - 1] = '\0';
+
+	has_peer = !IS_IPADDR_NONE(&peer);
+
+	if (IS_IPADDR_NONE(&addr))
+		goto stream_failure;
+	if (!zebra_midr_ipaddr_to_prefix(&addr, prefixlen, &p)) {
+		zlog_warn(
+			"%s: invalid prefixlen %u for interface %s, dropping address set",
+			__func__, prefixlen, ifname[0] ? ifname : "<none>");
+		return;
+	}
+	if (has_peer
+	    && !zebra_midr_ipaddr_to_prefix(&peer,
+					    IS_IPADDR_V6(&peer) ? 128 : 32,
+					    &pp))
+		goto stream_failure;
+
+	ifp = zebra_midr_lookup_if(zvrf, ifname, ifindex);
+	if (!ifp) {
+		zlog_warn("%s: unknown interface %s (ifindex %u), dropping address set",
+			  __func__, ifname[0] ? ifname : "<none>", ifindex);
+		return;
+	}
+
+	if_ip_address_install(ifp, &p, label[0] ? label : NULL,
+			      has_peer ? &pp : NULL);
+
+	return;
+
+stream_failure:
+	return;
+}
+
+/*
+ * Remove an overlay address from an existing interface on behalf of a MIDR
+ * control-plane client.  See zclient_send_interface_address_unset().
+ */
+static void zebra_interface_address_unset(ZAPI_HANDLER_ARGS)
+{
+	struct stream *s = msg;
+	char ifname[IFNAMSIZ] = {};
+	struct ipaddr addr, peer;
+	struct interface *ifp;
+	struct prefix p, pp;
+	ifindex_t ifindex;
+	uint8_t prefixlen;
+	bool has_peer;
+
+	/* label is part of the wire format but is not needed on removal. */
+	STREAM_GET(ifname, s, IFNAMSIZ);
+	/* The wire field is a fixed IFNAMSIZ byte run; force termination so
+	 * later %s uses of a malformed request cannot read past the buffer.
+	 */
+	ifname[IFNAMSIZ - 1] = '\0';
+	STREAM_GETL(s, ifindex);
+	if (!zebra_midr_decode_addr(s, &addr))
+		goto stream_failure;
+	STREAM_GETC(s, prefixlen);
+	if (!zebra_midr_decode_addr(s, &peer))
+		goto stream_failure;
+	STREAM_FORWARD_GETP(s, IFNAMSIZ);
+
+	has_peer = !IS_IPADDR_NONE(&peer);
+
+	if (IS_IPADDR_NONE(&addr))
+		goto stream_failure;
+	if (!zebra_midr_ipaddr_to_prefix(&addr, prefixlen, &p)) {
+		zlog_warn(
+			"%s: invalid prefixlen %u for interface %s, dropping address unset",
+			__func__, prefixlen, ifname[0] ? ifname : "<none>");
+		return;
+	}
+	if (has_peer
+	    && !zebra_midr_ipaddr_to_prefix(&peer,
+					    IS_IPADDR_V6(&peer) ? 128 : 32,
+					    &pp))
+		goto stream_failure;
+
+	ifp = zebra_midr_lookup_if(zvrf, ifname, ifindex);
+	if (!ifp) {
+		zlog_warn("%s: unknown interface %s (ifindex %u), dropping address unset",
+			  __func__, ifname[0] ? ifname : "<none>", ifindex);
+		return;
+	}
+
+	/* if_ip_address_uninstall() asserts on a missing entry, so guard. */
+	if (!connected_check_ptp(ifp, &p, has_peer ? &pp : NULL)) {
+		zlog_warn("%s: address %pFX not configured on %s, dropping unset",
+			  __func__, &p, ifp->name);
+		return;
+	}
+
+	if_ip_address_uninstall(ifp, &p, has_peer ? &pp : NULL);
+
+	return;
+
+stream_failure:
+	return;
+}
+
+/*
+ * Bring an interface administratively up or down on behalf of a MIDR
+ * control-plane client.  See zclient_send_interface_admin_up().
+ */
+static void zebra_interface_set_admin_up(ZAPI_HANDLER_ARGS)
+{
+	struct stream *s = msg;
+	char ifname[IFNAMSIZ] = {};
+	struct interface *ifp;
+	ifindex_t ifindex;
+	uint8_t up;
+
+	STREAM_GET(ifname, s, IFNAMSIZ);
+	/* The wire field is a fixed IFNAMSIZ byte run; force termination so
+	 * later %s uses of a malformed request cannot read past the buffer.
+	 */
+	ifname[IFNAMSIZ - 1] = '\0';
+	STREAM_GETL(s, ifindex);
+	STREAM_GETC(s, up);
+
+	ifp = zebra_midr_lookup_if(zvrf, ifname, ifindex);
+	if (!ifp) {
+		zlog_warn("%s: unknown interface %s (ifindex %u), dropping admin %s",
+			  __func__, ifname[0] ? ifname : "<none>", ifindex,
+			  up ? "up" : "down");
+		return;
+	}
+
+	if (up)
+		if_no_shutdown(ifp);
+	else
+		if_shutdown(ifp);
+
+stream_failure:
+	return;
+}
+
 static void zsend_error_msg(struct zserv *client, enum zebra_error_types error,
 			    struct zmsghdr *bad_hdr)
 {
@@ -4350,6 +4600,9 @@ void (*const zserv_handlers[])(ZAPI_HANDLER_ARGS) = {
 	[ZEBRA_TC_CLASS_DELETE] = zread_tc_class,
 	[ZEBRA_TC_FILTER_ADD] = zread_tc_filter,
 	[ZEBRA_TC_FILTER_DELETE] = zread_tc_filter,
+	[ZEBRA_INTERFACE_ADDRESS_SET] = zebra_interface_address_set,
+	[ZEBRA_INTERFACE_ADDRESS_UNSET] = zebra_interface_address_unset,
+	[ZEBRA_INTERFACE_SET_ADMIN_UP] = zebra_interface_set_admin_up,
 };
 
 /*

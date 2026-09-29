@@ -5383,6 +5383,141 @@ zclient_send_gre_delete(struct zclient *client, vrf_id_t vrf_id,
 	return zclient_send_message(client);
 }
 
+/*
+ * Encode an optional address as (family, address).  A NONE address is
+ * encoded as a bare AF_UNSPEC byte, so the zebra-side decoder knows that
+ * no address bytes follow.
+ */
+static void zclient_encode_opt_addr(struct stream *s, const struct ipaddr *ia)
+{
+	if (IS_IPADDR_NONE(ia)) {
+		stream_putc(s, AF_UNSPEC);
+		return;
+	}
+
+	zclient_gre_encode_addr(s, ia);
+}
+
+/*
+ * Ask zebra to install an overlay address on an existing interface.
+ *
+ * Wire format (after the ZAPI header):
+ *   IFNAMSIZ bytes            ifname
+ *   uint32                    ifindex (0 => resolve by ifname + vrf)
+ *   uint8 family + address    overlay address (4 or 16 bytes)
+ *   uint8                     prefixlen
+ *   uint8 family + address    peer (AF_UNSPEC => none)
+ *   IFNAMSIZ bytes            label (may be empty)
+ */
+enum zclient_send_status
+zclient_send_interface_address_set(struct zclient *client, vrf_id_t vrf_id,
+				   const struct zclient_interface_address *addr)
+{
+	struct stream *s;
+
+	if (!client || client->sock < 0) {
+		zlog_err("%s : zclient not ready", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (!addr || (addr->ifname[0] == '\0' && addr->ifindex == 0)) {
+		zlog_err("%s : interface name or ifindex is mandatory",
+			 __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (IS_IPADDR_NONE(&addr->addr)) {
+		zlog_err("%s : overlay address is mandatory", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+
+	s = client->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_INTERFACE_ADDRESS_SET, vrf_id);
+	stream_put(s, addr->ifname, IFNAMSIZ);
+	stream_putl(s, addr->ifindex);
+	zclient_gre_encode_addr(s, &addr->addr);
+	stream_putc(s, addr->prefixlen);
+	zclient_encode_opt_addr(s, &addr->peer);
+	stream_put(s, addr->label, IFNAMSIZ);
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return zclient_send_message(client);
+}
+
+/*
+ * Ask zebra to remove an overlay address from an existing interface.
+ * Wire format is identical to zclient_send_interface_address_set().
+ */
+enum zclient_send_status
+zclient_send_interface_address_unset(struct zclient *client, vrf_id_t vrf_id,
+				     const struct zclient_interface_address *addr)
+{
+	struct stream *s;
+
+	if (!client || client->sock < 0) {
+		zlog_err("%s : zclient not ready", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (!addr || (addr->ifname[0] == '\0' && addr->ifindex == 0)) {
+		zlog_err("%s : interface name or ifindex is mandatory",
+			 __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (IS_IPADDR_NONE(&addr->addr)) {
+		zlog_err("%s : overlay address is mandatory", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+
+	s = client->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_INTERFACE_ADDRESS_UNSET, vrf_id);
+	stream_put(s, addr->ifname, IFNAMSIZ);
+	stream_putl(s, addr->ifindex);
+	zclient_gre_encode_addr(s, &addr->addr);
+	stream_putc(s, addr->prefixlen);
+	zclient_encode_opt_addr(s, &addr->peer);
+	stream_put(s, addr->label, IFNAMSIZ);
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return zclient_send_message(client);
+}
+
+/*
+ * Ask zebra to bring an interface administratively up (up=true) or down
+ * (up=false).
+ *
+ * Wire format (after the ZAPI header):
+ *   IFNAMSIZ bytes  ifname
+ *   uint32          ifindex (0 => resolve by ifname + vrf)
+ *   uint8           up (1 = up, 0 = down)
+ */
+enum zclient_send_status
+zclient_send_interface_admin_up(struct zclient *client, vrf_id_t vrf_id,
+				const char *ifname, bool up)
+{
+	struct stream *s;
+	char name[IFNAMSIZ] = {};
+
+	if (!client || client->sock < 0) {
+		zlog_err("%s : zclient not ready", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	if (!ifname || ifname[0] == '\0') {
+		zlog_err("%s : interface name is mandatory", __func__);
+		return ZCLIENT_SEND_FAILURE;
+	}
+	strlcpy(name, ifname, sizeof(name));
+
+	s = client->obuf;
+	stream_reset(s);
+	zclient_create_header(s, ZEBRA_INTERFACE_SET_ADMIN_UP, vrf_id);
+	stream_put(s, name, IFNAMSIZ);
+	stream_putl(s, 0);
+	stream_putc(s, up ? 1 : 0);
+	stream_putw_at(s, 0, stream_get_endp(s));
+
+	return zclient_send_message(client);
+}
+
 
 /*
  * Opaque notification features

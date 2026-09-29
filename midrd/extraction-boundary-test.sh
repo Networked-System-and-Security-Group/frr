@@ -51,6 +51,7 @@ $cc $flags -c "$tmp/contract.c" -o "$tmp/contract.o"
 cat >"$tmp/dp-contract.c" <<'EOF'
 #include "midr-dp-backend.h"
 #include "midr-gre.h"
+#include "midr-virtual-link.h"
 #include "midr-spf-install.h"
 #include "midr-zebra.h"
 int main(void) { return MIDR_SRV6_MAX_SEGS == 8 ? 0 : 1; }
