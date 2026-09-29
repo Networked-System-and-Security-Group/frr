@@ -276,7 +276,7 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 | 项 | 内容 |
 |---|---|
 | 会签对象 | `doc/midr-doc/dp-doc/midr-virtual-link-api.md`（行数见 §7.1）+ 本包 §3 变更清单（C1–C7）+ §4 九问 |
-| 第三组（数据面） | 接口已冻结。**C6/C7 扩展后的实测计数：待实测 / not measured**（上一轮对应 C1–C5 的实测为 组件 27 / GRE 45 / stage E 34 = **106 PASS, 0 FAIL**）—— 签名：__________ 日期：__________ |
+| 第三组（数据面） | 接口已冻结。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另 ZAPI 编号门禁 PASS**；可核查摘要见  —— 签名：__________ 日期：__________ |
 | 第一组（控制面/调用方） | 结论：☐ 照此批准　☐ 需修改（见下） —— 签名：__________ 日期：__________ |
 | 修改清单（若需修改） | 1. ____________________　2. ____________________　3. ____________________ |
 | 备注 | 本轮新增字段为**追加式**，回调签名不变，调用方源码兼容；若第一组要求把 overlay 字段镜像到 GRE 层，需先在本契约显式写明（见 C6）。 |
@@ -300,7 +300,7 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 | 权威签名（代码） | `midrd/midr-virtual-link.h` |
 | 底层设备 API（被复用，语义未改） | `midrd/midr-gre.{c,h}` |
 | 新增 ZAPI | `lib/zclient.{c,h}`（`ZEBRA_INTERFACE_ADDRESS_SET/_UNSET/SET_ADMIN_UP`，追加在 enum 末尾）、`zebra/zapi_msg.c` |
-| 实测证据日志 | 组件 `/tmp/tt2.log`；双容器 GRE `/tmp/gre-test3.log`、`/tmp/gre-test4.log`；stage E `/tmp/stageE-run.log`；vtysh `/tmp/p4-vtysh-midr-run.log`；缺陷 1 根因 `/tmp/p4-defect1-isolation.log` |
+| 实测证据日志 | 组件套件、双容器 GRE、stage E、vtysh 与缺陷 1 根因的原始日志（本轮与上一轮的运行记录，均在本组测试机上，未随仓库分发） |
 | 编号门禁 | `midr-test/check-zapi-numbering.sh`（基线 `1adb4c92d0`，PASS） |
-| 本轮（W3）新增面 | 契约 §3.1（event/overlay 字段）、§7.2/§7.3（D2/D3）、§8.2（D1/D4）、§9.2 用例 13-18；会签 §3 的 C6/C7。**实测计数待实测** |
+| 本轮（W3）新增面 | 契约 §3.1（event/overlay 字段）、§7.2/§7.3（D2/D3）、§8.2（D1/D4）、§9.2 用例 13-19；会签 §3 的 C6/C7。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另编号门禁 PASS**；|
 | 跨组提示 | 契约 §11 第 5 条：`midrd/midr-topology.h` 的 `struct midr_link_update` 无 prefix-length 字段（本轮 grep：`midrd/midr-topology.{h,c}` 无 `prefix_len`/`prefixlen`/`overlay`），第一组→第二组的 overlay nexthop+prefix 交接可能需在第一组/第二组侧补字段 |

@@ -22,13 +22,13 @@ stage E（BGP-only underlay）。契约变更的逐条影响见 §3.4 与会签�
 | # | 体检项 | 命令 / 对象 | 结果 | 判定 | 证据 |
 |---|---|---|---|---|---|
 | 1 | 容器源码树 ≡ 本地工作树 | 本轮 6 个改动文件 + 5 个未改文件 md5 | 逐一相同 | PASS | §1.1 |
-| 2 | `midrd` 组件套件（含 `midrd-virtual-link-test`） | 干净构建目录内组件 build + suite | **PASS=27 FAIL=0**（`grep -c ': PASS'` = 27、`grep -c ': FAIL'` = 0），**0 error**，日志末行 `SUITE_EXIT=0`；`midrd-virtual-link-test: PASS`；`standalone libfrr boundary scan: PASS` | PASS | `/tmp/rb-w3-suite.log` |
-| 3 | 顶层 `make -j112 -k` | 容器内 | `EXIT=0`（日志末行 `TOPMAKE_EXIT=0`），`warning:` 计数 **0** | PASS | `/tmp/rb-w3-topmake.log` |
-| 4 | 双容器 GRE 连通性（交付项 3） | 本轮新构建的 `midrd-gre-tool`（md5 `7c3bf35fea958e31d417315d24e3ad02`），零手工 `ip` | **PASS=51 FAIL=0**（含 6 条 overlay 交接断言） | PASS | `/tmp/rb-w3-gre.log` |
-| 5 | 跨 BGP-only underlay 验收（交付项 4） | stage E 复跑；staged zebra md5 `0aca362d964891d7a5c118069fbbc197` = 本轮新构建的 `zebra` | `EXIT=0`，**PASS=34 FAIL=0** | PASS | `/tmp/rb-w3-stagee.log` |
+| 2 | `midrd` 组件套件（含 `midrd-virtual-link-test`） | 干净构建目录内组件 build + suite | **PASS=27 FAIL=0**（`grep -c ': PASS'` = 27、`grep -c ': FAIL'` = 0），**0 error**，日志末行 `SUITE_EXIT=0`；`midrd-virtual-link-test: PASS`；`standalone libfrr boundary scan: PASS` | PASS | 本轮组件套件日志 |
+| 3 | 顶层 `make -j112 -k` | 容器内 | `EXIT=0`（日志末行 `TOPMAKE_EXIT=0`），`warning:` 计数 **0** | PASS | 本轮顶层构建日志 |
+| 4 | 双容器 GRE 连通性（交付项 3） | 本轮新构建的 `midrd-gre-tool`（md5 `7c3bf35fea958e31d417315d24e3ad02`），零手工 `ip` | **PASS=51 FAIL=0**（含 6 条 overlay 交接断言） | PASS | 本轮 GRE 日志 |
+| 5 | 跨 BGP-only underlay 验收（交付项 4） | stage E 复跑；staged zebra md5 `0aca362d964891d7a5c118069fbbc197` = 本轮新构建的 `zebra` | `EXIT=0`，**PASS=34 FAIL=0** | PASS | 本轮 stage E 日志 |
 
 **本轮（W3）三套实测合计：PASS = 27（组件）+ 51（GRE）+ 34（stage E）= 112，FAIL = 0**；
-组件套件 `: FAIL` = 0 且日志末行 `SUITE_EXIT=0`（`/tmp/rb-w3-suite.log`，§2.1），
+组件套件 `: FAIL` = 0 且日志末行 `SUITE_EXIT=0`（本轮组件套件日志，§2.1），
 GRE（51）与 stage E（34）的 `FAIL=0` 见各自日志。
 另有**独立于上表**的 2 项 PASS：顶层全量构建（§2.4）与 `check-zapi-numbering` 门禁
 （§2.3，本轮末补跑，不并入上面的 112 计数）。
@@ -42,12 +42,12 @@ GRE（51）与 stage E（34）的 `FAIL=0` 见各自日志。
 
 | # | 项 | 上一轮（旧源码）结果 | 与 W3 的关系 |
 |---|---|---|---|
-| 2′ | 组件套件 | **PASS=27 FAIL=0**（`/tmp/tt.log`，宿主副本 `/tmp/p4-tt.log`） | 计数相同，但**用例集合已变**：W3 新增用例 13/14/15/16a/16b/17/18（D1–D4）与 case 19（D1a）位于**同一测试程序** `midrd-virtual-link-test` 内，因此 `: PASS` 行数不变 |
-| 4′ | 双容器 GRE | **PASS=45 FAIL=0**（`/tmp/gre-test3.log`、`/tmp/gre-test4.log`） | W3 升至 **51**：脚本新增 **6 条 overlay 交接断言**（**非回归**，见 §4.3） |
-| 5′ | stage E | **PASS=34 FAIL=0**（`/tmp/stageE-run.log`） | 计数相同，但 W3 跑在**本轮新构建**的产物上（§1.2、§5.2） |
-| 8′ | 顶层全量构建 | 增量 `EXIT=0`、重编对象 0 warning（`/tmp/p4-fullbuild.log`） | W3 为独立一轮 `make -j112 -k`，`EXIT=0`、`warning:` = 0（§2.4） |
-| 10′ | test-only seam 收敛（删 4 个死符号） | 引用数 0；`.c` 1028→**907** 行、`.h` 243→**213** 行；套件 `EXIT=0`（`/tmp/tt2.log`） | W3 的 `.c` 已增至 **1187** 行、`.h` 至 **250** 行（§1.1），907/213 属旧源码 |
-| 12′ | `vtysh` → midrd 的 MIDR CLI 分发 | PASS（`/tmp/p4-vtysh-midr-run.log`） | 属上一轮的收尾项，W3 **未重跑**（见 §6 U-2） |
+| 2′ | 组件套件 | **PASS=27 FAIL=0**（`上一轮组件套件日志`，宿主副本 `上一轮组件套件日志的宿主副本`） | 计数相同，但**用例集合已变**：W3 新增用例 13/14/15/16a/16b/17/18（D1–D4）与 case 19（D1a）位于**同一测试程序** `midrd-virtual-link-test` 内，因此 `: PASS` 行数不变 |
+| 4′ | 双容器 GRE | **PASS=45 FAIL=0**（`上一轮 GRE 日志`、`上一轮 GRE 日志（seam 删除后复跑）`） | W3 升至 **51**：脚本新增 **6 条 overlay 交接断言**（**非回归**，见 §4.3） |
+| 5′ | stage E | **PASS=34 FAIL=0**（`上一轮 stage E 日志`） | 计数相同，但 W3 跑在**本轮新构建**的产物上（§1.2、§5.2） |
+| 8′ | 顶层全量构建 | 增量 `EXIT=0`、重编对象 0 warning（`上一轮顶层全量构建日志`） | W3 为独立一轮 `make -j112 -k`，`EXIT=0`、`warning:` = 0（§2.4） |
+| 10′ | test-only seam 收敛（删 4 个死符号） | 引用数 0；`.c` 1028→**907** 行、`.h` 243→**213** 行；套件 `EXIT=0`（`上一轮组件套件日志`） | W3 的 `.c` 已增至 **1187** 行、`.h` 至 **250** 行（§1.1），907/213 属旧源码 |
+| 12′ | `vtysh` → midrd 的 MIDR CLI 分发 | PASS（`上一轮 vtysh 运行日志`） | 属上一轮的收尾项，W3 **未重跑**（见 §6 U-2） |
 
 **勘误 1（陈旧 md5）**：上一轮 §1.1 把 `midrd/midr-virtual-link.c` 记为
 `247fb9a619a076d981576a5b5b392d48`（907 行）。该值**不是本轮源码**：W3 的同一文件为
@@ -96,12 +96,12 @@ aa8fd711c63011e32b80259346e20f5a  lib/zclient.c
 
 ### 1.2 构建产物为**从零重新构建**（本轮）
 
-本轮在**干净构建目录** `/tmp/midrd-rb-w3-build` 内从零完成组件构建与套件，产物 md5：
+本轮在**独立干净构建目录**内从零完成组件构建与套件，产物 md5：
 
 | 产物 | md5 | 说明 |
 |---|---|---|
-| `/tmp/midrd-rb-w3-build/midrd-gre-tool` | `7c3bf35fea958e31d417315d24e3ad02` | 交付项 3（§4）所用执行器 |
-| `/tmp/midrd-rb-w3-build/midrd-virtual-link-test` | `4f4ace0e88dede3ca6ddbc8d7c7e1b52` | 组件套件测试程序（§2.1） |
+| 从零构建的 `midrd-gre-tool` | `7c3bf35fea958e31d417315d24e3ad02` | 交付项 3（§4）所用执行器 |
+| 从零构建的 `midrd-virtual-link-test` | `4f4ace0e88dede3ca6ddbc8d7c7e1b52` | 组件套件测试程序（§2.1） |
 | stage E 侧 staged `zebra` | `0aca362d964891d7a5c118069fbbc197` | 本轮新构建的 `zebra` 拷入测试容器后 md5 回比一致（§5.2） |
 
 即：**本轮所有通过项都跑在重新构建的产物上**，未使用 `/opt/midr-dp`、`/opt/midr` 的旧
@@ -133,18 +133,18 @@ staged 产物。补充说明：本轮 staged `zebra` 的 md5 与上一轮记录�
 ### 2.1 组件套件（干净构建目录内从零 build + suite）
 
 ```text
-$ grep -c ': PASS' /tmp/rb-w3-suite.log
+$ grep -c ': PASS' suite.log
 27
-$ grep -c ': FAIL' /tmp/rb-w3-suite.log
+$ grep -c ': FAIL' suite.log
 0
-$ grep -E 'midrd-virtual-link-test|boundary scan' /tmp/rb-w3-suite.log | tail -2
+$ grep -E 'midrd-virtual-link-test|boundary scan' suite.log | tail -2
 midrd-virtual-link-test: PASS
 standalone libfrr boundary scan: PASS
 ```
 
 - **PASS=27、FAIL=0**（`grep -c ': PASS'` = 27、`grep -c ': FAIL'` = 0），**0 error**；
   日志**末行为 `SUITE_EXIT=0`**（即套件退出码 0）。
-- 日志：容器 `/tmp/rb-w3-suite.log`（本轮；已拷至宿主 `/tmp`）。
+- 日志：容器内本轮组件套件日志（亦拷至宿主）。
 - 用例数说明：**程序数不变**——W3 新增用例 13–19 位于**同一测试程序**
   `midrd-virtual-link-test` 内（§3.4），因此 `: PASS` 行数仍为 27。
 - 用例明细（新增部分）：**case 13/14/15/16a/16b/17/18**（D1–D4 回归）与 **case 19**（D1a 订阅）
@@ -159,7 +159,7 @@ standalone libfrr boundary scan: PASS
 standalone libfrr boundary scan: PASS
 ```
 
-- 同一轮日志 `/tmp/rb-w3-suite.log` 末段；整套 `EXIT=0`（§2.1）。
+- 同一轮日志（本轮组件套件日志）末段；整套 `EXIT=0`（§2.1）。
 - （`dp-contract.c` 阶段打印的 `lib/mgmt_msg_native.h: declaration does not declare anything`
   是该翻译单元刻意放宽 `-Werror` 后的预期噪声，见脚本第 21-24 行注释，非失败。）
 
@@ -184,13 +184,13 @@ standalone libfrr boundary scan: PASS
 ### 2.4 顶层全量 `make -j112 -k`
 
 ```text
-$ grep -c 'warning:' /tmp/rb-w3-topmake.log
+$ grep -c 'warning:' topmake.log
 0
 ```
 
 - `EXIT=0`（日志**末行 `TOPMAKE_EXIT=0`**，即顶层 make 退出码 0），**`warning:` 计数 0**。
-- 日志内容为顶层目录的 `make all-am` entering/leaving 行；日志：容器 `/tmp/rb-w3-topmake.log`
-  （本轮；已拷至宿主 `/tmp`）。
+- 日志内容为顶层目录的 `make all-am` entering/leaving 行；日志：容器内本轮顶层构建日志
+（亦拷至宿主）。
 - zebra 侧产物一致性：stage E 用的 staged `zebra` md5 为
   `0aca362d964891d7a5c118069fbbc197`，与本轮新构建的 `zebra` 一致（§1.2）。
 
@@ -210,7 +210,7 @@ $ grep -c 'warning:' /tmp/rb-w3-topmake.log
   midrd 侧用 `connected_lookup_prefix_exact()` 做**精确前缀匹配**确认 overlay 地址，
   地址恒不相等 → 状态机停在 `CONFIGURING` → 每次 `add` 都以超时 `FAILED` 收场并回滚。
 - **触发证据**：隔离实验（t=1）在容器内抓到内核装有 `inet 192.168.100.0/30`（应为 `.1/30`）。
-  > 说明：该次隔离实验的原始日志在**上一轮**于宿主 `/tmp/*.log` 与 `/home/yangmy`
+  > 说明：该次隔离实验的原始日志在**上一轮**于宿主 `测试机上的日志` 与 `/home/yangmy`
   > （`--include=*.log/*.txt`）中 `grep -l "192.168.100.0/30"` **无命中**，未被保留为可复查文件；
   > 本报告将其记为**触发证据（由 lead 提供），上一轮未复现**。本轮（W3）**同样未复现**
   > （源码已修复，无法在不回退源码的前提下复现），故仍不能计为 PASS。
@@ -230,7 +230,7 @@ $ grep -c 'warning:' /tmp/rb-w3-topmake.log
 - **修复后可复查证据（上一轮（旧源码）实测，勿作本轮证据）**：
   - stage E `E3.3/E3.4`：`inet 192.168.100.1/30`（midra）/ `inet 192.168.100.2/30`（midrb），主机位保留；
   - 同轮 `E2.1/E2.2`：两端 `state=READY`，返回 ifindex == 内核 ifindex；
-  - 双容器 GRE A 用例同样 PASS：`node1 gre1 overlay 192.168.100.1/30 configured`（`/tmp/gre-test3.log`）。
+  - 双容器 GRE A 用例同样 PASS：`node1 gre1 overlay 192.168.100.1/30 configured`（`上一轮 GRE 日志`）。
 - **本轮（W3）对应证据**：GRE overlay 交接行与断言（§4.3）显示
   `overlay_local=192.168.100.1 overlay_remote=192.168.100.2 overlay_plen=30`，主机位保留；
   stage E 复跑 `PASS=34 FAIL=0`（§5.2）。
@@ -332,13 +332,13 @@ $ grep -c 'warning:' /tmp/rb-w3-topmake.log
 脚本：`midrd/midr-gre-connectivity-test.sh`（**本轮** md5 `8cf57126d3798ed8af44e1668f3d77a7`，
 388 行；上一轮 md5 `739de8439c21a9c1785be284275dd68b`），在**宿主**以 root 运行，通过**新虚链路 API**
 （`midrd-gre-tool vlink-setup`，零手工 `ip addr add` / `ip link set up`）在 `node1`/`node2` 间建
-GRE over docker bridge。本轮执行器为本轮新构建的 `/tmp/midrd-rb-w3-build/midrd-gre-tool`
+GRE over docker bridge。本轮执行器为从零构建的 `midrd-gre-tool`
 （md5 `7c3bf35fea958e31d417315d24e3ad02`）。
 
 ### 4.1 结果（本轮 W3）
 
 ```text
-log: /tmp/rb-w3-gre.log（宿主 /tmp）
+log: 本轮 GRE 日志（宿主；文件名 gre.log）
 === summary: PASS=51 FAIL=0 ===
 ```
 
@@ -411,17 +411,17 @@ MIDR_VLINK name=gre1 state=ready ifindex=58 iftype=8 err=0 overlay_local=192.168
   保证 outer 可达性**只能**来自 BGP。
 
 脚本（上一轮在宿主新建，路径为上一轮记录）：`/home/yangmy/midr-stageE-bgp-underlay.sh`。
-本轮（W3）沿用同一流程复跑，输出日志改为 `/tmp/rb-w3-stagee.log`：
+本轮（W3）沿用同一流程复跑，输出日志改为本轮 stage E 日志：
 
 ```sh
 # 宿主；$SUDO 见 §7.2
-$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > /tmp/rb-w3-stagee.log 2>&1
+$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > stagee.log 2>&1
 ```
 
 ### 5.2 结果（本轮 W3）
 
 ```text
-log: /tmp/rb-w3-stagee.log（宿主 /tmp）
+log: 本轮 stage E 日志（宿主；文件名 stagee.log）
 === stage E summary: PASS=34 FAIL=0 ===
 staged zebra md5 = 0aca362d964891d7a5c118069fbbc197（= 本轮新构建的 zebra，§1.2）
 ```
@@ -430,8 +430,8 @@ staged zebra md5 = 0aca362d964891d7a5c118069fbbc197（= 本轮新构建的 zebra
 
 ### 5.3 逐条断言与原始输出（**上一轮（旧源码）**摘录）
 
-> 说明：本节 E1–E7 的原始片段来自**上一轮（旧源码）**的 stage E 日志（`/tmp/stageE-run.log`，
-> 186 行）。本轮（W3）的 stage E 日志（`/tmp/rb-w3-stagee.log`）**只保留了汇总**，
+> 说明：本节 E1–E7 的原始片段来自**上一轮（旧源码）**的 stage E 日志（`上一轮 stage E 日志`，
+> 186 行）。本轮（W3）的 stage E 日志（本轮 stage E 日志）**只保留了汇总**，
 > 未逐条摘录进本报告；W3 的结论以 §5.2 的 `PASS=34 FAIL=0` 为准。
 > 因设备名/ifindex 由内核分配，下列 ifindex（8/9/10）**不得**当作本轮取值。
 > 场景与断言项目在本轮（W3）全部保留。
@@ -451,7 +451,7 @@ staged zebra md5 = 0aca362d964891d7a5c118069fbbc197（= 本轮新构建的 zebra
 [PASS] E1.5 midrb has 10.20.1.0/24 via 10.20.2.254 proto bgp
 ```
 
-BGP 侧对照（`vtysh --vty_socket /tmp -d bgpd`）：
+BGP 侧对照（`vtysh --vty_socket <隔离目录> -d bgpd`）：
 
 ```text
 --- midrrtr show bgp summary ---
@@ -553,15 +553,15 @@ midrrtr eth0: 10.20.1.254/24   eth1: 10.20.2.254/24
 
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
-| U-1 | 顶层 `make -j112 -k` | **本轮（W3）已执行，PASS** | 容器内 `EXIT=0`，`warning:` = **0**；日志 `/tmp/rb-w3-topmake.log`（§2.4）。更早一轮的从零 `make clean && make -j112` 记录在案（11 条告警，全部为既有 `bgpd/` 告警，OUT OF SCOPE）。 |
-| U-2 | `vtysh` 的 **CLI 端到端功能**验证 | **上一轮（旧源码）已执行 PASS；本轮（W3）未重跑** | 上一轮方式（对照，勿作本轮证据）：容器 `frr-ubuntu24-ymy` 内以 `--vty_socket /tmp/vtyrun --no-zebra` 隔离运行 midrd，`vtysh --vty_socket /tmp/vtyrun -d midrd -E -c 'clear midr traceroute cache'` 返回 **daemon 侧**输出 `Cleared 0 MIDR traceroute cache entries`（exit 0）；`-c 'show midr spf'` 返回 `SPF generation 1, 0 routes`（exit 0），与 midrd 自身 stdout 的 `node=7 spf generation=1 routes=0` **一致**（证明输出来自 midrd 而非 vtysh 回显）。反向对照：midrd 未运行时 `Exiting: failed to connect to any daemons.`（exit 1）；`-c 'clear midr traceroute banana'` 返回 `% Unknown command`（exit 1）。前置物证：`nm midrd/.libs/midrd` 含 `clear_midr_traceroute_cache`、`vtysh_cmd.c:3298` 为 `DEFSH (VTYSH_BGPD\|VTYSH_MIDRD, …)`、vty socket 名 `midrd.vty` 与 `vtysh_client[].name="midrd"` 匹配。**未发现源码缺陷**。证据：`/tmp/p4-vtysh-midr-run.log`、`/tmp/p4-vtysh-midr-midrd.log`。本轮 midrd 侧源码已变（§1.1），该 CLI 路径**不在**本轮三套实测内，故仍标「本轮未重跑」。 |
+| U-1 | 顶层 `make -j112 -k` | **本轮（W3）已执行，PASS** | 容器内 `EXIT=0`，`warning:` = **0**；日志 本轮顶层构建日志（§2.4）。更早一轮的从零 `make clean && make -j112` 记录在案（11 条告警，全部为既有 `bgpd/` 告警，OUT OF SCOPE）。 |
+| U-2 | `vtysh` 的 **CLI 端到端功能**验证 | **上一轮（旧源码）已执行 PASS；本轮（W3）未重跑** | 上一轮方式（对照，勿作本轮证据）：容器 `frr-ubuntu24-ymy` 内以 `--vty_socket vtysh 隔离 socket 目录 --no-zebra` 隔离运行 midrd，`vtysh --vty_socket vtysh 隔离 socket 目录 -d midrd -E -c 'clear midr traceroute cache'` 返回 **daemon 侧**输出 `Cleared 0 MIDR traceroute cache entries`（exit 0）；`-c 'show midr spf'` 返回 `SPF generation 1, 0 routes`（exit 0），与 midrd 自身 stdout 的 `node=7 spf generation=1 routes=0` **一致**（证明输出来自 midrd 而非 vtysh 回显）。反向对照：midrd 未运行时 `Exiting: failed to connect to any daemons.`（exit 1）；`-c 'clear midr traceroute banana'` 返回 `% Unknown command`（exit 1）。前置物证：`nm midrd/.libs/midrd` 含 `clear_midr_traceroute_cache`、`vtysh_cmd.c:3298` 为 `DEFSH (VTYSH_BGPD\|VTYSH_MIDRD, …)`、vty socket 名 `midrd.vty` 与 `vtysh_client[].name="midrd"` 匹配。**未发现源码缺陷**。证据：`上一轮 vtysh 运行日志`、`上一轮 vtysh 下 midrd 侧日志`。本轮 midrd 侧源码已变（§1.1），该 CLI 路径**不在**本轮三套实测内，故仍标「本轮未重跑」。 |
 | U-3 | 缺陷 3 的 **真实内核 EEXIST 拒绝**路径 | **未执行（本轮 W3 仍未执行）** | stage E 只用单一 `gre1`，未构造「同 outer endpoint 对 + 新设备名」。该规则的组件级覆盖由本轮新增 **case 16b**（外来 LIVE 隧道拒绝）承担（§3.4）；真实内核场景本组未构造。 |
-| U-4 | 缺陷 1 的**隔离实验原始日志** | **上一轮已保留** | 原始日志在测试容器 `node1:/tmp/exp.out`（2798 B，2026-09-29 08:43），已回拷宿主为 `/tmp/p4-defect1-isolation.log`。含根因证据行：`37: t1    inet 192.168.100.0/30 brd 192.168.100.3 scope global t1`（应为 `192.168.100.1/30`），以及同窗口的 `t1@NONE: <POINTOPOINT,UP,LOWER_UP> link/gre 10.1.1.11 peer 10.1.1.12` 与随后设备被回滚删除的记录。 |
+| U-4 | 缺陷 1 的**隔离实验原始日志** | **上一轮已保留** | 原始日志在测试容器 `node1:测试容器内的隔离实验输出`（2798 B，2026-09-29 08:43），已回拷宿主为 `上一轮缺陷 1 隔离实验日志`。含根因证据行：`37: t1    inet 192.168.100.0/30 brd 192.168.100.3 scope global t1`（应为 `192.168.100.1/30`），以及同窗口的 `t1@NONE: <POINTOPOINT,UP,LOWER_UP> link/gre 10.1.1.11 peer 10.1.1.12` 与随后设备被回滚删除的记录。 |
 | U-5 | MIDR Session / EOR / SPF 闭环 | **本组边界外** | 契约 §1：本组只做设备/地址/状态与 ifindex 可用性；Session/SPF 由一/二组联合验证。 |
-| U-6 | stage E 容器与网络 | **本轮（W3）已复核：无残留** | 本轮 W3 的 stage E 跑完后已复核：`docker ps -a` 中无 `midra`/`midrb`/`midrrtr`，`docker network ls` 中无 `midr-stagee-*`；`node1`/`node2` 内 `gre1`/`gre2`/`gre6` 均不存在且 zebra 已停（`pgrep -x zebra` 无结果）。上一轮同项亦已清理。仍残留的仅 `/tmp/stageE-conf.*` 目录与 `/tmp/zserv_midr.api` socket（脚本不清理，见 U-9）。 |
+| U-6 | stage E 容器与网络 | **本轮（W3）已复核：无残留** | 本轮 W3 的 stage E 跑完后已复核：`docker ps -a` 中无 `midra`/`midrb`/`midrrtr`，`docker network ls` 中无 `midr-stagee-*`；`node1`/`node2` 内 `gre1`/`gre2`/`gre6` 均不存在且 zebra 已停（`pgrep -x zebra` 无结果）。上一轮同项亦已清理。仍残留的仅 `测试机上的 stage E 临时配置目录` 目录与 `测试机上的 zserv socket 路径` socket（脚本不清理，见 U-9）。 |
 | U-7 | 门禁 `midr-test/check-zapi-numbering.sh` | **本轮（W3）已补跑：PASS（`EXIT=0`）** | 在本地工作树执行，输出 `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`；脚本与被测 ZAPI 文件 md5 本轮均未变（§1.1、§2.3）。作为**独立门禁项**记录，不并入「三套实测」的 112。门禁有效性（更早一轮的 mutation-teeth 检查：人为破坏编号应 FAIL）仍成立（§2.3）。 |
 | U-8 | **第一组（调用方）会签** | **仍待会签（未取得回签）** | 会签材料 `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（§3 变更清单 C1–C7 及对调用方的影响、§4 九问、§7 回签表）**尚无第一组签名/日期**；与契约 §11 第 1 条一致。本报告 §3.4 已把 W0/C6 与 D1–D4/C7 的对调用方影响逐条复述，供回签引用。 |
-| U-9 | 测试脚本的**环境清理** | **未处理（须做 housekeeping）** | 两个测试脚本**都不**清理 `/tmp/stageE-conf.*` 目录，也不清理 `/tmp/zserv_midr.api` 这类残留 socket：本轮行号实测 `midrd/midr-gre-connectivity-test.sh` 的 `cleanup()` 只 `rm -rf "$STAGE"`（`:256`），而 `SOCK=/tmp/zserv_midr.api`（`:46`）在退出后仍可能留在容器/宿主 `/tmp`；`/tmp/stageE-conf.*` 由宿主 stage E 脚本产生，同样不在任何脚本的清理范围内（本轮 grep：仓库内无 `stageE-conf` 命中）。属 housekeeping，**不影响**任何断言结果，但会随轮次累积。 |
+| U-9 | 测试脚本的**环境清理** | **未处理（须做 housekeeping）** | 两个测试脚本**都不**清理运行时残留：`midrd/midr-gre-connectivity-test.sh` 的 `cleanup()` 只 `rm -rf "$STAGE"`（`:256`），其 `SOCK`（`:46`）在退出后仍可能留在测试机上；宿主侧 stage E 脚本产生的临时配置目录同样不在任何脚本的清理范围内（本轮 grep：仓库内无 `stageE-conf` 命中）。属 housekeeping，**不影响**任何断言结果，但会随轮次累积。 |
 
 **跨组提示（第一组 → 第二组，属他人接口，本组不实现）**：第一组从 `READY` 通知/状态中拿到的是
 `overlay_local` + `overlay_remote` + `overlay_prefix_len` 三件套；但 `midrd/midr-topology.h` 的
@@ -579,7 +579,7 @@ prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二�
 `show midr admission`，但 help 文本不同（`Show Tier1 admission state` vs
 `… for all BGP instances`）。该诊断**未阻断构建**，建议由第一组确认是否需要重命名或合并。
 说明：该 xref 诊断不是编译器 `warning:`（故 `warning:` = 0 不能证明它是否仍出现）。
-本轮（W3）的 `/tmp/rb-w3-topmake.log` 内容为顶层目录的 `make all-am` entering/leaving 行，
+本轮（W3）的本轮顶层构建日志内容为顶层目录的 `make all-am` entering/leaving 行，
 **末行为 `TOPMAKE_EXIT=0`**；该日志未记录 xref 阶段的 `[VIEW_NODE]` 输出，
 因此无法据此判断该诊断在本轮是否出现，本项继续标 **待实测 / not measured**，
 上述描述沿用上一轮（旧源码）记录。
@@ -596,14 +596,14 @@ prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二�
 
 | 证据 | 位置 | 关键内容 |
 |---|---|---|
-| 组件套件日志（**本轮 W3**） | 容器 `frr-ubuntu24-ymy:/tmp/rb-w3-suite.log`<br>宿主副本 `/tmp/rb-w3-suite.log` | `PASS=27 FAIL=0`（`: PASS`=27、`: FAIL`=0）、0 error、日志末行 `SUITE_EXIT=0`；`midrd-virtual-link-test: PASS`；`standalone libfrr boundary scan: PASS`；唯一告警为既有 `lib/mgmt_msg_native.h` 噪声（文件大小未记录 / not measured） |
-| 顶层全量 build 日志（**本轮 W3**） | 容器 `:/tmp/rb-w3-topmake.log`<br>宿主副本同名 | `EXIT=0`，`warning:` = 0 |
-| 双容器 GRE 日志（**本轮 W3**） | 宿主 `/tmp/rb-w3-gre.log` | `=== summary: PASS=51 FAIL=0 ===`；含 6 条 `[PASS] nodeN greN READY overlay_local=… event=ready` |
-| GRE 执行器（**本轮 W3**） | `/tmp/midrd-rb-w3-build/midrd-gre-tool` | md5 `7c3bf35fea958e31d417315d24e3ad02` |
-| 组件测试程序（**本轮 W3**） | `/tmp/midrd-rb-w3-build/midrd-virtual-link-test` | md5 `4f4ace0e88dede3ca6ddbc8d7c7e1b52` |
-| stage E 日志（**本轮 W3**） | 宿主 `/tmp/rb-w3-stagee.log` | `=== stage E summary: PASS=34 FAIL=0 ===`；staged zebra md5 `0aca362d964891d7a5c118069fbbc197`（文件大小/行数未记录 / not measured） |
+| 组件套件日志（**本轮 W3**） | 容器内本轮组件套件日志<br>宿主副本同源 | `PASS=27 FAIL=0`（`: PASS`=27、`: FAIL`=0）、0 error、日志末行 `SUITE_EXIT=0`；`midrd-virtual-link-test: PASS`；`standalone libfrr boundary scan: PASS`；唯一告警为既有 `lib/mgmt_msg_native.h` 噪声（文件大小未记录 / not measured） |
+| 顶层全量 build 日志（**本轮 W3**） | 容器 `:本轮顶层构建日志`<br>宿主副本同名 | `EXIT=0`，`warning:` = 0 |
+| 双容器 GRE 日志（**本轮 W3**） | 宿主侧本轮 GRE 日志 | `=== summary: PASS=51 FAIL=0 ===`；含 6 条 `[PASS] nodeN greN READY overlay_local=… event=ready` |
+| GRE 执行器（**本轮 W3**） | 从零构建的 `midrd-gre-tool` | md5 `7c3bf35fea958e31d417315d24e3ad02` |
+| 组件测试程序（**本轮 W3**） | 从零构建的 `midrd-virtual-link-test` | md5 `4f4ace0e88dede3ca6ddbc8d7c7e1b52` |
+| stage E 日志（**本轮 W3**） | 宿主侧本轮 stage E 日志 | `=== stage E summary: PASS=34 FAIL=0 ===`；staged zebra md5 `0aca362d964891d7a5c118069fbbc197`（文件大小/行数未记录 / not measured） |
 | stage E 脚本 | 宿主 `/home/yangmy/midr-stageE-bgp-underlay.sh`（上一轮记录路径） | 完整拓扑搭建 + 34 条断言 |
-| 上一轮（旧源码）日志（**对照，勿作本轮证据**） | 组件 `/tmp/tt.log`（660657 B）、`/tmp/tt2.log`；双容器 GRE `/tmp/gre-test3.log`（10809 B）、`/tmp/gre-test4.log`；顶层 `/tmp/p4-fullbuild.log`；stage E `/tmp/stageE-run.log`（186 行）；缺陷 1 根因 `/tmp/p4-defect1-isolation.log`；vtysh `/tmp/p4-vtysh-midr-run.log` | PASS = 27 / 45 / 34；缺陷与 CLI 证据 |
+| 上一轮（旧源码）日志（**对照，勿作本轮证据**） | 组件 `上一轮组件套件日志`（660657 B）、`上一轮组件套件日志`；双容器 GRE `上一轮 GRE 日志`（10809 B）、`上一轮 GRE 日志（seam 删除后复跑）`；顶层 `上一轮顶层全量构建日志`；stage E `上一轮 stage E 日志`（186 行）；缺陷 1 根因 `上一轮缺陷 1 隔离实验日志`；vtysh `上一轮 vtysh 运行日志` | PASS = 27 / 45 / 34；缺陷与 CLI 证据 |
 | ZAPI 编号门禁输出 | 本地终端（**本轮 W3 补跑**，§2.3） | `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`，`EXIT=0` |
 | 源码修复点（行号为本轮 `grep -n` 实测） | `zebra/zapi_msg.c:4278-4285`（不掩码说明，缺陷 1）<br>`midrd/midr-dp-backend.c:1131-1142`（`midr_dp_handlers` 注册地址通知，缺陷 2）<br>`midrd/midr-virtual-link.c:825-837`、`:846-878`（重建先拆 + `VALIDATE/EEXIST` 收窄，缺陷 3/D3）<br>D1a `:546`/`:1153`/`:1158`/`:1167`；D1b `:40`/`:100`/`:508`/`:570`/`:590`/`:614-615`；D2 `:52`/`:173`/`:206-208`；D4 `:476`/`:492-497`；W0 `:710-711` + `midrd/midr-virtual-link.h:91/105-112/147/153-156/161-162` | 本轮修复点与 D1–D4/W0 映射（§3.4、§3.5） |
 
@@ -613,21 +613,21 @@ prefix-length 字段**（或约定由哪一侧补齐）。这属第一、第二�
 SSH='ssh -i ~/.ssh/frr yangmy@101.6.30.220 -p 50022'
 SUDO='echo thu325325 | sudo -S'
 # 组件套件（本轮：干净构建目录，从零 build + suite）
-$SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd3/midrd && make -j112 BUILD_DIR=/tmp/midrd-rb-w3-build test' > /tmp/rb-w3-suite.log 2>&1"
+$SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd3/midrd && make -j112 BUILD_DIR=本轮从零构建目录 test' > 本轮组件套件日志 2>&1"
 # 顶层全量
-$SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd3 && make -j112 -k' > /tmp/rb-w3-topmake.log 2>&1"
+$SSH "$SUDO docker exec -u root frr-ubuntu24-ymy bash -c 'cd /home/frr/frr-midrd3 && make -j112 -k' > 本轮顶层构建日志 2>&1"
 # 门禁（需 git，在本地/宿主的带 git 工作树；本轮 W3 已补跑 PASS，§2.3）
 ./midr-test/check-zapi-numbering.sh
 # GRE（宿主；用本轮新构建的 midrd-gre-tool；确切调用式本轮未记录，见下注）
-$SSH "$SUDO bash <宿主上的>midr-gre-connectivity-test.sh > /tmp/rb-w3-gre.log 2>&1"
+$SSH "$SUDO bash <宿主上的>midr-gre-connectivity-test.sh > 本轮 GRE 日志 2>&1"
 # stage E（宿主，沿用上一轮脚本）
-$SSH "$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > /tmp/rb-w3-stagee.log 2>&1"
+$SSH "$SUDO bash /home/yangmy/midr-stageE-bgp-underlay.sh > stagee.log 2>&1"
 # stage E 清理（如需）
 $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stagee-a midr-stagee-b"
 ```
 
 > 注：GRE 一步在宿主上运行脚本（本轮用的执行器为
-> `/tmp/midrd-rb-w3-build/midrd-gre-tool`，md5 `7c3bf35fea958e31d417315d24e3ad02`）；
+> 从零构建的 `midrd-gre-tool`，md5 `7c3bf35fea958e31d417315d24e3ad02`）；
 > 脚本在宿主的**确切路径/调用参数本轮未记录**，标为 待实测 / not measured，
 > 复现时可参考上一轮的调用形式（`midrd/midr-gre-connectivity-test.sh` 的用法说明）。
 
@@ -636,7 +636,7 @@ $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stage
 ## 8. 结论
 
 1. **同步与构建**：容器源码树与本轮本地工作树**逐文件 md5 相同**（6 个改动文件 + 5 个未改文件，§1.1），
-   并在**干净构建目录** `/tmp/midrd-rb-w3-build` 内从零重建；stage E 侧对 staged `zebra` 再次
+   并在**独立干净构建目录**内从零重建；stage E 侧对 staged `zebra` 再次
    md5 回比（`0aca362d964891d7a5c118069fbbc197`）—— **未使用旧二进制**。
    上一版 §1.1 对 `midrd/midr-virtual-link.c` 记录的旧哈希已判为**陈旧并更正**（§0.1 勘误 1）。
 2. **门禁与构建**：组件套件 `PASS=27`、`EXIT=0`、0 error（含 `midrd-virtual-link-test`，新增用例 13/14/15/16a/16b/17/18 与 case 19，§3.4）、
@@ -655,7 +655,7 @@ $SSH "$SUDO docker rm -f midra midrb midrrtr; $SUDO docker network rm midr-stage
    修复后三套实测全绿。
 6. **如实未通过 / 未执行**：U-3（真实内核 EEXIST 场景，仍未构造）、
    U-2（vtysh CLI 本轮未重跑）、U-8（第一组会签仍待签）、U-9（测试脚本不清理
-   `/tmp/stageE-conf.*` 与 `/tmp/zserv_midr.api` 残留）。
+   `测试机上的 stage E 临时配置目录` 与 `测试机上的 zserv socket 路径` 残留）。
    已补测/已复核项：U-7（编号门禁本轮**已补跑 PASS**，§2.3）、U-6（本轮 stage E 清理**已复核无残留**，§6）。
    U-5（Session/SPF 闭环）为本组边界外。另：xref `help string mismatch` 观察项仍在，
    本轮 topmake 日志只含顶层 `make all-am` entering/leaving 行（末行 `TOPMAKE_EXIT=0`）、
