@@ -4252,8 +4252,12 @@ stream_failure:
 }
 
 /*
- * Turn an ipaddr + prefix length into a masked struct prefix.  Returns
- * false when the prefix length is out of range for the address family.
+ * Turn an ipaddr + prefix length into a struct prefix for zebra's
+ * connected-route path.  Returns false when the prefix length is out of range
+ * for the address family.
+ *
+ * The address is deliberately NOT masked here; see the block at the end of the
+ * function for why masking broke the MIDR virtual link.
  */
 static bool zebra_midr_ipaddr_to_prefix(const struct ipaddr *ia,
 					uint8_t prefixlen, struct prefix *p)
@@ -4376,6 +4380,7 @@ static void zebra_interface_address_unset(ZAPI_HANDLER_ARGS)
 {
 	struct stream *s = msg;
 	char ifname[IFNAMSIZ] = {};
+	char label[IFNAMSIZ] = {};
 	struct ipaddr addr, peer;
 	struct interface *ifp;
 	struct prefix p, pp;
@@ -4383,7 +4388,9 @@ static void zebra_interface_address_unset(ZAPI_HANDLER_ARGS)
 	uint8_t prefixlen;
 	bool has_peer;
 
-	/* label is part of the wire format but is not needed on removal. */
+	/* Same wire layout as the set path.  The label is decoded here too, so a
+	 * truncated request is rejected by the length check rather than merely
+	 * skipped over (removal does not otherwise need the value). */
 	STREAM_GET(ifname, s, IFNAMSIZ);
 	/* The wire field is a fixed IFNAMSIZ byte run; force termination so
 	 * later %s uses of a malformed request cannot read past the buffer.
@@ -4395,7 +4402,9 @@ static void zebra_interface_address_unset(ZAPI_HANDLER_ARGS)
 	STREAM_GETC(s, prefixlen);
 	if (!zebra_midr_decode_addr(s, &peer))
 		goto stream_failure;
-	STREAM_FORWARD_GETP(s, IFNAMSIZ);
+	STREAM_GET(label, s, IFNAMSIZ);
+	label[IFNAMSIZ - 1] = '\0';
+	(void)label;
 
 	has_peer = !IS_IPADDR_NONE(&peer);
 
