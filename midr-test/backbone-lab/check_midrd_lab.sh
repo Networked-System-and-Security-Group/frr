@@ -11,7 +11,10 @@
 #      group, a backbone mesh between bootstraps and the manual r1-r2 edge;
 #   5. the node directory group 1 floods matches every node's table;
 #   6. group 2 accepted the Node/Link facts and SPF reaches every member of
-#      the same group; inter-group routes are reported for information.
+#      the same group; inter-group routes are reported for information;
+#   7. every reported Link rides a READY GRE virtual link: fe80 overlay
+#      addresses and the tunnel's ifindex, the device is UP in the kernel,
+#      and (IPv6) same-group service prefixes route out of a tunnel.
 # The Tier1 admission scenario (z1) is checked by check_tier1_admission.sh.
 #
 # Read-only.
@@ -352,6 +355,49 @@ for node in $MEMBERS; do
 		pass "$node SPF reaches every member of group ${GROUP[$node]}" ||
 		fail "$node SPF lacks routes for:$missing"
 	info "$node $(printf '%s\n' "$spf" | grep '^Summary')"
+done
+
+########################################################################
+# 7. Virtual links (group 1 asks group 3 for one GRE tunnel per Link)
+########################################################################
+for node in $MEMBERS; do
+	vl="$(mvty "$node" 'show midr virtual-links')"
+	snap="$(mvty "$node" 'show midr group2-snapshot')"
+	links=$(printf '%s\n' "$snap" | grep -c '^  -> ')
+	ready=$(printf '%s\n' "$vl" | grep -cE '^  mgre-[0-9a-f]{8} .* READY ')
+	odd=$(printf '%s\n' "$snap" | grep '^     addr ' |
+		grep -cvE '^     addr fe80::[0-9a-f:]+ -> fe80::[0-9a-f:]+ ifindex [1-9][0-9]*$')
+	[ "$links" -gt 0 ] && [ "$odd" -eq 0 ] && [ "$ready" -ge "$links" ] &&
+		pass "$node reports $links Link(s) over READY virtual links (fe80 + GRE ifindex)" ||
+		fail "$node Links: $links reported, $odd not on a virtual link, $ready tunnels READY"
+
+	bad=
+	while read -r ifname ifindex; do
+		kernel="$(rexec "$node" ip -o link show dev "$ifname")"
+		printf '%s\n' "$kernel" | grep -q "^$ifindex: $ifname[@:]" &&
+			printf '%s\n' "$kernel" | grep -q '[<,]UP[,>]' ||
+			bad="$bad $ifname"
+	done < <(printf '%s\n' "$vl" |
+		awk '$1 ~ /^mgre-/ && $4 == "READY" {print $1, $6}')
+	[ -z "$bad" ] &&
+		pass "$node GRE devices exist with the reported ifindex and are UP" ||
+		fail "$node GRE devices missing, renumbered or down:$bad"
+
+	for other in $MEMBERS; do
+		[ "$other" != "$node" ] && [ "${GROUP[$other]}" = "${GROUP[$node]}" ] || continue
+		dst="$(svc "$other")"
+		dst="${dst%/*}"
+		route="$(rexec "$node" ip route get "$dst")"
+		if printf '%s\n' "$route" | grep -q ' dev mgre-'; then
+			pass "$node routes $dst out of a GRE virtual link"
+		elif [ "$FAMILY" = ipv6 ]; then
+			fail "$node routes $dst not over GRE: $(printf '%s' "$route" | head -1)"
+		else
+			# Group 3's SPF only lets a Link carry prefixes of its own
+			# family, and virtual-link Links are IPv6 (fe80).
+			info "$node IPv4 $dst is not routed over GRE (fe80 Links carry IPv6 only): $(printf '%s' "$route" | head -1)"
+		fi
+	done
 done
 
 printf 'midrd lab result (%s): %d passed, %d failed\n' "$FAMILY" "$PASS" "$FAIL"

@@ -54,6 +54,7 @@ CAPTURE="$REPO_ROOT/midr-test/backbone-group2/capture_group1_group2_state.sh"
 VERIFY="$REPO_ROOT/midr-test/backbone-group2/verify_group1_group2_evidence.py"
 TIER1_CHECK="$SCRIPT_DIR/check_tier1_admission.sh"
 IPV6_CHECK="$SCRIPT_DIR/check_ipv6_only.sh"
+VLINK_CHECK="$SCRIPT_DIR/check_virtual_links.sh"
 if [ "$STACK" = midrd ]; then
 	ACCEPTANCE="$SCRIPT_DIR/check_midrd_lab.sh"
 fi
@@ -247,12 +248,19 @@ run_acceptance()
 	fi
 	run_capture post-convergence
 	capture_status=$?
+	# Last: it deletes a tunnel and blocks overlay replies for a while.
+	vlink_status=skipped
+	if [ "$STACK" = midrd ]; then
+		run_vlink_check
+		vlink_status=$?
+	fi
 	set -e
-	printf 'stack=%s family=%s acceptance=%s tier1-admission=%s ipv6-only=%s capture=%s\n' \
+	printf 'stack=%s family=%s acceptance=%s tier1-admission=%s ipv6-only=%s capture=%s virtual-links=%s\n' \
 		"$STACK" "$FAMILY" "$acceptance_status" "$tier1_status" "$ipv6_status" \
-		"$capture_status" | tee "$RUN_ROOT/result.txt"
+		"$capture_status" "$vlink_status" | tee "$RUN_ROOT/result.txt"
 	[ "$acceptance_status" -eq 0 ] && [ "$tier1_status" -eq 0 ] &&
 		{ [ "$ipv6_status" = skipped ] || [ "$ipv6_status" -eq 0 ]; } &&
+		{ [ "$vlink_status" = skipped ] || [ "$vlink_status" -eq 0 ]; } &&
 		[ "$capture_status" -eq 0 ]
 }
 
@@ -261,6 +269,14 @@ run_ipv6_check()
 	MIDR_LAB_PREFIX="$LAB_PREFIX" \
 		MIDR_LAB_STACK="$STACK" \
 		"$IPV6_CHECK" 2>&1 | tee "$RUN_ROOT/ipv6-only.log"
+	return "${PIPESTATUS[0]}"
+}
+
+run_vlink_check()
+{
+	MIDR_LAB_PREFIX="$LAB_PREFIX" \
+		MIDR_LAB_FAMILY="$FAMILY" \
+		"$VLINK_CHECK" 2>&1 | tee "$RUN_ROOT/virtual-links.log"
 	return "${PIPESTATUS[0]}"
 }
 
@@ -348,6 +364,11 @@ case "$MODE" in
 		[ -f "$TOPOLOGY" ] || die "prepared topology is missing: $TOPOLOGY"
 		run_ipv6_check
 		;;
+	vlink-check)
+		[ "$STACK" = midrd ] || die "vlink-check needs MIDR_LAB_STACK=midrd"
+		[ -f "$TOPOLOGY" ] || die "prepared topology is missing: $TOPOLOGY"
+		run_vlink_check
+		;;
 	capture)
 		preflight
 		run_capture manual
@@ -358,6 +379,6 @@ case "$MODE" in
 		containerlab destroy --topo "$TOPOLOGY" 2>&1 | tee "$RUN_ROOT/destroy.log"
 		;;
 	*)
-		die "usage: [MIDR_LAB_STACK=midrd|bgpd] [MIDR_LAB_FAMILY=ipv4|ipv6] $0 [preflight|build|deploy|all|check|tier1-check|ipv6-check|capture|destroy]"
+		die "usage: [MIDR_LAB_STACK=midrd|bgpd] [MIDR_LAB_FAMILY=ipv4|ipv6] $0 [preflight|build|deploy|all|check|tier1-check|ipv6-check|vlink-check|capture|destroy]"
 		;;
 esac
