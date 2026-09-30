@@ -328,12 +328,115 @@ static void test_layered_ted_spf(void)
 	midr_spf_routes_clear(routes, count);
 }
 
+static void test_ted_cross_family_nexthops(void)
+{
+	struct midr_ted_node nodes[] = {
+		{.node_id = 1, .group_id = 10},
+		{.node_id = 2, .group_id = 10},
+	};
+	struct midr_ted_link links[] = {
+		{.local_node_id = 1, .remote_node_id = 2,
+		 .local_group_id = 10, .remote_group_id = 10, .link_id = 1,
+		 .canonical_cost = 5, .local_ifindex = 11,
+		 .family = MIDR_CORE_AF_IPV6,
+		 .remote_address = {0xfe, 0x80, [15] = 2}},
+		{.local_node_id = 1, .remote_node_id = 2,
+		 .local_group_id = 10, .remote_group_id = 10, .link_id = 2,
+		 .canonical_cost = 5, .local_ifindex = 12,
+		 .family = MIDR_CORE_AF_IPV6,
+		 .remote_address = {0xfe, 0x80, [15] = 2}},
+	};
+	struct midr_ted_link egress = {
+		.local_node_id = 1, .remote_node_id = 3,
+		.local_group_id = 10, .remote_group_id = 20,
+		.canonical_cost = 7, .local_ifindex = 13,
+		.family = MIDR_CORE_AF_IPV6,
+		.remote_address = {0xfe, 0x80, [15] = 3},
+	};
+	struct midr_ted_node_prefix prefixes[] = {
+		{.key = ted_prefix(MIDR_CORE_AF_IPV4, 24, 198), .node_id = 2},
+		{.key = ted_prefix(MIDR_CORE_AF_IPV6, 64, 0x20), .node_id = 2},
+	};
+	struct midr_ted_group_edge edge = {
+		.source_group_id = 10, .target_group_id = 20, .aggregate_cost = 7,
+	};
+	struct midr_ted_prefix_group remote_prefix = {
+		.key = ted_prefix(MIDR_CORE_AF_IPV4, 24, 203), .group_id = 20,
+	};
+	struct midr_ted_view view = {
+		.generation = 43, .local_node_id = 1, .local_group_id = 10,
+		.nodes = nodes, .node_count = 2,
+		.intra_links = links, .intra_link_count = 2,
+		.egress_links = &egress, .egress_link_count = 1,
+		.node_prefixes = prefixes, .node_prefix_count = 2,
+		.group_edges = &edge, .group_edge_count = 1,
+		.prefix_groups = &remote_prefix, .prefix_group_count = 1,
+	};
+	struct midr_spf_route routes[3] = {0};
+	const struct midr_spf_route *route;
+	size_t count = 0;
+
+	assert(midr_spf_compute_ted(&view, routes, 3, &count) == 0);
+	assert(count == 3);
+	route = find_route(routes, count, &prefixes[0].key);
+	assert(route && route->reachable && route->metric == 5 &&
+	       route->scope == MIDR_SPF_ROUTE_INTRA_GROUP &&
+	       route->nexthop_count == 2);
+	assert(route->nexthops[0].family == MIDR_CORE_AF_IPV6 &&
+	       route->nexthops[0].ifindex == 11 &&
+	       route->nexthops[1].ifindex == 12 &&
+	       route->nexthops[0].address[0] == 0xfe);
+	route = find_route(routes, count, &remote_prefix.key);
+	assert(route && route->scope == MIDR_SPF_ROUTE_INTER_GROUP &&
+	       route->metric == 7 && route->nexthop_count == 1 &&
+	       route->nexthops[0].ifindex == 13 &&
+	       route->nexthops[0].destination_group_id == 20);
+	route = find_route(routes, count, &prefixes[1].key);
+	assert(route && route->nexthop_count == 2);
+	midr_spf_routes_clear(routes, count);
+
+	for (size_t index = 0; index < 2; index++)
+		links[index].local_ifindex = 0;
+	egress.local_ifindex = 0;
+	assert(midr_spf_compute_ted(&view, routes, 3, &count) == 0);
+	for (size_t index = 0; index < count; index++)
+		assert(routes[index].nexthop_count == 0);
+	midr_spf_routes_clear(routes, count);
+
+	for (size_t index = 0; index < 2; index++) {
+		links[index].local_ifindex = 11 + index;
+		links[index].remote_address[0] = 0x20;
+		links[index].remote_address[1] = 0x01;
+	}
+	egress.local_ifindex = 13;
+	egress.remote_address[0] = 0x20;
+	egress.remote_address[1] = 0x01;
+	assert(midr_spf_compute_ted(&view, routes, 3, &count) == 0);
+	assert(find_route(routes, count, &prefixes[0].key)->nexthop_count == 0);
+	assert(find_route(routes, count, &remote_prefix.key)->nexthop_count == 0);
+	assert(find_route(routes, count, &prefixes[1].key)->nexthop_count == 2);
+	midr_spf_routes_clear(routes, count);
+
+	for (size_t index = 0; index < 2; index++) {
+		links[index].family = MIDR_CORE_AF_IPV4;
+		memset(links[index].remote_address, 0,
+		       sizeof(links[index].remote_address));
+		links[index].remote_address[0] = 192;
+		links[index].remote_address[3] = 2;
+	}
+	assert(midr_spf_compute_ted(&view, routes, 3, &count) == 0);
+	assert(find_route(routes, count, &prefixes[0].key)->nexthop_count == 2);
+	assert(find_route(routes, count, &prefixes[1].key)->nexthop_count == 0);
+	midr_spf_routes_clear(routes, count);
+}
+
 int main(void)
 {
 	test_direct_prefix_selection();
 	test_link_graph_costs();
 	test_ipv6_ecmp_nexthops();
 	test_layered_ted_spf();
+	test_ted_cross_family_nexthops();
 	puts("midrd-spf-test: PASS");
 	return 0;
 }

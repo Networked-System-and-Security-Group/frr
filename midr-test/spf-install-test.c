@@ -286,10 +286,70 @@ static void test_runtime_ready_and_not_ready(void)
 	midr_ted_destroy(&ctx.ted);
 }
 
+static void test_ipv4_link_local_install(void)
+{
+	struct midr_context ctx;
+	struct zebra_probe probe = {0};
+	struct midr_spf_nexthop nexthop = {
+		.family = MIDR_CORE_AF_IPV6,
+		.address = {0xfe, 0x80, [15] = 2},
+		.ifindex = 11,
+	};
+	struct midr_spf_nexthop updated_nexthop = nexthop;
+	struct midr_spf_route route = route_v4(1, 5, &nexthop);
+	struct midr_spf_route updated_route = route;
+	struct midr_spf_results results = {
+		.references = 1, .generation = 1, .routes = &route, .count = 1,
+	};
+	struct midr_spf_results updated_results = {
+		.references = 1, .generation = 2,
+		.routes = &updated_route, .count = 1,
+	};
+
+	ted_create(&ctx);
+	assert(midr_zebra_backend_register(&ctx, &probe_ops, &probe) == 0);
+	assert(midr_spf_install_results(&ctx, NULL, &results) == 0);
+	assert(probe.adds == 1 && probe.deferred == 1);
+	assert(probe.last_prefix.family == AF_INET &&
+	       IS_IPADDR_V6(&probe.last_path.nexthop) &&
+	       IN6_IS_ADDR_LINKLOCAL(&probe.last_path.nexthop.ipaddr_v6) &&
+	       probe.last_path.ifindex == 11);
+	assert(midr_spf_install_results(&ctx, &results, &results) == 0);
+	assert(probe.adds == 1 && probe.deferred == 1);
+
+	updated_nexthop.ifindex = 21;
+	updated_route.nexthops = &updated_nexthop;
+	probe.fail_add_attempt = probe.add_attempts + 1;
+	assert(midr_spf_install_results(&ctx, &results, &updated_results) == -EIO);
+	assert(probe.aborts == 1 && probe.adds == 1);
+	probe.fail_add_attempt = 0;
+	assert(midr_spf_install_results(&ctx, &results, &updated_results) == 0);
+	assert(probe.adds == 2 && probe.last_path.ifindex == 21);
+	assert(midr_spf_install_results(&ctx, &updated_results, NULL) == 0);
+	assert(probe.deletes >= 1);
+
+	updated_nexthop.ifindex = 0;
+	assert(midr_spf_install_results(&ctx, NULL, &updated_results) == 0);
+	assert(probe.adds == 2);
+	updated_nexthop.ifindex = 21;
+	updated_nexthop.address[0] = 0x20;
+	updated_nexthop.address[1] = 0x01;
+	assert(midr_spf_install_results(&ctx, NULL, &updated_results) == 0);
+	assert(probe.adds == 2);
+	updated_route.family = MIDR_CORE_AF_IPV6;
+	updated_route.prefix_len = 64;
+	updated_nexthop.family = MIDR_CORE_AF_IPV4;
+	assert(midr_spf_install_results(&ctx, NULL, &updated_results) == 0);
+	assert(probe.adds == 2);
+	assert(midr_zebra_backend_unregister(&ctx) == 0);
+	midr_ted_destroy(&ctx.ted);
+}
+
 int main(void)
 {
 	test_result_diff_and_compatibility_payload();
 	test_runtime_ready_and_not_ready();
+	test_ipv4_link_local_install();
 	puts("midrd-spf-install-test: PASS");
 	return 0;
 }
