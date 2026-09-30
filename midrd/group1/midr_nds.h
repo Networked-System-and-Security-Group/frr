@@ -733,6 +733,10 @@ extern void midr_nds_finish(struct midr_g1 *g1);
 /* A midrd session went up (peer->established) or down (was_established). */
 extern void midr_nds_session_status(struct midr_g1_peer *peer,
 				    bool was_established);
+/* Report the Link to @remote_rid again if it has a measurement; used when its
+ * virtual link became READY. */
+extern void midr_nds_report_link_by_rid(struct midr_g1 *g1,
+					uint32_t remote_rid);
 
 /* ===========================================================================
  * NDS node table (migrated from the old bgp_midr_node.c)

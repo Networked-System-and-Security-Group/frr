@@ -1769,8 +1769,9 @@ DEFUN(g1_show_midr_group2_snapshot,
 			l->metrics.rtt_us, l->metrics.loss_ppm,
 			l->metrics.available_bandwidth_kbps,
 			l->metrics.measurement_seqno, l->version);
-		vty_out(vty, "     addr %pIA -> %pIA\n",
-			&l->link_local_address, &l->link_remote_address);
+		vty_out(vty, "     addr %pIA -> %pIA ifindex %d\n",
+			&l->link_local_address, &l->link_remote_address,
+			l->local_ifindex);
 	}
 
 	midr_nds_topology_snapshot_release(ctx, &snapshot);

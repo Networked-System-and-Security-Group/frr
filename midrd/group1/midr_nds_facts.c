@@ -18,6 +18,7 @@
 #include "midrd/group1/midr_g1.h"
 #include "midrd/group1/midr_nds.h"
 #include "midrd/group1/midr_nds_facts.h"
+#include "midrd/group1/midr_vlink.h"
 
 DEFINE_MTYPE_STATIC(MIDR_G1, MIDR_NDS_FACTS, "MIDR NDS fact table");
 DEFINE_MTYPE_STATIC(MIDR_G1, MIDR_NDS_FACT_LINK, "MIDR NDS link fact");
@@ -625,6 +626,8 @@ void midr_nds_report_link(struct midr_g1 *g1, const struct midr_link_entry *link
 	struct midr_node_entry *remote_node;
 	struct midr_link_metrics metrics = {};
 	struct ipaddr local_locator, remote_locator;
+	struct midr_g1_vlink_info vlink = {};
+	bool use_vlink;
 	uint32_t local_rid, remote_rid;
 	uint64_t link_id, seqno;
 	int ret;
@@ -730,6 +733,21 @@ void midr_nds_report_link(struct midr_g1 *g1, const struct midr_link_entry *link
 	}
 
 	/*
+	 * 闸门④ 虚链路 READY（midrd 连着 zebra 时）。会话跑在 underlay 上，对端
+	 * locator 隔着多跳，当不了 FIB 下一跳；链路改由第三组建一条 GRE，READY
+	 * 之后才报，报的是 GRE 的 ifindex 和隧道内层地址（见 midr_vlink.h）。
+	 * 还没 READY 就先不报，READY 时 midr_vlink 会回头重报这一条。
+	 */
+	use_vlink = midr_g1_vlink_enabled();
+	if (use_vlink &&
+	    !midr_g1_vlink_ready(g1, remote_rid, &local_locator,
+				 &remote_locator, &vlink)) {
+		MIDR_LOG("MIDR facts: 虚链路未就绪，link 上报跳过 (%pFX)",
+			 &link->remote_node_id);
+		return;
+	}
+
+	/*
 	 * 满格丢包 = 链路不可用，转**撤销**（2026-08-20 口径改定，推翻 08-19 的
 	 * "夹 999999 照报"）。依据是第二组原文档 §5.5 白纸黑字：`loss_ppm ==
 	 * 1000000` 表示 Link 不可用，第一组不得继续 upsert ACTIVE、对已存在对象
@@ -775,13 +793,21 @@ void midr_nds_report_link(struct midr_g1 *g1, const struct midr_link_entry *link
 	metrics.measurement_seqno = seqno;
 
 	/*
-	 * 链路两端地址：两端真实 locator 均已在入口验证为 present、有效、唯一且
-	 * 同族。Router ID 永不作为 endpoint 回落值。
-	 * local_ifindex 恒 0（多跳链路出口由路由表现算，文档
-	 * 约定填 0 = 不适用），XCALLOC 已置 0。
+	 * 链路两端地址。有虚链路时填 GRE 的 ifindex 和隧道内层地址（fe80），
+	 * 第三组据此装“内层对端 + GRE 出接口”的路由；外层 locator 不进 Link。
+	 * 没有虚链路（midrd 不连 zebra）时照旧填两端 locator、ifindex 0
+	 * （多跳链路出口由路由表现算）。locator 已在入口验证为 present、有效、
+	 * 唯一且同族；Router ID 永不作为 endpoint 回落值。
 	 */
-	fl->data.link_local_address = local_locator;
-	fl->data.link_remote_address = remote_locator;
+	if (use_vlink) {
+		fl->data.local_ifindex = vlink.ifindex;
+		fl->data.link_local_address = vlink.overlay_local;
+		fl->data.link_remote_address = vlink.overlay_remote;
+	} else {
+		fl->data.local_ifindex = 0;
+		fl->data.link_local_address = local_locator;
+		fl->data.link_remote_address = remote_locator;
+	}
 	fl->data.metrics = metrics;
 	fl->data.policy_state = MIDR_POLICY_ALLOWED;
 
@@ -1012,10 +1038,28 @@ static bool snapshot_link_eligible(struct midr_g1 *g1,
 	if (!midr_nds_local_transport_get(g1, &local_locator) ||
 	    !midr_nds_node_transport_get(g1, &remote, &remote_locator) ||
 	    ipaddr_family(&local_locator) != ipaddr_family(&remote_locator) ||
-	    !midr_nds_locator_unique(g1, &remote, &remote_locator) ||
-	    !midr_ipaddr_same(&fl->data.link_local_address, &local_locator) ||
-	    !midr_ipaddr_same(&fl->data.link_remote_address, &remote_locator))
+	    !midr_nds_locator_unique(g1, &remote, &remote_locator))
 		return false;
+	if (fl->data.local_ifindex > 0) {
+		struct midr_g1_vlink_info vlink;
+
+		/* 虚链路：隧道仍 READY、外层还是当前这一代 locator，且事实里的
+		 * ifindex/内层地址就是这条隧道的。 */
+		if (!midr_g1_vlink_get(fl->data.key.remote_node_id, &vlink) ||
+		    !midr_ipaddr_same(&vlink.outer_local, &local_locator) ||
+		    !midr_ipaddr_same(&vlink.outer_remote, &remote_locator) ||
+		    vlink.ifindex != fl->data.local_ifindex ||
+		    !midr_ipaddr_same(&fl->data.link_local_address,
+				      &vlink.overlay_local) ||
+		    !midr_ipaddr_same(&fl->data.link_remote_address,
+				      &vlink.overlay_remote))
+			return false;
+	} else if (!midr_ipaddr_same(&fl->data.link_local_address,
+				     &local_locator) ||
+		   !midr_ipaddr_same(&fl->data.link_remote_address,
+				     &remote_locator)) {
+		return false;
+	}
 
 	/* 闸门① 会话 Established —— 会话没了就不该继续声称这条链路在。 */
 	if (!midr_node_established_peer(g1, &remote))
@@ -1064,6 +1108,13 @@ static const char *snapshot_node_selfcheck(const struct midr_node_update *node)
 	return NULL;
 }
 
+static bool snapshot_link_address_valid(const struct ipaddr *address)
+{
+	return midr_ipaddr_valid_locator(address) ||
+	       (IS_IPADDR_V6(address) &&
+		IN6_IS_ADDR_LINKLOCAL(&address->ipaddr_v6));
+}
+
 static const char *snapshot_link_selfcheck(const struct midr_link_update *link)
 {
 	if (link->local_ifindex < 0)
@@ -1071,9 +1122,15 @@ static const char *snapshot_link_selfcheck(const struct midr_link_update *link)
 	if (!snapshot_ipaddr_present(&link->link_local_address) ||
 	    !snapshot_ipaddr_present(&link->link_remote_address))
 		return "链路两端地址缺失";
-	if (!midr_ipaddr_valid_locator(&link->link_local_address) ||
-	    !midr_ipaddr_valid_locator(&link->link_remote_address))
+	/* 虚链路报的是出接口上的 fe80 内层地址，带 ifindex 才有意义。 */
+	if (link->local_ifindex > 0) {
+		if (!snapshot_link_address_valid(&link->link_local_address) ||
+		    !snapshot_link_address_valid(&link->link_remote_address))
+			return "虚链路内层地址非法";
+	} else if (!midr_ipaddr_valid_locator(&link->link_local_address) ||
+		   !midr_ipaddr_valid_locator(&link->link_remote_address)) {
 		return "链路端点 locator 非法";
+	}
 	if (ipaddr_family(&link->link_local_address) !=
 	    ipaddr_family(&link->link_remote_address))
 		return "链路两端地址族不一致";

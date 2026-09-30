@@ -29,6 +29,7 @@
 #include "midrd/group1/midr_cl.h"
 #include "midrd/group1/midr_pm.h"
 #include "midrd/group1/midr_store.h"
+#include "midrd/group1/midr_vlink.h"
 
 /* §8.31 bootstrap 种子持久化参数 */
 #define MIDR_STORE_SEED_KEEP	  32 /* 种子库最多留几条（防膨胀，prune 上限） */
@@ -693,6 +694,8 @@ static void midr_nds_detach_node(struct midr_g1 *g1, struct midr_node_entry *ent
 	 * 不做的话事实表只增不减，轮 3 的 snapshot 会把早就拆掉的链路重报一遍。
 	 */
 	midr_nds_report_link_withdraw(g1, &entry->node_id);
+	/* 邻接没了，它的虚链路随之删除（Link 已在上一行撤掉）。 */
+	midr_g1_vlink_release(g1, entry->node_id.u.prefix4.s_addr);
 	/* node_id is the canonical PM/fact key and must always be retired, even
 	 * when the node has no usable locator.  Remove a distinct historical
 	 * locator key as well. */
@@ -4885,6 +4888,22 @@ static void midr_nds_report_link_on_established(struct midr_g1 *g1,
 	}
 }
 
+void midr_nds_report_link_by_rid(struct midr_g1 *g1, uint32_t remote_rid)
+{
+	struct prefix node_id = { .family = AF_INET,
+				  .prefixlen = IPV4_MAX_BITLEN };
+	struct midr_link_entry *le;
+
+	if (!g1 || !g1->midr_nds_info || !remote_rid)
+		return;
+	node_id.u.prefix4.s_addr = remote_rid;
+	le = midr_global_view_find_link(g1->midr_nds_info->global_view,
+					&node_id);
+	/* 与会话上沿首报同一口径：没有真实测量值就等 PM 回灌。 */
+	if (le && le->short_term.rtt_us)
+		midr_nds_report_link(g1, le);
+}
+
 /*
  * 会话建立时身份不合法（手配会话的对端身份与节点表冲突等）的延后清理。
  * bgpd 版在会话掉线时也经此"当场拆边清账"；midrd 版掉线只起断连计时（见
@@ -4992,6 +5011,8 @@ void midr_nds_session_status(struct midr_g1_peer *peer, bool was_established)
 	 * 重连，交接文档（第二版）要求第一组不因 Session Down 撤销仍然有效的 Link；
 	 * 这里只起断连计时，断开超过 MIDR_SESSION_DOWN_AGE 仍未恢复才由老化扫描
 	 * 拆边销账。挂靠引导的故障切换照旧（挂靠边不上报 Link）。
+	 * 虚链路同理：会话走 underlay，掉线时隧道仍可转发，Link 仍是有效事实；
+	 * 隧道本身失效才由 midr_vlink 立即撤销。
 	 */
 	midr_ledger_note_down(peer->g1, transport);
 	midr_nds_attach_note_down(peer->g1, transport);

@@ -11,12 +11,15 @@
 #include "memory.h"
 
 #include "midrd/midr-context.h"
+#include "midrd/midr-dp-backend.h"
 #include "midrd/midr-session.h"
 #include "midrd/midr-spf.h"
 #include "midrd/midr-topology.h"
+#include "midrd/midr-virtual-link.h"
 #include "midrd/group1/midr_g1.h"
 #include "midrd/group1/midr_nds.h"
 #include "midrd/group1/midr_nds_facts.h"
+#include "midrd/group1/midr_vlink.h"
 
 #define LOCAL_NODE_ID 0x0100000aU /* 10.0.0.1 */
 #define REMOTE_NODE_ID 0x0200000aU /* 10.0.0.2 */
@@ -53,7 +56,71 @@ static struct {
 	unsigned int node_withdraws;
 	unsigned int link_upserts;
 	unsigned int link_withdraws;
+
+	/* Group 3's virtual-link service. */
+	int vlink_add_rc;
+	enum midr_virtual_link_state vlink_add_state;
+	midr_vlink_notify_cb vlink_cb;
+	struct midr_virtual_link_desc vlink_desc; /* last add */
+	char vlink_deleted[IFNAMSIZ];		  /* last del */
+	unsigned int vlink_adds;
+	unsigned int vlink_dels;
 } stub;
+
+/* Non-NULL: midrd runs the data plane, so group 1 uses virtual links. */
+struct midr_dp_backend *midr_dp_backend_get(void)
+{
+	return (struct midr_dp_backend *)&stub;
+}
+
+int midr_virtual_link_add(struct midr_context *c,
+			  const struct midr_virtual_link_desc *desc,
+			  struct midr_virtual_link_status *status)
+{
+	assert(c == ctx && desc);
+	stub.vlink_adds++;
+	stub.vlink_desc = *desc;
+	if (status) {
+		memset(status, 0, sizeof(*status));
+		strlcpy(status->ifname, desc->ifname, sizeof(status->ifname));
+		status->state = stub.vlink_add_rc ? MIDR_VLINK_FAILED
+						  : stub.vlink_add_state;
+		if (stub.vlink_add_rc) {
+			status->stage = MIDR_VLINK_STAGE_GRE_CREATE;
+			status->last_error = EIO;
+		}
+	}
+	return stub.vlink_add_rc;
+}
+
+int midr_virtual_link_del(struct midr_context *c, const char *ifname,
+			  struct midr_virtual_link_status *status)
+{
+	assert(c == ctx && ifname);
+	(void)status;
+	stub.vlink_dels++;
+	strlcpy(stub.vlink_deleted, ifname, sizeof(stub.vlink_deleted));
+	return 0;
+}
+
+void midr_virtual_link_register_notify(midr_vlink_notify_cb cb, void *arg)
+{
+	(void)arg;
+	assert(!stub.vlink_cb);
+	stub.vlink_cb = cb;
+}
+
+void midr_virtual_link_unregister_notify(midr_vlink_notify_cb cb)
+{
+	assert(stub.vlink_cb == cb);
+	stub.vlink_cb = NULL;
+}
+
+const char *midr_virtual_link_state_str(enum midr_virtual_link_state state)
+{
+	(void)state;
+	return "stub";
+}
 
 uint32_t midr_context_node_id(const struct midr_context *c)
 {
@@ -398,6 +465,179 @@ static void test_node_upsert_failure(struct midr_g1 *g1)
 	printf("node upsert failure keeps the fact for retry and resync: PASS\n");
 }
 
+static void vlink_event(const char *ifname, enum midr_virtual_link_event ev,
+			ifindex_t ifindex)
+{
+	struct midr_virtual_link_status st = {};
+
+	assert(stub.vlink_cb);
+	strlcpy(st.ifname, ifname, sizeof(st.ifname));
+	st.event = ev;
+	st.ifindex = ifindex;
+	switch (ev) {
+	case MIDR_VLINK_EV_READY:
+		st.state = MIDR_VLINK_READY;
+		st.overlay_ready = true;
+		break;
+	case MIDR_VLINK_EV_FAILED:
+		st.state = MIDR_VLINK_FAILED;
+		st.stage = MIDR_VLINK_STAGE_DEVICE_CONFIRM;
+		st.last_error = ENODEV;
+		break;
+	case MIDR_VLINK_EV_DOWN:
+		st.state = MIDR_VLINK_DOWN;
+		break;
+	case MIDR_VLINK_EV_DEVICE_UP:
+	case MIDR_VLINK_EV_ADDRESS_SET:
+	case MIDR_VLINK_EV_NONE:
+		st.state = MIDR_VLINK_DEVICE_UP;
+		break;
+	}
+	stub.vlink_cb(&st, NULL);
+}
+
+static void test_vlink_overlay_address(void)
+{
+	struct in_addr a, b;
+	struct ipaddr addr;
+	char buf[INET6_ADDRSTRLEN];
+
+	inet_pton(AF_INET, "10.0.0.11", &a);
+	inet_pton(AF_INET, "10.0.0.22", &b);
+	midr_g1_vlink_overlay_addr(a.s_addr, b.s_addr, &addr);
+	assert(IS_IPADDR_V6(&addr));
+	inet_ntop(AF_INET6, &addr.ipaddr_v6, buf, sizeof(buf));
+	assert(!strcmp(buf, "fe80::a00:b:a00:16"));
+	midr_g1_vlink_overlay_addr(b.s_addr, a.s_addr, &addr);
+	inet_ntop(AF_INET6, &addr.ipaddr_v6, buf, sizeof(buf));
+	assert(!strcmp(buf, "fe80::a00:16:a00:b"));
+	printf("virtual link overlay address fe80::<local><remote>: PASS\n");
+}
+
+static void test_vlink_lifecycle(struct midr_g1 *g1)
+{
+	struct ipaddr local = v4(0xc0000201), remote = v4(0xc0000202);
+	struct ipaddr moved = v4(0xc0000212);
+	struct ipaddr overlay_local, overlay_remote;
+	struct midr_g1_vlink_info info;
+	const char *name = "mgre-0a000002"; /* REMOTE_NODE_ID = 10.0.0.2 */
+	unsigned int adds = stub.vlink_adds, dels = stub.vlink_dels;
+
+	assert(midr_g1_vlink_enabled() && stub.vlink_cb);
+	midr_g1_vlink_overlay_addr(LOCAL_NODE_ID, REMOTE_NODE_ID,
+				   &overlay_local);
+	midr_g1_vlink_overlay_addr(REMOTE_NODE_ID, LOCAL_NODE_ID,
+				   &overlay_remote);
+
+	/* First ask: one request, mirrored overlay addresses, not ready. */
+	stub.vlink_add_state = MIDR_VLINK_CREATING;
+	assert(!midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &remote,
+				    &info));
+	assert(stub.vlink_adds == adds + 1);
+	assert(!strcmp(stub.vlink_desc.ifname, name));
+	assert(!ipaddr_cmp(&stub.vlink_desc.outer_local, &local));
+	assert(!ipaddr_cmp(&stub.vlink_desc.outer_remote, &remote));
+	assert(!ipaddr_cmp(&stub.vlink_desc.overlay_local, &overlay_local));
+	assert(!ipaddr_cmp(&stub.vlink_desc.overlay_remote, &overlay_remote));
+	assert(stub.vlink_desc.overlay_prefix_len == 64);
+	assert(!stub.vlink_desc.flags);
+
+	/* Asking again while it is being built does not re-request. */
+	assert(!midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &remote,
+				    &info));
+	assert(stub.vlink_adds == adds + 1);
+
+	/* DEVICE_UP is not enough; READY is not either until the peer answers
+	 * on the overlay. */
+	vlink_event(name, MIDR_VLINK_EV_DEVICE_UP, 27);
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, &info));
+	vlink_event(name, MIDR_VLINK_EV_READY, 27);
+	run_queued();
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, &info));
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &remote,
+				   &info));
+	assert(info.ifindex == 27);
+	assert(!ipaddr_cmp(&info.overlay_local, &overlay_local));
+	assert(!ipaddr_cmp(&info.overlay_remote, &overlay_remote));
+	assert(stub.vlink_adds == adds + 1);
+
+	/* The peer stops answering: withdrawn after PROBE_MISSES probes, the
+	 * tunnel stays and a later reply brings the Link back. */
+	for (unsigned int i = 1; i < MIDR_G1_VLINK_PROBE_MISSES; i++)
+		midr_g1_vlink_probe_event(REMOTE_NODE_ID, false);
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, false);
+	run_queued();
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	assert(stub.vlink_dels == dels);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, &info) && info.ifindex == 27);
+
+	/* The device disappears: no longer ready. */
+	vlink_event(name, MIDR_VLINK_EV_FAILED, 0);
+	run_queued();
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+
+	/* Rebuilt with a new ifindex; probed again before it counts. */
+	vlink_event(name, MIDR_VLINK_EV_READY, 31);
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, &info) && info.ifindex == 31);
+
+	/* A locator change rebuilds the tunnel under the same name. */
+	assert(!midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &moved,
+				    &info));
+	assert(stub.vlink_adds == adds + 2);
+	assert(stub.vlink_desc.flags & MIDR_VLINK_F_REBIND);
+	assert(!ipaddr_cmp(&stub.vlink_desc.outer_remote, &moved));
+	vlink_event(name, MIDR_VLINK_EV_READY, 33);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, &info) && info.ifindex == 33);
+	assert(!ipaddr_cmp(&info.outer_remote, &moved));
+
+	/* DOWN while not READY (a retry tearing the old device down) is not
+	 * another failure; READY afterwards works as usual. */
+	vlink_event(name, MIDR_VLINK_EV_FAILED, 0);
+	vlink_event(name, MIDR_VLINK_EV_DOWN, 0);
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	vlink_event(name, MIDR_VLINK_EV_READY, 35);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, &info) && info.ifindex == 35);
+
+	/* DOWN of a READY tunnel is a loss. */
+	vlink_event(name, MIDR_VLINK_EV_DOWN, 0);
+	run_queued();
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	vlink_event(name, MIDR_VLINK_EV_READY, 36);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+
+	/* Release deletes the tunnel; its DOWN notification is ignored. */
+	midr_g1_vlink_release(g1, REMOTE_NODE_ID);
+	assert(stub.vlink_dels == dels + 1);
+	assert(!strcmp(stub.vlink_deleted, name));
+	vlink_event(name, MIDR_VLINK_EV_DOWN, 0);
+	assert(!midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+
+	/* A rejected request is not ready and is not re-sent on every ask. */
+	stub.vlink_add_rc = -1;
+	assert(!midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &remote,
+				    &info));
+	assert(!midr_g1_vlink_ready(g1, REMOTE_NODE_ID, &local, &remote,
+				    &info));
+	assert(stub.vlink_adds == adds + 3);
+	stub.vlink_add_rc = 0;
+	midr_g1_vlink_release(g1, REMOTE_NODE_ID);
+	run_queued();
+	printf("virtual link request/ready/probe/failure/rebuild/release: PASS\n");
+}
+
 static void test_terminate_with_queued_events(struct midr_g1 *g1)
 {
 	struct ipaddr remote = v4(0xc0000203); /* 192.0.2.3 */
@@ -449,6 +689,8 @@ int main(void)
 
 	test_session_events(g1);
 	test_node_upsert_failure(g1);
+	test_vlink_overlay_address();
+	test_vlink_lifecycle(g1);
 	test_terminate_with_queued_events(g1);
 
 	cmd_terminate();

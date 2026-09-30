@@ -18,6 +18,7 @@
 #include "midrd/group1/midr_tier1_list.h"
 #include "midrd/group1/midr_tier1_vty.h"
 #include "midrd/group1/midr_trace_scheduler.h"
+#include "midrd/group1/midr_vlink.h"
 #include "midrd/midr-spf.h"
 
 DEFINE_MGROUP(MIDR_G1, "MIDR group 1");
@@ -560,6 +561,8 @@ int midr_group1_init(struct event_loop *master, struct midr_context *ctx)
 	midr_nds_vty_init();
 
 	midr_nodedir_init(g1);
+	/* Before NDS: its first Link reports already ask for tunnels. */
+	midr_g1_vlink_init(g1);
 	midr_nds_init(g1);
 	zlog_notice("MIDR group 1 started, router-id %pI4", &g1->router_id);
 	return 0;
@@ -583,6 +586,7 @@ void midr_group1_terminate(void)
 	midr_session_observer_unregister(g1->ctx);
 	midr_topology_provider_unregister(g1->ctx);
 	midr_nds_finish(g1);
+	midr_g1_vlink_finish(g1);
 	midr_nodedir_finish(g1);
 	while ((peer = listnode_head(g1->peer)))
 		midr_g1_peer_delete(peer);

@@ -43,6 +43,8 @@ midr_group1_sources = \
 	midrd/group1/midr_trace_types.h \
 	midrd/group1/midr_trace_udp.c \
 	midrd/group1/midr_trace_udp.h \
+	midrd/group1/midr_vlink.c \
+	midrd/group1/midr_vlink.h \
 	# end
 
 midrd_midrd_SOURCES += midrd/midr-session.h $(midr_group1_sources)
