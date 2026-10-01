@@ -7,14 +7,14 @@
 #   1. every node runs the expected daemons and the underlay is up;
 #   2. the underlay forwards between every pair of MIDR transports;
 #   3. groups form as configured (bootstraps, reps) or chosen by CL (z2);
-#   4. overlay sessions are native midrd sessions, full mesh inside each
-#      group, a backbone mesh between bootstraps and the manual r1-r2 edge;
+#   4. native midrd sessions form each group's policy-permitted mesh, a
+#      backbone mesh between bootstraps and the manual r1-r2 edge;
 #   5. the node directory group 1 floods matches every node's table;
 #   6. group 2 accepted the Node/Link facts and SPF reaches every member of
 #      the same group; inter-group routes are reported for information;
 #   7. every reported Link rides a READY GRE virtual link: fe80 overlay
 #      addresses and the tunnel's ifindex, the device is UP in the kernel,
-#      and (IPv6) same-group service prefixes route out of a tunnel.
+#      and IPv4/IPv6 same-group service prefixes use proto-199 GRE routes.
 # The Tier1 admission scenario (z1) is checked by check_tier1_admission.sh.
 #
 # Read-only.
@@ -38,19 +38,23 @@ declare -A NUM=([b1]=101 [b2]=102 [b3]=103 [b4]=104 [b5]=105
 		[t1]=201 [t2]=202 [t3]=203
 		[r1]=111 [m1a]=112 [m1b]=113 [r2]=121 [m2a]=122
 		[z1]=191 [z2]=192)
-declare -A GROUP=([r1]=1 [m1a]=1 [m1b]=1 [z2]=1 [r2]=2 [m2a]=2 [z1]=2)
+declare -A GROUP=([r1]=1 [m1a]=1 [m1b]=1 [z2]=0 [r2]=2 [m2a]=2 [z1]=2)
+declare -A ADMISSION
+source "$(dirname -- "${BASH_SOURCE[0]}")/midrd-lab-state.sh" || exit 2
 
 case "$FAMILY" in
 	ipv4)
 		loc() { printf '10.99.0.%s' "${NUM[$1]}"; }
 		svc() { printf '198.18.0.%s/32' "${NUM[$1]}"; }
 		PING=(ping -4)
+		IPR=(ip -4 route)
 		UNDERLAY_AF=ipv4Unicast
 		;;
 	ipv6)
 		loc() { printf 'fd00:99::%s' "${NUM[$1]}"; }
 		svc() { printf 'fd00:18::%s/128' "${NUM[$1]}"; }
 		PING=(ping -6)
+		IPR=(ip -6 route)
 		UNDERLAY_AF=ipv6Unicast
 		;;
 	*)
@@ -215,6 +219,14 @@ for node in $BOOTSTRAPS; do
 		pass "$node is a group-0 bootstrap" ||
 		fail "$node is not a group-0 bootstrap: $(printf '%s' "$self" | tr '\n' ' ')"
 done
+z2_self="$(mvty z2 'show midr self')"
+z2_log="$(midrd_log z2)"
+if z2_group=$(midr_lab_z2_group "$z2_self" "$z2_log"); then
+	GROUP[z2]=$z2_group
+	pass "zero-config z2 joined group $z2_group consistently with its CL recommendation"
+else
+	fail "z2 has an invalid, configured or inconsistent CL group: $(printf '%s' "$z2_self" | tr '\n' ' ')"
+fi
 for node in $MEMBERS; do
 	self="$(mvty "$node" 'show midr self')"
 	gid="$(field "$self" '^Group-ID')"
@@ -229,24 +241,31 @@ for node in r1 r2; do
 		pass "$node is its group's representative" ||
 		fail "$node is not a representative"
 done
-z2_log="$(midrd_log z2)"
-recommend="$(printf '%s\n' "$z2_log" | grep 'REP_PROBE_DONE → RECOMMEND' | tail -n 1)"
-printf '%s\n' "$recommend" | grep -q '群 1 代表' &&
-	pass "zero-config z2 joined by performance: ${recommend#*MIDR CL: }" ||
-	fail "z2 has no CL recommendation for group 1: ${recommend:-none}"
-
 ########################################################################
 # 4. Native overlay sessions
 ########################################################################
 bad=
-for a in $MEMBERS; do
-	for b in $MEMBERS; do
-		[ "$a" = "$b" ] || [ "${GROUP[$a]}" != "${GROUP[$b]}" ] && continue
-		read -r state count origin <<<"$(session "$a" "$(loc "$b")")"
-		[ "$state" = Established ] || bad="$bad $a->$b($state,$origin)"
+blocked_pairs=0
+for node in $MEMBERS; do
+	ADMISSION[$node]="$(mvty "$node" 'show midr admission')"
+done
+for source_node in $MEMBERS; do
+	for target_node in $MEMBERS; do
+		[ "$source_node" = "$target_node" ] ||
+			[ "${GROUP[$source_node]}" != "${GROUP[$target_node]}" ] && continue
+		read -r state count origin <<<"$(session "$source_node" "$(loc "$target_node")")"
+		if midr_lab_tier1_blocks "${ADMISSION[$source_node]}" "$(loc "$target_node")" ||
+		   midr_lab_tier1_blocks "${ADMISSION[$target_node]}" "$(loc "$source_node")"; then
+			blocked_pairs=$((blocked_pairs + 1))
+			[ "$state" != Established ] ||
+				bad="$bad $source_node->$target_node(Established despite Tier1 rejection)"
+		else
+			[ "$state" = Established ] ||
+				bad="$bad $source_node->$target_node($state,$origin)"
+		fi
 	done
 done
-[ -z "$bad" ] && pass 'each group is a full mesh of Established midrd sessions' ||
+[ -z "$bad" ] && pass "each group's permitted sessions are Established; $blocked_pairs explicitly Tier1-blocked directions remain disconnected" ||
 	fail "missing same-group sessions:$bad"
 
 bad=
@@ -387,15 +406,14 @@ for node in $MEMBERS; do
 		[ "$other" != "$node" ] && [ "${GROUP[$other]}" = "${GROUP[$node]}" ] || continue
 		dst="$(svc "$other")"
 		dst="${dst%/*}"
-		route="$(rexec "$node" ip route get "$dst")"
-		if printf '%s\n' "$route" | grep -q ' dev mgre-'; then
-			pass "$node routes $dst out of a GRE virtual link"
-		elif [ "$FAMILY" = ipv6 ]; then
-			fail "$node routes $dst not over GRE: $(printf '%s' "$route" | head -1)"
+		src="$(svc "$node")"
+		src="${src%/*}"
+		route="$(rexec "$node" "${IPR[@]}" get "$dst" from "$src")"
+		fib="$(rexec "$node" "${IPR[@]}" show proto 199 match "$dst")"
+		if midr_lab_route_is_gre "$route" "$fib"; then
+			pass "$node routes $dst out of a proto-199 GRE virtual link"
 		else
-			# Group 3's SPF only lets a Link carry prefixes of its own
-			# family, and virtual-link Links are IPv6 (fe80).
-			info "$node IPv4 $dst is not routed over GRE (fe80 Links carry IPv6 only): $(printf '%s' "$route" | head -1)"
+			fail "$node has no proto-199 GRE route for $dst: $(printf '%s' "$route" | head -1)"
 		fi
 	done
 done
