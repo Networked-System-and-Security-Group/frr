@@ -555,6 +555,15 @@ void midr_ctrl_send_member_request(struct bgp *bgp, struct ipaddr rep_transport,
 {
 	if (!bgp || !bgp->midr_nds_info)
 		return;
+	/* Bound the main candidate's list wait as well as PM warm-up. A
+	 * received list restarts this timer; no response still reaches CL. */
+	if (bgp->midr_nds_info->join_phase == MIDR_JOIN_PROBING_MEMBERS &&
+	    bgp->midr_nds_info->join_group_id == group_id) {
+		event_cancel(&bgp->midr_nds_info->t_member_probe_done);
+		event_add_timer(bm->master, midr_ctrl_member_probe_done_cb,
+				bgp, MIDR_JOIN_PROBE_WAIT_SECS,
+				&bgp->midr_nds_info->t_member_probe_done);
+	}
 	midr_ctrl_enqueue_request(bgp, rep_transport, MIDR_CTRL_MEMBER_LIST_REQ,
 				  group_id, &midr_ctrl_retx_default);
 	MIDR_FLOW_LOG("MIDR ctrl: sent MEMBER_LIST_REQ to %pIA (group %u)",
@@ -1445,6 +1454,12 @@ static void midr_ctrl_recv_rep_list(struct bgp *bgp, const uint8_t *buf,
 	struct midr_ctrl_identity_key *identities = NULL;
 	uint16_t count, i;
 
+	/* Discard late lists before they replace the active candidate directory. */
+	if (!mi->join_intent || mi->join_phase == MIDR_JOIN_PROBING_MEMBERS) {
+		midr_ctrl_drop_pending(mi, src, MIDR_CTRL_REP_LIST_REQ);
+		return;
+	}
+
 	if (n < 0 || !midr_ctrl_decode_list_header(
 			     buf, (size_t)n, MIDR_CTRL_REP_LIST_RESP,
 			     MIDR_CTRL_REP_ITEM_LEN, &count) ||
@@ -1571,7 +1586,7 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	}
 	/* 代表自己那条（组装时放最前）自带真实群号，用它判定这是哪一路响应。 */
 	resp_group = items[0].group_id;
-	is_join_candidate =
+	is_join_candidate = mi->join_phase == MIDR_JOIN_PROBING_MEMBERS &&
 		mi->join_group_id != 0 && resp_group == mi->join_group_id;
 	is_anchor = !is_join_candidate && resp_group != 0 &&
 		    (resp_group == mi->anchor_group_id[0] ||
@@ -1624,10 +1639,11 @@ static void midr_ctrl_recv_member_list(struct bgp *bgp, const uint8_t *buf,
 	XFREE(MTYPE_TMP, items);
 
 	if (is_join_candidate) {
+		mi->join_member_list_received = true;
 		/*
 		 * 探完整批成员后，编排层显式发 MEMBER_PROBE_DONE，交 CL 评估是否
-		 * 入群（I-7 JOIN/CREATE）。一整批只发一次。不在此清 join_phase：
-		 * 收尾在 midr_nds_on_cluster_decision 的 JOIN/CREATE 分支。
+		 * 入群（I-7 JOIN/RECOMMEND/CREATE）。一整批只发一次。
+		 * 不在此清 join_phase：回退或收尾由 I-7 决策推进。
 		 */
 		MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
 			      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);

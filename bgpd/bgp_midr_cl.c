@@ -12,13 +12,13 @@
  * 两个主决策点：
  *   REP_PROBE_DONE    -> 按长期 RTT/丢包率/带宽分数从 mi->rep_dir 选最优群代表
  *                        （RECOMMEND），无可用代表时输出 CREATE。
- *   MEMBER_PROBE_DONE -> 统计目标群内满足长期性能阈值的 is_adjacent 邻居数量，
- *                        达到 MIDR_CL_MIN_GOOD_LINKS 则 JOIN，否则 CREATE。
+ *   MEMBER_PROBE_DONE -> 验证目标群成员；达标则 JOIN，否则尝试下一可用群，
+ *                        全部已发现候选群不可用后才 CREATE。
  *
  * 注意事项：
  *   目前 MEMBER_PROBE_DONE 在 NDS 设计中于成员表灌入后立即触发，若使用真实 UDP
  *   探测，此时可能尚未收到探测回复（rtt_us=0）。CL 将 rtt_us=0 视为"未探测到"，
- *   不计入好链路。此时会输出 CREATE。Stage 1 定时器驱动的稳态优化见 §8 待办。
+ *   不计入好链路。该群验证失败后继续尝试其它候选，候选耗尽才 CREATE。
  */
 
 #include <zebra.h>
@@ -200,10 +200,11 @@ static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
  * 无可用候选时输出 CREATE（new_group_id = 当前最大 group_id + 1）。
  */
 static void cl_handle_rep_probe_done(struct bgp *bgp,
-				     const struct midr_global_view *gv)
+				     const struct midr_global_view *gv,
+				     uint32_t failed_group_id)
 {
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
-	size_t max = listcount(mi->rep_dir);
+	size_t max = mi->rep_dir ? listcount(mi->rep_dir) : 0;
 	struct midr_rep_entry **rank_rep;
 	struct midr_link_entry **rank_link;
 	size_t nrank = 0, chosen, i;
@@ -249,12 +250,13 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 
 	/* Performance orders the groups; admission decides which may be joined. */
 	for (chosen = 0; chosen < nrank; chosen++) {
-		if (!midr_admission_candidate_blocked(bgp,
+		if (!rank_rep[chosen]->join_failed &&
+		    !midr_admission_candidate_blocked(bgp,
 						      rank_rep[chosen]->rep_transport))
 			break;
 		MIDR_FLOW_LOG(
 			"MIDR CL: REP_PROBE_DONE → 跳过第 %zu 名群 %u 代表 %pI4"
-			"（rtt=%u us）：路径命中 Tier1，准入拒绝",
+			"（rtt=%u us）：成员验证失败或准入拒绝",
 			chosen + 1, rank_rep[chosen]->group_id,
 			&rank_rep[chosen]->rep_rid,
 			rank_link[chosen]->long_term.rtt_us);
@@ -275,6 +277,7 @@ static void cl_handle_rep_probe_done(struct bgp *bgp,
 		struct midr_rep_identity *identity;
 
 		d.decision_type = MIDR_DECISION_RECOMMEND;
+		d.failed_group_id = failed_group_id;
 		d.new_group_id = rank_rep[chosen]->group_id;
 		d.old_group_id = mi->local_group_id;
 		d.recommended_rep_id.family = AF_INET;
@@ -389,7 +392,8 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
  * 处理 MEMBER_PROBE_DONE：
  *   目标群 = mi->join_group_id（由 RECOMMEND 阶段确定）。
  *   遍历全局视图中该群的 is_adjacent 节点，统计满足长期 RTT/丢包率阈值的数量。
- *   够格则 JOIN；否则 CREATE（分配新群 ID = 最大 + 1）。
+ *   够格则 JOIN；否则标记该群验证失败，按代表性能继续尝试未失败的群。
+ *   只有全部已发现候选群都不可用才 CREATE（分配新群 ID = 最大 + 1）。
  *
  * JOIN threshold is capped the same way the PERIODIC_SYNC stay threshold is
  * (min(MIDR_CL_MIN_GOOD_LINKS, total known members) — see cl_handle_periodic_
@@ -406,9 +410,9 @@ static size_t cl_count_good_member_links(const struct bgp *bgp,
  * that needs at least one known good link to justify, whereas staying put
  * on zero data defaults to "don't panic-leave".
  *
- * 注：当前 NDS 不支持次优代表重试流程（RECOMMEND guard 仅在 PROBING_REPS 阶段
- * 生效）。若需要重试，后续可在 NDS 放开 guard 后在此输出 RECOMMEND，CL 保存有
- * 序候选列表即可实现 group-demo 的完整回退逻辑。
+ * 本轮失败标记保留在代表目录中，并按群号标记所有代表，避免换代表重试同一群。
+ * 重试 RECOMMEND 携带 failed_group_id，NDS 仅接受当前成员评估完成后的回退。
+ * 配置群号仍由运维决定，不自动切换到其它群。
  */
 static void cl_handle_member_probe_done(struct bgp *bgp,
 					const struct midr_global_view *gv)
@@ -420,9 +424,12 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 	size_t good_links, total_known, join_threshold;
 	struct midr_cluster_decision d = {};
 
-	good_links = cl_count_good_member_links(bgp, gv, target_gid,
-						&worst_rtt, &worst_loss,
-						&total_known);
+	good_links = total_known = 0;
+	/* A timed-out request must not JOIN using a previous attempt's members. */
+	if (mi->join_member_list_received)
+		good_links = cl_count_good_member_links(bgp, gv, target_gid,
+							&worst_rtt, &worst_loss,
+							&total_known);
 	join_threshold = total_known < MIDR_CL_MIN_GOOD_LINKS
 				  ? total_known
 				  : MIDR_CL_MIN_GOOD_LINKS;
@@ -436,7 +443,23 @@ static void cl_handle_member_probe_done(struct bgp *bgp,
 			"（%zu/%zu 条好链路，认识 %zu 个成员）",
 			target_gid, good_links, join_threshold, total_known);
 	} else {
-		uint32_t new_gid = cl_max_group_id(gv) + 1;
+		uint32_t new_gid;
+		struct listnode *node;
+		struct midr_rep_entry *rep;
+
+		MIDR_FLOW_LOG(
+			"MIDR CL: MEMBER_PROBE_DONE → 群 %u 验证失败"
+			"（%zu/%zu 条好链路，收到成员表=%d）",
+			target_gid, good_links, join_threshold,
+			mi->join_member_list_received);
+		if (!mi->config_group_id && mi->rep_dir) {
+			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, rep))
+				if (rep->group_id == target_gid)
+					rep->join_failed = true;
+			cl_handle_rep_probe_done(bgp, gv, target_gid);
+			return;
+		}
+		new_gid = cl_max_group_id(gv) + 1;
 
 		d.decision_type = MIDR_DECISION_CREATE;
 		d.new_group_id = new_gid;
@@ -678,7 +701,7 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 			MIDR_LOG("MIDR CL: REP_PROBE_DONE 但群代表目录为空");
 			break;
 		}
-		cl_handle_rep_probe_done(bgp, gv);
+		cl_handle_rep_probe_done(bgp, gv, 0);
 		break;
 
 	case MIDR_TRIGGER_MEMBER_PROBE_DONE:
@@ -759,7 +782,7 @@ static void midr_cl_on_global_view(struct bgp *bgp,
 		 * Only reconsider a phase whose original probe timer has completed. */
 		if (mi->join_phase == MIDR_JOIN_PROBING_REPS && mi->rep_dir &&
 		    !mi->t_rep_probe_done)
-			cl_handle_rep_probe_done(bgp, gv);
+			cl_handle_rep_probe_done(bgp, gv, 0);
 		else if (mi->join_phase == MIDR_JOIN_PROBING_MEMBERS && !mi->t_member_probe_done)
 			cl_handle_member_probe_done(bgp, gv);
 		break;

@@ -302,6 +302,8 @@ struct midr_rep_entry {
 	as_t rep_asn;
 	struct in_addr rep_rid; /* rep's IPv4 router-id identity；Control v4
 				 * decoder rejects zero */
+	/* Member validation failed in this join round; applies to the whole group. */
+	bool join_failed;
 };
 
 /*
@@ -437,6 +439,8 @@ struct midr_cluster_decision {
 	enum midr_decision_type decision_type;
 	uint32_t new_group_id;
 	uint32_t old_group_id;
+	/* RECOMMEND retry only: candidate just rejected; zero for initial selection. */
+	uint32_t failed_group_id;
 	struct prefix recommended_rep_id; /* only for RECOMMEND */
 	struct list *evidence;	       /* list of struct midr_node_evidence */
 	/*
@@ -455,7 +459,8 @@ typedef void (*midr_global_view_cb)(struct bgp *bgp,
 
 /*
  * 新节点加入流程所处的阶段。仅用于 midr_nds_on_cluster_decision 的幂等 guard
- * （RECOMMEND 只在 PROBING_REPS、JOIN/CREATE 只在 PROBING_MEMBERS 处理）与
+ * （RECOMMEND 在 PROBING_REPS 或成员评估完成后的回退阶段处理；
+ * JOIN 在 PROBING_MEMBERS、CREATE 在任一探测阶段处理）与
  * `show midr join` 展示。trigger（REP/MEMBER_PROBE_DONE）由编排层在"探完一批"
  * 后显式 notify_cl，不在 I-5 回灌时按本阶段推导。
  */
@@ -673,6 +678,8 @@ struct bgp_midr_nds {
 	enum midr_join_phase join_phase; /* 加入流程阶段，决定 I-5 回灌发哪个 trigger */
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */
+	/* A fresh main-candidate member list arrived in this attempt. */
+	bool join_member_list_received;
 
 	/*
 	 * 正在评估的两个次优群号（RECOMMEND 时从 CL 回灌的 anchor_reps 记

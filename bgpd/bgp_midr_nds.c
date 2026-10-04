@@ -2276,15 +2276,18 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		}
 		rep_transport = recommended_transport;
 
-		/*
-		 * §1.1 第一段产物：CL 选定群代表。幂等 guard——只在"探群代表"阶段
-		 * 处理第一个 RECOMMEND（探测同步循环会触发多次 REP_PROBE_DONE，第一次
-		 * 在此把阶段推进到 PROBING_MEMBERS，后续因阶段不符被忽略）。
-		 * 待办 1：若某群代表中途下线，REP_PROBE_DONE 可能因"探不齐"而发不出
-		 *         （现阶段靠"探到即推进"跑通正常流程，超时兜底后续再做）。
-		 */
-		if (mi->join_phase != MIDR_JOIN_PROBING_REPS) {
-			MIDR_LOG("MIDR I-7：RECOMMEND 但不在探群代表阶段，忽略");
+		/* Initial selection and a completed member attempt may advance.
+		 * A retry must identify the current failed group, so duplicate or
+		 * late recommendations cannot interrupt the next probe window. */
+		if ((mi->join_phase == MIDR_JOIN_PROBING_REPS &&
+		     decision->failed_group_id != 0) ||
+		    (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+		     (mi->join_phase != MIDR_JOIN_PROBING_MEMBERS ||
+		      !decision->failed_group_id ||
+		      decision->failed_group_id != mi->join_group_id ||
+		      target_gid == mi->join_group_id || mi->config_group_id ||
+		      mi->t_member_probe_done))) {
+			MIDR_LOG("MIDR I-7：过期或未完成成员评估的 RECOMMEND，忽略");
 			break;
 		}
 
@@ -2330,6 +2333,10 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 
 		mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
 		mi->join_group_id = target_gid;
+		mi->join_member_list_received = false;
+		event_cancel(&mi->t_rep_probe_done);
+		event_cancel(&mi->t_member_probe_done);
+		midr_nds_anchor_ctx_clear(bgp);
 		/*
 		 * 此处【不】通告群号——RECOMMEND 只是选定要评估的候选群，尚未真正
 		 * 入群。群号通告（TLV 1185）推迟到 JOIN（CL 判定值得入群后），避免
@@ -3426,6 +3433,7 @@ static void midr_join_round_start(struct bgp *bgp)
 	struct bgp_midr_nds *mi = bgp->midr_nds_info;
 	struct listnode *node;
 	struct midr_bootstrap_entry *b;
+	struct midr_rep_entry *rep;
 
 	/*
 	 * ⑧=A 第四守卫（5b）：引导节点不入群、不 join。
@@ -3450,6 +3458,17 @@ static void midr_join_round_start(struct bgp *bgp)
 	/* 表达一个尚未落定的加入意图：REP_LIST_RESP 到达时凭此放行进入 join。
 	 * 手动换组会作废它，届时迟到的响应被丢弃（见 midr_nds_set_group_id）。 */
 	mi->join_intent = true;
+
+	/* Candidate failures are local to one round, including restarts before
+	 * a new directory arrives. Cancel the preceding candidate's timer. */
+	event_cancel(&mi->t_rep_probe_done);
+	event_cancel(&mi->t_member_probe_done);
+	mi->join_phase = MIDR_JOIN_IDLE;
+	mi->join_in_progress = false;
+	mi->join_group_id = 0;
+	mi->join_member_list_received = false;
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, rep))
+		rep->join_failed = false;
 
 	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b))
 		b->failed = false;
@@ -4751,6 +4770,10 @@ void midr_join_on_rep_list(struct bgp *bgp)
 		MIDR_LOG("MIDR 加入：加入意图已作废（多半被手动换组中止），丢弃迟到的 REP_LIST_RESP");
 		return;
 	}
+	/* Once member validation begins, late directory responses must not
+	 * restart representative probing or erase this round's failure history. */
+	if (mi->join_phase == MIDR_JOIN_PROBING_MEMBERS)
+		return;
 
 	if (!mi->rep_dir || list_isempty(mi->rep_dir)) {
 		MIDR_FLOW_LOG("MIDR 加入：群代表目录为空，放弃加入");
