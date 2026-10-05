@@ -270,6 +270,10 @@ extern int midr_ctrl_connect_group(struct bgp *bgp, uint32_t group_id,
  */
 extern void midr_ctrl_send_rep_request(struct bgp *bgp,
 				       struct ipaddr bootstrap_transport);
+/* (Re)arm MEMBER_PROBE_DONE after secs (0 = as soon as possible). */
+extern void midr_ctrl_arm_member_probe_done(struct bgp *bgp, long secs);
+/* (Re)arm ANCHOR_PROBE_DONE after secs (0 = as soon as possible). */
+extern void midr_ctrl_arm_anchor_probe_done(struct bgp *bgp, long secs);
 extern void midr_ctrl_send_member_request(struct bgp *bgp,
 					  struct ipaddr rep_transport,
 					  uint32_t group_id);

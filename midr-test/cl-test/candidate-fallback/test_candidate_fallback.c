@@ -27,7 +27,6 @@ static void reset_fixture(void)
 	next_id = 1;
 	nds.rep_dir = list_new();
 	nds.bootstrap_list = list_new();
-	nds.join_member_list_received = true;
 	view.nodes = list_new();
 	view.links = list_new();
 	owner.midr_nds_info = &nds;
@@ -149,16 +148,54 @@ static void expect_state(bool condition, const char *description)
 	printf("%s %s: %s\n", condition ? "PASS" : "FAIL", case_name, description);
 }
 
+static bool in_batch(uint32_t gid)
+{
+	for (size_t i = 0; i < MIDR_JOIN_BATCH_MAX; i++)
+		if (nds.join_batch_gid[i] == gid)
+			return true;
+	return false;
+}
+
+static bool batch_is(uint32_t a, uint32_t b, uint32_t c)
+{
+	return nds.join_batch_gid[0] == a && nds.join_batch_gid[1] == b &&
+	       nds.join_batch_gid[2] == c;
+}
+
+static bool group_listed(uint32_t gid)
+{
+	struct listnode *n;
+	struct midr_rep_entry *rep;
+	for (ALL_LIST_ELEMENTS_RO(nds.rep_dir, n, rep))
+		if (rep->group_id == gid && rep->members_listed)
+			return true;
+	return false;
+}
+
+/* Anchor groups attached to decision index (1-based), in order; 0 = none. */
+static bool anchors_are(size_t index, uint32_t a, uint32_t b)
+{
+	size_t count = (a != 0) + (b != 0);
+	return decisions[index - 1].anchor_count == count &&
+	       (!a || decisions[index - 1].anchors[0].group_id == a) &&
+	       (!b || decisions[index - 1].anchors[1].group_id == b);
+}
+
 static void deliver_member_list(uint32_t gid)
 {
 	struct listnode *n;
 	struct midr_node_entry *node;
-	assert(nds.join_group_id == gid);
-	/* Model the validated list input. Parsing/PM remain outside this harness. */
+	struct midr_rep_entry *rep;
+	assert(nds.join_phase == MIDR_JOIN_PROBING_MEMBERS && in_batch(gid));
+	/* Model the validated list input (midr_ctrl_recv_member_list): members
+	 * become join candidates and the group is marked listed. Parsing/PM
+	 * remain outside this harness. */
 	for (ALL_LIST_ELEMENTS_RO(view.nodes, n, node))
 		if (node->group_id == gid)
 			node->is_adjacent = true;
-	nds.join_member_list_received = true;
+	for (ALL_LIST_ELEMENTS_RO(nds.rep_dir, n, rep))
+		if (rep->group_id == gid)
+			rep->members_listed = true;
 }
 
 static void fire_member_timer(void)
@@ -171,7 +208,8 @@ static void fire_member_timer(void)
 }
 
 /* The sink does not execute NDS. Advance its inputs explicitly after verifying
- * the selected representative, just as the RECOMMEND consumer would do. */
+ * the selected batch, just as the RECOMMEND consumer would do, and deliver
+ * every candidate's member list. */
 static bool select_first_group(void)
 {
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
@@ -182,8 +220,10 @@ static bool select_first_group(void)
 	}
 	nds.join_phase = MIDR_JOIN_PROBING_MEMBERS;
 	nds.join_group_id = 1;
-	for (size_t i = 0; i < decisions[0].anchor_count; i++)
-		nds.anchor_group_id[i] = decisions[0].anchors[i].group_id;
+	for (size_t i = 0; i < decisions[0].candidate_count; i++)
+		nds.join_batch_gid[i] = decisions[0].candidates[i];
+	for (size_t i = 0; i < decisions[0].candidate_count; i++)
+		deliver_member_list(decisions[0].candidates[i]);
 	return true;
 }
 
@@ -286,6 +326,8 @@ static void baseline(void)
 	add_members(2, 5, 5000, 0.01, true);
 	nds.join_phase = MIDR_JOIN_PROBING_MEMBERS;
 	nds.join_group_id = 2;
+	nds.join_batch_gid[0] = 2;
+	deliver_member_list(2);
 	trigger(MIDR_TRIGGER_MEMBER_PROBE_DONE);
 	expect_decision(1, MIDR_DECISION_JOIN, 2);
 	destroy_fixture();
@@ -294,11 +336,11 @@ static void baseline(void)
 static void regression(void)
 {
 	const char *names[] = {
-		"bad-member-rtt-retry-second-group",
-		"bad-member-loss-retry-second-group",
-		"four-of-five-good-links-retry-second-group",
-		"empty-first-member-list-retry-second-group",
-		"bad-first-group-blocked-second-retry-third",
+		"bad-member-rtt-join-second-group-in-batch",
+		"bad-member-loss-join-second-group-in-batch",
+		"four-of-five-good-links-join-second-group-in-batch",
+		"empty-first-member-list-join-second-group-in-batch",
+		"bad-first-group-blocked-second-join-third-in-batch",
 	};
 	for (unsigned int scenario = 0; scenario < array_size(names); scenario++) {
 		reset_fixture();
@@ -314,19 +356,23 @@ static void regression(void)
 		else if (scenario == 1)
 			add_members(1, 5, 5000, 0.05, true); /* strict loss bound */
 		else if (scenario == 2) {
-			add_members(1, 4, 5000, 0.01, true);
+			/* The representative is a listed member too: 4 good of 5. */
+			add_members(1, 3, 5000, 0.01, true);
 			link_for(add_node(1, 5000, 0.01, true))->status = MIDR_LINK_DOWN;
 		}
 
-		/* Runner-up members are known/probed as anchors (not adjacent).
- * Retry must fetch/evaluate them as the next main candidate; their mere
- * existence must not silently count them toward group 1's JOIN threshold. */
+		/* The runner-up is evaluated in the same batch window; its members
+		 * count only toward its own group, never toward group 1. */
 		add_members(scenario == 4 ? 3 : 2, 5, 5000, 0.01, false);
 		if (select_first_group()) {
+			if (scenario == 3) {
+				/* An empty MEMBER_LIST_RESP is dropped by Control, so
+				 * group 1 is never marked listed. */
+				((struct midr_rep_entry *)nds.rep_dir->head->data)
+					->members_listed = false;
+			}
 			trigger(MIDR_TRIGGER_MEMBER_PROBE_DONE);
-			/* Desired retry contract: try the next allowed representative
- * before CREATE. These are ordinary failing assertions, not xfails. */
-			expect_decision(2, MIDR_DECISION_RECOMMEND, scenario == 4 ? 3 : 2);
+			expect_decision(2, MIDR_DECISION_JOIN, scenario == 4 ? 3 : 2);
 		}
 		destroy_fixture();
 	}
@@ -336,116 +382,165 @@ static void state_flow(void)
 {
 	/* Real CL -> real NDS RECOMMEND case -> real Control request/timer. */
 	reset_fixture();
-	case_name = "retry-second-group-then-join";
+	case_name = "batch-of-three-joins-second-with-anchors-first-and-third";
 	execute_nds = true;
-	add_rep(1, 1000);
-	add_rep(2, 2000);
+	for (uint32_t gid = 1; gid <= 4; gid++)
+		add_rep(gid, gid * 1000);
 	add_members(1, 5, 25000, 0.01, false);
 	add_members(2, 5, 5000, 0.01, false);
+	add_members(3, 5, 5000, 0.01, false);
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
 	expect_decision(1, MIDR_DECISION_RECOMMEND, 1);
 	expect_state(nds.join_phase == MIDR_JOIN_PROBING_MEMBERS &&
-		     nds.join_group_id == 1 && nds.t_member_probe_done &&
-		     !nds.join_member_list_received && requested_groups[0] == 1,
-		     "NDS requests group 1 with a list-wait timer");
-	{
-		struct midr_cluster_decision premature = {
-			.decision_type = MIDR_DECISION_RECOMMEND,
-			.new_group_id = 2, .failed_group_id = 1,
-			.recommended_rep_id = node_id(2),
-		};
-		size_t before = request_count;
-		test_apply_recommend(&owner, &premature);
-		expect_state(nds.join_group_id == 1 && request_count == before,
-			     "unfinished member evaluation rejects premature retry");
-	}
-	deliver_member_list(1);
-	fire_member_timer();
-	expect_decision(2, MIDR_DECISION_RECOMMEND, 2);
-	expect_state(decisions[1].failed_gid == 1 && nds.join_group_id == 2 &&
-		     nds.t_member_probe_done && !nds.join_member_list_received,
-		     "NDS accepts retry, requests group 2 and resets fresh-list state");
+		     nds.join_group_id == 1 && batch_is(1, 2, 3) &&
+		     nds.t_member_probe_done && request_count == 3 &&
+		     requested_groups[0] == 1 && requested_groups[1] == 2 &&
+		     requested_groups[2] == 3,
+		     "NDS requests the whole batch with one list-wait timer");
 	{
 		struct midr_cluster_decision late = {
 			.decision_type = MIDR_DECISION_RECOMMEND,
-			.new_group_id = 2, .failed_group_id = 1,
-			.recommended_rep_id = node_id(2),
+			.new_group_id = 4,
+			.recommended_rep_id = node_id(4),
 		};
 		size_t before = request_count;
 		test_apply_recommend(&owner, &late);
-		expect_state(nds.join_group_id == 2 && request_count == before,
-			     "duplicate retry does not restart group 2");
+		expect_state(batch_is(1, 2, 3) && request_count == before,
+			     "a RECOMMEND during member evaluation is ignored");
 	}
+	deliver_member_list(1);
 	deliver_member_list(2);
+	deliver_member_list(3);
 	fire_member_timer();
-	expect_decision(3, MIDR_DECISION_JOIN, 2);
+	expect_decision(2, MIDR_DECISION_JOIN, 2);
+	expect_state(anchors_are(2, 1, 3),
+		     "anchors are the best other groups: 1 (failed) and 3");
 	destroy_fixture();
 
 	reset_fixture();
-	case_name = "create-only-after-all-four-groups-fail";
+	case_name = "whole-batch-fails-creates-without-trying-later-groups";
 	execute_nds = true;
-	for (uint32_t gid = 1; gid <= 4; gid++) {
+	for (uint32_t gid = 1; gid <= 5; gid++) {
 		add_rep(gid, gid * 1000);
-		add_members(gid, 5, 25000, 0.01, false);
+		add_members(gid, 5, gid == 5 ? 5000 : 25000, 0.01, false);
 	}
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
-	for (uint32_t gid = 1; gid <= 4; gid++) {
-		expect_decision(gid, MIDR_DECISION_RECOMMEND, gid);
-		expect_state(nds.join_group_id == gid && nds.t_member_probe_done,
-			     "candidate is actually requested before it is rejected");
+	expect_decision(1, MIDR_DECISION_RECOMMEND, 1);
+	for (uint32_t gid = 1; gid <= 3; gid++)
 		deliver_member_list(gid);
-		fire_member_timer();
+	fire_member_timer();
+	expect_decision(2, MIDR_DECISION_CREATE, 6);
+	expect_state(batch_is(1, 2, 3) && request_count == 3 &&
+		     !group_listed(4) && !group_listed(5),
+		     "groups 4 and 5 are never asked, although group 5 would pass");
+	expect_state(anchors_are(2, 1, 2), "CREATE carries anchors 1 and 2");
+	{
+		struct midr_cluster_decision late = {
+			.decision_type = MIDR_DECISION_RECOMMEND,
+			.new_group_id = 4,
+			.recommended_rep_id = node_id(4),
+		};
+		size_t before = request_count;
+		test_apply_recommend(&owner, &late);
+		expect_state(batch_is(1, 2, 3) && request_count == before,
+			     "a late RECOMMEND does not start a second batch");
 	}
-	expect_decision(5, MIDR_DECISION_CREATE, 5);
 	destroy_fixture();
 
 	reset_fixture();
-	case_name = "list-timeout-retries-without-stale-member-join";
+	case_name = "list-timeout-does-not-join-on-stale-members";
 	execute_nds = true;
 	add_rep(1, 1000);
 	add_rep(2, 2000);
 	add_members(1, 5, 5000, 0.01, true); /* Previous attempt's good data. */
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_state(batch_is(1, 2, 0) && nds.t_member_probe_done,
+		     "batch has a bounded list wait");
 	fire_member_timer(); /* No fresh list received. */
-	expect_decision(2, MIDR_DECISION_RECOMMEND, 2);
-	expect_state(!nds.join_member_list_received && nds.t_member_probe_done,
-		     "second group also has a bounded list wait");
-	fire_member_timer();
-	expect_decision(3, MIDR_DECISION_CREATE, 3);
+	expect_decision(2, MIDR_DECISION_CREATE, 3);
+	expect_state(anchors_are(2, 0, 0),
+		     "groups whose lists never arrived are not anchors");
 	destroy_fixture();
 
 	reset_fixture();
-	case_name = "duplicate-representatives-do-not-retry-a-failed-group";
+	case_name = "silent-group-skipped-as-anchor";
+	execute_nds = true;
+	for (uint32_t gid = 1; gid <= 4; gid++)
+		add_rep(gid, gid * 1000);
+	add_members(2, 5, 5000, 0.01, false);
+	add_members(3, 5, 25000, 0.01, false);
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	deliver_member_list(2); /* Group 1's representative never answers. */
+	deliver_member_list(3);
+	fire_member_timer();
+	expect_decision(2, MIDR_DECISION_JOIN, 2);
+	expect_state(anchors_are(2, 3, 4),
+		     "silent group 1 is skipped; untried group 4 fills the slot");
+	destroy_fixture();
+
+	reset_fixture();
+	case_name = "unresolvable-candidate-is-skipped-in-its-batch";
+	execute_nds = true;
+	add_rep(1, 1000)->rep_transport.v4 = 0; /* no usable locator */
+	add_rep(2, 2000);
+	add_members(2, 5, 5000, 0.01, false);
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_state(batch_is(1, 2, 0) && request_count == 1 &&
+		     requested_groups[0] == 2 && nds.t_member_probe_done &&
+		     nds.t_member_probe_done->seconds == MIDR_JOIN_PROBE_WAIT_SECS,
+		     "group 1 stays in the batch without a request; group 2 is asked");
+	deliver_member_list(2);
+	fire_member_timer();
+	expect_decision(2, MIDR_DECISION_JOIN, 2);
+	destroy_fixture();
+
+	reset_fixture();
+	case_name = "fully-unresolvable-batch-creates-at-once";
+	execute_nds = true;
+	for (uint32_t gid = 1; gid <= 4; gid++) {
+		struct midr_rep_entry *rep = add_rep(gid, gid * 1000);
+		if (gid <= 3)
+			rep->rep_transport.v4 = 0; /* no usable locator */
+	}
+	add_members(4, 5, 5000, 0.01, false);
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_state(batch_is(1, 2, 3) && request_count == 0 &&
+		     nds.t_member_probe_done && nds.t_member_probe_done->seconds == 0,
+		     "no request could be sent, so evaluation is due immediately");
+	fire_member_timer();
+	expect_decision(2, MIDR_DECISION_CREATE, 5);
+	expect_state(request_count == 0 && anchors_are(2, 4, 0),
+		     "group 4 is not tried; it is the only anchor with a reachable list");
+	destroy_fixture();
+
+	reset_fixture();
+	case_name = "duplicate-representatives-take-one-batch-slot";
 	execute_nds = true;
 	add_rep(1, 1000);
 	add_rep(1, 1500);
 	add_rep(2, 2000);
 	add_members(1, 5, 25000, 0.01, false);
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_state(batch_is(1, 2, 0), "one batch slot per group");
 	deliver_member_list(1);
 	fire_member_timer();
-	expect_decision(2, MIDR_DECISION_RECOMMEND, 2);
-	expect_state(((struct midr_rep_entry *)nds.rep_dir->head->data)->join_failed &&
-		     ((struct midr_rep_entry *)nds.rep_dir->head->next->data)->join_failed,
-		     "every representative of the rejected group is marked");
-	fire_member_timer();
-	expect_decision(3, MIDR_DECISION_CREATE, 3);
+	expect_decision(2, MIDR_DECISION_CREATE, 3);
 	destroy_fixture();
 
 	reset_fixture();
-	case_name = "new-round-clears-rejected-groups-and-old-timers";
-	add_rep(1, 1000)->join_failed = true;
+	case_name = "new-round-clears-listed-groups-and-old-timers";
+	add_rep(1, 1000)->members_listed = true;
 	nds.join_phase = MIDR_JOIN_PROBING_MEMBERS;
 	nds.join_group_id = 1;
-	nds.join_member_list_received = true;
+	nds.join_batch_gid[0] = 1;
 	nds.join_in_progress = true;
 	event_add_timer(NULL, midr_ctrl_member_probe_done_cb, &owner, 60,
 			&nds.t_member_probe_done);
 	midr_join_round_start(&owner);
 	expect_state(nds.join_phase == MIDR_JOIN_IDLE && !nds.join_in_progress &&
-		     nds.join_group_id == 0 && !nds.join_member_list_received &&
+		     nds.join_group_id == 0 && batch_is(0, 0, 0) &&
 		     !nds.t_member_probe_done && nds.join_intent &&
-		     !((struct midr_rep_entry *)nds.rep_dir->head->data)->join_failed,
+		     !group_listed(1),
 		     "new round discards the previous attempt's failure state");
 	nds.join_phase = MIDR_JOIN_PROBING_REPS;
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
@@ -459,11 +554,15 @@ static void state_flow(void)
 	add_rep(1, 1000);
 	add_rep(2, 2000);
 	add_members(1, 5, 25000, 0.01, false);
+	add_members(2, 5, 5000, 0.01, false);
 	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_state(batch_is(1, 0, 0) && request_count == 1,
+		     "a pinned node evaluates only its configured group");
 	deliver_member_list(1);
 	fire_member_timer();
 	expect_decision(2, MIDR_DECISION_CREATE, 3);
-	expect_state(nds.join_group_id == 1, "CL does not redirect the pinned group to group 2");
+	expect_state(nds.join_group_id == 1 && anchors_are(2, 2, 0),
+		     "CL does not redirect the pinned group; group 2 is an anchor");
 	destroy_fixture();
 }
 

@@ -1934,15 +1934,22 @@ DEFUN(show_midr_join,
 	 * 会误导：CL 走 CREATE 分支自建群时二者不同（候选 2 / 实建 4）。
 	 * 流程结束后该字段已清零，此处只在真正在途时才显示。
 	 */
-	if (mi->join_group_id)
-		vty_out(vty, "Target group   : %u (加入中的候选群)\n",
+	if (mi->join_group_id) {
+		int i;
+
+		vty_out(vty, "Target group   : %u (加入中的候选群；本批",
 			mi->join_group_id);
+		for (i = 0; i < MIDR_JOIN_BATCH_MAX; i++)
+			if (mi->join_batch_gid[i])
+				vty_out(vty, " %u", mi->join_batch_gid[i]);
+		vty_out(vty, ")\n");
+	}
 	/*
-	 * C-7：正在评估的两个备选群（ANCHOR 候选）。join 的 RECOMMEND 阶段由
-	 * CL 回灌进 anchor_group_id[2]，NDS 据此向这两个群的代表发
-	 * MEMBER_LIST_REQ 限时探测，探完发 ANCHOR_PROBE_DONE 交 CL 重选。
-	 * ⚠ 与上面的 Target group 不是一回事：那个是已选定、正在加入的候选群；
-	 * 这两个是仍在评估、尚未选中的次优群。
+	 * C-7：锚点群（ANCHOR 候选）。JOIN/CREATE 落定时由 CL 回灌进
+	 * anchor_group_id[2]（除本群外排名最高的两个群），NDS 对尚无数据的群
+	 * 发 MEMBER_LIST_REQ 限时探测，探完发 ANCHOR_PROBE_DONE 交 CL 选节点。
+	 * ⚠ 与上面的 Target group 不是一回事：那个是正在评估的候选批；
+	 * 这两个是落定后用来建群间连接的群。
 	 * 槽位值 0 = 该槽无候选；两槽皆空印 "(none)"——0 本身是合法群号，
 	 * 不能拿它当"没有"。
 	 */

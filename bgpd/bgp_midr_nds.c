@@ -2188,6 +2188,7 @@ static void midr_join_settle_group(struct bgp *bgp, uint32_t gid)
 	mi->join_in_progress = false;
 	mi->join_intent = false;
 	mi->join_group_id = 0;
+	memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 }
 
 /*
@@ -2237,6 +2238,93 @@ static bool midr_rep_identity_resolve(
 	return found;
 }
 
+static bool midr_rep_dir_group_listed(struct bgp_midr_nds *mi, uint32_t gid)
+{
+	struct listnode *node;
+	struct midr_rep_entry *r;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r))
+		if (r->group_id == gid && r->members_listed)
+			return true;
+	return false;
+}
+
+/*
+ * JOIN/CREATE 落定前：记下 CL 选的锚点群（decision->anchor_reps，至多 2 个），
+ * 并把这些群里评估期按候选成员标了 is_adjacent 的节点降为锚点候选——否则落定
+ * 时 midr_group_reconverge 第 3 步会把它们当"旧群邻接"拆掉，删掉锚点评估要用
+ * 的探测数据。其余落选候选群的成员仍由第 3 步清理。
+ */
+static void midr_join_anchor_keep(struct bgp *bgp,
+				  const struct list *anchor_reps)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct listnode *node;
+	struct midr_rep_identity *identity;
+	struct midr_node_entry *entry;
+	int slot = 0;
+
+	midr_nds_anchor_ctx_clear(bgp);
+	if (!anchor_reps)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(anchor_reps, node, identity))
+		if (slot < 2 && identity->group_id)
+			mi->anchor_group_id[slot++] = identity->group_id;
+
+	frr_each (midr_node_hash, &mi->global_view->nodes, entry) {
+		if (entry->is_self || !entry->is_adjacent || !entry->group_id)
+			continue;
+		if (entry->group_id != mi->anchor_group_id[0] &&
+		    entry->group_id != mi->anchor_group_id[1])
+			continue;
+		if (midr_node_established_peer(bgp, &entry->node_id))
+			continue; /* 真邻接，不是评估期候选 */
+		entry->is_adjacent = false;
+	}
+}
+
+/*
+ * JOIN/CREATE 落定后：本轮已收到成员表的锚点群，成员早已在探，直接可选；
+ * 没收到过的群向其代表要成员表。都有数据就立即发 ANCHOR_PROBE_DONE，否则
+ * 等一个热身窗口（成员表到达会重新计时，见 midr_ctrl_recv_member_list）。
+ */
+static void midr_join_anchor_request(struct bgp *bgp,
+				     const struct list *anchor_reps)
+{
+	struct bgp_midr_nds *mi = bgp->midr_nds_info;
+	struct listnode *node;
+	struct midr_rep_identity *identity;
+	struct ipaddr transport;
+	bool any = false, requested = false;
+
+	if (!anchor_reps)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(anchor_reps, node, identity)) {
+		if (!identity->group_id ||
+		    (identity->group_id != mi->anchor_group_id[0] &&
+		     identity->group_id != mi->anchor_group_id[1]))
+			continue;
+		any = true;
+		if (midr_rep_dir_group_listed(mi, identity->group_id)) {
+			MIDR_FLOW_LOG("MIDR I-7：锚点群 %u 成员已在评估期探测，直接参与锚点选择",
+				      identity->group_id);
+			continue;
+		}
+		if (!midr_rep_identity_resolve(bgp, identity, &transport)) {
+			zlog_warn("MIDR I-7: anchor representative identity cannot be resolved to a unique same-family locator");
+			continue;
+		}
+		midr_ctrl_send_member_request(bgp, transport,
+					      identity->group_id);
+		requested = true;
+		MIDR_FLOW_LOG("MIDR I-7：向锚点群 %u 代表 %pIA 请求成员（锚点候选）",
+			      identity->group_id, &transport);
+	}
+	if (any)
+		midr_ctrl_arm_anchor_probe_done(
+			bgp, requested ? MIDR_JOIN_PROBE_WAIT_SECS : 0);
+}
+
 void midr_nds_on_cluster_decision(struct bgp *bgp,
 				  const struct midr_cluster_decision *decision)
 {
@@ -2266,28 +2354,16 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			.group_id = decision->new_group_id,
 			.node_id = decision->recommended_rep_id,
 		};
-		struct ipaddr recommended_transport;
-		struct ipaddr rep_transport;
+		struct ipaddr batch_transport[MIDR_JOIN_BATCH_MAX];
+		bool batch_resolved[MIDR_JOIN_BATCH_MAX] = {};
+		struct listnode *cn;
+		struct midr_rep_identity *cand;
+		int nbatch = 1, nsent = 0, i;
 
-		if (!midr_rep_identity_resolve(bgp, &recommended,
-					       &recommended_transport)) {
-			zlog_warn("MIDR I-7: RECOMMEND representative identity cannot be resolved to a unique same-family locator");
-			break;
-		}
-		rep_transport = recommended_transport;
-
-		/* Initial selection and a completed member attempt may advance.
-		 * A retry must identify the current failed group, so duplicate or
-		 * late recommendations cannot interrupt the next probe window. */
-		if ((mi->join_phase == MIDR_JOIN_PROBING_REPS &&
-		     decision->failed_group_id != 0) ||
-		    (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
-		     (mi->join_phase != MIDR_JOIN_PROBING_MEMBERS ||
-		      !decision->failed_group_id ||
-		      decision->failed_group_id != mi->join_group_id ||
-		      target_gid == mi->join_group_id || mi->config_group_id ||
-		      mi->t_member_probe_done))) {
-			MIDR_LOG("MIDR I-7：过期或未完成成员评估的 RECOMMEND，忽略");
+		/* One batch per round: once member evaluation starts, duplicate or
+		 * late recommendations cannot replace the batch being probed. */
+		if (mi->join_phase != MIDR_JOIN_PROBING_REPS) {
+			MIDR_LOG("MIDR I-7：不在探代表阶段的 RECOMMEND（重复或过期），忽略");
 			break;
 		}
 
@@ -2302,38 +2378,49 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 				bgp, mi->config_group_id);
 			struct midr_rep_identity configured;
 
+			/* midrd: a refreshed directory may list this node as its own
+			 * group's representative; it cannot ask itself for members. */
+			if (r && IPV4_ADDR_SAME(&r->rep_rid, &bgp->router_id))
+				r = NULL;
+			if (r) {
+				configured.group_id = r->group_id;
+				configured.node_id.family = AF_INET;
+				configured.node_id.prefixlen = IPV4_MAX_BITLEN;
+				configured.node_id.u.prefix4 = r->rep_rid;
+				if (!midr_rep_identity_resolve(bgp, &configured,
+							       &batch_transport[0])) {
+					zlog_warn("MIDR I-7: configured group representative identity cannot be resolved to a unique same-family locator");
+					r = NULL;
+				}
+			}
 			if (!r) {
 				/*
 				 * 目录只是"某个引导节点知道的代表"、不是全网真相，
 				 * 所以这只是兜底不是解法（暂存区 B-5，归 CL owner
 				 * 的群生命周期语义）：以配置群号落定、结束 join，
-				 * 不把流程卡死在探代表阶段。
+				 * 不把流程卡死在探代表阶段。代表地址解析不出来同样
+				 * 要不到成员表，按同一兜底处理。
 				 */
-				zlog_info("MIDR I-7：不采纳 RECOMMEND 群 %u（本地配置群 %u）；目录中无群 %u 的代表，跳过探成员直接按配置群号落定",
+				zlog_info("MIDR I-7：不采纳 RECOMMEND 群 %u（本地配置群 %u）；目录中无群 %u 的可用代表，跳过探成员直接按配置群号落定",
 					  decision->new_group_id,
 					  mi->config_group_id,
 					  mi->config_group_id);
 				midr_join_settle_group(bgp, mi->config_group_id);
 				break;
 			}
-			configured.group_id = r->group_id;
-			configured.node_id.family = AF_INET;
-			configured.node_id.prefixlen = IPV4_MAX_BITLEN;
-			configured.node_id.u.prefix4 = r->rep_rid;
-			if (!midr_rep_identity_resolve(bgp, &configured,
-						       &rep_transport)) {
-				zlog_warn("MIDR I-7: configured group representative identity cannot be resolved to a unique same-family locator");
-				break;
-			}
+			batch_resolved[0] = true;
 			target_gid = mi->config_group_id;
 			MIDR_FLOW_LOG("MIDR I-7：不采纳 RECOMMEND 群 %u——按配置群 %u 走，向其代表 %pIA 要成员表",
 				      decision->new_group_id, target_gid,
-				      &rep_transport);
+				      &batch_transport[0]);
+		} else {
+			batch_resolved[0] = midr_rep_identity_resolve(
+				bgp, &recommended, &batch_transport[0]);
 		}
 
 		mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
 		mi->join_group_id = target_gid;
-		mi->join_member_list_received = false;
+		memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 		event_cancel(&mi->t_rep_probe_done);
 		event_cancel(&mi->t_member_probe_done);
 		midr_nds_anchor_ctx_clear(bgp);
@@ -2341,75 +2428,44 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		 * 此处【不】通告群号——RECOMMEND 只是选定要评估的候选群，尚未真正
 		 * 入群。群号通告（TLV 1185）推迟到 JOIN（CL 判定值得入群后），避免
 		 * "提前开香槟"。join_group_id 仅记录候选群，供后续探成员 / 建连用。
-		 */
-		/* 向群代表请求成员列表（MEMBER_LIST_REQ）。 */
-		midr_ctrl_send_member_request(bgp, rep_transport, target_gid);
-		MIDR_FLOW_LOG("MIDR I-7：RECOMMEND 群代表 %pIA → 进入探成员阶段，请求群 %u 成员",
-			      &rep_transport, target_gid);
-
-		/*
-		 * 顺带向至多 2 个"别的群"的代表也发 MEMBER_LIST_REQ，为群间锚点
-		 * 连接收集候选。先重置两个槽位——上一轮
-		 * join（若有）留下的群号不能带进这一轮，否则新到达的 MEMBER_LIST_RESP
-		 * 可能被误判成命中旧槽位。候选不足 2 个时未用到的槽位保持 0
-		 * （cl_handle_anchor_probe_done 按 0 跳过）。
 		 *
-		 * 【我方改动，需知会 zhc】原实现固定取 CL 的第 2/3 名（decision->
-		 * anchor_reps）当锚点候选。那是"第 1 名必定是我要进的群"这一前提下的
-		 * 写法——而配了群号的节点【不采纳】CL 的群号安排（见上方手配分支），
-		 * 第 1 名对它而言只是个外群，照原写法这类节点永远拿不到它，白丢一个
-		 * 最优候选；更早一步，若配置群号恰好等于第 2/3 名，那个槽位还会哑火
-		 * （MEMBER_LIST_RESP 分流先判"是不是我要进的群"，锚点这一路轮不到）。
-		 * 改成按【目标群】剔除：候选池 = CL 前三名（第 1 名在 new_group_id +
-		 * recommended_rep，第 2/3 名在 anchor_reps），剔掉 gid == target_gid
-		 * 的那一个，取剩下的前 2 个。没配群号时 target_gid 就是第 1 名，剔完
-		 * 剩第 2/3 名 —— 与原行为完全一致。
+		 * 一批候选群并行评估：向每个群的代表要成员表（MEMBER_LIST_REQ），
+		 * 成员表到达即起探，一个热身窗口后 MEMBER_PROBE_DONE 交 CL 按排名
+		 * 逐个验证。配了群号的节点只评估配置群。锚点群不在此请求——它取决
+		 * 于最终落定哪个群，由 JOIN/CREATE 携带（见 midr_join_anchor_keep）。
+		 *
+		 * 兜底：代表地址解析不出来的群仍留在本批、但不发请求——它收不到
+		 * 成员表，CL 评估时按"验证失败"跳过。整批都解析不出来时立即交 CL
+		 * 评估（整批失败即 CREATE），不让加入卡死。
 		 */
-		mi->anchor_group_id[0] = 0;
-		mi->anchor_group_id[1] = 0;
-		{
-			uint32_t pool_gid[3];
-			struct ipaddr pool_transport[3];
-			int npool = 0, slot = 0, i;
-
-			/* 第 1 名：CL 推荐的群及其代表。 */
-			pool_gid[npool] = decision->new_group_id;
-			pool_transport[npool] = recommended_transport;
-			npool++;
-
-			/* Resolve the second- and third-ranked stable identities. */
-			if (decision->anchor_reps) {
-				struct listnode *an;
-				struct midr_rep_identity *ar;
-				struct ipaddr anchor_transport;
-
-				for (ALL_LIST_ELEMENTS_RO(decision->anchor_reps,
-							  an, ar)) {
-					if (npool >= 3)
-						break;
-					if (!midr_rep_identity_resolve(
-						    bgp, ar, &anchor_transport)) {
-						zlog_warn("MIDR I-7: anchor representative identity cannot be resolved to a unique same-family locator");
-						continue;
-					}
-					pool_gid[npool] = ar->group_id;
-					pool_transport[npool] = anchor_transport;
-					npool++;
-				}
+		mi->join_batch_gid[0] = target_gid;
+		if (!mi->config_group_id && decision->candidate_reps)
+			for (ALL_LIST_ELEMENTS_RO(decision->candidate_reps, cn,
+						  cand)) {
+				if (nbatch >= MIDR_JOIN_BATCH_MAX)
+					break;
+				if (cand->group_id == target_gid)
+					continue;
+				batch_resolved[nbatch] = midr_rep_identity_resolve(
+					bgp, cand, &batch_transport[nbatch]);
+				mi->join_batch_gid[nbatch++] = cand->group_id;
 			}
 
-			for (i = 0; i < npool && slot < 2; i++) {
-				if (pool_gid[i] == target_gid)
-					continue; /* 这是我要进的群，不是搭桥对象 */
-				mi->anchor_group_id[slot] = pool_gid[i];
-				midr_ctrl_send_member_request(bgp,
-							      pool_transport[i],
-							      pool_gid[i]);
-				MIDR_FLOW_LOG("MIDR I-7：RECOMMEND 附带请求次优群 %u 成员（锚点候选）",
-					      pool_gid[i]);
-				slot++;
+		for (i = 0; i < nbatch; i++) {
+			if (!batch_resolved[i]) {
+				zlog_warn("MIDR I-7：候选群 %u 的代表解析不到唯一同族地址，要不到成员表，本批按验证失败跳过",
+					  mi->join_batch_gid[i]);
+				continue;
 			}
+			midr_ctrl_send_member_request(bgp, batch_transport[i],
+						      mi->join_batch_gid[i]);
+			nsent++;
+			MIDR_FLOW_LOG("MIDR I-7：RECOMMEND 候选 %d/%d：向群代表 %pIA 请求群 %u 成员",
+				      i + 1, nbatch, &batch_transport[i],
+				      mi->join_batch_gid[i]);
 		}
+		if (!nsent)
+			midr_ctrl_arm_member_probe_done(bgp, 0);
 		break;
 	}
 	case MIDR_DECISION_JOIN:
@@ -2428,6 +2484,7 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		 * （reconverge 内按"邻接却已不同群"判据自然拆 0 个）；非首次（换群）
 		 * 则顺带断开原群会话，补上旧版 JOIN 只建不拆的缺口。
 		 */
+		midr_join_anchor_keep(bgp, decision->anchor_reps);
 		mi->join_members =
 			midr_group_reconverge(bgp, decision->new_group_id);
 		/* join 落定回稳态：清意图（此后迟到的 REP_LIST_RESP 不再重启 join），
@@ -2436,8 +2493,10 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		mi->join_in_progress = false;
 		mi->join_intent = false;
 		mi->join_group_id = 0; /* 候选群字段回零：流程已结束，真身看 local_group_id */
+		memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 		zlog_info("MIDR I-7：JOIN 群 %u 完成（经重收敛编排建连 %u 个成员），加入流程结束（回稳态）",
 			  decision->new_group_id, mi->join_members);
+		midr_join_anchor_request(bgp, decision->anchor_reps);
 		break;
 	case MIDR_DECISION_LEAVE:
 		/*
@@ -2599,9 +2658,11 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 		 * TODO（仍缺）：如何主动引导其它节点加入本新群（现依赖它们各自 join 时
 		 * 经引导节点目录发现本群）。
 		 */
+		midr_join_anchor_keep(bgp, decision->anchor_reps);
 		midr_join_settle_group(bgp, create_gid);
 		zlog_info("MIDR I-7：CREATE 落定群 %u，加入流程结束（回稳态）",
 			  create_gid);
+		midr_join_anchor_request(bgp, decision->anchor_reps);
 		break;
 	}
 	case MIDR_DECISION_REP_ELECT:
@@ -2708,10 +2769,27 @@ void midr_nds_on_cluster_decision(struct bgp *bgp,
 			struct listnode *rn;
 			struct midr_rep_entry *r;
 
-			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r))
-				if (r->group_id == mi->anchor_group_id[0] ||
-				    r->group_id == mi->anchor_group_id[1])
+			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r)) {
+				struct listnode *cn;
+				struct midr_node_evidence *cev;
+				bool chosen = false;
+
+				if (r->group_id != mi->anchor_group_id[0] &&
+				    r->group_id != mi->anchor_group_id[1])
+					continue;
+				/* A representative chosen as an anchor keeps its
+				 * probe, like the members below. */
+				if (decision->evidence)
+					for (ALL_LIST_ELEMENTS_RO(decision->evidence,
+								  cn, cev))
+						if (IPV4_ADDR_SAME(&cev->node_id.u.prefix4,
+								   &r->rep_rid)) {
+							chosen = true;
+							break;
+						}
+				if (!chosen)
 					midr_stop_rep_probe_entry(bgp, r);
+			}
 		}
 
 		/*
@@ -3466,9 +3544,9 @@ static void midr_join_round_start(struct bgp *bgp)
 	mi->join_phase = MIDR_JOIN_IDLE;
 	mi->join_in_progress = false;
 	mi->join_group_id = 0;
-	mi->join_member_list_received = false;
+	memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, rep))
-		rep->join_failed = false;
+		rep->members_listed = false;
 
 	for (ALL_LIST_ELEMENTS_RO(mi->bootstrap_list, node, b))
 		b->failed = false;

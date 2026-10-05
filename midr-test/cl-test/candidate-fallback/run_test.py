@@ -63,6 +63,8 @@ def nds_excerpts(module):
                "    default: assert(false);\n    }\n}\n")
     return "\n\n".join((
         function_source(ctrl, "midr_ctrl_member_probe_done_cb"),
+        function_source(ctrl, "midr_ctrl_arm_member_probe_done"),
+        function_source(ctrl, "midr_ctrl_in_join_batch"),
         function_source(ctrl, "midr_ctrl_send_member_request"),
         function_source(nds, "midr_rep_dir_find_group"),
         function_source(nds, "midr_rep_identity_resolve"),

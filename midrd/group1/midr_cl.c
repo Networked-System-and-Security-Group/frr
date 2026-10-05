@@ -10,15 +10,17 @@
  *   CL 只读 gv；不碰 BGP-LS / 会话 / 定时器。
  *
  * 两个主决策点：
- *   REP_PROBE_DONE    -> 按长期 RTT/丢包率/带宽分数从 mi->rep_dir 选最优群代表
- *                        （RECOMMEND），无可用代表时输出 CREATE。
- *   MEMBER_PROBE_DONE -> 验证目标群成员；达标则 JOIN，否则尝试下一可用群，
- *                        全部已发现候选群不可用后才 CREATE。
+ *   REP_PROBE_DONE    -> 按长期 RTT/丢包率/带宽分数给群代表排名，取前
+ *                        MIDR_JOIN_BATCH_MAX 个可用群作为一批候选（RECOMMEND），
+ *                        无可用代表时输出 CREATE。
+ *   MEMBER_PROBE_DONE -> 按排名验证这一批候选群；第一个达标的 JOIN，整批不达标
+ *                        则 CREATE，不再评估排名更靠后的群。
+ *                        JOIN/CREATE 附带锚点群：除自己群外排名最高的两个群。
  *
  * 注意事项：
  *   目前 MEMBER_PROBE_DONE 在 NDS 设计中于成员表灌入后立即触发，若使用真实 UDP
  *   探测，此时可能尚未收到探测回复（rtt_us=0）。CL 将 rtt_us=0 视为"未探测到"，
- *   不计入好链路。该群验证失败后继续尝试其它候选，候选耗尽才 CREATE。
+ *   不计入好链路。该批验证失败即 CREATE。
  */
 
 #include <zebra.h>
@@ -189,28 +191,22 @@ static bool cl_rep_is_better(const struct midr_rep_entry *cand_r,
 
 /*
  * 从 mi->rep_dir（群代表目录）中，结合 gv->links 的长期探测指标，按性能给各群
- * 代表排名（每群取最优的一位），经 I-7 RECOMMEND 回灌排名最靠前、且未被 Tier1
- * 准入拒绝的代表；同时回灌除它之外排名最靠前的两个群（用于群间锚点连接方案），
- * 供 NDS 请求这两个次优群的成员列表。锚点群不因其代表被拒而剔除——锚点选的是
- * 群内成员，被拒成员由 cl_select_anchor_candidates() 单独过滤。
- *
- * 候选筛选条件：链路状态 UP 且已有探测数据（rtt_us > 0）。
- * 排序规则见 cl_rep_is_better()。
- *
- * 无可用候选时输出 CREATE（new_group_id = 当前最大 group_id + 1）。
+ * 代表排名（每群取最优的一位，best first）。候选筛选条件：链路状态 UP 且已有
+ * 探测数据（rtt_us > 0）；排序规则见 cl_rep_is_better()。
+ * 返回名次数；rank_rep/rank_link 由本函数分配、调用方 XFREE。
  */
-static void cl_handle_rep_probe_done(struct midr_g1 *g1,
-				     const struct midr_global_view *gv,
-				     uint32_t failed_group_id)
+static size_t cl_rank_groups(struct midr_g1 *g1,
+			     const struct midr_global_view *gv,
+			     struct midr_rep_entry ***out_rep,
+			     struct midr_link_entry ***out_link)
 {
 	struct midr_nds *mi = g1->midr_nds_info;
 	size_t max = mi->rep_dir ? listcount(mi->rep_dir) : 0;
 	struct midr_rep_entry **rank_rep;
 	struct midr_link_entry **rank_link;
-	size_t nrank = 0, chosen, i;
+	size_t nrank = 0, i;
 	struct listnode *n;
 	struct midr_rep_entry *r;
-	struct midr_cluster_decision d = {};
 
 	rank_rep = XCALLOC(MTYPE_TMP, (max + 1) * sizeof(*rank_rep));
 	rank_link = XCALLOC(MTYPE_TMP, (max + 1) * sizeof(*rank_link));
@@ -248,67 +244,159 @@ static void cl_handle_rep_probe_done(struct midr_g1 *g1,
 		nrank++;
 	}
 
+	*out_rep = rank_rep;
+	*out_link = rank_link;
+	return nrank;
+}
+
+/* 群级标记：members_listed 记在该群的每一位代表上。 */
+static bool cl_group_listed(const struct midr_nds *mi, uint32_t gid)
+{
+	struct listnode *n;
+	struct midr_rep_entry *r;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r))
+		if (r->group_id == gid && r->members_listed)
+			return true;
+	return false;
+}
+
+static bool cl_group_in_batch(const struct midr_nds *mi, uint32_t gid)
+{
+	size_t i;
+
+	for (i = 0; i < MIDR_JOIN_BATCH_MAX; i++)
+		if (gid && mi->join_batch_gid[i] == gid)
+			return true;
+	return false;
+}
+
+/*
+ * 给 JOIN/CREATE 决策附上锚点群：除落定群（exclude_gid）与配置群外，按代表
+ * 性能排名最靠前的两个群。锚点群不因其代表被 Tier1 拒绝而剔除——锚点选的
+ * 是群内成员，被拒成员由 cl_select_anchor_candidates() 单独过滤。
+ * 本轮请求过成员表却没收到的群（代表不回）跳过、顺延到下一名；没请求过的
+ * 群照常入选，由 NDS 落定后去要成员表。
+ */
+static void cl_add_anchor_reps(struct midr_g1 *g1,
+			       struct midr_cluster_decision *d,
+			       struct midr_rep_entry **rank_rep, size_t nrank,
+			       uint32_t exclude_gid)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_rep_identity *identity;
+	size_t i;
+
+	d->anchor_reps = list_new();
+	for (i = 0; i < nrank && listcount(d->anchor_reps) < 2; i++) {
+		uint32_t gid = rank_rep[i]->group_id;
+
+		if (gid == exclude_gid || gid == mi->config_group_id)
+			continue;
+		if (cl_group_in_batch(mi, gid) && !cl_group_listed(mi, gid)) {
+			MIDR_FLOW_LOG("MIDR CL: 群 %u 本轮未收到成员表，不作锚点群，顺延",
+				      gid);
+			continue;
+		}
+		identity = XCALLOC(MTYPE_MIDR_REP_IDENTITY, sizeof(*identity));
+		cl_identity_from_rep(identity, rank_rep[i]);
+		listnode_add(d->anchor_reps, identity);
+	}
+}
+
+static void cl_free_identities(struct list **l)
+{
+	struct listnode *node, *nnode;
+	struct midr_rep_identity *identity;
+
+	if (!*l)
+		return;
+	for (ALL_LIST_ELEMENTS(*l, node, nnode, identity))
+		XFREE(MTYPE_MIDR_REP_IDENTITY, identity);
+	list_delete(l);
+}
+
+/* 本轮无群可入：CREATE 新群（new_group_id = 当前最大 group_id + 1），附锚点群。 */
+static void cl_emit_create(struct midr_g1 *g1, const struct midr_global_view *gv,
+			   struct midr_rep_entry **rank_rep, size_t nrank)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_cluster_decision d = {};
+
+	d.decision_type = MIDR_DECISION_CREATE;
+	d.new_group_id = cl_max_group_id(gv) + 1;
+	d.old_group_id = mi->local_group_id;
+	cl_add_anchor_reps(g1, &d, rank_rep, nrank, 0);
+	MIDR_FLOW_LOG("MIDR CL: 无可入的候选群，CREATE 新群 %u（%d 个锚点群）",
+		      d.new_group_id, listcount(d.anchor_reps));
+	midr_nds_on_cluster_decision(g1, &d);
+	cl_free_identities(&d.anchor_reps);
+}
+
+/*
+ * 选候选群：按排名取前 MIDR_JOIN_BATCH_MAX 个代表未被 Tier1 准入拒绝的群，
+ * 经 I-7 RECOMMEND 回灌，NDS 并行要成员表、并行探测，一个热身窗口后由
+ * MEMBER_PROBE_DONE 按排名逐个验证。只评估这一批，不往后顺延。
+ * 无可用候选时 CREATE。
+ */
+static void cl_handle_rep_probe_done(struct midr_g1 *g1,
+				     const struct midr_global_view *gv)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_rep_entry **rank_rep;
+	struct midr_link_entry **rank_link;
+	struct midr_rep_entry *batch[MIDR_JOIN_BATCH_MAX];
+	struct midr_link_entry *batch_link[MIDR_JOIN_BATCH_MAX];
+	size_t nrank, nbatch = 0, i;
+	struct midr_cluster_decision d = {};
+
+	nrank = cl_rank_groups(g1, gv, &rank_rep, &rank_link);
+
 	/* Performance orders the groups; admission decides which may be joined. */
-	for (chosen = 0; chosen < nrank; chosen++) {
-		if (!rank_rep[chosen]->join_failed &&
-		    !midr_admission_candidate_blocked(g1,
-						      rank_rep[chosen]->rep_transport))
-			break;
+	for (i = 0; i < nrank && nbatch < MIDR_JOIN_BATCH_MAX; i++) {
+		if (!midr_admission_candidate_blocked(g1,
+						      rank_rep[i]->rep_transport)) {
+			batch_link[nbatch] = rank_link[i];
+			batch[nbatch++] = rank_rep[i];
+			continue;
+		}
 		MIDR_FLOW_LOG(
 			"MIDR CL: REP_PROBE_DONE → 跳过第 %zu 名群 %u 代表 %pI4"
-			"（rtt=%u us）：成员验证失败或准入拒绝",
-			chosen + 1, rank_rep[chosen]->group_id,
-			&rank_rep[chosen]->rep_rid,
-			rank_link[chosen]->long_term.rtt_us);
+			"（rtt=%u us）：准入拒绝",
+			i + 1, rank_rep[i]->group_id, &rank_rep[i]->rep_rid,
+			rank_link[i]->long_term.rtt_us);
 	}
 
-	if (chosen == nrank) {
-		uint32_t new_gid = cl_max_group_id(gv) + 1;
-
-		d.decision_type = MIDR_DECISION_CREATE;
-		d.new_group_id = new_gid;
-		d.old_group_id = mi->local_group_id;
-		MIDR_FLOW_LOG(
-			"MIDR CL: REP_PROBE_DONE → 无可用群代表，CREATE 新群 %u",
-			new_gid);
-		midr_nds_on_cluster_decision(g1, &d);
+	if (nbatch == 0) {
+		cl_emit_create(g1, gv, rank_rep, nrank);
 	} else {
-		struct listnode *node, *nnode;
 		struct midr_rep_identity *identity;
 
 		d.decision_type = MIDR_DECISION_RECOMMEND;
-		d.failed_group_id = failed_group_id;
-		d.new_group_id = rank_rep[chosen]->group_id;
+		d.new_group_id = batch[0]->group_id;
 		d.old_group_id = mi->local_group_id;
 		d.recommended_rep_id.family = AF_INET;
 		d.recommended_rep_id.prefixlen = IPV4_MAX_BITLEN;
-		d.recommended_rep_id.u.prefix4 = rank_rep[chosen]->rep_rid;
+		d.recommended_rep_id.u.prefix4 = batch[0]->rep_rid;
 
 		/* Pass only stable identities across I-7. */
-		d.anchor_reps = list_new();
-		for (i = 0; i < nrank && listcount(d.anchor_reps) < 2; i++) {
-			if (i == chosen)
-				continue;
+		d.candidate_reps = list_new();
+		for (i = 0; i < nbatch; i++) {
 			identity = XCALLOC(MTYPE_MIDR_REP_IDENTITY,
 					   sizeof(*identity));
-			cl_identity_from_rep(identity, rank_rep[i]);
-			listnode_add(d.anchor_reps, identity);
+			cl_identity_from_rep(identity, batch[i]);
+			listnode_add(d.candidate_reps, identity);
+			MIDR_FLOW_LOG("MIDR CL: REP_PROBE_DONE → RECOMMEND 候选 %zu/%zu：群 %u 代表 %pI4"
+				      "（rtt=%u us, loss=%.4f, bw=%u）",
+				      i + 1, nbatch, batch[i]->group_id,
+				      &batch[i]->rep_rid,
+				      batch_link[i]->long_term.rtt_us,
+				      batch_link[i]->long_term.loss_rate,
+				      batch_link[i]->long_term.bw_score);
 		}
 
-		MIDR_FLOW_LOG(
-			"MIDR CL: REP_PROBE_DONE → RECOMMEND 群 %u 代表 %pI4"
-			"（rtt=%u us, loss=%.4f, bw=%u），另有 %d 个次优群锚点候选",
-			rank_rep[chosen]->group_id, &rank_rep[chosen]->rep_rid,
-			rank_link[chosen]->long_term.rtt_us,
-			rank_link[chosen]->long_term.loss_rate,
-			rank_link[chosen]->long_term.bw_score,
-			listcount(d.anchor_reps));
-
 		midr_nds_on_cluster_decision(g1, &d);
-
-		for (ALL_LIST_ELEMENTS(d.anchor_reps, node, nnode, identity))
-			XFREE(MTYPE_MIDR_REP_IDENTITY, identity);
-		list_delete(&d.anchor_reps);
+		cl_free_identities(&d.candidate_reps);
 	}
 
 	XFREE(MTYPE_TMP, rank_rep);
@@ -390,10 +478,11 @@ static size_t cl_count_good_member_links(const struct midr_g1 *g1,
 
 /*
  * 处理 MEMBER_PROBE_DONE：
- *   目标群 = mi->join_group_id（由 RECOMMEND 阶段确定）。
- *   遍历全局视图中该群的 is_adjacent 节点，统计满足长期 RTT/丢包率阈值的数量。
- *   够格则 JOIN；否则标记该群验证失败，按代表性能继续尝试未失败的群。
- *   只有全部已发现候选群都不可用才 CREATE（分配新群 ID = 最大 + 1）。
+ *   候选批 = mi->join_batch_gid[]（由 RECOMMEND 阶段确定，按排名）。按排名
+ *   逐个验证：本轮收到成员表、且群内 is_adjacent 候选成员中满足长期 RTT/
+ *   丢包率阈值的数量达标，则 JOIN 第一个达标的群；整批都不达标则 CREATE
+ *   （分配新群 ID = 最大 + 1），不再评估排名更靠后的群。JOIN/CREATE 都附上
+ *   锚点群（cl_add_anchor_reps）。
  *
  * JOIN threshold is capped the same way the PERIODIC_SYNC stay threshold is
  * (min(MIDR_CL_MIN_GOOD_LINKS, total known members) — see cl_handle_periodic_
@@ -410,68 +499,65 @@ static size_t cl_count_good_member_links(const struct midr_g1 *g1,
  * that needs at least one known good link to justify, whereas staying put
  * on zero data defaults to "don't panic-leave".
  *
- * 本轮失败标记保留在代表目录中，并按群号标记所有代表，避免换代表重试同一群。
- * 重试 RECOMMEND 携带 failed_group_id，NDS 仅接受当前成员评估完成后的回退。
- * 配置群号仍由运维决定，不自动切换到其它群。
+ * 配置群号仍由运维决定，不自动切换到其它群（NDS 按配置群号落定 CREATE）。
  */
 static void cl_handle_member_probe_done(struct midr_g1 *g1,
 					const struct midr_global_view *gv)
 {
 	struct midr_nds *mi = g1->midr_nds_info;
-	uint32_t target_gid = mi->join_group_id;
-	uint32_t worst_rtt = 0;
-	double worst_loss = 0.0;
-	size_t good_links, total_known, join_threshold;
+	struct midr_rep_entry **rank_rep;
+	struct midr_link_entry **rank_link;
+	size_t nrank, slot;
 	struct midr_cluster_decision d = {};
 
-	good_links = total_known = 0;
-	/* A timed-out request must not JOIN using a previous attempt's members. */
-	if (mi->join_member_list_received)
-		good_links = cl_count_good_member_links(g1, gv, target_gid,
+	for (slot = 0; slot < MIDR_JOIN_BATCH_MAX; slot++) {
+		uint32_t gid = mi->join_batch_gid[slot];
+		uint32_t worst_rtt = 0;
+		double worst_loss = 0.0;
+		size_t good_links, total_known, join_threshold;
+
+		if (!gid)
+			continue;
+		/* A timed-out request must not JOIN using stale members. */
+		if (!cl_group_listed(mi, gid)) {
+			MIDR_FLOW_LOG("MIDR CL: MEMBER_PROBE_DONE → 群 %u 未收到成员表，不入",
+				      gid);
+			continue;
+		}
+		good_links = cl_count_good_member_links(g1, gv, gid,
 							&worst_rtt, &worst_loss,
 							&total_known);
-	join_threshold = total_known < MIDR_CL_MIN_GOOD_LINKS
-				  ? total_known
-				  : MIDR_CL_MIN_GOOD_LINKS;
-
-	if (total_known > 0 && good_links >= join_threshold) {
-		d.decision_type = MIDR_DECISION_JOIN;
-		d.new_group_id = target_gid;
-		d.old_group_id = mi->local_group_id;
-		MIDR_FLOW_LOG(
-			"MIDR CL: MEMBER_PROBE_DONE → JOIN 群 %u"
-			"（%zu/%zu 条好链路，认识 %zu 个成员）",
-			target_gid, good_links, join_threshold, total_known);
-	} else {
-		uint32_t new_gid;
-		struct listnode *node;
-		struct midr_rep_entry *rep;
-
-		MIDR_FLOW_LOG(
-			"MIDR CL: MEMBER_PROBE_DONE → 群 %u 验证失败"
-			"（%zu/%zu 条好链路，收到成员表=%d）",
-			target_gid, good_links, join_threshold,
-			mi->join_member_list_received);
-		if (!mi->config_group_id && mi->rep_dir) {
-			for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, rep))
-				if (rep->group_id == target_gid)
-					rep->join_failed = true;
-			cl_handle_rep_probe_done(g1, gv, target_gid);
+		join_threshold = total_known < MIDR_CL_MIN_GOOD_LINKS
+					  ? total_known
+					  : MIDR_CL_MIN_GOOD_LINKS;
+		if (total_known > 0 && good_links >= join_threshold) {
+			MIDR_FLOW_LOG(
+				"MIDR CL: MEMBER_PROBE_DONE → JOIN 群 %u"
+				"（候选批第 %zu 个，%zu/%zu 条好链路，认识 %zu 个成员）",
+				gid, slot + 1, good_links, join_threshold,
+				total_known);
+			nrank = cl_rank_groups(g1, gv, &rank_rep, &rank_link);
+			d.decision_type = MIDR_DECISION_JOIN;
+			d.new_group_id = gid;
+			d.old_group_id = mi->local_group_id;
+			cl_add_anchor_reps(g1, &d, rank_rep, nrank, gid);
+			midr_nds_on_cluster_decision(g1, &d);
+			cl_free_identities(&d.anchor_reps);
+			XFREE(MTYPE_TMP, rank_rep);
+			XFREE(MTYPE_TMP, rank_link);
 			return;
 		}
-		new_gid = cl_max_group_id(gv) + 1;
-
-		d.decision_type = MIDR_DECISION_CREATE;
-		d.new_group_id = new_gid;
-		d.old_group_id = mi->local_group_id;
 		MIDR_FLOW_LOG(
 			"MIDR CL: MEMBER_PROBE_DONE → 群 %u 仅 %zu/%zu 条好链路"
-			"（认识 %zu 个成员，最差 rtt=%u us, loss=%.4f），CREATE 新群 %u",
-			target_gid, good_links, join_threshold, total_known,
-			worst_rtt, worst_loss, new_gid);
+			"（认识 %zu 个成员，最差 rtt=%u us, loss=%.4f），不入",
+			gid, good_links, join_threshold, total_known,
+			worst_rtt, worst_loss);
 	}
 
-	midr_nds_on_cluster_decision(g1, &d);
+	nrank = cl_rank_groups(g1, gv, &rank_rep, &rank_link);
+	cl_emit_create(g1, gv, rank_rep, nrank);
+	XFREE(MTYPE_TMP, rank_rep);
+	XFREE(MTYPE_TMP, rank_link);
 }
 
 /* ===========================================================================
@@ -701,7 +787,7 @@ static void midr_cl_on_global_view(struct midr_g1 *g1,
 			MIDR_LOG("MIDR CL: REP_PROBE_DONE 但群代表目录为空");
 			break;
 		}
-		cl_handle_rep_probe_done(g1, gv, 0);
+		cl_handle_rep_probe_done(g1, gv);
 		break;
 
 	case MIDR_TRIGGER_MEMBER_PROBE_DONE:
@@ -782,7 +868,7 @@ static void midr_cl_on_global_view(struct midr_g1 *g1,
 		 * Only reconsider a phase whose original probe timer has completed. */
 		if (mi->join_phase == MIDR_JOIN_PROBING_REPS && mi->rep_dir &&
 		    !mi->t_rep_probe_done)
-			cl_handle_rep_probe_done(g1, gv, 0);
+			cl_handle_rep_probe_done(g1, gv);
 		else if (mi->join_phase == MIDR_JOIN_PROBING_MEMBERS && !mi->t_member_probe_done)
 			cl_handle_member_probe_done(g1, gv);
 		break;

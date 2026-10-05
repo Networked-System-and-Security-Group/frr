@@ -116,6 +116,7 @@ midr_g1_peer_lookup_su(struct midr_g1 *g1, const union sockunion *su)
  * and bad-link RTTs before CL evaluates. */
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
 #define MIDR_JOIN_REP_REFRESH_SECS  20 /* 探测代表期间重拉一次目录 */
+#define MIDR_JOIN_BATCH_MAX         3  /* 每批并行评估的候选群数 */
 
 /*
  * 退网延时拆会话（秒）：`midr shutdown` 先发撤销、隔这么久再拆会话——拆了会话
@@ -311,8 +312,8 @@ struct midr_rep_entry {
 	as_t rep_asn;
 	struct in_addr rep_rid; /* rep's IPv4 router-id identity；Control v4
 				 * decoder rejects zero */
-	/* Member validation failed in this join round; applies to the whole group. */
-	bool join_failed;
+	/* This round received the group's member list; its members are probed. */
+	bool members_listed;
 };
 
 /*
@@ -448,15 +449,19 @@ struct midr_cluster_decision {
 	enum midr_decision_type decision_type;
 	uint32_t new_group_id;
 	uint32_t old_group_id;
-	/* RECOMMEND retry only: candidate just rejected; zero for initial selection. */
-	uint32_t failed_group_id;
 	struct prefix recommended_rep_id; /* only for RECOMMEND */
 	struct list *evidence;	       /* list of struct midr_node_evidence */
 	/*
-	 * Valid only for RECOMMEND. Contains up to two borrowed
-	 * struct midr_rep_identity pointers for the second- and third-ranked
-	 * representatives. The identities are valid only during the synchronous
-	 * I-7 callback and contain no locator.
+	 * RECOMMEND only: the batch of candidate groups to evaluate together,
+	 * best first (at most MIDR_JOIN_BATCH_MAX, the first is new_group_id).
+	 * Borrowed struct midr_rep_identity pointers, valid only during the
+	 * synchronous I-7 callback; they contain no locator.
+	 */
+	struct list *candidate_reps;
+	/*
+	 * JOIN and CREATE only: up to two borrowed struct midr_rep_identity
+	 * pointers for the best-ranked other groups, which get the inter-group
+	 * anchor links once the join settles. Same lifetime as candidate_reps.
 	 */
 	struct list *anchor_reps;
 };
@@ -689,11 +694,12 @@ struct midr_nds {
 	enum midr_join_phase join_phase; /* 加入流程阶段，决定 I-5 回灌发哪个 trigger */
 	uint32_t join_group_id;	      /* group joined (for show midr join) */
 	uint32_t join_members;	      /* members we initiated sessions to */
-	/* A fresh main-candidate member list arrived in this attempt. */
-	bool join_member_list_received;
+	/* Groups of the batch under evaluation, best first; 0 = unused slot.
+	 * join_group_id is the first of them. */
+	uint32_t join_batch_gid[MIDR_JOIN_BATCH_MAX];
 
 	/*
-	 * 正在评估的两个次优群号（RECOMMEND 时从 CL 回灌的 anchor_reps 记
+	 * 正在评估的两个次优群号（JOIN/CREATE 时从 CL 回灌的 anchor_reps 记
 	 * 下），0 = 该槽位无候选。NDS 向这两个群的代表发 MEMBER_LIST_REQ、
 	 * 限时探测后发 ANCHOR_PROBE_DONE，CL 据此重新从 gv->nodes 里按群号
 	 * 筛候选（见 cl_handle_anchor_probe_done）。

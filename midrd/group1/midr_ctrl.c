@@ -95,6 +95,34 @@ static void midr_ctrl_anchor_probe_done_cb(struct event *t)
 static void midr_ctrl_retx_timer(struct event *t);
 static void midr_ctrl_udp_recv(struct event *t);
 
+void midr_ctrl_arm_anchor_probe_done(struct midr_g1 *g1, long secs)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+
+	event_cancel(&mi->t_anchor_probe_done);
+	event_add_timer(midr_g1_master(), midr_ctrl_anchor_probe_done_cb, g1,
+			secs, &mi->t_anchor_probe_done);
+}
+
+void midr_ctrl_arm_member_probe_done(struct midr_g1 *g1, long secs)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+
+	event_cancel(&mi->t_member_probe_done);
+	event_add_timer(midr_g1_master(), midr_ctrl_member_probe_done_cb, g1, secs,
+			&mi->t_member_probe_done);
+}
+
+static bool midr_ctrl_in_join_batch(const struct midr_nds *mi, uint32_t gid)
+{
+	int i;
+
+	for (i = 0; i < MIDR_JOIN_BATCH_MAX; i++)
+		if (gid && mi->join_batch_gid[i] == gid)
+			return true;
+	return false;
+}
+
 /* 到该 transport 的 BGP 会话是否已 Established（判活统一走会话状态：子稿 §1
  * 前提二"会话 Down 即死"，不引用 legacy last_seen/expire）。 */
 static bool midr_ctrl_transport_session_up(struct midr_g1 *g1,
@@ -578,10 +606,10 @@ void midr_ctrl_send_member_request(struct midr_g1 *g1, struct ipaddr rep_transpo
 {
 	if (!g1 || !g1->midr_nds_info)
 		return;
-	/* Bound the main candidate's list wait as well as PM warm-up. A
+	/* Bound the candidate batch's list wait as well as PM warm-up. A
 	 * received list restarts this timer; no response still reaches CL. */
 	if (g1->midr_nds_info->join_phase == MIDR_JOIN_PROBING_MEMBERS &&
-	    g1->midr_nds_info->join_group_id == group_id) {
+	    midr_ctrl_in_join_batch(g1->midr_nds_info, group_id)) {
 		event_cancel(&g1->midr_nds_info->t_member_probe_done);
 		event_add_timer(midr_g1_master(), midr_ctrl_member_probe_done_cb,
 				g1, MIDR_JOIN_PROBE_WAIT_SECS,
@@ -1544,11 +1572,11 @@ invalid:
  * probe each (I-1).  Connecting is deferred to the JOIN decision (see ⑥):
  * only after CL judges the group worth joining does NDS connect_group.
  *
- * RECOMMEND 阶段现在最多并发发出 3 个 MEMBER_LIST_REQ——主候选群
- * （mi->join_group_id）+ 至多 2 个次优群（mi->anchor_group_id[]）。
- * 三路响应都会落到这同一个函数，靠响应里自带的 group_id（items[0]，代表本身
- * 那条）区分是哪一路：命中 join_group_id 走原有入群评估路径；命中
- * anchor_group_id[] 走新的锚点候选路径（不置 is_adjacent，避免污染本群邻接
+ * RECOMMEND 阶段并发向一批候选群（mi->join_batch_gid[]，至多
+ * MIDR_JOIN_BATCH_MAX 个）发 MEMBER_LIST_REQ；JOIN/CREATE 落定后再向尚无数据的
+ * 锚点群（mi->anchor_group_id[]）补发。各路响应都会落到这同一个函数，靠响应里
+ * 自带的 group_id（items[0]，代表本身那条）区分是哪一路：命中候选批走入群评估
+ * 路径；命中 anchor_group_id[] 走锚点候选路径（不置 is_adjacent，避免污染本群邻接
  * 统计；见 midr_nds_learn_anchor_candidate 头注释）；两者都不命中视为过期/
  * 串台响应（例如上一轮 join 的迟到响应），只清 pending、不灌表。
  */
@@ -1613,7 +1641,7 @@ static void midr_ctrl_recv_member_list(struct midr_g1 *g1, const uint8_t *buf,
 	/* 代表自己那条（组装时放最前）自带真实群号，用它判定这是哪一路响应。 */
 	resp_group = items[0].group_id;
 	is_join_candidate = mi->join_phase == MIDR_JOIN_PROBING_MEMBERS &&
-		mi->join_group_id != 0 && resp_group == mi->join_group_id;
+		midr_ctrl_in_join_batch(mi, resp_group);
 	is_anchor = !is_join_candidate && resp_group != 0 &&
 		    (resp_group == mi->anchor_group_id[0] ||
 		     resp_group == mi->anchor_group_id[1]);
@@ -1665,14 +1693,21 @@ static void midr_ctrl_recv_member_list(struct midr_g1 *g1, const uint8_t *buf,
 	XFREE(MTYPE_TMP, items);
 
 	if (is_join_candidate) {
-		mi->join_member_list_received = true;
+		struct listnode *rn;
+		struct midr_rep_entry *r;
+
+		/* 群级标记：CL 只用本轮收到过成员表的群判 JOIN / 选锚点群。 */
+		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, rn, r))
+			if (r->group_id == resp_group)
+				r->members_listed = true;
 		/*
-		 * 探完整批成员后，编排层显式发 MEMBER_PROBE_DONE，交 CL 评估是否
-		 * 入群（I-7 JOIN/RECOMMEND/CREATE）。一整批只发一次。
-		 * 不在此清 join_phase：回退或收尾由 I-7 决策推进。
+		 * 候选批各群成员表各自到达，共用一个定时器——每到一路就重新起
+		 * 热身倒计时，较晚到的群也有足够探测时间。到点后编排层显式发
+		 * MEMBER_PROBE_DONE，交 CL 按排名评估整批（I-7 JOIN/RECOMMEND/
+		 * CREATE）。不在此清 join_phase：回退或收尾由 I-7 决策推进。
 		 */
-		MIDR_FLOW_LOG("MIDR 加入：收到群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
-			      mi->join_group_id, MIDR_JOIN_PROBE_WAIT_SECS);
+		MIDR_FLOW_LOG("MIDR 加入：收到候选群 %u 成员列表，MEMBER_PROBE_DONE 将在 %d 秒后触发（等待 EWMA 热身）",
+			      resp_group, MIDR_JOIN_PROBE_WAIT_SECS);
 		event_cancel(&mi->t_member_probe_done);
 		event_add_timer(midr_g1_master(), midr_ctrl_member_probe_done_cb,
 				g1, MIDR_JOIN_PROBE_WAIT_SECS,
@@ -2484,6 +2519,14 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct midr_g1 *g1,
 	 * restore them.  Reissue I-1 through the common connect path, including
 	 * ledger replay, without turning an anchor into a same-group neighbor. */
 	if (reason == MIDR_SESSION_CL_ANCHOR)
+		midr_pm_add_target(g1, &entry->node_id, MIDR_SRC_BOOTSTRAP,
+				   entry->capabilities);
+	/* The accepting end of a cross-group anchor (a reply to a member of
+	 * another group while this node is in a group) needs its own link
+	 * data too: otherwise only the initiator reports the Link. */
+	if (reason == MIDR_SESSION_PEER_REQ_REPLY && entry->group_id &&
+	    g1->midr_nds_info->local_group_id &&
+	    entry->group_id != g1->midr_nds_info->local_group_id)
 		midr_pm_add_target(g1, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 				   entry->capabilities);
 

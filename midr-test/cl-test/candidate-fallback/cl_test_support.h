@@ -33,6 +33,7 @@
 #define MIDR_CAP_BOOTSTRAP (1U << 2)
 #define IPV4_ADDR_SAME(a, b) ((a)->s_addr == (b)->s_addr)
 #define MIDR_JOIN_PROBE_WAIT_SECS 60
+#define MIDR_JOIN_BATCH_MAX 3
 #define array_size(a) (sizeof(a) / sizeof((a)[0]))
 #define DEFINE_MTYPE_STATIC(...)
 #define XCALLOC(type, size) test_calloc(1, size)
@@ -147,7 +148,7 @@ struct midr_rep_entry {
 	uint32_t group_id;
 	struct ipaddr rep_transport;
 	struct in_addr rep_rid;
-	bool join_failed;
+	bool members_listed;
 };
 enum midr_trigger_type {
 	MIDR_TRIGGER_REP_PROBE_DONE = 1, MIDR_TRIGGER_MEMBER_PROBE_DONE,
@@ -174,9 +175,8 @@ struct midr_rep_identity {
 struct midr_cluster_decision {
 	enum midr_decision_type decision_type;
 	uint32_t new_group_id, old_group_id;
-	uint32_t failed_group_id;
 	struct prefix recommended_rep_id;
-	struct list *evidence, *anchor_reps;
+	struct list *evidence, *candidate_reps, *anchor_reps;
 };
 struct test_owner;
 typedef void (*midr_global_view_cb)(struct test_owner *, enum midr_trigger_type,
@@ -190,7 +190,8 @@ struct test_nds {
 	enum midr_join_phase join_phase;
 	struct event *t_rep_probe_done, *t_member_probe_done, *t_rep_refresh;
 	struct event *t_anchor_probe_done;
-	bool join_member_list_received, join_in_progress, join_intent;
+	uint32_t join_batch_gid[MIDR_JOIN_BATCH_MAX];
+	bool join_in_progress, join_intent;
 	struct list *bootstrap_list;
 	struct listnode *bootstrap_cur;
 	midr_global_view_cb cl_callback;
@@ -313,14 +314,15 @@ static time_t monotime(struct timespec *unused)
 	return 1000;
 }
 
-/* Copy borrowed identities synchronously: CL frees anchor_reps on return. */
+/* Copy borrowed identities synchronously: CL frees the lists on return. */
 static struct {
 	enum midr_decision_type type;
 	uint32_t gid, old_gid;
-	uint32_t failed_gid;
 	struct prefix representative;
 	struct midr_rep_identity anchors[2];
 	size_t anchor_count;
+	uint32_t candidates[MIDR_JOIN_BATCH_MAX];
+	size_t candidate_count;
 } decisions[16];
 static size_t decision_count;
 
@@ -335,13 +337,18 @@ static void midr_nds_on_cluster_decision(struct test_owner *owner,
 	decisions[index].type = d->decision_type;
 	decisions[index].gid = d->new_group_id;
 	decisions[index].old_gid = d->old_group_id;
-	decisions[index].failed_gid = d->failed_group_id;
 	decisions[index].representative = d->recommended_rep_id;
 	if (d->anchor_reps)
 		for (ALL_LIST_ELEMENTS_RO(d->anchor_reps, node, identity)) {
 			size_t slot = decisions[index].anchor_count++;
 			assert(slot < array_size(decisions[index].anchors));
 			decisions[index].anchors[slot] = *identity;
+		}
+	if (d->candidate_reps)
+		for (ALL_LIST_ELEMENTS_RO(d->candidate_reps, node, identity)) {
+			size_t slot = decisions[index].candidate_count++;
+			assert(slot < array_size(decisions[index].candidates));
+			decisions[index].candidates[slot] = identity->group_id;
 		}
 	if (execute_nds && d->decision_type == MIDR_DECISION_RECOMMEND)
 		test_apply_recommend(owner, d);
