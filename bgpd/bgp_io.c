@@ -9,7 +9,6 @@
 #include <zebra.h>
 #include <pthread.h>		// for pthread_mutex_unlock, pthread_mutex_lock
 #include <sys/uio.h>		// for writev
-#include <time.h>
 
 #include "frr_pthread.h"
 #include "linklist.h"		// for list_delete, list_delete_all_node, lis...
@@ -27,7 +26,6 @@
 #include "bgpd/bgp_packet.h"	// for bgp_notify_io_invalid...
 #include "bgpd/bgp_trace.h"	// for frrtraces
 #include "bgpd/bgpd.h"		// for peer, BGP_MARKER_SIZE, bgp_master, bm
-#include "bgpd/bgp_midr_sync.h"
 /* clang-format on */
 
 /* forward declarations */
@@ -36,15 +34,6 @@ static uint16_t bgp_read(struct peer_connection *connection, int *code_p);
 static void bgp_process_writes(struct event *event);
 static void bgp_process_reads(struct event *event);
 static bool validate_header(struct peer_connection *connection);
-
-static uint64_t bgp_io_now_ns(void)
-{
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
 
 /* generic i/o status codes */
 #define BGP_IO_TRANS_ERR (1 << 0) /* EAGAIN or similar occurred */
@@ -86,10 +75,8 @@ void bgp_writes_off(struct peer_connection *connection)
 	/* Clear out the write fifo */
 	frr_with_mutex (&connection->io_mtx) {
 		if (connection->obuf != NULL) {
-			while ((s = stream_fifo_pop(connection->obuf)) != NULL) {
-				midr_sync_packet_dropped(connection, s);
+			while ((s = stream_fifo_pop(connection->obuf)) != NULL)
 				stream_free(s);
-			}
 		}
 	}
 
@@ -229,9 +216,6 @@ static int read_ibuf_work(struct peer_connection *connection)
 	assert(STREAM_WRITEABLE(pkt) == pktsize);
 	assert(ringbuf_get(ibw, pkt->data, pktsize) == pktsize);
 	stream_set_endp(pkt, pktsize);
-	/* This is the receive-age boundary: fragmentation and kernel wait are
-	 * covered by the sender's B, while FIFO and parser delay are local elapsed. */
-	stream_set_monotime_ns(pkt, bgp_io_now_ns());
 
 	frrtrace(2, frr_bgp, packet_read, connection, pkt);
 	frr_with_mutex (&connection->io_mtx) {
@@ -381,15 +365,6 @@ static uint16_t bgp_write(struct peer_connection *connection)
 
 	count = iovsz = 0;
 	while (count < wpkt_quanta_old && iovsz < array_size(iov) && s) {
-		/* Once a MIDR UPDATE has waited beyond the age compensation already
-		 * encoded in it, no remaining bytes may be sent.  This also catches
-		 * a process pause after a partial write; reconnect discards the old
-		 * byte stream and rebuilds the snapshot with a fresh age. */
-		if (midr_sync_packet_timed_out(connection, s)) {
-			BGP_EVENT_ADD(connection, TCP_fatal_error);
-			SET_FLAG(status, BGP_IO_FATAL_ERR);
-			goto done;
-		}
 		ostreams[iovsz] = s;
 		iov[iovsz].iov_base = stream_pnt(s);
 		iov[iovsz].iov_len = STREAM_READABLE(s);
@@ -502,7 +477,6 @@ static uint16_t bgp_write(struct peer_connection *connection)
 			break;
 		}
 
-		midr_sync_packet_written(connection, s);
 		stream_free(s);
 		ostreams[i] = NULL;
 		update_last_write = 1;

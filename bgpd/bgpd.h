@@ -107,7 +107,6 @@ enum bgp_af_index {
 	BGP_AF_IPV4_FLOWSPEC,
 	BGP_AF_IPV6_FLOWSPEC,
 	BGP_AF_BGP_LS,
-	BGP_AF_MIDR_LS,
 	BGP_AF_MAX
 };
 
@@ -130,6 +129,7 @@ struct bgp_master {
 	/* BGP thread master.  */
 	struct event_loop *master;
 
+	/* Listening sockets */
 	struct list *listen_sockets;
 
 	/* BGP port number.  */
@@ -837,10 +837,6 @@ struct bgp {
 	/* BGP-LS specific data */
 	struct bgp_ls *ls_info;
 
-	/* MIDR specific data（第二组 = midr_info，我方 NDS = midr_nds_info） */
-	struct bgp_midr *midr_info;
-	struct bgp_midr_nds *midr_nds_info;
-
 	/* BGP table route-map.  */
 	struct bgp_rmap table_map[AFI_MAX][SAFI_MAX];
 
@@ -1130,8 +1126,7 @@ struct bgp {
 	uint64_t bestpath_runs;
 	uint64_t node_already_on_queue;
 	uint64_t node_deferred_on_queue;
-	/* MIDR data-plane deferred batch state (opaque). */
-	void *midr_dp;
+
 	QOBJ_FIELDS;
 };
 DECLARE_QOBJ_TYPE(bgp);
@@ -1478,8 +1473,6 @@ enum connection_direction {
 };
 
 struct peer_connection {
-	/* Permit for this TCP attempt only, cleared by bgp_stop(). */
-	uint64_t midr_admission_permit;
 	struct peer *peer;
 	enum connection_direction dir;
 
@@ -1858,18 +1851,6 @@ struct peer {
 /* BGP-LS per-peer link identifiers configured */
 #define PEER_FLAG_LS_LOCAL_LINK_ID  (1ULL << 49)
 #define PEER_FLAG_LS_REMOTE_LINK_ID (1ULL << 50)
-/*
- * MIDR overlay session marker.  Set ONLY by midr_nds_ctrl_setup_overlay_peer()
- * (the single shaping point both auto-connect and `midr neighbor` pass through),
- * so it uniquely stamps peers MIDR itself created.  Read by
- * midr_nds_peer_is_overlay() to distinguish MIDR overlay sessions from
- * operator-configured underlay sessions (which peer_remote_as() sets no MIDR
- * flag on).  Lives/dies with the peer object — no explicit clear needed.
- * ⚠ 必须留在本块（peer->flags 的位空间）：曾误放进下方 af_flags 块的 bit 37，
- * 与本块 PEER_FLAG_CAPABILITY_FQDN 撞位（FQDN 默认置 1），判据恒真、守卫失效
- * ——07-22 E3b 实验实抓。
- */
-#define PEER_FLAG_MIDR_OVERLAY (1ULL << 51)
 
 	/*
 	 *GR-Disabled mode means unset PEER_FLAG_GRACEFUL_RESTART
@@ -3023,7 +3004,6 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV4_FLOWSPEC;
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3045,7 +3025,6 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV6_FLOWSPEC;
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -3057,7 +3036,6 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_EVPN:
 			return BGP_AF_L2VPN_EVPN;
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_LABELED_UNICAST:
@@ -3073,8 +3051,6 @@ static inline int afindex(afi_t afi, safi_t safi)
 		switch (safi) {
 		case SAFI_BGP_LS:
 			return BGP_AF_BGP_LS;
-		case SAFI_MIDR_LS:
-			return BGP_AF_MIDR_LS;
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_LABELED_UNICAST:

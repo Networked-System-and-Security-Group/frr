@@ -61,8 +61,6 @@
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_vty.h"
-#include "bgpd/bgp_midr_nds.h"
-#include "bgpd/bgp_midr_nds_vty.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_nhg.h"
@@ -84,11 +82,6 @@
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_ls.h"
 #include "bgpd/bgp_ls_ted.h"
-#include "bgpd/bgp_midr_private.h"
-#include "bgpd/bgp_midr_sync.h"
-#include "bgpd/bgp_midr_vty.h"
-#include "bgpd/midr_trace_scheduler.h"
-#include "bgpd/midr_tier1_list.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -995,8 +988,6 @@ int bgp_map_afi_safi_iana2int(iana_afi_t pkt_afi, iana_safi_t pkt_safi,
 	*safi = safi_iana2int(pkt_safi);
 	if (*afi == AFI_MAX || *safi == SAFI_MAX)
 		return -1;
-	if (*safi == SAFI_MIDR_LS && *afi != AFI_BGP_LS)
-		return -1;
 
 	return 0;
 }
@@ -1007,8 +998,7 @@ int bgp_map_afi_safi_int2iana(afi_t afi, safi_t safi, iana_afi_t *pkt_afi,
 	/* Map from internal values to IANA values, return error if
 	 * internal values are bad (unexpected).
 	 */
-	if (afi == AFI_MAX || safi == SAFI_MAX
-	    || (safi == SAFI_MIDR_LS && afi != AFI_BGP_LS))
+	if (afi == AFI_MAX || safi == SAFI_MAX)
 		return -1;
 	*pkt_afi = afi_int2iana(afi);
 	*pkt_safi = safi_int2iana(safi);
@@ -1320,10 +1310,6 @@ enum bgp_peer_sort peer_sort_lookup(struct peer *peer)
  */
 void bgp_peer_connection_buffers_free(struct peer_connection *connection)
 {
-	if (connection && connection->peer && connection->peer->bgp &&
-	    connection->peer->bgp->midr_info)
-		midr_sync_connection_down(&connection->peer->bgp->midr_info->ctx,
-					  connection);
 	frr_with_mutex (&connection->io_mtx) {
 		if (connection->ibuf) {
 			stream_fifo_free(connection->ibuf);
@@ -3946,11 +3932,6 @@ peer_init:
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
 		bgp_ls_init(bgp);
-		/* 第二组的 MIDR 上下文必须先建：我方 NDS 侧
-		 * midr_context_get_default() 要取它（取不到有懒惰重取兜底，
-		 * 但别故意排反）。 */
-		bgp_midr_init(bgp);
-		bgp_midr_nds_init(bgp);
 	}
 
 	/*initialize global GR FSM */
@@ -4772,9 +4753,6 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
-	/* 拆除与创建反序：NDS 后建先拆（它引用第二组 ctx），再拆 ctx 本体。 */
-	bgp_midr_nds_finish(bgp);
-	bgp_midr_finish(bgp);
 	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
@@ -5152,11 +5130,7 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 	    || peer->afc[AFI_IP6][SAFI_ENCAP]
 	    || peer->afc[AFI_IP6][SAFI_FLOWSPEC]
 	    || peer->afc[AFI_L2VPN][SAFI_EVPN]
-	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS]
-	    /* (4,9) MIDR-LS：第二组加该族时漏在此处登记。件②（轮 4）撤掉 (4,8)
-	     * 之后 MIDR overlay 会话只剩这一个族，不认它就等于"没有任何激活地址
-	     * 族" → FSM 压根不启动、peer 永远 Idle（Opens Sent 恒 0）。 */
-	    || peer->afc[AFI_BGP_LS][SAFI_MIDR_LS])
+	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
 		return BGP_PEER_ACTIVE;
 
 	return BGP_PEER_AF_UNCONFIGURED;
@@ -9394,18 +9368,12 @@ void bgp_init(unsigned short instance)
 	/* Init zebra. */
 	bgp_zebra_init(bm->master, instance);
 
-	if (midr_trace_scheduler_init(bm->master) != 0)
-		zlog_warn(
-			"MIDR traceroute scheduler is unavailable; traceroute requests will be rejected");
-
 #ifdef ENABLE_BGP_VNC
 	vnc_zebra_init(bm->master);
 #endif
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
-	bgp_midr_vty_init();
-	bgp_midr_nds_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
@@ -9458,15 +9426,6 @@ void bgp_terminate(void)
 	struct peer *peer;
 	struct listnode *node, *nnode;
 	struct listnode *mnode, *mnnode;
-
-	/*
-	 * No further event-loop iteration is guaranteed after this function.
-	 * First settle callbacks while their consumers are alive, then perform
-	 * the engine's event/fd teardown.
-	 */
-	midr_trace_scheduler_quiesce();
-	midr_trace_scheduler_fini();
-	midr_tier1_list_fini();
 
 	QOBJ_UNREG(bm);
 

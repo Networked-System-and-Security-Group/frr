@@ -51,7 +51,6 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mplsvpn.h"
-#include "bgpd/bgp_midr_prefix.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
@@ -68,16 +67,10 @@
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
-#include "bgpd/midr_ip2asn.h"
-#include "bgpd/midr_tier1_vty.h"
-#include "bgpd/midr_trace_scheduler.h"
-#include "bgpd/midr_tier1_list.h"
 #ifdef ENABLE_BGP_VNC
 #include "bgpd/rfapi/bgp_rfapi_cfg.h"
 #endif
 #include "bgpd/bgp_ls.h"
-
-// 自己注册的命令
 
 FRR_CFG_DEFAULT_BOOL(BGP_IMPORT_CHECK,
 	{
@@ -187,7 +180,6 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV4_NODE;
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
 		case SAFI_EVPN:
@@ -209,7 +201,6 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV6_NODE;
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
 		case SAFI_EVPN:
@@ -266,8 +257,6 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 	} else if (afi == AFI_BGP_LS) {
 		if (safi == SAFI_BGP_LS)
 			return "Link-State Link-State";
-		if (safi == SAFI_MIDR_LS)
-			return "MIDR Link-State";
 	}
 
 	return "Unknown";
@@ -313,8 +302,6 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 	} else if (afi == AFI_BGP_LS) {
 		if (safi == SAFI_BGP_LS)
 			return "linkState";
-		if (safi == SAFI_MIDR_LS)
-			return "midrLinkState";
 	}
 
 	return "Unknown";
@@ -639,7 +626,6 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return "ipv4-flowspec";
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNSPEC:
 		case SAFI_EVPN:
 		case SAFI_MAX:
@@ -661,7 +647,6 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_FLOWSPEC:
 			return "ipv6-flowspec";
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNSPEC:
 		case SAFI_EVPN:
 		case SAFI_MAX:
@@ -673,7 +658,6 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_EVPN:
 			return "l2vpn-evpn";
 		case SAFI_BGP_LS:
-		case SAFI_MIDR_LS:
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_MPLS_VPN:
@@ -689,8 +673,6 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		switch (safi) {
 		case SAFI_BGP_LS:
 			return "link-state";
-		case SAFI_MIDR_LS:
-			return "midr-link-state";
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_MPLS_VPN:
@@ -2019,7 +2001,6 @@ DEFPY (no_bgp_router_id,
 
 	return CMD_SUCCESS;
 }
-
 
 DEFPY(bgp_community_alias, bgp_community_alias_cmd,
       "[no$no] bgp community alias WORD$community ALIAS_NAME$alias_name",
@@ -20516,17 +20497,11 @@ DEFPY(bgp_ls_distribute_bgp_fabric,
 	bgp->ls_info->instance_id = instance_id;
 	bgp->ls_info->enable_distribution = true;
 
-	/*
-	 * 本命令**只置开关、不当场导出**：同步调 bgp_ls_export_bgp_topology()
-	 * 会在 frr.conf 加载 / VTY 处理期形成很深的调用链而爆栈。
-	 *
-	 * 真正的导出由 router-id 更新那条路触发（bgpd.c 的 bgp_router_id_set()
-	 * 末尾：enable_distribution 为真即调 export）。
-	 * 〔件②（轮 4）注记：原注释写"defer 到 keepalive 定时器"是不准确的——
-	 * MIDR 的 keepalive 调的是 midr_propagate_self()、只发 Node NLRI，从来
-	 * 不是全量 export；而件② 已把那条自通告线整条删除，keepalive 定时器现在
-	 * 空转。BGP-LS 自身的导出功能不受影响，仍走上面那条 router-id 路径。〕
-	 */
+	if (bgp_ls_export_bgp_topology(bgp) != 0) {
+		vty_out(vty, "%% Failed to export BGP topology\n");
+		return CMD_WARNING;
+	}
+
 	if (BGP_DEBUG(linkstate, LINKSTATE))
 		vty_out(vty,
 			"BGP-LS: BGP fabric topology export enabled (instance-id %" PRIu64 ")\n",
@@ -21040,11 +21015,8 @@ static void bgp_config_write_peer_global(struct vty *vty, struct bgp *bgp,
 	int if_pg_printed = false;
 	int if_ras_printed = false;
 
-	/* NDS writes persistent manual intent as `midr session`.  Serializing
-	 * its runtime peers as ordinary neighbors loses overlay ownership on
-	 * reload and prevents NDS from restoring or managing those sessions. */
-	if (peer_dynamic_neighbor(peer) ||
-	    CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
+	/* Skip dynamic neighbors. */
+	if (peer_dynamic_neighbor(peer))
 		return;
 
 	if (peer->conf_if)
@@ -21472,9 +21444,8 @@ static void bgp_config_write_peer_af(struct vty *vty, struct bgp *bgp,
 	if (IS_BGP_INSTANCE_HIDDEN(bgp))
 		return;
 
-	/* Overlay AF state is restored by NDS along with the owned peer. */
-	if (peer_dynamic_neighbor(peer) ||
-	    CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY))
+	/* Skip dynamic neighbors. */
+	if (peer_dynamic_neighbor(peer))
 		return;
 
 	if (peer->conf_if)
@@ -21840,7 +21811,6 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 	bgp_config_write_network(vty, bgp, afi, safi);
 
 	bgp_config_write_redistribute(vty, bgp, afi, safi);
-	midr_prefix_config_write_family(vty, bgp, afi, safi);
 
 	bgp_config_write_ipv6_nexthop_prefer_global(vty, bgp, afi, safi);
 
@@ -21853,7 +21823,6 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			bgp_config_write_peer_damp(vty, group->conf, afi, safi);
 	for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, peer))
 		if (peer_is_config_node(peer) &&
-		    !CHECK_FLAG(peer->flags, PEER_FLAG_MIDR_OVERLAY) &&
 		    peer_af_flag_check(peer, afi, safi, PEER_FLAG_CONFIG_DAMPENING))
 			bgp_config_write_peer_damp(vty, peer, afi, safi);
 
@@ -21933,13 +21902,6 @@ int bgp_config_write(struct vty *vty)
 	hook_call(bgp_snmp_traps_config_write, vty);
 
 	vty_out(vty, "!\n");
-	if (midr_tier1_list_config_write(vty))
-		vty_out(vty, "!\n");
-	if (midr_ip2asn_config_write(vty))
-		vty_out(vty, "!\n");
-	if (midr_trace_scheduler_config_write(vty))
-		vty_out(vty, "!\n");
-
 	if (bm->rmap_update_timer != RMAP_DEFAULT_UPDATE_TIMER)
 		vty_out(vty, "bgp route-map delay-timer %u\n",
 			bm->rmap_update_timer);
@@ -24599,9 +24561,6 @@ void bgp_vty_init(void)
 
 	/* "show bgp vrfs bestpath" command. */
 	install_element(VIEW_NODE, &show_bgp_vrf_bestpath_cmd);
-
-	/* MIDR application-layer underlay observation helpers. */
-	midr_tier1_vty_init();
 
 	/* Community-list. */
 	community_list_vty();

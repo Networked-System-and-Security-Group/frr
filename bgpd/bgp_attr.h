@@ -133,8 +133,6 @@ struct bgp_attr_srv6_vpn {
 	struct in6_addr sid;
 };
 
-struct bgp_midr_ls_attr;
-
 /* BGP core attribute structure. */
 struct attr {
 	/* AS Path structure */
@@ -336,11 +334,6 @@ struct attr {
 
 	/* For BGP-LS Attribute (RFC 9552) */
 	struct bgp_ls_attr *ls_attr;
-
-	/* MIDR attributes use pointers because type codes 253/254 do not fit
-	 * in the attr->flag presence bitmap.
-	 */
-	struct bgp_midr_ls_attr *midr_ls;
 };
 
 /* rmap_change_flags definition */

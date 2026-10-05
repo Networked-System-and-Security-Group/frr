@@ -27,8 +27,6 @@
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_memory.h"
 #include "bgpd/bgp_trace.h"
-#include "bgpd/bgp_midr_private.h"
-#include "bgpd/bgp_midr_sync.h"
 
 const struct message capcode_str[] = {
 	{ CAPABILITY_CODE_MP, "MultiProtocol Extensions" },
@@ -221,11 +219,6 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 							       "capabilityErrorMultiProtocolSafi",
 							       "BGP-LS");
 					break;
-				case SAFI_MIDR_LS:
-					json_object_string_add(json_cap,
-							       "capabilityErrorMultiProtocolSafi",
-							       "MIDR-LS");
-					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
 					json_object_int_add(
@@ -280,9 +273,6 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 					break;
 				case SAFI_BGP_LS:
 					vty_out(vty, "SAFI BGP-LS");
-					break;
-				case SAFI_MIDR_LS:
-					vty_out(vty, "SAFI MIDR-LS");
 					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
@@ -585,10 +575,6 @@ static int bgp_capability_restart(struct peer_connection *connection,
 					"%s Addr-family %s/%s(afi/safi) not supported. Ignore the Graceful Restart capability for this AFI/SAFI",
 					peer->host, iana_afi2str(pkt_afi),
 					iana_safi2str(pkt_safi));
-		} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
-			if (peer->bgp && peer->bgp->midr_info)
-				midr_sync_capability_tuple_ignored(
-					&peer->bgp->midr_info->ctx, false);
 		} else if (!peer->afc[afi][safi]) {
 			if (bgp_debug_neighbor_events(peer))
 				zlog_debug(
@@ -634,10 +620,6 @@ static int bgp_capability_llgr(struct peer_connection *connection, struct capabi
 					"%s Addr-family %s/%s(afi/safi) not supported. Ignore the Long-lived Graceful Restart capability for this AFI/SAFI",
 					peer->host, iana_afi2str(pkt_afi),
 					iana_safi2str(pkt_safi));
-		} else if (afi == AFI_BGP_LS && safi == SAFI_MIDR_LS) {
-			if (peer->bgp && peer->bgp->midr_info)
-				midr_sync_capability_tuple_ignored(
-					&peer->bgp->midr_info->ctx, true);
 		} else if (!peer->afc[afi][safi]
 			   || !CHECK_FLAG(peer->af_cap[afi][safi],
 					  PEER_CAP_RESTART_AF_RCV)) {
@@ -1574,11 +1556,7 @@ int bgp_open_option_parse(struct peer_connection *connection, uint16_t length, i
 		    && !peer->afc_nego[AFI_IP6][SAFI_ENCAP]
 		    && !peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC]
 		    && !peer->afc_nego[AFI_L2VPN][SAFI_EVPN]
-		    && !peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS]
-		    /* (4,9) MIDR-LS：与 peer_active() 那处同源的漏登记，见
-		     * bgpd.c 的 peer_active()。件② 撤掉 (4,8) 后 MIDR overlay
-		     * 会话只协商这一个族，不认它会误报"无共同地址族"并 NOTIFY。 */
-		    && !peer->afc_nego[AFI_BGP_LS][SAFI_MIDR_LS]) {
+		    && !peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS]) {
 			flog_err(EC_BGP_PKT_OPEN,
 				 "%s [Error] Configured AFI/SAFIs do not overlap with received MP capabilities",
 				 peer->host);

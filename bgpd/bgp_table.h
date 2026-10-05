@@ -42,8 +42,6 @@ struct bgp_table {
 	uint64_t version;
 };
 
-struct midr_rib_identity;
-
 enum bgp_path_selection_reason {
 	bgp_path_selection_none,
 	bgp_path_selection_first,
@@ -97,7 +95,6 @@ struct bgp_dest {
 	mpls_label_t local_label;
 
 	struct bgp_ls_nlri *ls_nlri;
-	struct midr_rib_identity *midr_identity;
 
 	struct bgp_attr_srv6_l3service *srv6_unicast;
 
