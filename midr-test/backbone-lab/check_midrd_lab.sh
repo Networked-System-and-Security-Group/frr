@@ -230,7 +230,8 @@ for node in r1 r2; do
 		fail "$node is not a representative"
 done
 z2_log="$(midrd_log z2)"
-recommend="$(printf '%s\n' "$z2_log" | grep 'REP_PROBE_DONE → RECOMMEND' | tail -n 1)"
+# The first candidate of the batch is the best-performing group.
+recommend="$(printf '%s\n' "$z2_log" | grep 'REP_PROBE_DONE → RECOMMEND 候选 1/' | tail -n 1)"
 printf '%s\n' "$recommend" | grep -q '群 1 代表' &&
 	pass "zero-config z2 joined by performance: ${recommend#*MIDR CL: }" ||
 	fail "z2 has no CL recommendation for group 1: ${recommend:-none}"

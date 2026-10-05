@@ -273,10 +273,13 @@ done
 ########################################################################
 # 5. Allowed sessions were created through the session API
 ########################################################################
+# Anchors are chosen after z1 settles, when group 1 may already have members
+# outside t1 (m1b, z2); only the blocked r1/m1a must never be chosen.
 anchor="$(printf '%s\n' "$(node_log z1)" | grep 'ANCHOR_PROBE_DONE → 群 1/' | tail -n 1)"
-printf '%s\n' "$anchor" | grep -q '共选出 0 个锚点候选' &&
-	pass 'z1 CL selected no group-1 anchor (its only candidate r1 is blocked)' ||
-	fail "z1 CL anchor selection for group 1 is unexpected: ${anchor:-no ANCHOR log}"
+blocked_anchor="$(printf '%s\n' "$(node_log z1)" | grep -E 'ANCHOR evidence\[[0-9]+\]=10\.0\.0\.(111|112)$' | head -n 1)"
+[ -n "$anchor" ] && [ -z "$blocked_anchor" ] &&
+	pass "z1 CL chose no blocked group-1 anchor: ${anchor#*MIDR CL: }" ||
+	fail "z1 CL anchor selection for group 1 is unexpected: ${blocked_anchor:-${anchor:-no ANCHOR log}}"
 
 # Group 2 members.
 EXPECTED_TRANSPORTS="$(loc 121) $(loc 122)"

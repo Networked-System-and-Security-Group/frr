@@ -256,6 +256,11 @@ topology:
         - logs-backbone/z2:/etc/frr/logs
       exec:
         - ip addr replace 10.99.0.192/32 dev lo
+        # Group 1 (r1, same transit t1) must win z2's representative ranking:
+        # delay only z2 -> r2 by 2 ms, before midrd starts measuring.
+        - "sudo -n tc qdisc replace dev eth1 root handle 1: prio"
+        - "sudo -n tc qdisc replace dev eth1 parent 1:3 handle 30: netem delay 2ms"
+        - "sudo -n tc filter replace dev eth1 parent 1: protocol ip prio 1 u32 match ip dst 10.99.0.121/32 flowid 1:3"
         - mkdir -p /var/lib/frr
         - chown frr:frr /var/lib/frr
         - chown frr:frr /etc/frr/frr.conf
