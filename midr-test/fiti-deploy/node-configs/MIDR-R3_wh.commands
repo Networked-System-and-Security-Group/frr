@@ -1,0 +1,6 @@
+configure terminal
+midr transport-address 240a:a00f:800:3::2
+midr role bootstrap
+midr session 240a:a00f:810:3::2 remote-as 65111
+midr bootstrap 240a:a00f:810:3::2 remote-as 65111 router-id 111.0.0.0
+end

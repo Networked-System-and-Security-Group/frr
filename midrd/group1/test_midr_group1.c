@@ -19,6 +19,8 @@
 #include "midrd/group1/midr_g1.h"
 #include "midrd/group1/midr_nds.h"
 #include "midrd/group1/midr_nds_facts.h"
+#include "midrd/group1/midr_ctrl.h"
+#include "midrd/group1/midr_pm.h"
 #include "midrd/group1/midr_vlink.h"
 
 #define LOCAL_NODE_ID 0x0100000aU /* 10.0.0.1 */
@@ -638,6 +640,137 @@ static void test_vlink_lifecycle(struct midr_g1 *g1)
 	printf("virtual link request/ready/probe/failure/rebuild/release: PASS\n");
 }
 
+static void test_anchor_representative_cleanup(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct ipaddr local = v4(0xc0000201), remote = v4(0xc0000202);
+	struct ipaddr unused = v4(0xc0000203);
+	struct in_addr rid = { .s_addr = REMOTE_NODE_ID };
+	struct in_addr unused_rid = { .s_addr = OTHER_NODE_ID };
+	struct prefix remote_id = { .family = AF_INET,
+				    .prefixlen = IPV4_MAX_BITLEN };
+	struct prefix unused_id = remote_id;
+	struct midr_nds_link_metrics metrics = {
+		.rtt_us = 1000, .bw_score = 1000,
+	};
+	struct midr_node_evidence evidence = {};
+	struct midr_cluster_decision decision = {
+		.decision_type = MIDR_DECISION_ANCHOR,
+		.new_group_id = 7, .old_group_id = 7,
+	};
+	struct midr_g1_peer *peer;
+	unsigned int deletes;
+
+	mi->local_group_id = 7;
+	mi->transport_active = true;
+	mi->active_transport_addr = local;
+	mi->anchor_group_id[0] = 8;
+	mi->anchor_group_id[1] = 9;
+	remote_id.u.prefix4 = rid;
+	unused_id.u.prefix4 = unused_rid;
+	midr_rep_dir_add(g1, 8, remote, 0, rid);
+	midr_rep_dir_add(g1, 9, unused, 0, unused_rid);
+	midr_nds_learn_anchor_candidate(g1, rid, 0, remote, 8);
+	midr_nds_learn_anchor_candidate(g1, unused_rid, 0, unused, 9);
+	session_set(&remote, MIDR_SESSION_DOWN, 0);
+	peer = midr_g1_peer_create(g1, &remote, rid, 0);
+	assert(peer);
+	session_set(&remote, MIDR_SESSION_ESTABLISHED, REMOTE_NODE_ID);
+	notify(&remote, MIDR_SESSION_ESTABLISHED, REMOTE_NODE_ID, 0);
+	run_queued();
+	assert(peer->established);
+	midr_nds_on_link_update(g1, &remote_id, MIDR_LINK_UP, 0,
+				&metrics, &metrics);
+	midr_nds_on_link_update(g1, &unused_id, MIDR_LINK_UP, 0,
+				&metrics, &metrics);
+	vlink_event("mgre-0a000002", MIDR_VLINK_EV_READY, 27);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	deletes = stub.vlink_dels;
+	evidence.node_id = remote_id;
+	evidence.metrics = metrics;
+	decision.evidence = list_new();
+	listnode_add(decision.evidence, &evidence);
+
+	midr_nds_on_cluster_decision(g1, &decision);
+	assert(listcount(mi->global_view->links) == 1);
+	assert(prefix_same(&((struct midr_link_entry *)
+		listgetdata(listhead(mi->global_view->links)))->remote_node_id,
+		&remote_id));
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	assert(stub.vlink_dels == deletes);
+	assert(peer->established);
+	assert(!mi->anchor_group_id[0] && !mi->anchor_group_id[1]);
+	list_delete(&decision.evidence);
+	printf("anchor representative keeps PM Link and GRE; unused candidate cleaned: PASS\n");
+}
+
+static void test_received_anchor_and_role_transition(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_node_entry entry = {};
+	struct midr_probe_ctx key = {};
+	struct midr_cluster_decision join = {
+		.decision_type = MIDR_DECISION_JOIN,
+		.old_group_id = 7, .new_group_id = 8,
+	};
+	unsigned int probes;
+	struct sockaddr_in local = { .sin_family = AF_INET,
+		.sin_port = htons(MIDR_PM_PROBE_PORT) };
+	int freebind = 1;
+
+	mi->local_group_id = 7;
+	mi->transport_active = true;
+	mi->active_transport_addr = v4(0xc0000201);
+	/* Bind the test's documentation address without changing host routes. */
+	mi->pm_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(mi->pm_sock >= 0);
+	assert(!setsockopt(mi->pm_sock, IPPROTO_IP, IP_FREEBIND,
+			  &freebind, sizeof(freebind)));
+	local.sin_addr = mi->active_transport_addr.ipaddr_v4;
+	assert(!bind(mi->pm_sock, (struct sockaddr *)&local, sizeof(local)));
+	entry.node_id.family = AF_INET;
+	entry.node_id.prefixlen = IPV4_MAX_BITLEN;
+	entry.node_id.u.prefix4.s_addr = 0x0600000aU;
+	entry.transport_addr = v4(0xc0000206);
+	entry.has_transport_addr = true;
+	entry.group_id = 9;
+	key.target = entry.node_id;
+	/* The target was not in the directory.  Accepted requests must learn
+	 * it and start PM without making it a same-group neighbor. */
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, false) == MIDR_ADMISSION_READY);
+	assert(hash_lookup(mi->probe_contexts, &key));
+	assert(!midr_node_hash_find(&mi->global_view->nodes, &entry)->is_adjacent);
+	probes = hashcount(mi->probe_contexts);
+	entry.node_id.u.prefix4.s_addr = 0x0400000aU;
+	entry.transport_addr = v4(0xc0000204);
+	/* A bootstrap attachment must not acquire a business PM target. */
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, true) == MIDR_ADMISSION_READY);
+	assert(hashcount(mi->probe_contexts) == probes);
+	mi->local_capabilities = MIDR_CAP_BOOTSTRAP;
+	entry.node_id.u.prefix4.s_addr = 0x0500000aU;
+	entry.transport_addr = v4(0xc0000205);
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, false) == MIDR_ADMISSION_READY);
+	assert(hashcount(mi->probe_contexts) == probes);
+
+	mi->local_capabilities = MIDR_CAP_GROUP_REP;
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	midr_nds_on_cluster_decision(g1, &join);
+	assert(mi->local_group_id == 8);
+	assert(!(mi->local_capabilities & MIDR_CAP_GROUP_REP));
+	mi->local_capabilities = MIDR_CAP_GROUP_REP;
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	join.old_group_id = join.new_group_id = 8;
+	midr_nds_on_cluster_decision(g1, &join);
+	assert(mi->local_capabilities & MIDR_CAP_GROUP_REP);
+	mi->local_capabilities = 0;
+	printf("received anchor starts PM; bootstrap stays control-only; role belongs to its group: PASS\n");
+}
+
 static void test_terminate_with_queued_events(struct midr_g1 *g1)
 {
 	struct ipaddr remote = v4(0xc0000203); /* 192.0.2.3 */
@@ -691,6 +824,8 @@ int main(void)
 	test_node_upsert_failure(g1);
 	test_vlink_overlay_address();
 	test_vlink_lifecycle(g1);
+	test_anchor_representative_cleanup(g1);
+	test_received_anchor_and_role_transition(g1);
 	test_terminate_with_queued_events(g1);
 
 	cmd_terminate();

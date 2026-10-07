@@ -628,31 +628,10 @@ bool midr_discovery_should_peer(struct midr_g1 *g1,
  * node_id(router-id) 回灌又建一条——同一节点最多两条 link，两个键都删。
  * locator 缺失时仍必须删 node_id 键；del_link 未命中返回 false，故天然幂等。
  */
-/*
- * 这条边是不是 CL 下达的群间锚点边（台账 reason == CL_ANCHOR）。
- *
- * 用途：换群/离群的自动清理路径据此**降级处理**——只注销"本群邻居"身份
- * （is_adjacent 照清），保住会话与探测。判据用**台账**而非 CL 的 evidence
- * 清单：evidence 是评估期的临时数据、决策执行完就清零，台账才是常驻真相。
- *
- * ⚠⚠ **2026-08-19 实测：当前架构下本判据不可能命中，下面两处调用是死代码**
- * （对接轮 2 验证，backbone 台子 m2a 群 2→1→2 实验）。两条腿都断：
- *   ① **纯锚点边不带 is_adjacent** —— I-7 的 ANCHOR 分支只调 midr_ctrl_connect，
- *      全程不置该标记；而清理路径（对端改组、换群拆旧群）的判据前提正是
- *      is_adjacent，所以它们**本来就扫不到锚点边**，"误清 anchor"这件事在
- *      当前代码里不成立；
- *   ② **一旦带上 is_adjacent**（对端曾进过本群、被 connect_group 建连），
- *      台账 reason 已被覆盖成 SAME_GROUP —— 家规②只给 MANUAL 粘性，
- *      CL_ANCHOR 会被后续自动流程覆盖，于是这里查不到。
- *      实测轨迹：Origin 一路 CL_ANCHOR -> SAME_GROUP -> PEER_REQ_REPLY。
- *
- * 之所以**留着不删**：由此暴露的"锚点边变成同群边之后算什么"是个语义空洞
- * （运维改群号会拆掉 CL 建的锚点、且不会自动恢复），归 CL owner，待与 zhc
- * 讨论后再定这两处的去留。全案见 docs/记档不做清单.md 第 33 条。
- *
- * ⚠ 只给"换群/离群"这类**身份变化**路径用。节点真死的路（收到 withdraw、
- * expire 判死）不豁免——锚点死了就该拆。
- */
+/* Preserve the two data-plane halves of a cross-group anchor during group
+ * changes and candidate cleanup.  Bootstrap attachments are control-only;
+ * their received PEER_REQ_REPLY is not an anchor.  Withdraw/expiry paths
+ * still tear down dead peers regardless of this predicate. */
 static bool midr_nds_edge_is_anchor(struct midr_g1 *g1, uint32_t remote_rid)
 {
 	struct midr_nds *mi;
@@ -668,7 +647,10 @@ static bool midr_nds_edge_is_anchor(struct midr_g1 *g1, uint32_t remote_rid)
 
 	for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, led))
 		if (led->remote_rid.s_addr == remote_rid &&
-		    led->reason == MIDR_SESSION_CL_ANCHOR)
+		    (led->reason == MIDR_SESSION_CL_ANCHOR ||
+		     (led->reason == MIDR_SESSION_PEER_REQ_REPLY &&
+		      led->remote_group &&
+		      !(mi->local_capabilities & MIDR_CAP_BOOTSTRAP))))
 			return true;
 
 	return false;
@@ -1400,7 +1382,9 @@ static void midr_stop_rep_probe_entry(struct midr_g1 *g1,
 	/* is_self：本节点自兼群代表时不能把自己停了。is_adjacent：该代表若已是
 	 * 本群邻居（如它换群进了本群、而 rep_dir 里还是旧群号），归 reconverge
 	 * 第 3 步管，这里不碰——避免误伤正经邻接。 */
-	if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent)
+	/* Selected representatives remain persistent cross-group anchors. */
+	if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent ||
+	    midr_nds_edge_is_anchor(g1, rep_entry->node_id.u.prefix4.s_addr))
 		return;
 
 	midr_nds_detach_node(g1, rep_entry, MIDR_STOP_CLUSTER_CHANGE, false);
@@ -1416,7 +1400,7 @@ static uint32_t midr_group_reconverge(struct midr_g1 *g1, uint32_t new_gid)
 	uint32_t connected = 0, detached = 0, reps_stopped = 0;
 
 	/*
-	 * 0. 落到无群（new_gid==0，即 I-7 的 LEAVE / RECONNECT）时先卸任群代表。
+	 * 0. 离开原群（包括直接换群和 LEAVE / RECONNECT）时先卸任群代表。
 	 *
 	 * 群代表是**这个群的**代表，群都退了角色不能跟着节点走。放在改群号之前，
 	 * 卸任才随下面那笔通告一起发出去。
@@ -1434,7 +1418,7 @@ static uint32_t midr_group_reconverge(struct midr_g1 *g1, uint32_t new_gid)
 	 *   且静默——全网少一个引导候选却无人知晓，比留着更糟。故照
 	 *   midr_nds_set_capability() 里那条留证的同款做法只报错、不动位。
 	 */
-	if (new_gid == 0 && old_gid != 0) {
+	if (new_gid != old_gid && old_gid != 0) {
 		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
 			zlog_warn("MIDR：退出群 %u 同时卸任群代表（角色属于该群，不随节点走）——如仍需要请重敲 `midr role group-rep`",
 				  old_gid);
@@ -2142,7 +2126,8 @@ static void midr_join_settle_group(struct midr_g1 *g1, uint32_t gid)
 	struct midr_nds *mi = g1->midr_nds_info;
 	struct list *members;
 	bool alone;
-	bool was_rep = !!(mi->local_capabilities & MIDR_CAP_GROUP_REP);
+	bool was_rep = mi->local_group_id == gid &&
+		       !!(mi->local_capabilities & MIDR_CAP_GROUP_REP);
 
 	/*
 	 * 自身守卫（批 5c）：群号 0 = 未分群。落定 0 等于对外宣称"我是 0 号群的
@@ -2757,6 +2742,9 @@ void midr_nds_on_cluster_decision(struct midr_g1 *g1,
 							break;
 						}
 				if (chosen)
+					continue;
+				if (midr_nds_edge_is_anchor(g1,
+							   e->node_id.u.prefix4.s_addr))
 					continue;
 
 				midr_nds_detach_node(g1, e,

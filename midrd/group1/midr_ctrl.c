@@ -2470,6 +2470,17 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct midr_g1 *g1,
 	if (reason == MIDR_SESSION_CL_ANCHOR)
 		midr_pm_add_target(g1, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 				   entry->capabilities);
+	/* An accepted cross-group request needs a data-plane half here too.
+	 * ATTACH and bootstrap backbone sessions remain control-only.  Learn
+	 * the request's identity before PM resolves its locator; do not mark
+	 * it as a same-group neighbor. */
+	if (reason == MIDR_SESSION_PEER_REQ_REPLY && !attach_request &&
+	    !(mi->local_capabilities & MIDR_CAP_BOOTSTRAP) &&
+	    mi->local_group_id && entry->group_id &&
+	    entry->group_id != mi->local_group_id)
+		midr_nds_learn_anchor_candidate(g1, remote_rid, asn,
+					      entry->transport_addr,
+					      entry->group_id);
 
 	/*
 	 * 反向建连 nudge：请对端也建一条回来。由函数末尾提到去重之前——去重 return
