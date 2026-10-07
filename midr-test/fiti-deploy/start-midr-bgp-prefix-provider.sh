@@ -20,6 +20,7 @@ provider_args=(
     --prefix-socket "${MIDR_PREFIX_SOCKET:-/run/midr/prefix.sock}"
     --originator "$MIDR_NODE_ID"
     --interval "${MIDR_PREFIX_INTERVAL:-5}"
+    --max-as-path-length "${MIDR_PREFIX_MAX_AS_PATH_LENGTH:-1}"
 )
 if [ -n "${MIDR_PREFIX_EXCLUDE_FILE:-}" ]; then
     provider_args+=(--exclude-prefix-file "$MIDR_PREFIX_EXCLUDE_FILE")

@@ -63,6 +63,8 @@ test -f midr-test/fiti-deploy/node-configs/MIDR_fudan.commands
 
 边缘节点的 `edge_bgp` 为 `yes`，启动匹配版本的 `zebra + bgpd + midrd + Prefix Provider`；内部节点和专职 bootstrap 为 `no`，启动 `zebra + midrd`。普通成员自由分群，两个初始群代表不限制最终群组数量。`vtysh` 和 `midrd-vty.py` 都是客户端，不是常驻 daemon。
 
+Provider 默认只向 MIDR 导出有效选中且 `AS_PATH` 长度不超过 1 的 BGP 路径，长度过滤不影响 bgpd 自身学习和安装其他路由。节点 env 可通过 `MIDR_PREFIX_MAX_AS_PATH_LENGTH` 设置上限；未设置时为 1。策略回归命令为 `python3 midr-test/fiti-deploy/test_bgp_prefix_provider.py -v`。
+
 ## 发布包要求
 
 发布包必须是一个完整目录，至少包含：

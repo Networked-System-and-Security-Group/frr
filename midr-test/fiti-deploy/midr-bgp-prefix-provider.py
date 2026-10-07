@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -28,6 +29,7 @@ WITHDRAW = 3
 SNAPSHOT_END = 4
 EOR = 5
 FRAME_LEN = 48
+MAX_AS_PATH_LENGTH_DEFAULT = 1
 
 
 @dataclass(frozen=True)
@@ -99,9 +101,53 @@ def path_is_usable(path: dict[str, Any]) -> bool:
 
 
 def path_is_selected(path: dict[str, Any]) -> bool:
-    return any(truthy(path.get(key)) for key in (
+    return any(truthy(path.get(key)) or (
+        isinstance(path.get(key), dict) and truthy(path[key].get("overall"))
+    ) for key in (
         "best", "selected", "multipath", "bestpath", "bestPath",
     ))
+
+
+def as_path_length(path: dict[str, Any]) -> int | None:
+    """Match FRR aspath_count_hops: AS_SET counts once, confeds not at all."""
+    value = path.get("aspath", path.get("path"))
+    if isinstance(value, dict):
+        if "length" in value:
+            length = value["length"]
+            return length if type(length) is int and length >= 0 else None
+        if "segments" in value:
+            if not isinstance(value["segments"], list):
+                return None
+            length = 0
+            for segment in value["segments"]:
+                if not isinstance(segment, dict) or not isinstance(segment.get("list"), list):
+                    return None
+                kind = segment.get("type")
+                if kind == "as-sequence":
+                    length += len(segment["list"])
+                elif kind == "as-set":
+                    length += 1
+                elif kind not in ("as-confed-sequence", "as-confed-set"):
+                    return None
+            return length
+        value = value.get("string")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value in ("", "Local"):
+        return 0
+    length = 0
+    for token in re.findall(r"\{[^{}]*\}|\([^()]*\)|\[[^\[\]]*\]|\S+", value):
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
+            length += 1
+        elif token[0] in "{([" and token[-1] == {"{": "}", "(": ")", "[": "]"}[token[0]]:
+            members = re.split(r"[\s,]+", token[1:-1].strip())
+            if not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", member) for member in members):
+                return None
+            length += token[0] == "{"
+        else:
+            return None
+    return length
 
 
 def path_metric(path: dict[str, Any], route: dict[str, Any]) -> int:
@@ -130,7 +176,8 @@ def route_paths(route: dict[str, Any]) -> list[dict[str, Any]]:
     return [path for path in paths if isinstance(path, dict)] if isinstance(paths, list) else []
 
 
-def parse_bgp_json(payload: Any, excluded: set[ipaddress._BaseNetwork]) -> dict[str, Prefix]:
+def parse_bgp_json(payload: Any, excluded: set[ipaddress._BaseNetwork],
+                   max_as_path_length: int = MAX_AS_PATH_LENGTH_DEFAULT) -> dict[str, Prefix]:
     result: dict[str, Prefix] = {}
     seen: set[tuple[str, str]] = set()
     for text, route in iter_route_entries(payload):
@@ -152,6 +199,11 @@ def parse_bgp_json(payload: Any, excluded: set[ipaddress._BaseNetwork]) -> dict[
             if len(usable) != 1:
                 continue
             selected = usable
+        selected = [path for path in selected
+                    if (length := as_path_length(path)) is not None
+                    and length <= max_as_path_length]
+        if not selected:
+            continue
         metric = min(path_metric(path, route) for path in selected)
         result[str(network)] = Prefix(network, metric)
     return result
@@ -198,7 +250,8 @@ class Provider:
         result: dict[str, Prefix] = {}
         for command in ("show bgp ipv4 unicast json", "show bgp ipv6 unicast json"):
             payload = self.query(command)
-            result.update(parse_bgp_json(payload, self.excluded))
+            result.update(parse_bgp_json(payload, self.excluded,
+                                         self.args.max_as_path_length))
         return result
 
     def close(self) -> None:
@@ -289,6 +342,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--socket-timeout", type=float, default=10.0)
     parser.add_argument("--exclude-prefix", action="append", default=[])
     parser.add_argument("--exclude-prefix-file")
+    parser.add_argument("--max-as-path-length", type=int,
+                        default=MAX_AS_PATH_LENGTH_DEFAULT,
+                        help="maximum exported AS_PATH hop count (default: 1)")
     parser.add_argument("--log-level", default="INFO",
                         choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args()
@@ -298,6 +354,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("originator must be in 1..4294967295")
     if args.interval <= 0:
         parser.error("interval must be positive")
+    if not 0 <= args.max_as_path_length <= 0xFFFFFFFF:
+        parser.error("max-as-path-length must be in 0..4294967295")
     return args
 
 
@@ -307,6 +365,7 @@ def main() -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
         excluded = read_excludes(args)
+        logging.info("Prefix export policy: max-as-path-length=%d", args.max_as_path_length)
         Provider(args, excluded).run()
     except (OSError, ValueError) as exc:
         logging.error("provider stopped: %s", exc)
