@@ -11,7 +11,7 @@
 | P-01 | 节点重启后入群卡死、群间不建锚点，overlay 分裂 | 第一组 | 待验证（`02e0905344` 实验回归通过，未上 FITI） | 现网 overlay 自 2026-10-15/16 起失效 |
 | P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 部署脚本已处置，随下次 apply 生效 | P-01 的现网触发源 |
 | P-03 | midrd/zebra 日志无限增长 | 第三组（zebra/mgmtd）、第二组（midrd 输出）、部署 | 现网已缓解（logrotate），根因待修 | 已有节点磁盘写满；zebra 因无 mgmtd 每台每天约 4 GB 错误日志 |
-| P-04 | 反向发布的 locator 环路 | 第三组、环境维护方 | 方案待确定（暂定 BGP-R 通告 locator /64，实验已验证） | 反向发布上线的前置条件 |
+| P-04 | 反向发布的 locator 环路 | 第三组 | 方案待确定（暂定边缘 MIDR 经 iBGP 通告本机 locator /64，实验已验证） | 反向发布上线的前置条件 |
 | P-05 | MIDR 路由反向发布到网关 | 第三组 | 待验证（实验通过，未上 FITI） | 普通终端尚不能自动进入 overlay |
 | P-06 | 同 sequence 异内容未隔离 | 第二组 | 已定位 | 冲突时按到达顺序生效 |
 | P-07 | 未持久化或丢失 sequence 时，重启节点被邻居长期拒绝 | 第二组 | 已定位（待修复） | backbone 实验必现；FITI 已配置持久化，未受影响 |
@@ -181,40 +181,41 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 
 把远端站点前缀（如乌鲁木齐 `240a:a00f:300::/48`）发布给本站 BGP-R 后，远端 MIDR locator `240a:a00f:300:1::2` 也落在这个 /48 内。本站 MIDR 发往该 locator 的 GRE 外层和控制报文经表 1990 交给 BGP-R，BGP-R 按 /48 又送回本站 MIDR，形成本站内环路，隧道和控制面中断。表 1990 只约束 MIDR 节点自身，BGP-R 无法区分隧道外层与业务报文。
 
-**暂定方案（2026-10-20 讨论，待确定）**：各站 BGP-R 在 underlay 中单独通告本站 locator 所在的 /64，例如乌鲁木齐 `network 240a:a00f:300:1::/64`（云站点为 `800:1-3::/64`、`810:1-3::/64`；TEIN 的 `f000:737::/64` 已单独通告）。最长匹配让发往 locator 的报文留在 underlay，业务报文仍匹配 MIDR 导出的 /48。
+**暂定方案（2026-10-20 讨论，待确定）**：在 underlay 中单独发布 locator 所在的 /64，靠最长匹配把发往 locator 的报文留在 underlay，业务报文仍匹配 MIDR 导出的 /48。这条 /64 由边缘 MIDR 自己发出：FITI 的边缘 MIDR 与本站 BGP-R 同属一个 AS，已有 iBGP 会话（例如乌鲁木齐 BGP-R 为 `neighbor 240a:a00f:300:1::2 remote-as 4200000003`）。MIDR 用 `network <本机 locator>/64` 发给 BGP-R，BGP-R 照常经 eBGP 传给其他站点，不需要修改任何 BGP-R 的配置。
 
-配套实现（分支 `feat/midr-route-export-v2`）：
+覆盖范围：环路只发生在被 MIDR 导出前缀覆盖的 locator 上。武汉、郑州没有终端，也不接外部网络，R1～R3 全部改为内部节点（见 P-05），不向 MIDR 导入任何前缀，它们的 locator 不需要 /64。需要通告的是复旦、北航、乌鲁木齐、昆明、青岛 5 个边缘站点，各自只通告本机 locator。TEIN 的 `f000:737::/64` 已由 TEIN-B1 单独通告，TEIN 的定位暂不调整。
 
-- `tools/midr-deploy/gen-gateway-locator-config.sh` 按 profile 输出每台 BGP-R 需要加的配置，只打印，不登录 BGP-R。
-- BGP-R 会把这个 /64 也发给本站 MIDR。安装器把全部 locator 前缀写入 `/etc/midr/locators.txt`，Prefix Provider 默认排除这些前缀，不会把 /64 当作本站前缀导入 MIDR；MIDR 的出口 route-map 也拒绝 locator 前缀和默认路由。
+实现（`feat/midr-route-export-v2`）：`MIDR_ROUTE_EXPORT=yes` 时，安装器生成的出口配置包含本机 locator /64 的 `network` 语句；其余 locator /64 由 BGP-R 发给本站 MIDR 后，Prefix Provider 依据 `/etc/midr/locators.txt` 不导入，出口 route-map 也拒绝它们。
 
-实验验证（`midr-test/route-export-lab/test.sh`，两站点各一台 BGP-R 和一台 MIDR，13 项全部通过）：
+实验验证（`midr-test/route-export-lab/test.sh`，两站点结构与 FITI 边缘站点相同：MIDR 与网关 iBGP、网关 next-hop-self、网关之间 eBGP，网关不做任何 /64 配置；19 项全部通过）：
 
 | 阶段 | 网关去远端 locator 的出口 | MIDR 会话断开 | 业务 ping 丢失 |
 |---|---|---:|---:|
-| 未通告 /64（20 次采样） | 18 次指回本站 MIDR | 8 次 | 19 次 |
-| 通告 /64 后（30 次采样，60 s） | 全部走 underlay | 0 | 0 |
+| 生成的配置（30 次采样，60 s） | 全部走 underlay | 0 | 0 |
+| 撤掉 MIDR 的 /64 通告（20 次采样） | 19 次指回本站 MIDR | 8 次 | 19 次 |
+| 恢复后（30 次采样，60 s） | 全部走 underlay | 0 | 0 |
 
-通告 /64 后，业务流量仍从本站 MIDR 进入 GRE 虚链路（20 个 ping 使 GRE 发送计数加 20），MIDR 路由表中没有出现 locator /64。
+正常状态下业务流量从本站 MIDR 进入 GRE 虚链路（20 个 ping 使 GRE 发送计数加 20），网关从 MIDR 学到的路由带 `no-export`，没有传到另一个 AS，MIDR 路由表中没有 locator /64。
 
 待确定：
 
-- FITI 各站 BGP-R 的修改需要环境维护方同意；复旦 BGP-R（端口 15502）用当前密钥登录不了。
-- BGP-R 之间的 underlay 策略是否放行 /64，需要在 FITI 上逐台核对对远端 locator 的最长匹配。
+- 其他 4 个边缘站点与 BGP-R 是否同样为 iBGP；用新脚本 check 时，安装器会对开启反向发布的节点做这项检查。
+- BGP-R 之间的 underlay 策略是否放行 /64，部署后需逐站核对 `ip -6 route get <远端 locator>`。
 - 长期是否把 locator 迁到与用户前缀不重叠的独立地址块（例如 `240a:a00f:f100::/48`）。
 
 ## P-05 MIDR 路由反向发布到网关
 
-分支 `feat/midr-route-export-v2`（基于 `feat/midr-three-way-integration` 的 `0d1512ab21`，未部署）已完成：
+分支 `feat/midr-route-export-v2`（已合入 `feat/midr-three-way-integration`，未部署）已完成：
 
 - `lib/route_types.txt`、`lib/log.c`：开放 `redistribute midr`，bgpd、ospf6d、ospfd、isisd 都可使用。
 - midrd 安装的路由统一带 tag（默认 199，`--route-tag`）。
 - Prefix Provider 改为读 detail JSON，过滤带 MIDR tag 的路径，防止回灌；默认排除 `/etc/midr/locators.txt` 中的 locator 前缀。
-- 部署脚本：节点 env 设 `MIDR_ROUTE_EXPORT=yes` 时，安装器用 `node/midr-export-config.sh` 在 bgpd 配置后追加出口配置，即只导出带 MIDR tag 的路由，拒绝默认路由和 locator 前缀，同时 `redistribute midr`（IPv4、IPv6）。默认不开启。
+- 部署脚本：节点 env 设 `MIDR_ROUTE_EXPORT=yes` 时，安装器用 `node/midr-export-config.sh` 在 bgpd 配置后追加出口配置：只导出带 MIDR tag 的路由并设 `no-export`，拒绝默认路由和 locator 前缀，同时通告本机 locator /64（见 P-04）。要求与网关为 iBGP，否则拒绝安装。默认不开启。
 - 移除 lib 中遗留的 `SAFI_MIDR_LS`（见 P-14），否则追加出口配置会让 bgpd 崩溃。
-- 验证：FRR 全量编译、midrd 组件测试、Provider 单元测试通过；两站点实验 13 项通过（见 P-04）；用新脚本对 FITI 12 台节点执行 check 全部通过，复旦临时开启 `MIDR_ROUTE_EXPORT=yes` 的 check 也通过。
+- FITI profile：武汉、郑州的 R1 改为内部节点（`edge_bgp=no`、`MIDR_PREFIX_MODE=none`）。两站没有终端，也不接外部网络；此前 R1_wh 的 Provider 把 `800::/48`、`810::/48`、`600::/48` 都导入了 MIDR。两台 R1 发给 BGP-R 的前缀数为 0，BGP-R 不依赖它们，重新部署后 BGP-R 上指向 R1 的邻居会空闲，可删除。
+- 验证：FRR 全量编译、midrd 组件测试、Provider 单元测试通过；两站点实验 19 项通过（见 P-04）；新 profile 对 FITI 12 台执行 check 全部通过，两台 R1 按内部节点检查，复旦临时开启 `MIDR_ROUTE_EXPORT=yes` 的 check 也通过。
 
-剩余：P-04 的 BGP-R 修改；BGP-R 的入口策略（`no-export`、local-preference，生成脚本给出了推荐模板，需按站点确认）；OSPF 等其他协议的出口配置尚未生成；FITI 上的终端业务与撤销验证。限制：不带 instance 的 `redistribute midr` 只取 instance 0（SPF）路由。
+剩余：随下一次整体发布部署到 FITI（R1_wh、R1_zhz 改为内部节点也在那时生效），然后做终端业务与撤销验证；OSPF 等其他协议的出口配置尚未生成。限制：不带 instance 的 `redistribute midr` 只取 instance 0（SPF）路由。
 
 ## P-06 同 sequence 异内容未隔离
 

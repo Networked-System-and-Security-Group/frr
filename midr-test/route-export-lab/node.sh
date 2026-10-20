@@ -30,10 +30,10 @@ ma|mb)
     cp /lab/cfg/$n-node.commands /etc/midr/node.commands
     cp /lab/cfg/$n-bgpd.conf /etc/midr/bgpd.conf
     cp /lab/locators.txt /etc/midr/locators.txt
-    bash /usr/local/libexec/midr/midr-export-config.sh /etc/midr/bgpd.conf \
-        /etc/midr/locators.txt 199 >>/etc/midr/bgpd.conf
-    printf 'hostname %s-zebra\n' $n >/etc/midr/zebra.conf
     set -a; . /etc/midr/node.env; set +a
+    bash /usr/local/libexec/midr/midr-export-config.sh /etc/midr/bgpd.conf \
+        /etc/midr/locators.txt "$MIDR_LOCATOR" 199 >>/etc/midr/bgpd.conf
+    printf 'hostname %s-zebra\n' $n >/etc/midr/zebra.conf
     ip -6 addr add "$MIDR_LOCATOR/64" dev eth1 nodad
     ip link set eth1 up
     sysctl -qw net.ipv6.conf.all.forwarding=1

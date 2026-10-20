@@ -15,14 +15,15 @@ FITI 模拟环境的 12 台 MIDR 路由器。它是 `tools/midr-deploy` 的默�
 | MIDR_wlq | 29502 | 103 | 240a:a00f:300:1::2 | member | auto | 是 |
 | MIDR_kmn | 27502 | 104 | 240a:a00f:400:1::2 | member | auto | 是 |
 | MIDR_qda | 25502 | 105 | 240a:a00f:500:1::2 | member | auto | 是 |
-| MIDR-R1_wh | 13006 | 106 | 240a:a00f:800:1::2 | member | auto | 是 |
+| MIDR-R1_wh | 13006 | 106 | 240a:a00f:800:1::2 | member | auto | 否 |
 | MIDR-R2_wh | 13007 | 107 | 240a:a00f:800:2::2 | member | auto | 否 |
-| MIDR-R1_zhz | 22003 | 109 | 240a:a00f:810:1::2 | member | auto | 是 |
+| MIDR-R1_zhz | 22003 | 109 | 240a:a00f:810:1::2 | member | auto | 否 |
 | MIDR-R2_zhz | 22004 | 110 | 240a:a00f:810:2::2 | member | auto | 否 |
 | TEIN-MIDR_pku | 14004 | 112 | 240a:a00f:f000:737::f037 | member | auto | 是 |
 
 - 边缘节点运行 zebra、bgpd、midrd 和 Prefix Provider，与本站 BGP-R（TEIN-MIDR_pku 为 TEIN-B1_pku）保持 BGP 会话。
-- 内部节点（R2_wh、R2_zhz）和 bootstrap（R3_wh、R3_zhz）只运行 zebra 和 midrd。
+- 武汉、郑州（云 A、云 B）没有终端，也不接外部网络，R1～R3 都只运行 zebra 和 midrd：R1、R2 为内部节点，R3 为 bootstrap。underlay 经本站云边界 BGP-R 的默认路由出站。
+- 2026-10-20 前 R1_wh、R1_zhz 按边缘节点部署，与本站 BGP-R 有 iBGP 会话；按本 profile 重新部署后会话停用，BGP-R 上对应的邻居可以删除。
 - 群 1、2 是初始预置群，普通成员自由分群，实际群数不限于 2。
 - `node-configs/*.commands` 中的 `remote-as` 65101～65112 是 MIDR overlay 编号，与站点 underlay BGP 的 AS 无关。
 

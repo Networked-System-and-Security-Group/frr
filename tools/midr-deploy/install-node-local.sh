@@ -103,7 +103,7 @@ case "${MIDR_ROUTE_EXPORT:-no}" in
         [ "$MIDR_EDGE_BGP" = yes ] || { echo 'MIDR_ROUTE_EXPORT=yes requires an edge node' >&2; exit 1; }
         [ -s "$STAGE/node.locators" ] || { echo 'route export needs the profile locator list' >&2; exit 1; }
         bash "$STAGE/midr-export-config.sh" "$BGP_CONFIG_SOURCE" "$STAGE/node.locators" \
-            "${MIDR_ROUTE_TAG:-199}" >/dev/null
+            "$MIDR_LOCATOR" "${MIDR_ROUTE_TAG:-199}" >/dev/null
         ;;
     *) echo 'MIDR_ROUTE_EXPORT must be yes or no' >&2; exit 1 ;;
 esac
@@ -260,7 +260,7 @@ if [ -s "$STAGE/node.locators" ]; then
 fi
 if [ "${MIDR_ROUTE_EXPORT:-no}" = yes ]; then
     bash "$STAGE/midr-export-config.sh" /etc/midr/bgpd.conf /etc/midr/locators.txt \
-        "${MIDR_ROUTE_TAG:-199}" >>/etc/midr/bgpd.conf
+        "$MIDR_LOCATOR" "${MIDR_ROUTE_TAG:-199}" >>/etc/midr/bgpd.conf
 fi
 printf 'hostname %s-zebra\n' "$MIDR_NODE_NAME" >/etc/midr/zebra.conf
 chmod 600 /etc/midr/zebra.conf

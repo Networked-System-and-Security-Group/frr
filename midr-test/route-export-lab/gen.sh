@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Two-site lab for the reverse-export locator loop.
+# Two-site lab for MIDR reverse export, shaped like a FITI edge site.
 #
 #   ta(lo) gwa ===underlay eBGP=== gwb tb(lo)
 #           |                       |
 #           ma ~~~~ MIDR GRE ~~~~~ mb
 #
-# gwa/gwb: site gateways (BGP-R), AS 65001/65002, originate their site /48
-#          and own a loopback inside it standing in for a terminal.
-# ma/mb:   MIDR edge nodes, AS 65101/65102, node 101/102.
+# gwa/gwb: site gateways (BGP-R), AS 65001/65002.  Each originates its site
+#          /48 and owns a loopback inside it standing in for a terminal.
+# ma/mb:   MIDR edge nodes 101/102, iBGP to their gateway (same AS) with
+#          next-hop-self on the gateway, as on FITI.
 set -euo pipefail
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 LAB=${MIDR_LAB_WORK:-/tmp/midr-route-export-lab}
@@ -23,42 +24,39 @@ ma,127.0.0.1,22,root,101,2001:db8:a:1::2,2001:db8:a:1::1,yes,member,1
 mb,127.0.0.1,22,root,102,2001:db8:b:1::2,2001:db8:b:1::1,yes,member,1
 EOF
 
-site() {  # site letter, gateway AS, peer gateway address, MIDR AS
-    local s=$1 as=$2 peer=$3 midr_as=$4
-    cat >"$LAB/cfg/gw$s-zebra.conf" <<EOF
-hostname gw$s
-EOF
+site() {  # site letter, AS, peer gateway address, peer AS
+    local s=$1 as=$2 peer=$3 peer_as=$4
+    printf 'hostname gw%s\n' "$s" >"$LAB/cfg/gw$s-zebra.conf"
+    # The gateway gives its MIDR node the site prefix and every locator /64
+    # it learns, so the MIDR side has to filter the locators itself.
     cat >"$LAB/cfg/gw$s-bgpd.conf" <<EOF
 hostname gw$s
-ipv6 prefix-list SITE seq 5 permit 2001:db8:$s::/48 le 64
+ipv6 prefix-list TO-MIDR seq 5 permit 2001:db8:$s::/48
+ipv6 prefix-list TO-MIDR seq 10 permit 2001:db8::/32 ge 64 le 64
 route-map TO-MIDR permit 10
- match ipv6 address prefix-list SITE
-exit
-route-map FROM-MIDR permit 10
- set local-preference 200
- set community no-export additive
+ match ipv6 address prefix-list TO-MIDR
 exit
 router bgp $as
- bgp router-id 10.0.0.$as
+ bgp router-id 10.0.0.$([ "$s" = a ] && echo 1 || echo 2)
  no bgp ebgp-requires-policy
  no bgp default ipv4-unicast
- neighbor $peer remote-as $([ "$s" = a ] && echo 65002 || echo 65001)
- neighbor 2001:db8:$s:1::2 remote-as $midr_as
+ neighbor $peer remote-as $peer_as
+ neighbor 2001:db8:$s:1::2 remote-as $as
  address-family ipv6 unicast
   network 2001:db8:$s::/48
   neighbor $peer activate
   neighbor 2001:db8:$s:1::2 activate
+  neighbor 2001:db8:$s:1::2 next-hop-self
   neighbor 2001:db8:$s:1::2 route-map TO-MIDR out
-  neighbor 2001:db8:$s:1::2 route-map FROM-MIDR in
  exit-address-family
 exit
 EOF
 }
-site a 65001 2001:db8:ff::2 65101
-site b 65002 2001:db8:ff::1 65102
+site a 65001 2001:db8:ff::2 65002
+site b 65002 2001:db8:ff::1 65001
 
-midr() {  # name, id, site letter, MIDR AS, peer locator, peer AS
-    local n=$1 id=$2 s=$3 as=$4 peer=$5 peer_as=$6
+midr() {  # name, id, site letter, AS, peer locator, peer MIDR id
+    local n=$1 id=$2 s=$3 as=$4 peer=$5 peer_id=$6
     cat >"$LAB/cfg/$n-node.env" <<EOF
 MIDR_RELEASE_DIR=/opt/midr
 MIDR_NODE_NAME=$n
@@ -77,7 +75,7 @@ EOF
 configure terminal
 midr transport-address 2001:db8:$s:1::2
 midr group-id 1
-midr session $peer remote-as $peer_as
+midr session $peer remote-as $((65000 + peer_id))
 end
 EOF
     cat >"$LAB/cfg/$n-bgpd.conf" <<EOF
@@ -86,15 +84,15 @@ router bgp $as
  bgp router-id $id.0.0.0
  no bgp ebgp-requires-policy
  no bgp default ipv4-unicast
- neighbor 2001:db8:$s:1::1 remote-as $([ "$s" = a ] && echo 65001 || echo 65002)
+ neighbor 2001:db8:$s:1::1 remote-as $as
  address-family ipv6 unicast
   neighbor 2001:db8:$s:1::1 activate
  exit-address-family
 exit
 EOF
 }
-midr ma 101 a 65101 2001:db8:b:1::2 65102
-midr mb 102 b 65102 2001:db8:a:1::2 65101
+midr ma 101 a 65001 2001:db8:b:1::2 102
+midr mb 102 b 65002 2001:db8:a:1::2 101
 
 node() {
     cat <<EOF

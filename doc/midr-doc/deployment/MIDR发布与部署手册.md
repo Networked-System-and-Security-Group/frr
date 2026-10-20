@@ -385,34 +385,40 @@ tools/midr-deploy/deploy-node.sh --node <name> --mode apply
 
 ## 14. 反向发布 MIDR 路由到网关
 
-反向发布让边缘 MIDR 把从 MIDR 学到的远端前缀发布给本站网关，普通终端的流量因此可以经网关进入 MIDR。默认关闭，目前只生成 BGP 网关的配置。
+反向发布让边缘 MIDR 把从 MIDR 学到的远端前缀发布给本站网关，终端流量因此可以经网关进入 MIDR：
 
-### 14.1 前置条件：网关单独通告 locator 前缀
-
-远端站点的前缀（如 `240a:a00f:300::/48`）通常覆盖远端 MIDR 的 locator（`240a:a00f:300:1::2`）。网关从本站 MIDR 学到这个 /48 之后，会把发往远端 locator 的 GRE 外层和控制报文也送回本站 MIDR，形成环路，Session 和隧道随之中断。因此开启反向发布之前，每个站点的网关都要在 underlay 中单独通告本站 locator 所在的 /64，靠最长匹配让 locator 流量留在 underlay。
-
-```bash
-tools/midr-deploy/gen-gateway-locator-config.sh --asn <网关AS>                  # 全部节点
-tools/midr-deploy/gen-gateway-locator-config.sh --node MIDR_wlq --asn 4200000003
+```text
+终端 → 本站网关 →（学自 MIDR 的远端前缀）→ 本站 MIDR ==GRE== 远端 MIDR → 远端网关 → 远端终端
 ```
 
-脚本只打印配置，不登录网关。输出包括必须添加的 `network <locator>/64`，以及推荐的入口策略模板：对来自 MIDR 的路由设置 `no-export` 和较高的 local-preference。MIDR 节点和网关通常不在同一个 AS，所以 `no-export` 必须由网关在入口设置。核对后在网关上用 `vtysh -f` 加载，并 `write memory`。应用后，在其他站点的网关上执行 `ip -6 route get <远端locator>`，确认走的是 underlay。
+默认关闭，目前只生成 BGP 的配置，要求边缘 MIDR 与本站网关在同一个 AS（iBGP），FITI 即是如此。
 
-### 14.2 MIDR 侧
+### 14.1 开启
 
-在边缘节点的 `node-configs/<name>.env` 中设置 `MIDR_ROUTE_EXPORT=yes`，再执行 check 和 apply。安装器会：
+在边缘节点的 `node-configs/<name>.env` 中设置 `MIDR_ROUTE_EXPORT=yes`，再执行 check 和 apply。安装器在 `/etc/midr/bgpd.conf` 末尾追加 `node/midr-export-config.sh` 生成的配置：
 
-- 把 profile 中全部 locator 前缀写入 `/etc/midr/locators.txt`。网关把 locator /64 发给本站 MIDR 后，Prefix Provider 依据这个文件不导入它们。
-- 用 `node/midr-export-config.sh` 在 `/etc/midr/bgpd.conf` 末尾追加出口配置：route-map `MIDR-EXPORT` 只放行带 MIDR tag 的路由，拒绝默认路由和 locator 前缀；IPv4、IPv6 都执行 `redistribute midr route-map MIDR-EXPORT`。AS 号取自原有的 `router bgp` 配置。
+- route-map `MIDR-EXPORT` 只放行带 MIDR tag 的路由，并设 `no-export`，网关只在本 AS 内使用它们；默认路由和所有 locator 前缀被拒绝。IPv4、IPv6 都执行 `redistribute midr route-map MIDR-EXPORT`。
+- `network <本机 locator>/64`：把本机 locator 所在的前缀作为普通 underlay 路由发给网关，不带 `no-export`，由网关传给其他站点。
+- AS 号取自原有的 `router bgp`；配置中没有同 AS 的邻居时，check 即报错。
+
+网关不需要任何改动：来自 MIDR 的路由 AS_PATH 为空，比经 underlay 学到的同一前缀更优。
+
+### 14.2 为什么要通告本机 locator
+
+远端站点的前缀（如 `240a:a00f:300::/48`）通常覆盖远端 MIDR 的 locator（`240a:a00f:300:1::2`）。本站网关从本站 MIDR 学到这个 /48 后，如果没有更具体的路由，会把发往远端 locator 的 GRE 外层和控制报文也送回本站 MIDR，形成环路，Session 和隧道随之中断。每个边缘 MIDR 通告自己的 locator /64 后，各站网关对 locator 的最长匹配都走 underlay。
+
+网关也会把其他站点的 locator /64 发给本站 MIDR。安装器把 profile 中全部 locator 前缀写入 `/etc/midr/locators.txt`，Prefix Provider 依据它不导入这些前缀。
+
+内部节点不导入任何前缀，它们的 locator 只有在被别处导出的前缀覆盖时才需要单独通告。在 FITI 上，武汉、郑州的全部 MIDR 都是内部节点，不需要。
 
 ### 14.3 验证
 
 ```bash
-# 网关：远端站点前缀来自本站 MIDR，远端 locator 走 underlay
+# 网关：远端站点前缀来自本站 MIDR（带 no-export），远端 locator 走 underlay
 vtysh -c 'show bgp ipv6 unicast <远端站点前缀>'
 ip -6 route get <远端locator>
-# 边缘 MIDR：本站 locator /64 没有进入 MIDR
+# 边缘 MIDR：没有 locator /64 进入 MIDR
 ip -6 route show proto 199
 ```
 
-两站点实验 `midr-test/route-export-lab/test.sh` 复现了环路，并验证了上述配置能消除它，结果记录在[待解决问题](../MIDR待解决问题.md) P-04。
+两站点实验 `midr-test/route-export-lab/test.sh` 验证了这套配置，也演示了撤掉 locator 通告后出现的环路，结果见[待解决问题](../MIDR待解决问题.md) P-04。

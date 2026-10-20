@@ -51,7 +51,7 @@ MIDR 原生 Session 与对象传输使用 `midrd` 自身的协议，不依赖 BG
 
 边缘角色与 MIDR 群角色是两个维度。边缘节点运行 `zebra + bgpd + midrd + Prefix Provider`，负责从本站 BGP-R 获取外部前缀。内部业务节点运行 `zebra + midrd`，消费 MIDR 传播的前缀和路由。专职 Bootstrap 运行 `zebra + midrd`，提供引导和目录服务，不作为业务前缀出口、不承担业务 GRE/FIB。
 
-FITI 使用武汉 R3、郑州 R3 作为专职 Bootstrap；北航为初始群 1 代表，复旦为初始群 2 代表。武汉、郑州各自使用 R1 作为边缘节点，R2 作为内部节点。其他站点 MIDR 为边缘节点。完整节点表与持久参数见 [FITI profile](../../tools/midr-deploy/profiles/fiti/README.md) 和 `tools/midr-deploy/profiles/fiti/nodes.csv`。
+FITI 使用武汉 R3、郑州 R3 作为专职 Bootstrap；北航为初始群 1 代表，复旦为初始群 2 代表。武汉、郑州没有终端，也不接外部网络，R1～R3 都是内部节点（R3 兼任 Bootstrap）。复旦、北航、乌鲁木齐、昆明、青岛和 TEIN 的 MIDR 为边缘节点。完整节点表与持久参数见 [FITI profile](../../tools/midr-deploy/profiles/fiti/README.md) 和 `tools/midr-deploy/profiles/fiti/nodes.csv`。
 
 ```text
 load local identity / locator / role / Bootstrap seeds
