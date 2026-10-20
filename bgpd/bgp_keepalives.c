@@ -234,7 +234,10 @@ void bgp_keepalives_on(struct peer_connection *connection)
 	struct peer *peer = connection->peer;
 
 	struct frr_pthread *fpt = bgp_pth_ka;
-	assert(fpt->running);
+	/* Startup configuration may create or remove peers before the keepalive
+	 * pthread is running.  The normal peer event path replays this state. */
+	if (!fpt || !atomic_load_explicit(&fpt->running, memory_order_relaxed))
+		return;
 
 	/* placeholder bucket data to use for fast key lookups */
 	static struct pkat holder = {0};
@@ -265,7 +268,10 @@ void bgp_keepalives_off(struct peer_connection *connection)
 	struct peer *peer = connection->peer;
 
 	struct frr_pthread *fpt = bgp_pth_ka;
-	assert(fpt->running);
+	/* Startup configuration may create or remove peers before the keepalive
+	 * pthread is running.  The normal peer event path replays this state. */
+	if (!fpt || !atomic_load_explicit(&fpt->running, memory_order_relaxed))
+		return;
 
 	/* placeholder bucket data to use for fast key lookups */
 	static struct pkat holder = {0};

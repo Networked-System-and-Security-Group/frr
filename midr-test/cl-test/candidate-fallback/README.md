@@ -1,6 +1,6 @@
 # CL 候选群回退与状态流程检查
 
-检查“按代表性能取前 3 个可用群并行验证，第一个达标的群 JOIN；这 3 个都不达标就 CREATE，不再尝试排名更靠后的群；JOIN/CREATE 附带除本群外排名最高的两个锚点群”。修复同步应用于 midrd 与 bgpd 的 CL/NDS/Control 实现。
+检查“按代表性能取前 3 个可用群并行验证，第一个达标的群 JOIN；这 3 个都不达标就 CREATE，不再尝试排名更靠后的群；JOIN/CREATE 附带除本群外排名最高的两个锚点群”。实现位于 midrd 的 CL/NDS/Control（bgpd 已还原为上游 10.7，不再包含 MIDR 代码）。
 
 ## 运行
 
@@ -10,10 +10,11 @@
 python midr-test/cl-test/candidate-fallback/run_test.py
 python midr-test/cl-test/candidate-fallback/run_test.py --suite baseline
 python midr-test/cl-test/candidate-fallback/run_test.py --suite regression
-python midr-test/cl-test/candidate-fallback/run_test.py --module midrd --cc gcc
+python midr-test/cl-test/candidate-fallback/run_test.py --suite restart
+python midr-test/cl-test/candidate-fallback/run_test.py --cc gcc
 ```
 
-默认分别编译 `midrd/group1/midr_cl.c` 和 `bgpd/bgp_midr_cl.c`，运行同一组断言。退出码：0 表示全部通过，1 表示行为断言失败，2 表示环境/编译错误。完整检查在修复后的实现上应全部通过。
+编译 `midrd/group1/midr_cl.c` 并运行全部断言。退出码：0 表示全部通过，1 表示行为断言失败，2 表示环境/编译错误。完整检查在修复后的实现上应全部通过。
 
 Linux/WSL 已安装 FRR 编译依赖时，可另行运行完整生产构建与相关组件测试：
 
@@ -21,7 +22,7 @@ Linux/WSL 已安装 FRR 编译依赖时，可另行运行完整生产构建与�
 python3 midr-test/cl-test/candidate-fallback/validate_linux.py
 ```
 
-此入口复制源码到一次性临时目录，编译 `midrd`、`bgpd`、`test_midr_group1` 和 `test_midr_admission`，确认 midrd 确实链接了 group 1，再执行组件和候选回退检查。日志位于本目录 `artifacts/linux-validation/`，原源码目录不产生编译产物。
+此入口复制源码到一次性临时目录，编译 `midrd`、上游 `bgpd` 和 `test_midr_group1`，确认 midrd 确实链接了 group 1，再执行组件和候选回退检查。日志位于本目录 `artifacts/linux-validation/`，原源码目录不产生编译产物。
 
 ## 用例
 
@@ -67,9 +68,32 @@ Ubuntu 24.04 / GCC 下两个模块的 88 个检查也全部通过；实际 FRR �
 
 改为分批并行评估并补上代表地址解析失败的兜底后，Linux / GCC 下两个模块各 51 个检查全部通过；`midrd`、`bgpd` 零告警构建，`test_midr_group1`、`test_midr_admission` 与 group 1 链接检查通过。backbone lab（midrd）IPv6：基础 85/0、Tier1 26/0、IPv6-only 10/0、virtual-link 34/0；IPv4：Tier1 26/0、virtual-link 15/0，基础验收一次 67/0、一次 59/8。失败的那次是 z2 测到两个代表 RTT 为 308 µs 对 314 µs，按性能排到群 2 并加入，其余 7 项均由此连带；这是验收脚本假设 z2 必入群 1 而 IPv4 拓扑中两者只差一跳造成的偶发，不是分群逻辑错误。
 
+### 合并 fix/stock-bgpd-10.7-midrd（2026-10-19）
+
+bgpd 还原为上游实现后删除了 `bgpd/bgp_midr_*`，本检查只保留 midrd 模块。macOS / Apple clang 下 45 个检查全部通过。
+
+### 节点重启后入群卡死（2026-10-19）
+
+对应《重启后入群卡死问题说明-致第一组-20261019》，新增 `restart` 套件 15 个检查：
+
+| 用例 | 修复后 | 修复前 |
+| --- | --- | --- |
+| 目录里有代表但一个都没测到（D1/D2） | REJOIN，轮数用尽后 CREATE | 直接 CREATE |
+| 没有引导候选时同上 | CREATE | CREATE |
+| 整批代表都没回成员表（D1） | REJOIN | CREATE |
+| 收到成员表但不达标 | CREATE | CREATE |
+| 视图被清空、目录仍有群 1..6（D3） | CREATE(7) | CREATE(1)，与现有群撞号 |
+| 链路连续 2 次不达标（D4） | 不退群，第 3 次才 LEAVE | 每次都 LEAVE |
+| 中间恢复一次 | 计数清零 | — |
+| 同时 CREATE 出同号群、见面后一群两代表（D3 残留） | 连续 2 次后 router-id 大的一方 REP_RESIGN | 两个代表一直共存，代表不做退群判定 |
+| router-id 小的一方 / 手配群号的一方 / 对方已不是代表 | 不卸任 | 不卸任 |
+| 对方 router-id 更大但一直不让位（手配了群号） | 连续 6 次后本节点 REP_RESIGN | 两个代表一直共存 |
+
+macOS / Apple clang 下 60 个检查全部通过；用合并后、修复前的 `midr_cl.c` 跑 `restart` 套件为 6 过 9 失败。D2（加入期间暂缓远端撤销）、D5（稳态补锚点）与 NDS 的 REJOIN 分支在 NDS/Control，不在本轻量检查范围，由 `midrd/group1/test_midr_group1` 的三个用例覆盖（Ubuntu 24.04 arm64 下通过；分别去掉暂缓与补锚点后对应用例失败）。多节点行为仍需 backbone lab / 12 节点实验验证。
+
 ## 结论与边界
 
-两处 CL 按代表性能为群排名，跳过代表被准入拒绝的群，取前 3 个评估；这 3 个都不达标即 CREATE。
+CL 按代表性能为群排名，跳过代表被准入拒绝的群，取前 3 个评估；这 3 个都不达标即 CREATE。
 
 NDS 只在探代表阶段接受 RECOMMEND，成员评估开始后的重复或迟到推荐一律忽略。每个主候选都有成员列表等待超时；收到有效列表后重新等待 PM 热身。没有本次有效成员表时不使用旧成员数据判 JOIN。迟到的代表目录不会覆盖成员评估中的目录。
 

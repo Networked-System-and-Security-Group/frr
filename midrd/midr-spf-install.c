@@ -76,7 +76,8 @@ static bool route_supported(const struct midr_spf_route *route)
 	count = route->nexthop_count < UINT8_MAX ? route->nexthop_count
 						 : UINT8_MAX;
 	for (size_t i = 0; i < count; i++)
-		if (route->nexthops[i].family != route->family)
+		if (!midr_spf_nexthop_compatible(route->family,
+					 &route->nexthops[i]))
 			return false;
 	return true;
 }

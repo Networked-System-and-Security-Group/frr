@@ -1503,9 +1503,13 @@ static void midr_ctrl_recv_rep_list(struct midr_g1 *g1, const uint8_t *buf,
 	struct midr_ctrl_rep_decoded *items = NULL;
 	struct midr_ctrl_identity_key *identities = NULL;
 	uint16_t count, i;
+	/* Steady-state anchor repair asked for this directory (no join). */
+	bool anchor_refresh = !mi->join_intent && mi->anchor_dir_refresh &&
+			      mi->join_phase == MIDR_JOIN_IDLE;
 
 	/* Discard late lists before they replace the active candidate directory. */
-	if (!mi->join_intent || mi->join_phase == MIDR_JOIN_PROBING_MEMBERS) {
+	if (!anchor_refresh &&
+	    (!mi->join_intent || mi->join_phase == MIDR_JOIN_PROBING_MEMBERS)) {
 		midr_ctrl_drop_pending(mi, src, MIDR_CTRL_REP_LIST_REQ);
 		return;
 	}
@@ -1556,6 +1560,12 @@ static void midr_ctrl_recv_rep_list(struct midr_g1 *g1, const uint8_t *buf,
 	XFREE(MTYPE_TMP, identities);
 	XFREE(MTYPE_TMP, items);
 	midr_ctrl_drop_pending(mi, src, MIDR_CTRL_REP_LIST_REQ);
+	if (anchor_refresh) {
+		MIDR_FLOW_LOG("MIDR ctrl: REP_LIST_RESP with %u reps — repairing anchors",
+			      count);
+		midr_anchor_on_rep_list(g1);
+		return;
+	}
 	MIDR_FLOW_LOG("MIDR ctrl: REP_LIST_RESP with %u reps — starting join", count);
 	midr_join_on_rep_list(g1);
 	return;
@@ -2521,14 +2531,17 @@ static enum midr_admission_result midr_ctrl_connect_internal(struct midr_g1 *g1,
 	if (reason == MIDR_SESSION_CL_ANCHOR)
 		midr_pm_add_target(g1, &entry->node_id, MIDR_SRC_BOOTSTRAP,
 				   entry->capabilities);
-	/* The accepting end of a cross-group anchor (a reply to a member of
-	 * another group while this node is in a group) needs its own link
-	 * data too: otherwise only the initiator reports the Link. */
-	if (reason == MIDR_SESSION_PEER_REQ_REPLY && entry->group_id &&
-	    g1->midr_nds_info->local_group_id &&
-	    entry->group_id != g1->midr_nds_info->local_group_id)
-		midr_pm_add_target(g1, &entry->node_id, MIDR_SRC_BOOTSTRAP,
-				   entry->capabilities);
+	/* An accepted cross-group request needs a data-plane half here too.
+	 * ATTACH and bootstrap backbone sessions remain control-only.  Learn
+	 * the request's identity before PM resolves its locator; do not mark
+	 * it as a same-group neighbor. */
+	if (reason == MIDR_SESSION_PEER_REQ_REPLY && !attach_request &&
+	    !(mi->local_capabilities & MIDR_CAP_BOOTSTRAP) &&
+	    mi->local_group_id && entry->group_id &&
+	    entry->group_id != mi->local_group_id)
+		midr_nds_learn_anchor_candidate(g1, remote_rid, asn,
+					      entry->transport_addr,
+					      entry->group_id);
 
 	/*
 	 * 反向建连 nudge：请对端也建一条回来。由函数末尾提到去重之前——去重 return

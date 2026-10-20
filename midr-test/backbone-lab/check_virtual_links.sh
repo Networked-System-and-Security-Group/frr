@@ -5,8 +5,7 @@
 #      a route to them, so traffic between them can only use the tunnels;
 #   2. every READY tunnel answers on its fe80 overlay addresses, and service
 #      prefixes of the same group ping each other out of a GRE device whose
-#      TX counter grows (IPv6; IPv4 prefixes are not carried by fe80 Links
-#      and are reported for information);
+#      TX counter grows for both IPv4 and IPv6;
 #   3. deleting a GRE device withdraws its Link and moves the route off it;
 #      the tunnel comes back with a new ifindex, the same link_id and a
 #      higher version, and traffic flows again;
@@ -26,18 +25,21 @@ TRANSIT="t1 t2 t3"
 MEMBERS="r1 r2 m1a m1b m2a z1 z2"
 declare -A NUM=([r1]=111 [m1a]=112 [m1b]=113 [r2]=121 [m2a]=122
 		[z1]=191 [z2]=192)
-declare -A GROUP=([r1]=1 [m1a]=1 [m1b]=1 [z2]=1 [r2]=2 [m2a]=2 [z1]=2)
+declare -A GROUP=([r1]=1 [m1a]=1 [m1b]=1 [z2]=0 [r2]=2 [m2a]=2 [z1]=2)
+source "$(dirname -- "${BASH_SOURCE[0]}")/midrd-lab-state.sh" || exit 2
 
 case "$FAMILY" in
 	ipv4)
 		loc() { printf '10.99.0.%s' "${NUM[$1]}"; }
 		svc() { printf '198.18.0.%s' "${NUM[$1]}"; }
 		IPR=(ip -4 route)
+		PING=(ping -4)
 		;;
 	ipv6)
 		loc() { printf 'fd00:99::%s' "${NUM[$1]}"; }
 		svc() { printf 'fd00:18::%s' "${NUM[$1]}"; }
 		IPR=(ip -6 route)
+		PING=(ping -6)
 		;;
 	*)
 		printf 'MIDR_LAB_FAMILY must be ipv4 or ipv6\n' >&2
@@ -88,7 +90,8 @@ tx_packets()
 
 route_dev()
 {
-	rexec "$1" "${IPR[@]}" get "$2" | grep -o ' dev [^ ]*' | head -1 | cut -c6-
+	rexec "$1" "${IPR[@]}" get "$2" from "$(svc "$1")" |
+		grep -o ' dev [^ ]*' | head -1 | cut -c6-
 }
 
 wait_for()
@@ -101,6 +104,16 @@ wait_for()
 	done
 	return 1
 }
+
+z2_self="$(mvty z2 'show midr self')"
+z2_log="$(rexec z2 cat /etc/frr/logs/midrd.log)"
+if z2_group=$(midr_lab_z2_group "$z2_self" "$z2_log"); then
+	GROUP[z2]=$z2_group
+	pass "z2's group $z2_group matches its unconfigured CL decision"
+else
+	fail 'z2 has an invalid, configured or inconsistent CL group'
+	exit 1
+fi
 
 ########################################################################
 # 1. Only the tunnels can carry the service prefixes
@@ -139,16 +152,14 @@ for node in $MEMBERS; do
 		src="$(svc "$node")"
 		dst="$(svc "$other")"
 		dev="$(route_dev "$node" "$dst")"
-		if [ "${dev#mgre-}" = "$dev" ]; then
-			if [ "$FAMILY" = ipv6 ]; then
-				fail "$node -> $dst is not routed over GRE (dev ${dev:-none})"
-			else
-				info "$node -> $dst is not routed over GRE (fe80 Links carry IPv6 only)"
-			fi
+		route="$(rexec "$node" "${IPR[@]}" get "$dst" from "$src")"
+		fib="$(rexec "$node" "${IPR[@]}" show proto 199 match "$dst")"
+		if ! midr_lab_route_is_gre "$route" "$fib"; then
+			fail "$node -> $dst has no proto-199 GRE route (dev ${dev:-none})"
 			continue
 		fi
 		before="$(tx_packets "$node" "$dev")"
-		if rexec "$node" ping -c 3 -W 2 -I "$src" "$dst" >/dev/null; then
+		if rexec "$node" "${PING[@]}" -c 3 -W 2 -I "$src" "$dst" >/dev/null; then
 			after="$(tx_packets "$node" "$dev")"
 			[ $((after - before)) -ge 3 ] &&
 				pass "$node $src -> $dst answered, sent over $dev (+$((after - before)) packets)" ||
@@ -195,11 +206,9 @@ else
 		[ "$link_id" = 0 ] && [ "$new_ifx" = "$tun_ifx" ] &&
 			pass 'the recovered Link keeps link_id 0 and carries the new tunnel ifindex' ||
 			fail "recovered Link: link_id $link_id, ifindex $new_ifx, tunnel ifindex $tun_ifx"
-		if [ "$FAMILY" = ipv6 ]; then
-			rexec m1a ping -c 3 -W 2 -I "$(svc m1a)" "$(svc r1)" >/dev/null &&
-				pass "traffic m1a -> r1 flows again after the rebuild" ||
-				fail "traffic m1a -> r1 does not flow after the rebuild"
-		fi
+		rexec m1a "${PING[@]}" -c 3 -W 2 -I "$(svc m1a)" "$(svc r1)" >/dev/null &&
+			pass "traffic m1a -> r1 flows again after the rebuild" ||
+			fail "traffic m1a -> r1 does not flow after the rebuild"
 	else
 		fail "$name was not rebuilt and re-reported within 40 s"
 	fi

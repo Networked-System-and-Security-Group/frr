@@ -16,7 +16,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 MODULES = {
     "midrd": ROOT / "midrd/group1/midr_cl.c",
-    "bgpd": ROOT / "bgpd/bgp_midr_cl.c",
 }
 # Only these dependencies are replaced. New dependencies require an explicit
 # harness update, rather than silently becoming empty headers.
@@ -24,8 +23,6 @@ SHIM_HEADERS = (
     "zebra.h", "log.h", "memory.h", "prefix.h", "linklist.h", "monotime.h",
     "midrd/group1/midr_g1.h", "midrd/group1/midr_nds.h",
     "midrd/group1/midr_admission.h", "midrd/group1/midr_cl.h",
-    "bgpd/bgpd.h", "bgpd/bgp_midr_nds.h",
-    "bgpd/bgp_midr_admission.h", "bgpd/bgp_midr_cl.h",
 )
 
 
@@ -42,23 +39,20 @@ def function_source(source, name):
     return body
 
 
-def nds_excerpts(module):
+def nds_excerpts():
     """Compile the real RECOMMEND consumer and request timer dependencies.
 
     The outer switch wrapper replaces unrelated JOIN/LEAVE/ANCHOR consumers;
     the selected case and function bodies are copied verbatim from production.
     """
-    directory, prefix = (ROOT / "midrd/group1", "midr_") if module == "midrd" else (
-        ROOT / "bgpd", "bgp_midr_")
-    nds = (directory / (prefix + "nds.c")).read_text(encoding="utf-8")
-    ctrl = (directory / (prefix + "ctrl.c")).read_text(encoding="utf-8")
+    directory = ROOT / "midrd/group1"
+    nds = (directory / "midr_nds.c").read_text(encoding="utf-8")
+    ctrl = (directory / "midr_ctrl.c").read_text(encoding="utf-8")
     start = nds.index("\tcase MIDR_DECISION_RECOMMEND: {")
     end = nds.index("\tcase MIDR_DECISION_JOIN:", start)
-    owner, state = ("midr_g1", "midr_nds") if module == "midrd" else ("bgp", "bgp_midr_nds")
-    arg = "g1" if module == "midrd" else "bgp"
-    wrapper = (f"static void test_apply_recommend(struct {owner} *{arg},\n"
+    wrapper = ("static void test_apply_recommend(struct midr_g1 *g1,\n"
                "    const struct midr_cluster_decision *decision)\n{\n"
-               f"    struct {state} *mi = {arg}->midr_nds_info;\n"
+               "    struct midr_nds *mi = g1->midr_nds_info;\n"
                "    switch (decision->decision_type) {\n" + nds[start:end] +
                "    default: assert(false);\n    }\n}\n")
     return "\n\n".join((
@@ -75,9 +69,8 @@ def nds_excerpts(module):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("all", "baseline", "regression"),
+    parser.add_argument("--suite", choices=("all", "baseline", "regression", "restart"),
                         default="all")
-    parser.add_argument("--module", choices=("both", *MODULES), default="both")
     parser.add_argument("--cc", default=os.environ.get("CC"),
                         help="C compiler executable or path (default: CC/cc/gcc/clang)")
     args = parser.parse_args()
@@ -86,7 +79,7 @@ def main():
     if not compiler:
         parser.error("No C compiler found; set --cc or CC to gcc/clang.")
 
-    modules = MODULES if args.module == "both" else {args.module: MODULES[args.module]}
+    modules = MODULES
     before = {name: hashlib.sha256(path.read_bytes()).hexdigest()
               for name, path in modules.items()}
     failed = False
@@ -103,7 +96,7 @@ def main():
             print(f"\n=== {name}: {source.relative_to(ROOT).as_posix()} ===", flush=True)
             unit = build / f"{name}_test.c"
             excerpt = build / f"{name}_nds_excerpts.h"
-            excerpt.write_text(nds_excerpts(name), encoding="utf-8")
+            excerpt.write_text(nds_excerpts(), encoding="utf-8")
             unit.write_text(
                 f'#define CL_TEST_{name.upper()} 1\n'
                 f'#include "{(HERE / "cl_test_support.h").as_posix()}"\n'

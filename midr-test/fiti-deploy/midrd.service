@@ -1,0 +1,27 @@
+[Unit]
+Description=MIDR routing daemon with persistent configuration
+Wants=network-online.target
+Requires=midr-zebra.service
+After=network-online.target midr-zebra.service
+Conflicts=frr.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/midr/node.env
+ExecStartPre=/usr/local/libexec/midr/setup-midr-underlay.py
+ExecStart=/usr/local/libexec/midr/start-midrd-service.sh
+ExecStartPost=/usr/local/libexec/midr/load-midrd-config.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=40
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

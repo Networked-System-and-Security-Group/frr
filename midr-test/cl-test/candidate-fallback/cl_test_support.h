@@ -20,13 +20,8 @@
 #include <arpa/inet.h>
 #endif
 
-#ifdef CL_TEST_MIDRD
 #define test_owner midr_g1
 #define test_nds midr_nds
-#else
-#define test_owner bgp
-#define test_nds bgp_midr_nds
-#endif
 
 #define IPV4_MAX_BITLEN 32
 #define MIDR_CAP_GROUP_REP (1U << 3)
@@ -137,7 +132,7 @@ struct midr_link_entry {
 };
 struct midr_node_entry {
 	struct prefix node_id;
-	uint32_t group_id;
+	uint32_t group_id, capabilities;
 	struct ipaddr transport_addr;
 	bool has_transport_addr, is_self, is_adjacent;
 };
@@ -159,7 +154,8 @@ enum midr_trigger_type {
 enum midr_decision_type {
 	MIDR_DECISION_RECOMMEND = 1, MIDR_DECISION_JOIN, MIDR_DECISION_LEAVE,
 	MIDR_DECISION_SPLIT, MIDR_DECISION_CREATE, MIDR_DECISION_REP_ELECT,
-	MIDR_DECISION_REP_RESIGN, MIDR_DECISION_ANCHOR, MIDR_DECISION_RECONNECT
+	MIDR_DECISION_REP_RESIGN, MIDR_DECISION_ANCHOR, MIDR_DECISION_RECONNECT,
+	MIDR_DECISION_REJOIN
 };
 enum midr_join_phase {
 	MIDR_JOIN_IDLE, MIDR_JOIN_PROBING_REPS, MIDR_JOIN_PROBING_MEMBERS
@@ -191,6 +187,7 @@ struct test_nds {
 	struct event *t_rep_probe_done, *t_member_probe_done, *t_rep_refresh;
 	struct event *t_anchor_probe_done;
 	uint32_t join_batch_gid[MIDR_JOIN_BATCH_MAX];
+	uint32_t join_retry_rounds, leave_pending_syncs, dup_rep_syncs;
 	bool join_in_progress, join_intent;
 	struct list *bootstrap_list;
 	struct listnode *bootstrap_cur;

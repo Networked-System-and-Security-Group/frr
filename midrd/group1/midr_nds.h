@@ -117,6 +117,9 @@ midr_g1_peer_lookup_su(struct midr_g1 *g1, const union sockunion *su)
 #define MIDR_JOIN_PROBE_WAIT_SECS   60
 #define MIDR_JOIN_REP_REFRESH_SECS  20 /* 探测代表期间重拉一次目录 */
 #define MIDR_JOIN_BATCH_MAX         3  /* 每批并行评估的候选群数 */
+/* 已落定但没有任何已建立锚点边的节点，每隔这么多个 PERIODIC_SYNC 周期
+ * 重拉一次代表目录、补选群间锚点（4 × 30s = 2 分钟）。 */
+#define MIDR_ANCHOR_RETRY_SYNCS     4
 
 /*
  * 退网延时拆会话（秒）：`midr shutdown` 先发撤销、隔这么久再拆会话——拆了会话
@@ -273,6 +276,14 @@ struct midr_node_entry {
 	 * 本字段与 remote-view 的逐字段更新正交，普通事实刷新不会把它清掉。
 	 */
 	bool is_adjacent;
+	/*
+	 * 加入期间收到的远端撤销被暂缓（midr_nds_remote_node_withdraw）：本机
+	 * 刚重启/刚退群时没有 MIDR 会话，节点目录不再刷新，条目 45s 到期会把
+	 * 正在评估的代表和候选成员连同链路数据删掉。暂缓到加入落定后由
+	 * midr_nds_flush_deferred_withdraws() 补做；期间再收到该节点的事实
+	 * 说明它还活着，清掉本标记。
+	 */
+	bool withdraw_deferred;
 
 	struct midr_node_hash_item hash_item;
 };
@@ -433,6 +444,15 @@ enum midr_decision_type {
 	 * dig itself out of total isolation.
 	 */
 	MIDR_DECISION_RECONNECT = 9,
+	/*
+	 * 本轮加入没能评估任何候选群：目录里有代表，但一个都没测到
+	 * （REP_PROBE_DONE），或整批代表都没回成员表（MEMBER_PROBE_DONE）。
+	 * 这说明目录过期（代表刚重启、换了群），不是"没有合适的群"——
+	 * 向引导重拉目录、重开一轮加入，而不是 CREATE 一个孤岛群。
+	 * 次数由 CL 按 join_retry_rounds 封顶，用尽后照常 CREATE。
+	 * old/new_group_id 均取 local_group_id，纯记录用。
+	 */
+	MIDR_DECISION_REJOIN = 10,
 };
 
 struct midr_node_evidence {
@@ -697,6 +717,17 @@ struct midr_nds {
 	/* Groups of the batch under evaluation, best first; 0 = unused slot.
 	 * join_group_id is the first of them. */
 	uint32_t join_batch_gid[MIDR_JOIN_BATCH_MAX];
+	/* 本次加入已因"没有可评估的候选群"重开的轮数（MIDR_DECISION_REJOIN），
+	 * 加入落定时清零。 */
+	uint32_t join_retry_rounds;
+	/* PERIODIC_SYNC 连续判定好链路不足的次数；够数才 LEAVE（去抖）。 */
+	uint32_t leave_pending_syncs;
+	/* PERIODIC_SYNC 连续看到本群另有 router-id 更小的代表的次数（一群两代表）。 */
+	uint32_t dup_rep_syncs;
+	/* 稳态补锚点：已向引导重拉代表目录，响应到达后据此选锚点群。 */
+	bool anchor_dir_refresh;
+	/* 稳态补锚点：自上次尝试以来经过的 PERIODIC_SYNC 周期数。 */
+	uint32_t anchor_idle_syncs;
 
 	/*
 	 * 正在评估的两个次优群号（JOIN/CREATE 时从 CL 回灌的 anchor_reps 记
@@ -1063,6 +1094,21 @@ extern void midr_nds_bootstrap_list_failed(struct midr_g1 *g1,
  * for its member list (MEMBER_LIST_REQ).  Called from the ctrl recv path.
  */
 extern void midr_join_on_rep_list(struct midr_g1 *g1);
+
+/*
+ * Steady-state anchor repair: a fresh representative directory arrived for
+ * a settled node that has no anchor edge (mi->anchor_dir_refresh).  Pick up
+ * to two other groups and run the usual anchor evaluation on them.
+ */
+extern void midr_anchor_on_rep_list(struct midr_g1 *g1);
+
+/*
+ * PERIODIC_SYNC housekeeping (also driven directly by test_midr_group1):
+ * apply remote withdrawals deferred during a join once it has settled, and
+ * start the steady-state anchor repair when a settled node has no anchor.
+ */
+extern void midr_nds_flush_deferred_withdraws(struct midr_g1 *g1);
+extern void midr_anchor_maintain(struct midr_g1 *g1);
 
 /*
  * Collect borrowed pointers to every non-self node in `group_id` into `out`

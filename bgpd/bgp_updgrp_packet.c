@@ -44,10 +44,6 @@
 #include "bgpd/bgp_addpath.h"
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_ls_nlri.h"
-#include "bgpd/bgp_midr_canonical.h"
-#include "bgpd/bgp_midr_packet.h"
-#include "bgpd/bgp_midr_private.h"
-#include "bgpd/bgp_midr_rib.h"
 
 /********************
  * PRIVATE FUNCTIONS
@@ -70,16 +66,7 @@ void bpacket_free(struct bpacket *pkt)
 	if (pkt->buffer)
 		stream_free(pkt->buffer);
 	pkt->buffer = NULL;
-	midr_instance_ref_release(&pkt->arr.midr_instance);
 	XFREE(MTYPE_BGP_PACKET, pkt);
-}
-
-static void bpacket_attr_vec_arr_copy(struct bpacket_attr_vec_arr *dest,
-				      const struct bpacket_attr_vec_arr *source)
-{
-	memcpy(dest, source, sizeof(*dest));
-	if (dest->midr_instance)
-		assert(midr_instance_ref_acquire(dest->midr_instance) == 0);
 }
 
 void bpacket_queue_init(struct bpacket_queue *q)
@@ -130,7 +117,8 @@ struct bpacket *bpacket_queue_add(struct bpacket_queue *q, struct stream *s,
 		pkt->ver = 1;
 		pkt->buffer = s;
 		if (vecarrp)
-			bpacket_attr_vec_arr_copy(&pkt->arr, vecarrp);
+			memcpy(&pkt->arr, vecarrp,
+			       sizeof(struct bpacket_attr_vec_arr));
 		else
 			bpacket_attr_vec_arr_reset(&pkt->arr);
 		bpacket_queue_add_packet(q, pkt);
@@ -145,7 +133,8 @@ struct bpacket *bpacket_queue_add(struct bpacket_queue *q, struct stream *s,
 	assert(last_pkt->buffer == NULL);
 	last_pkt->buffer = s;
 	if (vecarrp)
-		bpacket_attr_vec_arr_copy(&last_pkt->arr, vecarrp);
+		memcpy(&last_pkt->arr, vecarrp,
+		       sizeof(struct bpacket_attr_vec_arr));
 	else
 		bpacket_attr_vec_arr_reset(&last_pkt->arr);
 
@@ -346,37 +335,12 @@ struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
 					 struct peer_af *paf)
 {
 	struct stream *s = NULL;
-	bpacket_attr_vec *vec, *age_vec;
+	bpacket_attr_vec *vec;
 	struct peer *peer;
 	struct bgp_filter *filter;
-	struct midr_context *ctx;
-	uint64_t now_ns;
-	uint32_t age_ms;
 
 	s = stream_dup(pkt->buffer);
 	peer = PAF_PEER(paf);
-	age_vec = &pkt->arr.entries[BGP_ATTR_VEC_MIDR_AGE];
-	if (CHECK_FLAG(age_vec->flags, BPKT_ATTRVEC_FLAGS_UPDATED)) {
-		if (!pkt->arr.midr_instance || !peer || !peer->bgp ||
-		    !peer->bgp->midr_info ||
-		    age_vec->offset > stream_get_endp(s) ||
-		    stream_get_endp(s) - age_vec->offset < sizeof(uint32_t)) {
-			stream_free(s);
-			return NULL;
-		}
-		ctx = &peer->bgp->midr_info->ctx;
-		now_ns = midr_rib_now_ns(ctx);
-		if (!now_ns ||
-		    midr_rib_instance_ref_age_at(
-			    ctx, pkt->arr.midr_instance, now_ns,
-			    MIDR_CANONICAL_FORWARD_BUDGET_MS, &age_ms) != 0 ||
-		    age_ms >= midr_rib_max_age_ms(ctx)) {
-			stream_free(s);
-			return NULL;
-		}
-		stream_putl_at(s, age_vec->offset, age_ms);
-		stream_set_monotime_ns(s, now_ns);
-	}
 
 	vec = &pkt->arr.entries[BGP_ATTR_VEC_NH];
 
@@ -654,27 +618,20 @@ struct stream *bpacket_reformat_for_peer(struct bpacket *pkt,
 	return s;
 }
 
-/* Rebase vectors after the MP_REACH stream is inserted into the main UPDATE. */
+/*
+ * Update the vecarr offsets to go beyond 'pos' bytes, i.e. add 'pos'
+ * to each offset.
+ */
 static void bpacket_attr_vec_arr_update(struct bpacket_attr_vec_arr *vecarr,
-					size_t insert_pos, size_t insert_len)
+					size_t pos)
 {
 	int i;
 
 	if (!vecarr)
 		return;
 
-	for (i = 0; i < BGP_ATTR_VEC_MAX; i++) {
-		if (!CHECK_FLAG(vecarr->entries[i].flags,
-				BPKT_ATTRVEC_FLAGS_UPDATED))
-			continue;
-		/* MP nexthop offsets originate in the inserted snlri stream;
-		 * MIDR age originates in the main attribute stream after the
-		 * insertion point. */
-		if (i == BGP_ATTR_VEC_MIDR_AGE)
-			vecarr->entries[i].offset += insert_len;
-		else
-			vecarr->entries[i].offset += insert_pos;
-	}
+	for (i = 0; i < BGP_ATTR_VEC_MAX; i++)
+		vecarr->entries[i].offset += pos;
 }
 
 /*
@@ -754,11 +711,6 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 	while (adv) {
 		const struct prefix *dest_p;
 
-		/* MIDR age is part of the per-instance envelope. Do not batch
-		 * multiple identities under one attribute snapshot. */
-		if (safi == SAFI_MIDR_LS && num_pfx)
-			break;
-
 		assert(adv->dest);
 		dest = adv->dest;
 		dest_p = bgp_dest_get_prefix(dest);
@@ -769,11 +721,8 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 		space_remaining = STREAM_CONCAT_REMAIN(s, snlri, STREAM_SIZE(s))
 				  - BGP_MAX_PACKET_SIZE_OVERFLOW;
 		space_needed =
-			BGP_NLRI_LENGTH + addpath_overhead +
-			(safi == SAFI_MIDR_LS
-				 ? bgp_midr_packet_nlri_size(dest)
-				 : bgp_packet_mpattr_prefix_size(afi, safi,
-								 dest_p));
+			BGP_NLRI_LENGTH + addpath_overhead
+			+ bgp_packet_mpattr_prefix_size(afi, safi, dest_p);
 
 		/* When remaining space can't include NLRI and it's length.  */
 		if (space_remaining < space_needed)
@@ -928,18 +877,9 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 					snlri, peer, afi, safi, &vecarr,
 					adv->baa->attr);
 
-			if (safi == SAFI_MIDR_LS) {
-				if (bgp_midr_packet_nlri(snlri, dest) != 0) {
-					flog_err(EC_BGP_UPDATE_SND,
-						 "MIDR path missing object identity");
-					adv = bgp_advertise_clean_subgroup(subgrp, adj);
-					continue;
-				}
-			} else
-				bgp_packet_mpattr_prefix(
-					snlri, afi, safi, dest_p, prd,
-					label_pnt, num_labels, addpath_capable,
-					addpath_tx_id, adv->baa->attr, ls_nlri);
+			bgp_packet_mpattr_prefix(snlri, afi, safi, dest_p, prd, label_pnt,
+						 num_labels, addpath_capable, addpath_tx_id,
+						 adv->baa->attr, ls_nlri);
 		}
 
 		num_pfx++;
@@ -1001,8 +941,7 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 
 		if (!stream_empty(snlri)) {
 			packet = stream_dupcat(s, snlri, mpattr_pos);
-			bpacket_attr_vec_arr_update(&vecarr, mpattr_pos,
-						    stream_get_endp(snlri));
+			bpacket_attr_vec_arr_update(&vecarr, mpattr_pos);
 		} else
 			packet = stream_dup(s);
 		bgp_packet_set_size(packet);
@@ -1075,9 +1014,6 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 	while ((adv = bgp_adv_fifo_first(&subgrp->sync->withdraw)) != NULL) {
 		const struct prefix *dest_p;
 
-		if (safi == SAFI_MIDR_LS && num_pfx)
-			break;
-
 		assert(adv->dest);
 		adj = adv->adj;
 		dest = adv->dest;
@@ -1087,11 +1023,8 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 		space_remaining =
 			STREAM_WRITEABLE(s) - BGP_MAX_PACKET_SIZE_OVERFLOW;
 		space_needed =
-			BGP_NLRI_LENGTH + addpath_overhead + BGP_TOTAL_ATTR_LEN +
-			(safi == SAFI_MIDR_LS
-				 ? bgp_midr_packet_nlri_size(dest)
-				 : bgp_packet_mpattr_prefix_size(afi, safi,
-								 dest_p));
+			BGP_NLRI_LENGTH + addpath_overhead + BGP_TOTAL_ATTR_LEN
+			+ bgp_packet_mpattr_prefix_size(afi, safi, dest_p);
 
 		if (space_remaining < space_needed)
 			break;
@@ -1102,9 +1035,8 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 		} else
 			first_time = 0;
 
-		/* Link-state SAFIs use semantic NLRIs, not synthetic prefixes. */
-		if (afi == AFI_BGP_LS &&
-		    (safi == SAFI_BGP_LS || safi == SAFI_MIDR_LS)) {
+		/* BGP-LS uses special encoding - handle before standard cases */
+		if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS) {
 			/* Format MP_UNREACH header if first time */
 			if (first_time) {
 				iana_afi_t pkt_afi = afi_int2iana(afi);
@@ -1123,14 +1055,7 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 			}
 
 			ls_nlri = dest->ls_nlri;
-			if (safi == SAFI_MIDR_LS) {
-				if (bgp_midr_packet_nlri(s, dest) != 0) {
-					flog_err(EC_BGP_UPDATE_SND,
-						 "Failed to encode MIDR NLRI withdrawal");
-					bgp_adj_out_remove_subgroup(dest, adj, subgrp);
-					continue;
-				}
-			} else if (ls_nlri) {
+			if (ls_nlri) {
 				/* Encode the BGP-LS NLRI into the stream */
 				if (bgp_ls_encode_nlri(s, ls_nlri) < 0) {
 					flog_err(EC_BGP_UPDATE_SND,
@@ -1149,7 +1074,7 @@ struct bpacket *subgroup_withdraw_packet(struct update_subgroup *subgrp)
 
 			if (bgp_debug_update(NULL, NULL, subgrp->update_group, 0))
 				zlog_debug("u%" PRIu64 ":s%" PRIu64
-					   " send UPDATE link-state NLRI -- unreachable",
+					   " send UPDATE BGP-LS NLRI -- unreachable",
 					   subgrp->update_group->id, subgrp->id);
 
 			subgrp->scount--;
@@ -1522,7 +1447,6 @@ void bpacket_attr_vec_arr_reset(struct bpacket_attr_vec_arr *vecarr)
 		vecarr->entries[i].offset = 0;
 		i++;
 	}
-	vecarr->midr_instance = NULL;
 }
 
 /* Setup a particular node entry in the vecarr */

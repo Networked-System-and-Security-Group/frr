@@ -628,31 +628,10 @@ bool midr_discovery_should_peer(struct midr_g1 *g1,
  * node_id(router-id) 回灌又建一条——同一节点最多两条 link，两个键都删。
  * locator 缺失时仍必须删 node_id 键；del_link 未命中返回 false，故天然幂等。
  */
-/*
- * 这条边是不是 CL 下达的群间锚点边（台账 reason == CL_ANCHOR）。
- *
- * 用途：换群/离群的自动清理路径据此**降级处理**——只注销"本群邻居"身份
- * （is_adjacent 照清），保住会话与探测。判据用**台账**而非 CL 的 evidence
- * 清单：evidence 是评估期的临时数据、决策执行完就清零，台账才是常驻真相。
- *
- * ⚠⚠ **2026-08-19 实测：当前架构下本判据不可能命中，下面两处调用是死代码**
- * （对接轮 2 验证，backbone 台子 m2a 群 2→1→2 实验）。两条腿都断：
- *   ① **纯锚点边不带 is_adjacent** —— I-7 的 ANCHOR 分支只调 midr_ctrl_connect，
- *      全程不置该标记；而清理路径（对端改组、换群拆旧群）的判据前提正是
- *      is_adjacent，所以它们**本来就扫不到锚点边**，"误清 anchor"这件事在
- *      当前代码里不成立；
- *   ② **一旦带上 is_adjacent**（对端曾进过本群、被 connect_group 建连），
- *      台账 reason 已被覆盖成 SAME_GROUP —— 家规②只给 MANUAL 粘性，
- *      CL_ANCHOR 会被后续自动流程覆盖，于是这里查不到。
- *      实测轨迹：Origin 一路 CL_ANCHOR -> SAME_GROUP -> PEER_REQ_REPLY。
- *
- * 之所以**留着不删**：由此暴露的"锚点边变成同群边之后算什么"是个语义空洞
- * （运维改群号会拆掉 CL 建的锚点、且不会自动恢复），归 CL owner，待与 zhc
- * 讨论后再定这两处的去留。全案见 docs/记档不做清单.md 第 33 条。
- *
- * ⚠ 只给"换群/离群"这类**身份变化**路径用。节点真死的路（收到 withdraw、
- * expire 判死）不豁免——锚点死了就该拆。
- */
+/* Preserve the two data-plane halves of a cross-group anchor during group
+ * changes and candidate cleanup.  Bootstrap attachments are control-only;
+ * their received PEER_REQ_REPLY is not an anchor.  Withdraw/expiry paths
+ * still tear down dead peers regardless of this predicate. */
 static bool midr_nds_edge_is_anchor(struct midr_g1 *g1, uint32_t remote_rid)
 {
 	struct midr_nds *mi;
@@ -668,7 +647,10 @@ static bool midr_nds_edge_is_anchor(struct midr_g1 *g1, uint32_t remote_rid)
 
 	for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, led))
 		if (led->remote_rid.s_addr == remote_rid &&
-		    led->reason == MIDR_SESSION_CL_ANCHOR)
+		    (led->reason == MIDR_SESSION_CL_ANCHOR ||
+		     (led->reason == MIDR_SESSION_PEER_REQ_REPLY &&
+		      led->remote_group &&
+		      !(mi->local_capabilities & MIDR_CAP_BOOTSTRAP))))
 			return true;
 
 	return false;
@@ -1400,7 +1382,9 @@ static void midr_stop_rep_probe_entry(struct midr_g1 *g1,
 	/* is_self：本节点自兼群代表时不能把自己停了。is_adjacent：该代表若已是
 	 * 本群邻居（如它换群进了本群、而 rep_dir 里还是旧群号），归 reconverge
 	 * 第 3 步管，这里不碰——避免误伤正经邻接。 */
-	if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent)
+	/* Selected representatives remain persistent cross-group anchors. */
+	if (!rep_entry || rep_entry->is_self || rep_entry->is_adjacent ||
+	    midr_nds_edge_is_anchor(g1, rep_entry->node_id.u.prefix4.s_addr))
 		return;
 
 	midr_nds_detach_node(g1, rep_entry, MIDR_STOP_CLUSTER_CHANGE, false);
@@ -1416,7 +1400,7 @@ static uint32_t midr_group_reconverge(struct midr_g1 *g1, uint32_t new_gid)
 	uint32_t connected = 0, detached = 0, reps_stopped = 0;
 
 	/*
-	 * 0. 落到无群（new_gid==0，即 I-7 的 LEAVE / RECONNECT）时先卸任群代表。
+	 * 0. 离开原群（包括直接换群和 LEAVE / RECONNECT）时先卸任群代表。
 	 *
 	 * 群代表是**这个群的**代表，群都退了角色不能跟着节点走。放在改群号之前，
 	 * 卸任才随下面那笔通告一起发出去。
@@ -1434,7 +1418,7 @@ static uint32_t midr_group_reconverge(struct midr_g1 *g1, uint32_t new_gid)
 	 *   且静默——全网少一个引导候选却无人知晓，比留着更糟。故照
 	 *   midr_nds_set_capability() 里那条留证的同款做法只报错、不动位。
 	 */
-	if (new_gid == 0 && old_gid != 0) {
+	if (new_gid != old_gid && old_gid != 0) {
 		if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
 			zlog_warn("MIDR：退出群 %u 同时卸任群代表（角色属于该群，不随节点走）——如仍需要请重敲 `midr role group-rep`",
 				  old_gid);
@@ -1590,6 +1574,7 @@ void midr_nds_set_group_id(struct midr_g1 *g1, uint32_t new_gid)
 		mi->join_in_progress = false;
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_group_id = 0;
+		mi->join_retry_rounds = 0;
 		mi->bootstrap_cur = NULL; /* §8.32：收起 failover 游标，残留 pending
 					   * 死掉时守卫（intent+地址匹配）自然忽略 */
 		MIDR_LOG("MIDR 换组(手动)：作废在途加入意图");
@@ -1836,6 +1821,12 @@ static void midr_periodic_sync_timer(struct event *t)
 
 	/* 同群补边兜底：收包侧那条路只在状态跳变时触发，失败就没有下一次。 */
 	midr_nds_reconnect_missing_peers(g1);
+
+	/* 加入期间暂缓的远端撤销：落定后补做（D2）。 */
+	midr_nds_flush_deferred_withdraws(g1);
+
+	/* 稳态补锚点：没有任何已建立的群间锚点时定期补选（D5）。 */
+	midr_anchor_maintain(g1);
 
 	event_add_timer(midr_g1_master(), midr_periodic_sync_timer, g1,
 			MIDR_PERIODIC_SYNC_INTERVAL, &mi->t_periodic_sync);
@@ -2142,7 +2133,8 @@ static void midr_join_settle_group(struct midr_g1 *g1, uint32_t gid)
 	struct midr_nds *mi = g1->midr_nds_info;
 	struct list *members;
 	bool alone;
-	bool was_rep = !!(mi->local_capabilities & MIDR_CAP_GROUP_REP);
+	bool was_rep = mi->local_group_id == gid &&
+		       !!(mi->local_capabilities & MIDR_CAP_GROUP_REP);
 
 	/*
 	 * 自身守卫（批 5c）：群号 0 = 未分群。落定 0 等于对外宣称"我是 0 号群的
@@ -2191,6 +2183,7 @@ static void midr_join_settle_group(struct midr_g1 *g1, uint32_t gid)
 	mi->join_in_progress = false;
 	mi->join_intent = false;
 	mi->join_group_id = 0;
+	mi->join_retry_rounds = 0;
 	memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 }
 
@@ -2326,6 +2319,160 @@ static void midr_join_anchor_request(struct midr_g1 *g1,
 	if (any)
 		midr_ctrl_arm_anchor_probe_done(
 			g1, requested ? MIDR_JOIN_PROBE_WAIT_SECS : 0);
+}
+
+/* ===========================================================================
+ * 稳态补锚点（D5）
+ *
+ * 锚点原先只在加入评估时选一次：自建群的节点、配置群号的固定代表、以及
+ * 加入时锚点群恰好也在重启的节点，从此再没有群间锚点，随机顺序重启后
+ * overlay 分裂成孤岛。这里对"已落定、却没有任何已建立锚点边"的节点每隔
+ * MIDR_ANCHOR_RETRY_SYNCS 个周期重拉一次代表目录，响应到达后挑两个别的群
+ * 走现成的锚点评估（MEMBER_LIST_REQ → 热身 → ANCHOR_PROBE_DONE → ANCHOR）。
+ * =========================================================================*/
+
+/* 已建立的群间锚点边数：台账认账（同 midr_nds_edge_is_anchor），对端仍在
+ * 别的群，且会话 Established。 */
+static unsigned int midr_anchor_edges_established(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct listnode *node;
+	struct midr_session_ledger_entry *led;
+	unsigned int count = 0;
+
+	for (ALL_LIST_ELEMENTS_RO(mi->session_ledger, node, led)) {
+		union sockunion su;
+		struct midr_g1_peer *peer;
+
+		if (led->reason != MIDR_SESSION_CL_ANCHOR &&
+		    led->reason != MIDR_SESSION_PEER_REQ_REPLY)
+			continue;
+		if (!led->remote_group || led->remote_group == mi->local_group_id)
+			continue;
+		if (!midr_ipaddr_to_sockunion(&led->transport, &su))
+			continue;
+		peer = midr_g1_peer_lookup_su(g1, &su);
+		if (peer && peer->established)
+			count++;
+	}
+	return count;
+}
+
+static bool midr_anchor_repair_allowed(struct midr_nds *mi)
+{
+	return !(mi->local_capabilities & MIDR_CAP_BOOTSTRAP) && !mi->shutdown &&
+	       mi->local_group_id && mi->join_phase == MIDR_JOIN_IDLE &&
+	       !mi->join_intent && !mi->anchor_group_id[0] &&
+	       !mi->anchor_group_id[1] && !mi->t_anchor_probe_done;
+}
+
+/* PERIODIC_SYNC 每拍调用：够条件就向引导重拉代表目录。 */
+void midr_anchor_maintain(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct ipaddr dst;
+
+	if (!midr_anchor_repair_allowed(mi) ||
+	    midr_anchor_edges_established(g1)) {
+		mi->anchor_idle_syncs = 0;
+		return;
+	}
+	if (++mi->anchor_idle_syncs < MIDR_ANCHOR_RETRY_SYNCS)
+		return;
+	mi->anchor_idle_syncs = 0;
+
+	if (midr_ipaddr_valid_locator(&mi->join_bootstrap)) {
+		dst = mi->join_bootstrap;
+	} else if (mi->bootstrap_list && listhead(mi->bootstrap_list)) {
+		struct midr_bootstrap_entry *b =
+			listgetdata(listhead(mi->bootstrap_list));
+
+		dst = b->transport;
+	} else {
+		return;
+	}
+
+	mi->anchor_dir_refresh = true;
+	zlog_info("MIDR 锚点：群 %u 没有已建立的群间锚点，向引导 %pIA 重拉代表目录补选",
+		  mi->local_group_id, &dst);
+	midr_ctrl_send_rep_request(g1, dst);
+}
+
+void midr_anchor_on_rep_list(struct midr_g1 *g1)
+{
+	struct midr_nds *mi;
+	struct midr_rep_identity chosen[2] = {};
+	uint32_t chosen_rtt[2] = { UINT32_MAX, UINT32_MAX };
+	struct list *anchor_reps;
+	struct listnode *node;
+	struct midr_rep_entry *r;
+	int nchosen = 0, i;
+
+	if (!g1 || !g1->midr_nds_info)
+		return;
+	mi = g1->midr_nds_info;
+	mi->anchor_dir_refresh = false;
+	if (!midr_anchor_repair_allowed(mi))
+		return;
+
+	/*
+	 * 选两个别的群：代表链路有探测数据的按 RTT 排，没有的排在后面（按目录
+	 * 顺序）。只用来决定"问哪两个群要成员表"——真正的锚点节点由 CL 在
+	 * ANCHOR_PROBE_DONE 时按成员实测指标挑。
+	 */
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r)) {
+		struct prefix rep_id;
+		struct midr_link_entry *link;
+		uint32_t rtt = UINT32_MAX - 1;
+		int slot;
+
+		r->members_listed = false;
+		if (!r->group_id || r->group_id == mi->local_group_id ||
+		    r->rep_rid.s_addr == INADDR_ANY ||
+		    IPV4_ADDR_SAME(&r->rep_rid, &g1->router_id) ||
+		    midr_admission_candidate_blocked(g1, r->rep_transport))
+			continue;
+		for (i = 0; i < nchosen; i++)
+			if (chosen[i].group_id == r->group_id)
+				break;
+		if (i < nchosen)
+			continue;
+
+		midr_prefix_from_in_addr(&rep_id, r->rep_rid);
+		link = midr_global_view_find_link(mi->global_view, &rep_id);
+		if (link && link->status == MIDR_LINK_UP &&
+		    link->long_term.rtt_us > 0)
+			rtt = link->long_term.rtt_us;
+
+		if (nchosen < 2)
+			slot = nchosen++;
+		else if (rtt < chosen_rtt[1])
+			slot = 1;
+		else
+			continue;
+		if (slot == 1 && rtt < chosen_rtt[0]) {
+			chosen[1] = chosen[0];
+			chosen_rtt[1] = chosen_rtt[0];
+			slot = 0;
+		}
+		chosen[slot].group_id = r->group_id;
+		chosen[slot].node_id = rep_id;
+		chosen_rtt[slot] = rtt;
+	}
+
+	if (!nchosen) {
+		MIDR_LOG("MIDR 锚点：代表目录里没有别的群，暂不补锚点");
+		return;
+	}
+
+	anchor_reps = list_new();
+	for (i = 0; i < nchosen; i++)
+		listnode_add(anchor_reps, &chosen[i]);
+	zlog_info("MIDR 锚点：补选群间锚点，评估群 %u/%u（0 = 无）",
+		  chosen[0].group_id, chosen[1].group_id);
+	midr_join_anchor_keep(g1, anchor_reps);
+	midr_join_anchor_request(g1, anchor_reps);
+	list_delete(&anchor_reps);
 }
 
 void midr_nds_on_cluster_decision(struct midr_g1 *g1,
@@ -2497,6 +2644,7 @@ void midr_nds_on_cluster_decision(struct midr_g1 *g1,
 		mi->join_in_progress = false;
 		mi->join_intent = false;
 		mi->join_group_id = 0; /* 候选群字段回零：流程已结束，真身看 local_group_id */
+		mi->join_retry_rounds = 0;
 		memset(mi->join_batch_gid, 0, sizeof(mi->join_batch_gid));
 		zlog_info("MIDR I-7：JOIN 群 %u 完成（经重收敛编排建连 %u 个成员），加入流程结束（回稳态）",
 			  decision->new_group_id, mi->join_members);
@@ -2607,6 +2755,23 @@ void midr_nds_on_cluster_decision(struct midr_g1 *g1,
 				  left_gid, listcount(mi->bootstrap_list));
 			midr_join_round_start(g1);
 		}
+		break;
+	case MIDR_DECISION_REJOIN:
+		/*
+		 * 本轮一个候选群都没评估成（见 MIDR_DECISION_REJOIN）：向引导重拉
+		 * 目录、重开一轮。轮数由 CL 封顶，这里只计数。评估期灌入的候选
+		 * 成员不在此清——下一轮落定时 reconverge 第 3 步按"邻接却已不同群"
+		 * 统一拆掉，与 CREATE 的收尾同一条路。
+		 */
+		if (mi->join_phase != MIDR_JOIN_PROBING_REPS &&
+		    mi->join_phase != MIDR_JOIN_PROBING_MEMBERS) {
+			MIDR_LOG("MIDR I-7：REJOIN 但不在加入流程中，忽略");
+			break;
+		}
+		mi->join_retry_rounds++;
+		zlog_info("MIDR I-7：本轮没有可评估的候选群（目录可能已过期），重拉代表目录、重开加入（第 %u 轮）",
+			  mi->join_retry_rounds);
+		midr_join_round_start(g1);
 		break;
 	case MIDR_DECISION_SPLIT:
 		midr_originate_group_update(g1, decision->new_group_id,
@@ -2839,6 +3004,9 @@ void midr_nds_on_cluster_decision(struct midr_g1 *g1,
 							break;
 						}
 				if (chosen)
+					continue;
+				if (midr_nds_edge_is_anchor(g1,
+							   e->node_id.u.prefix4.s_addr))
 					continue;
 
 				midr_nds_detach_node(g1, e,
@@ -3808,6 +3976,7 @@ void midr_bootstrap_clear(struct midr_g1 *g1)
 		mi->join_in_progress = false;
 		mi->join_phase = MIDR_JOIN_IDLE;
 		mi->join_group_id = 0;
+		mi->join_retry_rounds = 0;
 		MIDR_LOG("MIDR bootstrap：清空候选清单并作废在途加入意图");
 	}
 }
@@ -4075,6 +4244,8 @@ unsigned int midr_nds_shutdown_enter(struct midr_g1 *g1)
 	mi->join_in_progress = false;
 	mi->join_phase = MIDR_JOIN_IDLE;
 	mi->join_group_id = 0;
+	mi->join_retry_rounds = 0;
+	mi->anchor_dir_refresh = false;
 	mi->bootstrap_cur = NULL;
 	midr_nds_anchor_ctx_clear(g1); /* 挂点①（配套一） */
 
@@ -5529,6 +5700,8 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 		midr_node_hash_add(&gv->nodes, entry);
 		is_new = true;
 	}
+	/* 又收到它的事实 = 它还活着，作废加入期间暂缓的那次撤销。 */
+	entry->withdraw_deferred = false;
 
 	if (entry->group_id != node->group_id) {
 		changed = true;
@@ -5645,6 +5818,61 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
 		(void)midr_nds_transport_reconcile(g1);
 }
 
+/*
+ * 加入期间暂缓远端撤销的对象：本轮正在评估的代表（rep_dir 里有它），以及
+ * 本批候选群里已灌入、正在探测的成员。
+ *
+ * 为什么要暂缓：节点刚重启或刚退群时没有 MIDR 会话，节点目录不再刷新，
+ * 条目寿命（45s）短于探代表窗口（60s）。到期撤销走 detach 清理链，会把
+ * 正在评估的代表连同链路数据删掉，REP_PROBE_DONE 时就"无可用代表"而
+ * CREATE 出孤岛群。真死的节点在落定后由 midr_nds_flush_deferred_withdraws()
+ * 补删，活着的会在此之前重新收到事实、清掉标记。
+ */
+static bool midr_join_protects_node(struct midr_nds *mi,
+				    const struct midr_node_entry *entry)
+{
+	struct listnode *node;
+	struct midr_rep_entry *r;
+	int i;
+
+	if (mi->join_phase == MIDR_JOIN_IDLE)
+		return false;
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r))
+		if (IPV4_ADDR_SAME(&r->rep_rid, &entry->node_id.u.prefix4))
+			return true;
+	if (!entry->is_adjacent || !entry->group_id)
+		return false;
+	for (i = 0; i < MIDR_JOIN_BATCH_MAX; i++)
+		if (mi->join_batch_gid[i] == entry->group_id)
+			return true;
+	return false;
+}
+
+/* 加入落定（或作废）之后，补做加入期间暂缓的远端撤销。 */
+void midr_nds_flush_deferred_withdraws(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_node_entry *entry;
+	bool removed = false;
+
+	if (mi->join_phase != MIDR_JOIN_IDLE || mi->join_intent)
+		return;
+
+	frr_each_safe (midr_node_hash, &mi->global_view->nodes, entry) {
+		if (!entry->withdraw_deferred)
+			continue;
+		MIDR_LOG("MIDR 远端视图：补做暂缓的 node 撤销 %pFX → 走 detach 清理链",
+			 &entry->node_id);
+		midr_nds_detach_node(g1, entry, MIDR_STOP_GRACEFUL_SHUTDOWN,
+				     true);
+		midr_node_hash_del(&mi->global_view->nodes, entry);
+		XFREE(MTYPE_MIDR_NODE_ENTRY, entry);
+		removed = true;
+	}
+	if (removed)
+		midr_nds_notify_cl(g1, MIDR_TRIGGER_NODE_CHANGE);
+}
+
 static void midr_nds_remote_node_withdraw(uint32_t node_id, uint64_t ls_sequence)
 {
 	struct midr_g1 *g1 = midr_nds_remote_bgp();
@@ -5675,6 +5903,14 @@ static void midr_nds_remote_node_withdraw(uint32_t node_id, uint64_t ls_sequence
 		return;
 
 	midr_nds_remote_note_withdraw(g1, rid);
+
+	/* 加入评估中的代表/候选成员：暂缓撤销，落定后再补做（D2）。 */
+	if (midr_join_protects_node(g1->midr_nds_info, entry)) {
+		entry->withdraw_deferred = true;
+		MIDR_LOG("MIDR 远端视图：node 撤销 %pI4 暂缓——它正在本轮加入评估中，落定后再处理",
+			 &rid);
+		return;
+	}
 
 	/* ⚠ 这条日志是"谁拆的会话"的定位手段。件②（轮 4）删掉旧 NLRI 线之后，
 	 * 与它成对的那条（"…（旧 NLRI 线）"）永久归零——记档 49 复现时不必再分辨

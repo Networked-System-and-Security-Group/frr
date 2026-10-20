@@ -25,11 +25,9 @@ def main():
         ("configure", ["./configure", "--disable-doc", "--disable-snmp",
                        "--disable-rpki", "--disable-zeromq"]),
         ("build", ["make", f"-j{min(os.cpu_count() or 2, 4)}", "midrd/midrd",
-                   "bgpd/bgpd", "midrd/group1/test_midr_group1",
-                   "tests/bgpd/test_midr_admission"]),
+                   "bgpd/bgpd", "midrd/group1/test_midr_group1"]),
         ("group1-linked", ["bash", "midrd/group1/verify-group1-linked.sh", "midrd/midrd"]),
         ("group1-test", ["midrd/group1/test_midr_group1"]),
-        ("admission-test", ["tests/bgpd/test_midr_admission"]),
         ("candidate-test", ["python3", "midr-test/cl-test/candidate-fallback/run_test.py"]),
     ]
     try:

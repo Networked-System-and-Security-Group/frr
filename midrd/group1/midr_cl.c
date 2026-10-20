@@ -15,6 +15,8 @@
  *                        无可用代表时输出 CREATE。
  *   MEMBER_PROBE_DONE -> 按排名验证这一批候选群；第一个达标的 JOIN，整批不达标
  *                        则 CREATE，不再评估排名更靠后的群。
+ *   两处都"一个候选群都没评估成"（代表没测到 / 没回成员表）时先 REJOIN，
+ *   重拉目录重开一轮，至多 MIDR_CL_JOIN_RETRY_MAX 轮。
  *                        JOIN/CREATE 附带锚点群：除自己群外排名最高的两个群。
  *
  * 注意事项：
@@ -54,6 +56,31 @@ DEFINE_MTYPE_STATIC(MIDR_G1, MIDR_REP_IDENTITY, "MIDR representative identity");
  * 需与目标群内 is_adjacent 邻居中满足阈值的数量对比。
  */
 #define MIDR_CL_MIN_GOOD_LINKS 5U
+
+/*
+ * 一次加入因"没有可评估的候选群"而重开的上限（MIDR_DECISION_REJOIN）。
+ * 用尽后照常 CREATE：代表长期失联时不能让节点永远加不进来。
+ */
+#define MIDR_CL_JOIN_RETRY_MAX 3U
+
+/*
+ * 退群去抖：PERIODIC_SYNC 连续这么多次（× MIDR_PERIODIC_SYNC_INTERVAL）
+ * 判定好链路不足才 LEAVE。群代表重启十几秒只会让链路短暂降级，不应让
+ * 同群成员全体退群重入。
+ */
+#define MIDR_CL_LEAVE_DEBOUNCE_SYNCS 3U
+
+/*
+ * 一群两代表去抖（见 cl_resolve_duplicate_rep）：连续这么多次 PERIODIC_SYNC
+ * 都看到本群另有一个 router-id 更小的代表，本节点卸任。
+ */
+#define MIDR_CL_DUP_REP_SYNCS 2U
+/*
+ * 对方 router-id 更大却迟迟不卸任（它手配了群号，按规则不让位）：本节点
+ * 等满这么多次后自己卸任。须明显长于 MIDR_CL_DUP_REP_SYNCS，留足对方按
+ * 常规先让位的时间。
+ */
+#define MIDR_CL_DUP_REP_YIELD_SYNCS 6U
 
 /* ===========================================================================
  * 内部辅助函数
@@ -142,19 +169,29 @@ static bool cl_node_is_better(const struct midr_node_entry *candidate,
 }
 
 /*
- * 遍历节点表，找出其中最大的 group_id，用于 CREATE 分配新群编号。
- * 若节点表为空，返回 0（CREATE 新群 ID 将为 1）。
+ * 找出已知的最大 group_id，用于 CREATE 分配新群编号。
+ * 节点表之外还要看代表目录：刚重启/刚退群的节点视图可能被清空，只看
+ * 节点表会得到一个已被占用的群号（例如 1），自任代表后再经 ATTACH 让引导
+ * 登记成该群代表，把后来者引向假代表。目录来自引导，覆盖面比本地视图全。
+ * 两者都为空时返回 0（CREATE 新群 ID 将为 1）。
  */
-static uint32_t cl_max_group_id(const struct midr_global_view *gv)
+static uint32_t cl_max_group_id(struct midr_g1 *g1,
+				 const struct midr_global_view *gv)
 {
+	struct midr_nds *mi = g1->midr_nds_info;
 	struct list *nodes = midr_nds_cl_nodes_getter(gv);
 	struct midr_node_entry *entry;
+	struct midr_rep_entry *r;
 	struct listnode *n;
 	uint32_t max_id = 0;
 
 	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry))
 		if (entry->group_id > max_id)
 			max_id = entry->group_id;
+	if (mi->rep_dir)
+		for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r))
+			if (r->group_id > max_id)
+				max_id = r->group_id;
 
 	list_delete(&nodes);
 	return max_id;
@@ -324,7 +361,7 @@ static void cl_emit_create(struct midr_g1 *g1, const struct midr_global_view *gv
 	struct midr_cluster_decision d = {};
 
 	d.decision_type = MIDR_DECISION_CREATE;
-	d.new_group_id = cl_max_group_id(gv) + 1;
+	d.new_group_id = cl_max_group_id(g1, gv) + 1;
 	d.old_group_id = mi->local_group_id;
 	cl_add_anchor_reps(g1, &d, rank_rep, nrank, 0);
 	MIDR_FLOW_LOG("MIDR CL: 无可入的候选群，CREATE 新群 %u（%d 个锚点群）",
@@ -333,11 +370,51 @@ static void cl_emit_create(struct midr_g1 *g1, const struct midr_global_view *gv
 	cl_free_identities(&d.anchor_reps);
 }
 
+/* 目录里是否有可评估的代表（不算本机自己、不算 rid=0 的异常条目）。 */
+static bool cl_rep_dir_has_candidates(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct listnode *n;
+	struct midr_rep_entry *r;
+
+	if (!mi->rep_dir)
+		return false;
+	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, n, r))
+		if (r->rep_rid.s_addr != INADDR_ANY &&
+		    !IPV4_ADDR_SAME(&r->rep_rid, &g1->router_id))
+			return true;
+	return false;
+}
+
+/*
+ * 本轮一个候选群都没评估成（代表都没测到 / 都没回成员表）：多半是目录
+ * 过期——代表刚重启、换了群号或还没重新入群。此时 CREATE 只会造出一个
+ * 孤岛群，改为重拉目录重开一轮（MIDR_DECISION_REJOIN）。轮数用尽、或没有
+ * 引导候选可问时返回 false，调用方照常 CREATE。
+ */
+static bool cl_try_rejoin(struct midr_g1 *g1, const char *why)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_cluster_decision d = {};
+
+	if (mi->join_retry_rounds >= MIDR_CL_JOIN_RETRY_MAX ||
+	    !mi->bootstrap_list || !listcount(mi->bootstrap_list))
+		return false;
+
+	d.decision_type = MIDR_DECISION_REJOIN;
+	d.old_group_id = mi->local_group_id;
+	d.new_group_id = mi->local_group_id;
+	MIDR_FLOW_LOG("MIDR CL: %s，REJOIN（第 %u/%u 轮重拉目录）", why,
+		      mi->join_retry_rounds + 1, MIDR_CL_JOIN_RETRY_MAX);
+	midr_nds_on_cluster_decision(g1, &d);
+	return true;
+}
+
 /*
  * 选候选群：按排名取前 MIDR_JOIN_BATCH_MAX 个代表未被 Tier1 准入拒绝的群，
  * 经 I-7 RECOMMEND 回灌，NDS 并行要成员表、并行探测，一个热身窗口后由
  * MEMBER_PROBE_DONE 按排名逐个验证。只评估这一批，不往后顺延。
- * 无可用候选时 CREATE。
+ * 无可用候选时 CREATE；但目录里有代表、只是一个都没测到时先 REJOIN。
  */
 static void cl_handle_rep_probe_done(struct midr_g1 *g1,
 				     const struct midr_global_view *gv)
@@ -351,6 +428,13 @@ static void cl_handle_rep_probe_done(struct midr_g1 *g1,
 	struct midr_cluster_decision d = {};
 
 	nrank = cl_rank_groups(g1, gv, &rank_rep, &rank_link);
+
+	if (!nrank && cl_rep_dir_has_candidates(g1) &&
+	    cl_try_rejoin(g1, "REP_PROBE_DONE → 目录中的代表一个都没测到")) {
+		XFREE(MTYPE_TMP, rank_rep);
+		XFREE(MTYPE_TMP, rank_link);
+		return;
+	}
 
 	/* Performance orders the groups; admission decides which may be joined. */
 	for (i = 0; i < nrank && nbatch < MIDR_JOIN_BATCH_MAX; i++) {
@@ -482,7 +566,8 @@ static size_t cl_count_good_member_links(const struct midr_g1 *g1,
  *   逐个验证：本轮收到成员表、且群内 is_adjacent 候选成员中满足长期 RTT/
  *   丢包率阈值的数量达标，则 JOIN 第一个达标的群；整批都不达标则 CREATE
  *   （分配新群 ID = 最大 + 1），不再评估排名更靠后的群。JOIN/CREATE 都附上
- *   锚点群（cl_add_anchor_reps）。
+ *   锚点群（cl_add_anchor_reps）。整批一个成员表都没收到时先 REJOIN
+ *   （cl_try_rejoin），轮数用尽才 CREATE。
  *
  * JOIN threshold is capped the same way the PERIODIC_SYNC stay threshold is
  * (min(MIDR_CL_MIN_GOOD_LINKS, total known members) — see cl_handle_periodic_
@@ -508,6 +593,7 @@ static void cl_handle_member_probe_done(struct midr_g1 *g1,
 	struct midr_rep_entry **rank_rep;
 	struct midr_link_entry **rank_link;
 	size_t nrank, slot;
+	bool any_listed = false;
 	struct midr_cluster_decision d = {};
 
 	for (slot = 0; slot < MIDR_JOIN_BATCH_MAX; slot++) {
@@ -524,6 +610,7 @@ static void cl_handle_member_probe_done(struct midr_g1 *g1,
 				      gid);
 			continue;
 		}
+		any_listed = true;
 		good_links = cl_count_good_member_links(g1, gv, gid,
 							&worst_rtt, &worst_loss,
 							&total_known);
@@ -553,6 +640,12 @@ static void cl_handle_member_probe_done(struct midr_g1 *g1,
 			gid, good_links, join_threshold, total_known,
 			worst_rtt, worst_loss);
 	}
+
+	/* 整批都没回成员表（代表在入群窗口内重启、或已另建新群而回了别的
+	 * 群号）：不是"没有合适的群"，重拉目录再试。 */
+	if (!any_listed &&
+	    cl_try_rejoin(g1, "MEMBER_PROBE_DONE → 整批候选群都没收到成员表"))
+		return;
 
 	nrank = cl_rank_groups(g1, gv, &rank_rep, &rank_link);
 	cl_emit_create(g1, gv, rank_rep, nrank);
@@ -688,6 +781,78 @@ static void cl_handle_anchor_probe_done(struct midr_g1 *g1,
  * =========================================================================*/
 
 /*
+ * 一群两代表（D3 残留）：两个节点几乎同时 CREATE 时看到的目录相同，会选出
+ * 同一个新群号并各自自任代表。同群号的节点在视图里见面后会自动建连
+ * （midr_discovery_should_peer），并成一个群，但留下两个代表；而代表不做
+ * 退群判定，这个群即使链路很差也不会再拆开。
+ *
+ * 规则：本群另有一个 router-id 更小的代表、连续 MIDR_CL_DUP_REP_SYNCS 次都在，
+ * 本节点卸任（REP_RESIGN），之后按普通成员走退群判定——链路好就留在合并后的
+ * 群里，链路差就 LEAVE 重入（那时视图里已有这个群号，不会再撞）。双方按同一
+ * 条规则各自判断，不需要协商，也不会同时卸任。
+ *
+ * 手配群号的节点不让位（归属听配置）。对方是否手配看不到，所以 router-id
+ * 更小的一方若连续 MIDR_CL_DUP_REP_YIELD_SYNCS 次仍看到 router-id 更大的
+ * 代表没让位，就认定对方不会让，自己卸任。两边都手配同一群号并都当代表
+ * 是运维配置冲突，这里不处理。
+ *
+ * 返回 true 表示本节点是代表、本拍已处理完（无论是否卸任）。
+ */
+static bool cl_resolve_duplicate_rep(struct midr_g1 *g1,
+				     const struct midr_global_view *gv)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct list *nodes;
+	struct midr_node_entry *entry, *smaller = NULL, *larger = NULL, *other;
+	struct listnode *n;
+	struct midr_cluster_decision d = {};
+	uint32_t self_rid = ntohl(g1->router_id.s_addr), needed;
+
+	if (!(mi->local_capabilities & MIDR_CAP_GROUP_REP))
+		return false;
+
+	nodes = midr_nds_cl_nodes_getter(gv);
+	for (ALL_LIST_ELEMENTS_RO(nodes, n, entry)) {
+		if (entry->is_self || entry->group_id != mi->local_group_id ||
+		    !(entry->capabilities & MIDR_CAP_GROUP_REP))
+			continue;
+		if (ntohl(entry->node_id.u.prefix4.s_addr) < self_rid)
+			smaller = entry;
+		else
+			larger = entry;
+	}
+	other = smaller ? smaller : larger;
+	needed = smaller ? MIDR_CL_DUP_REP_SYNCS : MIDR_CL_DUP_REP_YIELD_SYNCS;
+
+	if (!other || mi->config_group_id) {
+		mi->dup_rep_syncs = 0;
+		list_delete(&nodes);
+		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点是群代表，跳过退群判定");
+		return true;
+	}
+	if (++mi->dup_rep_syncs < needed) {
+		MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 另有代表 %pFX（router-id 更%s），暂不卸任（连续第 %u/%u 次）",
+			      mi->local_group_id, &other->node_id,
+			      smaller ? "小" : "大", mi->dup_rep_syncs, needed);
+		list_delete(&nodes);
+		return true;
+	}
+	mi->dup_rep_syncs = 0;
+	d.decision_type = MIDR_DECISION_REP_RESIGN;
+	d.old_group_id = mi->local_group_id;
+	d.new_group_id = mi->local_group_id;
+	if (smaller)
+		MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC → 群 %u 有两个代表，router-id 更小的 %pFX 保留，本节点 REP_RESIGN",
+			      mi->local_group_id, &other->node_id);
+	else
+		MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC → 群 %u 有两个代表，%pFX 连续 %u 次未让位（多半手配了群号），本节点 REP_RESIGN",
+			      mi->local_group_id, &other->node_id, needed);
+	list_delete(&nodes);
+	midr_nds_on_cluster_decision(g1, &d);
+	return true;
+}
+
+/*
  * 稳态退群判定：复用 cl_count_good_member_links() 对本节点当前所在群
  * （而非候选群）计好链路数，跌破留群阈值时输出 LEAVE。
  *
@@ -706,6 +871,12 @@ static void cl_handle_anchor_probe_done(struct midr_g1 *g1,
  *   - 群号刚变化不足 MIDR_JOIN_PROBE_WAIT_SECS 秒不评估：给 PM 长期 EWMA 留
  *     够收敛时间，否则刚 JOIN/CREATE 完成时群内链路数据还不够，会被误判成
  *     "好链路不够"立即又 LEAVE，形成抖动。
+ *
+ * 去抖：连续 MIDR_CL_LEAVE_DEBOUNCE_SYNCS 次不达标才 LEAVE，中间任何一次
+ * 达标即清零。群代表重启时成员到它的链路只降级十几秒，不该触发退群。
+ *
+ * 代表本身改为先查"一群两代表"（cl_resolve_duplicate_rep），让位卸任后
+ * 下一拍起按普通成员判定。
  */
 static void cl_handle_periodic_sync(struct midr_g1 *g1,
 				    const struct midr_global_view *gv)
@@ -717,14 +888,16 @@ static void cl_handle_periodic_sync(struct midr_g1 *g1,
 	struct midr_cluster_decision d = {};
 
 	if (mi->local_group_id == 0) {
+		mi->leave_pending_syncs = 0;
 		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点当前无群，跳过退群判定");
 		return;
 	}
-	if (mi->local_capabilities & MIDR_CAP_GROUP_REP) {
-		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 本节点是群代表，跳过退群判定");
+	if (cl_resolve_duplicate_rep(g1, gv)) {
+		mi->leave_pending_syncs = 0;
 		return;
 	}
 	if (monotime(NULL) - mi->group_settled_at < MIDR_JOIN_PROBE_WAIT_SECS) {
+		mi->leave_pending_syncs = 0;
 		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群号刚变化不足 %d 秒，跳过退群判定（等 EWMA 热身）",
 			 MIDR_JOIN_PROBE_WAIT_SECS);
 		return;
@@ -737,11 +910,20 @@ static void cl_handle_periodic_sync(struct midr_g1 *g1,
 				  ? total_adjacent
 				  : MIDR_CL_MIN_GOOD_LINKS;
 	if (good_links >= stay_threshold) {
+		mi->leave_pending_syncs = 0;
 		MIDR_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 仍有 %zu/%zu 条好链路（认识 %zu 个邻接节点），留群",
 			 mi->local_group_id, good_links, stay_threshold,
 			 total_adjacent);
 		return;
 	}
+	if (++mi->leave_pending_syncs < MIDR_CL_LEAVE_DEBOUNCE_SYNCS) {
+		MIDR_FLOW_LOG("MIDR CL: PERIODIC_SYNC — 群 %u 仅 %zu/%zu 条好链路，暂缓退群（连续第 %u/%u 次）",
+			      mi->local_group_id, good_links, stay_threshold,
+			      mi->leave_pending_syncs,
+			      MIDR_CL_LEAVE_DEBOUNCE_SYNCS);
+		return;
+	}
+	mi->leave_pending_syncs = 0;
 
 	d.decision_type = MIDR_DECISION_LEAVE;
 	d.old_group_id = mi->local_group_id;

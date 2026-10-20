@@ -1,0 +1,19 @@
+[Unit]
+Description=Matching BGP for edge MIDR
+Requires=midr-zebra.service
+After=midr-zebra.service
+Conflicts=frr.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/midr/node.env
+ExecStart=/usr/local/libexec/midr/start-midr-bgpd.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=40
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

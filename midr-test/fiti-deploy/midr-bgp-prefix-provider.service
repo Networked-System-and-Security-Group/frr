@@ -1,0 +1,21 @@
+[Unit]
+Description=External BGP Prefix Provider for MIDR
+Requires=midrd.service
+After=midrd.service midr-bgpd.service
+PartOf=midrd.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/midr/node.env
+ExecStart=/usr/local/libexec/midr/start-midr-bgp-prefix-provider.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+KillMode=control-group
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

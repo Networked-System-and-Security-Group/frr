@@ -19,6 +19,8 @@
 #include "midrd/group1/midr_g1.h"
 #include "midrd/group1/midr_nds.h"
 #include "midrd/group1/midr_nds_facts.h"
+#include "midrd/group1/midr_ctrl.h"
+#include "midrd/group1/midr_pm.h"
 #include "midrd/group1/midr_vlink.h"
 
 #define LOCAL_NODE_ID 0x0100000aU /* 10.0.0.1 */
@@ -638,6 +640,322 @@ static void test_vlink_lifecycle(struct midr_g1 *g1)
 	printf("virtual link request/ready/probe/failure/rebuild/release: PASS\n");
 }
 
+static void test_anchor_representative_cleanup(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct ipaddr local = v4(0xc0000201), remote = v4(0xc0000202);
+	struct ipaddr unused = v4(0xc0000203);
+	struct in_addr rid = { .s_addr = REMOTE_NODE_ID };
+	struct in_addr unused_rid = { .s_addr = OTHER_NODE_ID };
+	struct prefix remote_id = { .family = AF_INET,
+				    .prefixlen = IPV4_MAX_BITLEN };
+	struct prefix unused_id = remote_id;
+	struct midr_nds_link_metrics metrics = {
+		.rtt_us = 1000, .bw_score = 1000,
+	};
+	struct midr_node_evidence evidence = {};
+	struct midr_cluster_decision decision = {
+		.decision_type = MIDR_DECISION_ANCHOR,
+		.new_group_id = 7, .old_group_id = 7,
+	};
+	struct midr_g1_peer *peer;
+	unsigned int deletes;
+
+	mi->local_group_id = 7;
+	mi->transport_active = true;
+	mi->active_transport_addr = local;
+	mi->anchor_group_id[0] = 8;
+	mi->anchor_group_id[1] = 9;
+	remote_id.u.prefix4 = rid;
+	unused_id.u.prefix4 = unused_rid;
+	midr_rep_dir_add(g1, 8, remote, 0, rid);
+	midr_rep_dir_add(g1, 9, unused, 0, unused_rid);
+	midr_nds_learn_anchor_candidate(g1, rid, 0, remote, 8);
+	midr_nds_learn_anchor_candidate(g1, unused_rid, 0, unused, 9);
+	session_set(&remote, MIDR_SESSION_DOWN, 0);
+	peer = midr_g1_peer_create(g1, &remote, rid, 0);
+	assert(peer);
+	session_set(&remote, MIDR_SESSION_ESTABLISHED, REMOTE_NODE_ID);
+	notify(&remote, MIDR_SESSION_ESTABLISHED, REMOTE_NODE_ID, 0);
+	run_queued();
+	assert(peer->established);
+	midr_nds_on_link_update(g1, &remote_id, MIDR_LINK_UP, 0,
+				&metrics, &metrics);
+	midr_nds_on_link_update(g1, &unused_id, MIDR_LINK_UP, 0,
+				&metrics, &metrics);
+	vlink_event("mgre-0a000002", MIDR_VLINK_EV_READY, 27);
+	midr_g1_vlink_probe_event(REMOTE_NODE_ID, true);
+	run_queued();
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	deletes = stub.vlink_dels;
+	evidence.node_id = remote_id;
+	evidence.metrics = metrics;
+	decision.evidence = list_new();
+	listnode_add(decision.evidence, &evidence);
+
+	midr_nds_on_cluster_decision(g1, &decision);
+	assert(listcount(mi->global_view->links) == 1);
+	assert(prefix_same(&((struct midr_link_entry *)
+		listgetdata(listhead(mi->global_view->links)))->remote_node_id,
+		&remote_id));
+	assert(midr_g1_vlink_get(REMOTE_NODE_ID, NULL));
+	assert(stub.vlink_dels == deletes);
+	assert(peer->established);
+	assert(!mi->anchor_group_id[0] && !mi->anchor_group_id[1]);
+	list_delete(&decision.evidence);
+	printf("anchor representative keeps PM Link and GRE; unused candidate cleaned: PASS\n");
+}
+
+static void test_received_anchor_and_role_transition(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct midr_node_entry entry = {};
+	struct midr_probe_ctx key = {};
+	struct midr_cluster_decision join = {
+		.decision_type = MIDR_DECISION_JOIN,
+		.old_group_id = 7, .new_group_id = 8,
+	};
+	unsigned int probes;
+	struct sockaddr_in local = { .sin_family = AF_INET,
+		.sin_port = htons(MIDR_PM_PROBE_PORT) };
+	int freebind = 1;
+
+	mi->local_group_id = 7;
+	mi->transport_active = true;
+	mi->active_transport_addr = v4(0xc0000201);
+	/* Bind the test's documentation address without changing host routes. */
+	mi->pm_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(mi->pm_sock >= 0);
+	assert(!setsockopt(mi->pm_sock, IPPROTO_IP, IP_FREEBIND,
+			  &freebind, sizeof(freebind)));
+	local.sin_addr = mi->active_transport_addr.ipaddr_v4;
+	assert(!bind(mi->pm_sock, (struct sockaddr *)&local, sizeof(local)));
+	entry.node_id.family = AF_INET;
+	entry.node_id.prefixlen = IPV4_MAX_BITLEN;
+	entry.node_id.u.prefix4.s_addr = 0x0600000aU;
+	entry.transport_addr = v4(0xc0000206);
+	entry.has_transport_addr = true;
+	entry.group_id = 9;
+	key.target = entry.node_id;
+	/* The target was not in the directory.  Accepted requests must learn
+	 * it and start PM without making it a same-group neighbor. */
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, false) == MIDR_ADMISSION_READY);
+	assert(hash_lookup(mi->probe_contexts, &key));
+	assert(!midr_node_hash_find(&mi->global_view->nodes, &entry)->is_adjacent);
+	probes = hashcount(mi->probe_contexts);
+	entry.node_id.u.prefix4.s_addr = 0x0400000aU;
+	entry.transport_addr = v4(0xc0000204);
+	/* A bootstrap attachment must not acquire a business PM target. */
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, true) == MIDR_ADMISSION_READY);
+	assert(hashcount(mi->probe_contexts) == probes);
+	mi->local_capabilities = MIDR_CAP_BOOTSTRAP;
+	entry.node_id.u.prefix4.s_addr = 0x0500000aU;
+	entry.transport_addr = v4(0xc0000205);
+	assert(midr_ctrl_connect_received(g1, &entry,
+		MIDR_SESSION_PEER_REQ_REPLY, false) == MIDR_ADMISSION_READY);
+	assert(hashcount(mi->probe_contexts) == probes);
+
+	mi->local_capabilities = MIDR_CAP_GROUP_REP;
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	midr_nds_on_cluster_decision(g1, &join);
+	assert(mi->local_group_id == 8);
+	assert(!(mi->local_capabilities & MIDR_CAP_GROUP_REP));
+	mi->local_capabilities = MIDR_CAP_GROUP_REP;
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	join.old_group_id = join.new_group_id = 8;
+	midr_nds_on_cluster_decision(g1, &join);
+	assert(mi->local_capabilities & MIDR_CAP_GROUP_REP);
+	mi->local_capabilities = 0;
+	printf("received anchor starts PM; bootstrap stays control-only; role belongs to its group: PASS\n");
+}
+
+/* Deliver a NODE_ADV the way a neighbour floods it (midr_nodedir.c). */
+static void node_adv(struct midr_g1 *g1, const struct ipaddr *from,
+		     uint32_t node_id, uint32_t gid, uint32_t transport,
+		     uint64_t seq, bool withdrawn)
+{
+	uint8_t buf[MIDR_CTRL_NODE_ADV_LEN] = {};
+	struct ipaddr locator = v4(transport);
+	uint16_t u16;
+	uint32_t u32;
+	int i;
+
+	buf[0] = MIDR_CTRL_MSG_VERSION;
+	buf[1] = MIDR_CTRL_NODE_ADV;
+	u16 = htons(withdrawn ? 1 : 0);
+	memcpy(buf + 2, &u16, 2);
+	memcpy(buf + 4, &node_id, 4);
+	u32 = htonl(gid);
+	memcpy(buf + 8, &u32, 4);
+	if (!withdrawn)
+		assert(midr_ctrl_encode_locator(buf + 16, &locator));
+	for (i = 0; i < 8; i++)
+		buf[36 + i] = (uint8_t)(seq >> (56 - 8 * i));
+	u16 = htons(45);
+	memcpy(buf + 44, &u16, 2);
+	midr_nodedir_receive(g1, from, buf, sizeof(buf));
+}
+
+static struct midr_node_entry *view_node(struct midr_g1 *g1, uint32_t node_id)
+{
+	struct midr_node_entry key = {};
+
+	key.node_id.family = AF_INET;
+	key.node_id.prefixlen = IPV4_MAX_BITLEN;
+	key.node_id.u.prefix4.s_addr = node_id;
+	return midr_node_hash_find(&g1->midr_nds_info->global_view->nodes, &key);
+}
+
+/* D2: a node with no MIDR session sees its directory entries expire inside
+ * the 60 s probe window.  Withdrawals of the representatives being evaluated
+ * wait until the join has settled; a fresh fact cancels them. */
+static void test_join_defers_remote_withdraw(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct ipaddr neighbour = v4(0xc0000207);
+	struct in_addr neighbour_rid = { .s_addr = 0x0700000aU };
+	struct in_addr rep_rid = { .s_addr = 0x0800000aU };
+	uint32_t other = 0x0900000aU;
+	struct midr_g1_peer *peer;
+
+	peer = midr_g1_peer_create(g1, &neighbour, neighbour_rid, 0);
+	assert(peer);
+	session_set(&neighbour, MIDR_SESSION_ESTABLISHED, neighbour_rid.s_addr);
+	notify(&neighbour, MIDR_SESSION_ESTABLISHED, neighbour_rid.s_addr, 0);
+	run_queued();
+	assert(peer->established);
+
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0xc0000208, 1, false);
+	node_adv(g1, &neighbour, other, 6, 0xc0000209, 1, false);
+	assert(view_node(g1, rep_rid.s_addr) && view_node(g1, other));
+
+	mi->join_intent = true;
+	mi->join_phase = MIDR_JOIN_PROBING_REPS;
+	midr_rep_dir_add(g1, 5, v4(0xc0000208), 0, rep_rid);
+
+	/* The representative under evaluation stays; anyone else goes now. */
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0, 2, true);
+	node_adv(g1, &neighbour, other, 6, 0, 2, true);
+	assert(view_node(g1, rep_rid.s_addr) &&
+	       view_node(g1, rep_rid.s_addr)->withdraw_deferred);
+	assert(!view_node(g1, other));
+
+	/* It is alive after all: the deferral is cancelled. */
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0xc0000208, 3, false);
+	assert(!view_node(g1, rep_rid.s_addr)->withdraw_deferred);
+
+	/* Gone again: nothing is applied while the join is running... */
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0, 4, true);
+	midr_nds_flush_deferred_withdraws(g1);
+	assert(view_node(g1, rep_rid.s_addr));
+	/* ...and the withdrawal is applied once it has settled. */
+	mi->join_phase = MIDR_JOIN_IDLE;
+	mi->join_intent = false;
+	midr_nds_flush_deferred_withdraws(g1);
+	assert(!view_node(g1, rep_rid.s_addr));
+
+	midr_rep_dir_clear(g1);
+	printf("join defers withdrawals of evaluated representatives until it settles: PASS\n");
+}
+
+/* D1: REJOIN restarts the round and counts it; settling resets the count. */
+static void test_rejoin_round(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct in_addr bootstrap_rid = { .s_addr = 0x0a00000aU };
+	struct ipaddr bootstrap = v4(0xc000020a);
+	union sockunion su;
+	struct midr_cluster_decision rejoin = {
+		.decision_type = MIDR_DECISION_REJOIN,
+		.old_group_id = mi->local_group_id,
+		.new_group_id = mi->local_group_id,
+	};
+	struct midr_cluster_decision join = {
+		.decision_type = MIDR_DECISION_JOIN,
+		.old_group_id = mi->local_group_id,
+		.new_group_id = mi->local_group_id,
+	};
+
+	assert(midr_ipaddr_to_sockunion(&bootstrap, &su));
+	midr_join_via_bootstrap(g1, &su, 65010, bootstrap_rid);
+	assert(mi->join_intent);
+
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	mi->join_batch_gid[0] = 5;
+	midr_nds_on_cluster_decision(g1, &rejoin);
+	assert(mi->join_retry_rounds == 1 && mi->join_intent);
+	assert(mi->join_phase == MIDR_JOIN_IDLE && !mi->join_batch_gid[0]);
+
+	/* Only a running join can be restarted. */
+	midr_nds_on_cluster_decision(g1, &rejoin);
+	assert(mi->join_retry_rounds == 1);
+
+	mi->join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	midr_nds_on_cluster_decision(g1, &join);
+	assert(mi->join_phase == MIDR_JOIN_IDLE && !mi->join_intent);
+	assert(mi->join_retry_rounds == 0);
+	printf("REJOIN restarts the round; settling resets the retry count: PASS\n");
+}
+
+/* D5: a settled node without any anchor re-fetches the directory every
+ * MIDR_ANCHOR_RETRY_SYNCS syncs and evaluates two other groups. */
+static void test_anchor_repair(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct in_addr rid8 = { .s_addr = 0x1500000aU };
+	struct in_addr rid9 = { .s_addr = 0x1600000aU };
+	struct in_addr rid10 = { .s_addr = 0x1700000aU };
+	struct in_addr rid11 = { .s_addr = 0x1800000aU };
+	struct prefix id10 = { .family = AF_INET, .prefixlen = IPV4_MAX_BITLEN };
+	struct midr_nds_link_metrics metrics = { .rtt_us = 1000, .bw_score = 1000 };
+	int i;
+
+	assert(mi->local_group_id == 8 && mi->join_phase == MIDR_JOIN_IDLE);
+	midr_nds_anchor_ctx_clear(g1);
+	mi->anchor_idle_syncs = 0;
+	mi->anchor_dir_refresh = false;
+
+	/* Not while a join is running. */
+	mi->join_intent = true;
+	for (i = 0; i < MIDR_ANCHOR_RETRY_SYNCS + 1; i++)
+		midr_anchor_maintain(g1);
+	assert(!mi->anchor_dir_refresh && !mi->anchor_idle_syncs);
+	mi->join_intent = false;
+
+	for (i = 0; i < MIDR_ANCHOR_RETRY_SYNCS - 1; i++)
+		midr_anchor_maintain(g1);
+	assert(!mi->anchor_dir_refresh);
+	midr_anchor_maintain(g1);
+	assert(mi->anchor_dir_refresh);
+
+	/* The fresh directory: the own group is skipped, the measured group 10
+	 * ranks first, then the first unmeasured one. */
+	midr_rep_dir_clear(g1);
+	midr_rep_dir_add(g1, 8, v4(0xc0000215), 0, rid8);
+	midr_rep_dir_add(g1, 9, v4(0xc0000216), 0, rid9);
+	midr_rep_dir_add(g1, 10, v4(0xc0000217), 0, rid10);
+	midr_rep_dir_add(g1, 11, v4(0xc0000218), 0, rid11);
+	midr_nds_learn_anchor_candidate(g1, rid10, 0, v4(0xc0000217), 10);
+	id10.u.prefix4 = rid10;
+	midr_nds_on_link_update(g1, &id10, MIDR_LINK_UP, 0, &metrics, &metrics);
+	midr_anchor_on_rep_list(g1);
+	assert(!mi->anchor_dir_refresh);
+	assert(mi->anchor_group_id[0] == 10 && mi->anchor_group_id[1] == 9);
+	assert(mi->t_anchor_probe_done);
+
+	/* No second repair while that evaluation runs. */
+	for (i = 0; i < MIDR_ANCHOR_RETRY_SYNCS + 1; i++)
+		midr_anchor_maintain(g1);
+	assert(!mi->anchor_dir_refresh);
+
+	midr_nds_anchor_ctx_clear(g1);
+	midr_rep_dir_clear(g1);
+	midr_bootstrap_clear(g1);
+	printf("anchorless node re-fetches the directory and evaluates two other groups: PASS\n");
+}
+
 static void test_terminate_with_queued_events(struct midr_g1 *g1)
 {
 	struct ipaddr remote = v4(0xc0000203); /* 192.0.2.3 */
@@ -691,6 +1009,11 @@ int main(void)
 	test_node_upsert_failure(g1);
 	test_vlink_overlay_address();
 	test_vlink_lifecycle(g1);
+	test_anchor_representative_cleanup(g1);
+	test_received_anchor_and_role_transition(g1);
+	test_join_defers_remote_withdraw(g1);
+	test_rejoin_round(g1);
+	test_anchor_repair(g1);
 	test_terminate_with_queued_events(g1);
 
 	cmd_terminate();

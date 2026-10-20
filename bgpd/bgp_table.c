@@ -19,7 +19,6 @@
 #include "bgp_trace.h"
 #include "bgp_mpath.h"
 #include "bgp_ls.h"
-#include "bgp_midr_rib.h"
 
 void bgp_table_lock(struct bgp_table *rt)
 {
@@ -106,7 +105,6 @@ inline struct bgp_dest *bgp_dest_unlock_node(struct bgp_dest *dest)
 				bgp_ls_nlri_hash_del(&rt->bgp->ls_info->nlri_hash, dest->ls_nlri);
 			bgp_ls_nlri_free(dest->ls_nlri);
 		}
-		midr_rib_dest_cleanup(rt->bgp, dest);
 
 		XFREE(MTYPE_BGP_NODE, dest);
 		dest = NULL;
@@ -137,7 +135,6 @@ static void bgp_node_destroy(route_table_delegate_t *delegate,
 		/* Free mpath if exists */
 		if (dest->mpath)
 			bgp_path_info_mpath_free(&dest->mpath);
-		midr_rib_dest_cleanup(rt->bgp, dest);
 
 		XFREE(MTYPE_BGP_NODE, dest);
 		route_node_set_info(node, NULL);

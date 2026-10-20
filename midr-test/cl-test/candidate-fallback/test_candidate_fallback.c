@@ -116,6 +116,9 @@ static const char *decision_name(enum midr_decision_type type)
 	case MIDR_DECISION_RECOMMEND: return "RECOMMEND";
 	case MIDR_DECISION_JOIN: return "JOIN";
 	case MIDR_DECISION_CREATE: return "CREATE";
+	case MIDR_DECISION_LEAVE: return "LEAVE";
+	case MIDR_DECISION_REJOIN: return "REJOIN";
+	case MIDR_DECISION_REP_RESIGN: return "REP_RESIGN";
 	default: return "OTHER";
 	}
 }
@@ -566,6 +569,171 @@ static void state_flow(void)
 	destroy_fixture();
 }
 
+static void add_bootstrap(void)
+{
+	listnode_add(nds.bootstrap_list,
+		     test_calloc(1, sizeof(struct midr_bootstrap_entry)));
+}
+
+/* Node restart scenarios from the FITI rejoin report (2026-10-19). */
+static void restart(void)
+{
+	/* D1/D2: the directory lists reps but none was measured (they expired or
+	 * restarted during the window). Re-fetch the directory instead of
+	 * creating an island group, up to the retry limit. */
+	reset_fixture();
+	case_name = "unmeasured-reps-rejoin-before-create";
+	add_rep(1, 0);
+	add_rep(2, 0);
+	add_bootstrap();
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_decision(1, MIDR_DECISION_REJOIN, 0);
+	nds.join_retry_rounds = 3;
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_decision(2, MIDR_DECISION_CREATE, 3);
+	destroy_fixture();
+
+	reset_fixture();
+	case_name = "unmeasured-reps-without-bootstrap-create";
+	add_rep(1, 0);
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_decision(1, MIDR_DECISION_CREATE, 2);
+	destroy_fixture();
+
+	/* D1: every representative of the batch stayed silent (restarted inside
+	 * the window, or answered for a new group). */
+	reset_fixture();
+	case_name = "silent-batch-rejoins";
+	add_rep(1, 1000);
+	add_rep(2, 2000);
+	add_members(1, 5, 5000, 0.01, false);
+	add_bootstrap();
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	nds.join_phase = MIDR_JOIN_PROBING_MEMBERS;
+	nds.join_group_id = 1;
+	for (size_t i = 0; i < decisions[0].candidate_count; i++)
+		nds.join_batch_gid[i] = decisions[0].candidates[i];
+	trigger(MIDR_TRIGGER_MEMBER_PROBE_DONE);
+	expect_decision(2, MIDR_DECISION_REJOIN, 0);
+	destroy_fixture();
+
+	/* A listed group that fails the bar is a real answer: still CREATE. */
+	reset_fixture();
+	case_name = "listed-but-bad-batch-still-creates";
+	add_rep(1, 1000);
+	add_members(1, 5, 25000, 0.01, false);
+	add_bootstrap();
+	if (select_first_group()) {
+		trigger(MIDR_TRIGGER_MEMBER_PROBE_DONE);
+		expect_decision(2, MIDR_DECISION_CREATE, 2);
+	}
+	destroy_fixture();
+
+	/* D3: the node's view was emptied while the directory still lists
+	 * groups 1..6; the new group must not reuse one of them. */
+	reset_fixture();
+	case_name = "create-id-avoids-directory-groups";
+	for (uint32_t gid = 1; gid <= 6; gid++)
+		add_rep(gid, 0);
+	free_entries(&view.nodes);
+	free_entries(&view.links);
+	view.nodes = list_new();
+	view.links = list_new();
+	trigger(MIDR_TRIGGER_REP_PROBE_DONE);
+	expect_decision(1, MIDR_DECISION_CREATE, 7);
+	destroy_fixture();
+
+	/* D4: a representative restart degrades the links for a short while;
+	 * only consecutive failures make a member leave. */
+	reset_fixture();
+	case_name = "leave-is-debounced";
+	nds.join_phase = MIDR_JOIN_IDLE;
+	nds.local_group_id = 1;
+	add_members(1, 2, 30000, 0.0, true);
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	expect_state(decision_count == 0, "two bad syncs do not LEAVE");
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	expect_decision(1, MIDR_DECISION_LEAVE, 0);
+	destroy_fixture();
+
+	reset_fixture();
+	case_name = "recovered-links-reset-leave-debounce";
+	nds.join_phase = MIDR_JOIN_IDLE;
+	nds.local_group_id = 1;
+	add_members(1, 2, 30000, 0.0, true);
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	{
+		struct listnode *n;
+		struct midr_link_entry *link;
+		for (ALL_LIST_ELEMENTS_RO(view.links, n, link))
+			link->long_term.rtt_us = 5000;
+		trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+		for (ALL_LIST_ELEMENTS_RO(view.links, n, link))
+			link->long_term.rtt_us = 30000;
+	}
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	expect_state(decision_count == 0 && nds.leave_pending_syncs == 2,
+		     "a good sync restarts the count");
+	destroy_fixture();
+
+	/* D3 residue: two nodes created group 7 at the same time and met. The
+	 * larger router-id resigns; the smaller keeps the role. */
+	for (unsigned int scenario = 0; scenario < 4; scenario++) {
+		static const char *names[] = {
+			"duplicate-rep-larger-router-id-resigns",
+			"duplicate-rep-smaller-router-id-keeps-role-while-peer-yields",
+			"duplicate-rep-configured-group-keeps-role",
+			"duplicate-rep-gone-resets-count",
+		};
+		struct midr_node_entry *other;
+
+		reset_fixture();
+		case_name = names[scenario];
+		nds.join_phase = MIDR_JOIN_IDLE;
+		nds.local_group_id = 7;
+		nds.local_capabilities = MIDR_CAP_GROUP_REP;
+		/* Node ids are 10.0.0.1 and up. */
+		owner.router_id.s_addr = htonl(scenario == 1 ? 0x0a000000U
+							     : 0x0a0000c8U);
+		if (scenario == 2)
+			nds.config_group_id = 7;
+		other = add_node(7, 5000, 0.0, true);
+		other->capabilities = MIDR_CAP_GROUP_REP;
+		trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+		if (scenario == 3)
+			other->capabilities = 0;
+		trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+		if (scenario == 0)
+			expect_decision(1, MIDR_DECISION_REP_RESIGN, 7);
+		else if (scenario == 1)
+			expect_state(decision_count == 0 && nds.dup_rep_syncs == 2,
+				     "no REP_RESIGN while the larger peer may still yield");
+		else
+			expect_state(decision_count == 0 && !nds.dup_rep_syncs,
+				     "no REP_RESIGN");
+		destroy_fixture();
+	}
+
+	/* The larger peer never yields (it has a configured group): the smaller
+	 * one gives up the role after the longer wait. */
+	reset_fixture();
+	case_name = "duplicate-rep-yields-to-a-peer-that-never-resigns";
+	nds.join_phase = MIDR_JOIN_IDLE;
+	nds.local_group_id = 7;
+	nds.local_capabilities = MIDR_CAP_GROUP_REP;
+	owner.router_id.s_addr = htonl(0x0a000000U);
+	add_node(7, 5000, 0.0, true)->capabilities = MIDR_CAP_GROUP_REP;
+	for (int i = 0; i < 5; i++)
+		trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	expect_state(decision_count == 0, "five syncs leave room for the peer to yield");
+	trigger(MIDR_TRIGGER_PERIODIC_SYNC);
+	expect_decision(1, MIDR_DECISION_REP_RESIGN, 7);
+	destroy_fixture();
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 2);
@@ -575,6 +743,8 @@ int main(int argc, char **argv)
 		regression();
 	if (strcmp(argv[1], "all") == 0)
 		state_flow();
+	if (strcmp(argv[1], "all") == 0 || strcmp(argv[1], "restart") == 0)
+		restart();
 	printf("RESULT: %u checks, %u passed, %u failed\n", checks,
 	       checks - failures, failures);
 	return failures ? 1 : 0;

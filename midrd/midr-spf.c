@@ -72,6 +72,26 @@ static uint64_t add_cost(uint64_t left, uint64_t right)
 	return left + right;
 }
 
+bool midr_spf_nexthop_compatible(uint8_t prefix_family,
+			       const struct midr_spf_nexthop *nexthop)
+{
+	bool link_local;
+
+	if (!nexthop ||
+	    (prefix_family != MIDR_CORE_AF_IPV4 &&
+	     prefix_family != MIDR_CORE_AF_IPV6) ||
+	    (nexthop->family != MIDR_CORE_AF_IPV4 &&
+	     nexthop->family != MIDR_CORE_AF_IPV6))
+		return false;
+	link_local = nexthop->family == MIDR_CORE_AF_IPV6 &&
+		     nexthop->address[0] == 0xfe &&
+		     (nexthop->address[1] & 0xc0) == 0x80;
+	if (link_local && !nexthop->ifindex)
+		return false;
+	return prefix_family == nexthop->family ||
+	       (prefix_family == MIDR_CORE_AF_IPV4 && link_local);
+}
+
 void midr_spf_routes_clear(struct midr_spf_route *routes, size_t count)
 {
 	if (!routes)
@@ -309,10 +329,10 @@ static int route_add_event_nexthop(struct midr_spf_route *route,
 		.link_id = event->link_id,
 	};
 
-	if (event->family != route->family)
-		return 0;
 	memcpy(nexthop.address, event->remote_address,
 	       sizeof(nexthop.address));
+	if (!midr_spf_nexthop_compatible(route->family, &nexthop))
+		return 0;
 	return route_nexthop_add(route, &nexthop);
 }
 
@@ -490,10 +510,10 @@ static int route_add_ted_nexthop(struct midr_spf_route *route,
 		.link_id = link->link_id,
 	};
 
-	if (link->family != route->family)
-		return 0;
 	memcpy(nexthop.address, link->remote_address,
 	       sizeof(nexthop.address));
+	if (!midr_spf_nexthop_compatible(route->family, &nexthop))
+		return 0;
 	return route_nexthop_add(route, &nexthop);
 }
 

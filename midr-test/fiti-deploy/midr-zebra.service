@@ -1,0 +1,22 @@
+[Unit]
+Description=Matching Zebra for MIDR
+Wants=network-online.target
+After=network-online.target
+Conflicts=frr.service
+Before=midrd.service midr-bgpd.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/midr/node.env
+ExecStart=/usr/local/libexec/midr/start-midr-zebra.sh
+ExecStartPost=/usr/local/libexec/midr/wait-midr-zebra.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=40
+TimeoutStopSec=40
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

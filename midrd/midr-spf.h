@@ -66,6 +66,9 @@ int midr_spf_compute_ted(const struct midr_ted_view *view,
 
 void midr_spf_routes_clear(struct midr_spf_route *routes, size_t count);
 
+bool midr_spf_nexthop_compatible(uint8_t prefix_family,
+			       const struct midr_spf_nexthop *nexthop);
+
 /* Context-level handoff for the route-installation module.  Each get returns
  * a complete immutable result set derived from one committed TED generation.
  * Result references and consumer registration are event-thread operations. */
