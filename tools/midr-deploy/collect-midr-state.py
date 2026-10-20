@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Collect role, protocol and kernel evidence from the FITI MIDR nodes."""
+"""Collect role, protocol and kernel evidence from the MIDR nodes of a profile."""
 import argparse
 import concurrent.futures
 import csv
 import json
+import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 
 
@@ -43,6 +45,7 @@ PY
 
 def collect(node, output):
     args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+            *shlex.split(os.environ.get('MIDR_SSH_EXTRA', '')),
             '-p', node['ssh_port'], node['ssh_user'] + '@' + node['ssh_host'], 'bash', '-s']
     try:
         p = subprocess.run(args, input=REMOTE, capture_output=True, text=True, timeout=300)
@@ -70,11 +73,19 @@ def collect(node, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--nodes', type=Path, default=Path(__file__).with_name('nodes-12.csv'))
+    profile = Path(os.environ.get('MIDR_PROFILE',
+                                  Path(__file__).resolve().parent / 'profiles' / 'fiti'))
+    parser.add_argument('--profile', type=Path, default=profile,
+                        help='profile directory providing nodes.csv (default: $MIDR_PROFILE or profiles/fiti)')
+    parser.add_argument('--nodes', type=Path, default=None,
+                        help='explicit nodes.csv, overriding the profile')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=4)
     args = parser.parse_args()
-    nodes = list(csv.DictReader(args.nodes.open()))
+    nodes_file = args.nodes or args.profile / 'nodes.csv'
+    with nodes_file.open() as stream:
+        nodes = [row for row in csv.DictReader(stream)
+                 if row.get('name') and not row['name'].lstrip().startswith('#')]
     raw = args.output / 'raw'
     raw.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:

@@ -23,33 +23,39 @@ if [ "$MIDR_EDGE_BGP" = yes ] && [ "$MIDR_PREFIX_MODE" != socket ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || { echo 'deployment requires root' >&2; exit 1; }
-python3 - "$MIDR_LOCATOR" <<'PY'
+# Interface carrying the transport-address; setup-midr-underlay.py reads the
+# same variable from node.env.
+UNDERLAY_IF=${MIDR_UNDERLAY_INTERFACE:-ens5}
+python3 - "$MIDR_LOCATOR" "$UNDERLAY_IF" <<'PY'
 import json, subprocess, sys
-addresses = json.loads(subprocess.check_output(["ip", "-j", "-6", "addr", "show", "dev", "ens5"]))
+locator, device = sys.argv[1], sys.argv[2]
+addresses = json.loads(subprocess.check_output(["ip", "-j", "-6", "addr", "show", "dev", device]))
 locals_ = {a["local"] for interface in addresses for a in interface.get("addr_info", [])}
-if sys.argv[1] not in locals_:
-    raise SystemExit("ens5 does not carry this node's transport-address")
+if locator not in locals_:
+    raise SystemExit(f"{device} does not carry this node's transport-address {locator}")
 PY
-[ -r /etc/frr/daemons ] || { echo 'missing /etc/frr/daemons' >&2; exit 1; }
-[ -r /etc/frr/frr.conf ] || [ -r /etc/frr/bgpd.conf ] || {
-    echo 'missing /etc/frr/frr.conf and /etc/frr/bgpd.conf' >&2
-    exit 1
-}
-[ -r /etc/netplan/60-ens4.yaml ] && [ -r /etc/netplan/61-l3.yaml ]
-BGP_CONFIG_SOURCE="$STAGE/node.bgpd.conf"
-if [ ! -r "$BGP_CONFIG_SOURCE" ]; then
-    if [ -r /etc/frr/bgpd.conf ]; then
-        BGP_CONFIG_SOURCE=/etc/frr/bgpd.conf
-    else
-        BGP_CONFIG_SOURCE=/etc/frr/frr.conf
+# Platform-owned netplan files (MIDR_PROTECTED_NETPLAN, empty by default) must
+# exist now and be unchanged after deployment.
+read -r -a PROTECTED_NETPLAN <<<"${MIDR_PROTECTED_NETPLAN:-}"
+for file in "${PROTECTED_NETPLAN[@]}"; do
+    [ -r "/etc/netplan/$file" ] || { echo "missing protected netplan file: /etc/netplan/$file" >&2; exit 1; }
+done
+# A system FRR is optional.  Edge nodes need a BGP configuration: the
+# profile's node.bgpd.conf, else the system FRR's bgpd.conf or frr.conf.
+BGP_CONFIG_SOURCE=""
+for candidate in "$STAGE/node.bgpd.conf" /etc/frr/bgpd.conf /etc/frr/frr.conf; do
+    if [ -r "$candidate" ]; then
+        BGP_CONFIG_SOURCE=$candidate
+        break
     fi
-fi
+done
 if [ "$MIDR_EDGE_BGP" = yes ] && \
-   ! grep -Eq '^[[:space:]]*router bgp [0-9]+' "$BGP_CONFIG_SOURCE"; then
-    echo "edge MIDR is missing router bgp configuration: $BGP_CONFIG_SOURCE" >&2
+   { [ -z "$BGP_CONFIG_SOURCE" ] || \
+     ! grep -Eq '^[[:space:]]*router bgp [0-9]+' "$BGP_CONFIG_SOURCE"; }; then
+    echo "edge MIDR is missing router bgp configuration: ${BGP_CONFIG_SOURCE:-none found}" >&2
     exit 1
 fi
-ip -6 route show default | grep -F "via $MIDR_GATEWAY dev ens5"
+ip -6 route show default | grep -F "via $MIDR_GATEWAY dev $UNDERLAY_IF"
 (cd "$RELEASE" && sha256sum -c SHA256SUMS)
 # Check reused release directories before stopping any running service.
 if [ -f "$DEST/midrd" ]; then
@@ -85,7 +91,7 @@ for binary in midrd zebra bgpd vtysh; do
 done
 # The current FITI gateway and interface routes belong to Netplan.
 # Refuse to discard any additional protocol or static route configuration.
-if [ "${MIDR_OSPF6_LEAF_MIGRATION:-no}" != yes ] && \
+if [ "${MIDR_OSPF6_LEAF_MIGRATION:-no}" != yes ] && [ -r /etc/frr/frr.conf ] && \
    grep -Eq '^[[:space:]]*(ipv6 route|ip route|router ospf|router isis|router rip)' /etc/frr/frr.conf; then
     echo 'FRR includes additional routing configuration; migrate it before applying this deployment' >&2
     exit 1
@@ -98,10 +104,16 @@ fi
 
 BACKUP="/var/lib/midr/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)-$MIDR_NODE_NAME-$$"
 install -d -m 700 "$BACKUP"
-cp -a /etc/frr "$BACKUP/frr"
-cp -a /etc/netplan/60-ens4.yaml "$BACKUP/60-ens4.yaml"
-cp -a /etc/netplan/61-l3.yaml "$BACKUP/61-l3.yaml"
+if [ -d /etc/frr ]; then cp -a /etc/frr "$BACKUP/frr"; fi
+install -d -m 700 "$BACKUP/netplan"
+for file in "${PROTECTED_NETPLAN[@]}"; do
+    cp -a "/etc/netplan/$file" "$BACKUP/netplan/$file"
+done
 if [ -d /etc/midr ]; then cp -a /etc/midr "$BACKUP/midr"; fi
+for file in /etc/systemd/system/midr-logrotate.service \
+    /etc/systemd/system/midr-logrotate.timer /etc/needrestart/conf.d/midr.conf; do
+    if [ -f "$file" ]; then cp -a "$file" "$BACKUP/"; fi
+done
 systemctl is-enabled frr >"$BACKUP/frr-enabled.txt" 2>&1 || true
 systemctl is-active frr >"$BACKUP/frr-active.txt" 2>&1 || true
 for unit in midr-zebra.service midr-bgpd.service midrd.service midr-bgp-prefix-provider.service; do
@@ -156,8 +168,23 @@ rollback_on_error() {
             rm -f "/etc/systemd/system/$unit"
         fi
     done
+    for file in midr-logrotate.service midr-logrotate.timer; do
+        if [ -f "$BACKUP/$file" ]; then
+            cp -a "$BACKUP/$file" "/etc/systemd/system/$file"
+        else
+            systemctl disable --now midr-logrotate.timer 2>/dev/null
+            rm -f "/etc/systemd/system/$file"
+        fi
+    done
+    if [ -f "$BACKUP/midr.conf" ]; then
+        cp -a "$BACKUP/midr.conf" /etc/needrestart/conf.d/midr.conf
+    else
+        rm -f /etc/needrestart/conf.d/midr.conf
+    fi
     systemctl daemon-reload
-    cp -a "$BACKUP/frr/." /etc/frr/
+    if [ -d "$BACKUP/frr" ]; then
+        cp -a "$BACKUP/frr/." /etc/frr/
+    fi
     if [ -d "$BACKUP/midr" ]; then
         cp -a "$BACKUP/midr/." /etc/midr/
     fi
@@ -212,7 +239,9 @@ fi
 cp -a "$RELEASE/SHA256SUMS" "$DEST/SHA256SUMS"
 install -m 600 "$STAGE/node.env" /etc/midr/node.env
 install -m 600 "$STAGE/node.commands" /etc/midr/node.commands
-install -m 600 "$BGP_CONFIG_SOURCE" /etc/midr/bgpd.conf
+if [ -n "$BGP_CONFIG_SOURCE" ]; then
+    install -m 600 "$BGP_CONFIG_SOURCE" /etc/midr/bgpd.conf
+fi
 printf 'hostname %s-zebra\n' "$MIDR_NODE_NAME" >/etc/midr/zebra.conf
 chmod 600 /etc/midr/zebra.conf
 for script in start-midr-zebra.sh wait-midr-zebra.sh start-midr-bgpd.sh \
@@ -224,9 +253,18 @@ install -m 755 "$STAGE/setup-midr-underlay.py" \
     /usr/local/libexec/midr/setup-midr-underlay.py
 install -m 755 "$RELEASE/midr-bgp-prefix-provider.py" \
     /usr/local/libexec/midr/midr-bgp-prefix-provider.py
-for unit in midr-zebra.service midr-bgpd.service midrd.service midr-bgp-prefix-provider.service; do
+for unit in midr-zebra.service midr-bgpd.service midrd.service midr-bgp-prefix-provider.service \
+    midr-logrotate.service midr-logrotate.timer; do
     install -m 644 "$STAGE/$unit" "/etc/systemd/system/$unit"
 done
+# Size-based rotation of /var/log/midr (the daemons append through shell
+# redirection, so copytruncate needs no service restart).
+install -m 644 "$STAGE/midr-logrotate.conf" /etc/midr/logrotate.conf
+# Keep unattended upgrades from restarting the MIDR services at random times.
+if [ -d /etc/needrestart ]; then
+    install -d -m 755 /etc/needrestart/conf.d
+    install -m 644 "$STAGE/needrestart-midr.conf" /etc/needrestart/conf.d/midr.conf
+fi
 # All previous daemons are gone; only stale runtime sockets are removed.
 rm -f /run/midr/zserv.api /run/midr/zebra.vty /run/midr/bgpd.vty \
     /run/midr/midrd.vty /run/midr/prefix.sock /run/midr/zebra.pid \
@@ -234,7 +272,8 @@ rm -f /run/midr/zserv.api /run/midr/zebra.vty /run/midr/bgpd.vty \
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/midr-zebra.service \
     /etc/systemd/system/midr-bgpd.service /etc/systemd/system/midrd.service \
-    /etc/systemd/system/midr-bgp-prefix-provider.service
+    /etc/systemd/system/midr-bgp-prefix-provider.service \
+    /etc/systemd/system/midr-logrotate.service /etc/systemd/system/midr-logrotate.timer
 export LD_LIBRARY_PATH="$DEST/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 check_daemon_config() {
     local output
@@ -253,6 +292,7 @@ check_daemon_config "$DEST/zebra" -u root -g root -C -f /etc/midr/zebra.conf
 if [ "$MIDR_EDGE_BGP" = yes ]; then
     check_daemon_config "$DEST/bgpd" -u root -g root -S -C -f /etc/midr/bgpd.conf
 fi
+systemctl enable --now midr-logrotate.timer
 systemctl enable --now midr-zebra.service
 if [ "$MIDR_EDGE_BGP" = yes ]; then
     systemctl enable --now midr-bgpd.service
@@ -279,8 +319,9 @@ midrd_pid=$(systemctl show -p MainPID --value midrd.service)
 if [ "$MIDR_EDGE_BGP" = no ]; then
     if pgrep -x bgpd >/dev/null; then echo 'unexpected bgpd on internal MIDR' >&2; false; fi
 fi
-cmp "$BACKUP/60-ens4.yaml" /etc/netplan/60-ens4.yaml
-cmp "$BACKUP/61-l3.yaml" /etc/netplan/61-l3.yaml
+for file in "${PROTECTED_NETPLAN[@]}"; do
+    cmp "$BACKUP/netplan/$file" "/etc/netplan/$file"
+done
 for attempt in $(seq 1 20); do
     if python3 "$DEST/midrd-vty.py" --socket /run/midr/midrd.vty \
         -c 'show midr self' -c 'show midr neighbors'; then

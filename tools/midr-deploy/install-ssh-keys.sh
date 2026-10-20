@@ -3,28 +3,35 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: install-ssh-keys.sh [--inventory FILE] [--key PUBLIC_KEY]
+Usage: install-ssh-keys.sh [--profile DIR | --inventory FILE] [--key PUBLIC_KEY]
                            [--shared-password]
 
-Install one management host public key on every inventory host.
+Install one management host public key on every host of the profile
+(default profiles/fiti).
 Default: prompt for each host's password when installation is needed.
 --shared-password: prompt once and reuse it for hosts sharing a password.
 Existing authorized keys are preserved. Every host is verified with SSH.
+--inventory takes a legacy file with columns name,host,port,user,...
 EOF
 }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-INVENTORY="$SCRIPT_DIR/inventory-12.csv"
+# shellcheck source=lib/profile.sh
+. "$SCRIPT_DIR/lib/profile.sh"
+INVENTORY=""
+PROFILE_DIR=""
+PROFILE_INVENTORY=""
 PUBLIC_KEY="$HOME/.ssh/id_ed25519.pub"
 SHARED_PASSWORD=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --inventory|--key)
+        --inventory|--key|--profile)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             case "$1" in
                 --inventory) INVENTORY=$2 ;;
                 --key) PUBLIC_KEY=$2 ;;
+                --profile) PROFILE_DIR=$2 ;;
             esac
             shift 2
             ;;
@@ -46,6 +53,12 @@ done
 for command in ssh ssh-copy-id ssh-keygen; do
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
+if [ -z "$INVENTORY" ]; then
+    midr_profile_load "$PROFILE_DIR"
+    PROFILE_INVENTORY=$(mktemp)
+    INVENTORY=$PROFILE_INVENTORY
+    midr_nodes_select name ssh_host ssh_port ssh_user locator node_id role group >"$INVENTORY"
+fi
 [ -r "$INVENTORY" ] || { echo "Inventory is not readable: $INVENTORY" >&2; exit 1; }
 case "$PUBLIC_KEY" in
     *.pub) PRIVATE_KEY=${PUBLIC_KEY%.pub} ;;
@@ -72,6 +85,9 @@ done < "$INVENTORY"
 
 password_dir=""
 cleanup() {
+    if [ -n "$PROFILE_INVENTORY" ]; then
+        rm -f "$PROFILE_INVENTORY"
+    fi
     if [ -n "$password_dir" ]; then
         rm -f "$password_dir/password" "$password_dir/askpass"
         rmdir "$password_dir"
@@ -86,7 +102,7 @@ prepare_shared_password() {
     [ -n "$password_dir" ] && return
     password_dir=$(mktemp -d "${TMPDIR:-/tmp}/fiti-ssh-password.XXXXXXXX")
     # OpenSSH reads the password through askpass; never put it in argv.
-    IFS= read -r -s -p 'FITI SSH password (only hosts needing key installation): ' shared_password
+    IFS= read -r -s -p 'SSH password (only hosts needing key installation): ' shared_password
     printf '\n' >&2
     [ -n "$shared_password" ] || { echo "Password must not be empty" >&2; exit 2; }
     printf '%s\n' "$shared_password" >"$password_dir/password"

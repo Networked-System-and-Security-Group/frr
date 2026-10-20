@@ -3,16 +3,22 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: collect-underlay.sh [--inventory FILE] [--output DIR] [--interactive]
+Usage: collect-underlay.sh [--profile DIR | --inventory FILE] [--output DIR]
+                           [--interactive]
 
-Collect read-only state from every FITI MIDR host listed in FILE.
-By default SSH must already work with BatchMode=yes; --interactive prompts
-for authentication one node at a time. This script never changes a node.
+Collect read-only underlay state from every MIDR host of the profile
+(default profiles/fiti).  By default SSH must already work with
+BatchMode=yes; --interactive prompts for authentication one node at a time.
+This script never changes a node.  --inventory takes a legacy file with
+columns name,host,port,user,locator,node_id,role,group.
 EOF
 }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-INVENTORY="$SCRIPT_DIR/inventory-12.csv"
+# shellcheck source=lib/profile.sh
+. "$SCRIPT_DIR/lib/profile.sh"
+INVENTORY=""
+PROFILE_DIR=""
 OUTPUT=""
 INTERACTIVE=0
 
@@ -21,6 +27,11 @@ while [ "$#" -gt 0 ]; do
         --inventory)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             INVENTORY=$2
+            shift 2
+            ;;
+        --profile)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            PROFILE_DIR=$2
             shift 2
             ;;
         --output)
@@ -43,9 +54,15 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ -z "$INVENTORY" ]; then
+    midr_profile_load "$PROFILE_DIR"
+    INVENTORY=$(mktemp)
+    trap 'rm -f "$INVENTORY"' EXIT
+    midr_nodes_select name ssh_host ssh_port ssh_user locator node_id role group >"$INVENTORY"
+fi
 [ -r "$INVENTORY" ] || { echo "inventory is not readable: $INVENTORY" >&2; exit 1; }
 if [ -z "$OUTPUT" ]; then
-    OUTPUT="$PWD/fiti-underlay-$(date -u +%Y%m%dT%H%M%SZ)"
+    OUTPUT="$PWD/midr-underlay-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 mkdir -p "$OUTPUT/raw" "$OUTPUT/status"
 

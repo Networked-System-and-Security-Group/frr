@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate MIDR daemon logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate -s /var/lib/logrotate/midr.status /etc/midr/logrotate.conf

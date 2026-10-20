@@ -3,16 +3,22 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: check-transport-matrix.sh [--inventory FILE] [--output DIR]
+Usage: check-transport-matrix.sh [--profile DIR | --inventory FILE] [--output DIR]
 
 Read-only IPv6 route lookup for TCP 5871 from each host's transport-address
 to every listed endpoint. This checks the local FIB, not end-to-end delivery.
 SSH must already work with public-key BatchMode=yes.
+
+Nodes come from the profile's nodes.csv (default profiles/fiti); --inventory
+takes a legacy file with columns name,host,port,user,locator,node_id,role,group.
 EOF
 }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-INVENTORY="$SCRIPT_DIR/inventory-12.csv"
+# shellcheck source=lib/profile.sh
+. "$SCRIPT_DIR/lib/profile.sh"
+INVENTORY=""
+PROFILE_DIR=""
 OUTPUT=""
 
 while [ "$#" -gt 0 ]; do
@@ -20,6 +26,11 @@ while [ "$#" -gt 0 ]; do
         --inventory)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             INVENTORY=$2
+            shift 2
+            ;;
+        --profile)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            PROFILE_DIR=$2
             shift 2
             ;;
         --output)
@@ -38,8 +49,14 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ -z "$INVENTORY" ]; then
+    midr_profile_load "$PROFILE_DIR"
+    INVENTORY=$(mktemp)
+    trap 'rm -f "$INVENTORY"' EXIT
+    midr_nodes_select name ssh_host ssh_port ssh_user locator node_id role group >"$INVENTORY"
+fi
 [ -r "$INVENTORY" ] || { echo "inventory is not readable: $INVENTORY" >&2; exit 1; }
-[ -n "$OUTPUT" ] || OUTPUT="$PWD/fiti-transport-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
+[ -n "$OUTPUT" ] || OUTPUT="$PWD/midr-transport-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUTPUT/raw" "$OUTPUT/status"
 
 declare -a NAMES HOSTS PORTS USERS TARGETS

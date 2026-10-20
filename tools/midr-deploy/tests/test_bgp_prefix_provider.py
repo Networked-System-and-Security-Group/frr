@@ -6,7 +6,8 @@ import sys
 import unittest
 
 spec = importlib.util.spec_from_file_location(
-    "bgp_prefix_provider", Path(__file__).with_name("midr-bgp-prefix-provider.py"))
+    "bgp_prefix_provider",
+    Path(__file__).resolve().parent.parent / "node" / "midr-bgp-prefix-provider.py")
 provider = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = provider
 spec.loader.exec_module(provider)

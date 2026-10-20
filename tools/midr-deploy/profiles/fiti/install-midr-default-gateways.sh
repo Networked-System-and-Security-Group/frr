@@ -3,20 +3,23 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: install-midr-default-gateways.sh [--inventory FILE] [--dry-run|--apply]
+Usage: install-midr-default-gateways.sh [--dry-run|--apply]
 
+FITI-specific underlay preparation, run once before the first deployment.
+Adds each node's MIDR default route to the platform's /etc/netplan/61-l3.yaml
+(interface ens5, gateway from nodes.csv) and installs it immediately.
 Default mode is dry-run. --apply backs up both Netplan files, validates
-61-l3.yaml, and installs the default route immediately without netplan apply.
+61-l3.yaml, and installs the default route without netplan apply.
 EOF
 }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-INVENTORY="$SCRIPT_DIR/inventory-12.csv"
+# shellcheck source=../../lib/profile.sh
+. "$SCRIPT_DIR/../../lib/profile.sh"
 MODE=dry-run
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --inventory) INVENTORY=$2; shift 2 ;;
         --dry-run) MODE=dry-run; shift ;;
         --apply) MODE=apply; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -24,7 +27,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -r "$INVENTORY" ] || { echo "inventory is not readable: $INVENTORY" >&2; exit 1; }
+midr_profile_load "$SCRIPT_DIR"
+INVENTORY=$(mktemp)
+trap 'rm -f "$INVENTORY"' EXIT
+midr_nodes_select name ssh_host ssh_port ssh_user locator node_id role group gateway >"$INVENTORY"
 
 run_one() {
     local name=$1 host=$2 port=$3 user=$4 transport=$5 gateway=$6
