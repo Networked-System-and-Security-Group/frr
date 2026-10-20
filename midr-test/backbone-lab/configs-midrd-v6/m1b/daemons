@@ -16,4 +16,4 @@ pbrd=no
 bfdd=no
 fabricd=no
 midrd=yes
-midrd_options="--node-id 1895825418 --listen [fd00:99::113]:5871 --prefix fd00:18::113/128 --log file:/etc/frr/logs/midrd.log --log-level debug"
+midrd_options="--node-id 1895825418 --listen [fd00:99::113]:5871 --prefix fd00:18::113/128 --sequence-file /etc/frr/logs/midrd.seq --log file:/etc/frr/logs/midrd.log --log-level debug"

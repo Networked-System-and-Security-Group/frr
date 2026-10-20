@@ -138,7 +138,11 @@ def main():
                     prefix = ("198.18.0.%s/32" % num if family == 4
                               else "fd00:18::%s/128" % num)
                     options += " --prefix %s" % prefix
-                options += (" --log file:/etc/frr/logs/midrd.log"
+                # /etc/frr/logs is the per-node host directory the topology
+                # mounts and chowns to frr: the sequence file survives midrd
+                # restarts, so a restarted node is not rejected as older.
+                options += (" --sequence-file /etc/frr/logs/midrd.seq"
+                            " --log file:/etc/frr/logs/midrd.log"
                             " --log-level debug")
             (dst / "daemons").write_text(
                 daemons_file((node_dir / "daemons").read_text(), options))
