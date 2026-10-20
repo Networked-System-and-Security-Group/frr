@@ -43,8 +43,20 @@ PY
 '''
 
 
+CONTROL_DIR = os.environ.get('MIDR_SSH_CONTROL_DIR', f'/tmp/midr-ssh-{os.getuid()}')
+LIB = Path(__file__).resolve().parent / 'lib' / 'profile.sh'
+
+
+def login(node):
+    """Open the node's SSH master, asking for a password if the key is refused."""
+    subprocess.run(['bash', '-c', '. "$1"; midr_ssh_login "$2" "$3"', '_', str(LIB),
+                    node['ssh_port'], node['ssh_user'] + '@' + node['ssh_host']],
+                   check=False)
+
+
 def collect(node, output):
     args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+            '-o', 'ControlMaster=no', '-o', f'ControlPath={CONTROL_DIR}/%C',
             *shlex.split(os.environ.get('MIDR_SSH_EXTRA', '')),
             '-p', node['ssh_port'], node['ssh_user'] + '@' + node['ssh_host'], 'bash', '-s']
     try:
@@ -81,11 +93,16 @@ def main():
                         help='explicit nodes.csv, overriding the profile')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--no-login', action='store_true',
+                        help='do not log in first; nodes must accept the public key')
     args = parser.parse_args()
     nodes_file = args.nodes or args.profile / 'nodes.csv'
     with nodes_file.open() as stream:
         nodes = [row for row in csv.DictReader(stream)
                  if row.get('name') and not row['name'].lstrip().startswith('#')]
+    if not args.no_login:
+        for node in nodes:
+            login(node)
     raw = args.output / 'raw'
     raw.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:

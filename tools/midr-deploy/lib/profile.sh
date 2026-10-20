@@ -94,13 +94,140 @@ midr_node_field() {
 		END { exit found ? 0 : 1 }'
 }
 
-# midr_ssh / midr_scp : connect with the profile's extra options.
+# SSH to the nodes.
+#
+# midr_ssh_login opens a per-host OpenSSH master connection (ControlMaster)
+# kept for MIDR_SSH_PERSIST (default 15m); every later midr_ssh/midr_scp to
+# that host, from any tool, reuses it and needs no further authentication.
+# Login tries the public key first (BatchMode).  When the node rejects the
+# key and a terminal is available, it falls back to a password prompt.  The
+# password is read by ssh itself, or with MIDR_SSH_SHARED_PASSWORD=yes asked
+# once per run and handed to ssh through SSH_ASKPASS; it never appears in
+# argv or in a log.
+#
+#   MIDR_SSH_PASSWORD_FALLBACK=no   public key only (unattended runs)
+#   MIDR_SSH_SHARED_PASSWORD=yes    one password for every node
+#   MIDR_SSH_CONTROL_DIR            master sockets (default /tmp/midr-ssh-$UID)
+#
+# Close a master early with:
+#   ssh -O exit -o ControlPath=/tmp/midr-ssh-$UID/%C -p PORT USER@HOST
+MIDR_SSH_CONTROL_DIR=${MIDR_SSH_CONTROL_DIR:-/tmp/midr-ssh-$(id -u)}
+MIDR_SSH_PERSIST=${MIDR_SSH_PERSIST:-15m}
+export MIDR_SSH_CONTROL_DIR MIDR_SSH_PERSIST
+
+midr_ssh_control_path() {
+	install -d -m 700 "$MIDR_SSH_CONTROL_DIR"
+	printf '%s\n' "ControlPath=$MIDR_SSH_CONTROL_DIR/%C"
+}
+
+# midr_ssh / midr_scp : use the host's master when there is one, otherwise
+# connect directly with the public key.  They never start a master, so they
+# are safe inside pipes and command substitutions.
 midr_ssh() {
+	local path
+	path=$(midr_ssh_control_path)
 	# shellcheck disable=SC2086
-	ssh -o BatchMode=yes -o ConnectTimeout=10 $MIDR_SSH_EXTRA "$@"
+	ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o "$path" \
+		$MIDR_SSH_EXTRA "$@"
 }
 
 midr_scp() {
+	local path
+	path=$(midr_ssh_control_path)
 	# shellcheck disable=SC2086
-	scp -q -o BatchMode=yes -o ConnectTimeout=10 $MIDR_SSH_EXTRA "$@"
+	scp -q -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o "$path" \
+		$MIDR_SSH_EXTRA "$@"
+}
+
+# Ask the shared password once per run; child scripts inherit MIDR_SSH_ASKPASS.
+midr_ssh_shared_password() {
+	local dir password
+	[ -n "${MIDR_SSH_ASKPASS:-}" ] && [ -x "$MIDR_SSH_ASKPASS" ] && return 0
+	dir=$(mktemp -d "$MIDR_SSH_CONTROL_DIR/password.XXXXXX")
+	IFS= read -r -s -p 'SSH password for the MIDR nodes: ' password </dev/tty
+	printf '\n' >/dev/tty
+	[ -n "$password" ] || { rmdir "$dir"; echo 'password must not be empty' >&2; return 1; }
+	(umask 077; printf '%s\n' "$password" >"$dir/password")
+	unset password
+	printf '#!/bin/sh\ncat %s\n' "'$dir/password'" >"$dir/askpass"
+	chmod 700 "$dir/askpass"
+	MIDR_SSH_ASKPASS=$dir/askpass
+	MIDR_SSH_ASKPASS_OWNER=$$
+	export MIDR_SSH_ASKPASS MIDR_SSH_ASKPASS_OWNER
+}
+
+# Remove the shared password file; only the process that asked for it does.
+midr_ssh_cleanup() {
+	if [ -n "${MIDR_SSH_ASKPASS:-}" ] && [ "${MIDR_SSH_ASKPASS_OWNER:-}" = "$$" ]; then
+		rm -rf "$(dirname -- "$MIDR_SSH_ASKPASS")"
+		unset MIDR_SSH_ASKPASS MIDR_SSH_ASKPASS_OWNER
+	fi
+}
+
+# midr_ssh_login PORT USER@HOST : make sure the host has an authenticated
+# master, prompting for a password when public-key login is refused.
+midr_ssh_login() {
+	local port=$1 target=$2 path err rc
+	path=$(midr_ssh_control_path)
+	# shellcheck disable=SC2086
+	if ssh -o "$path" $MIDR_SSH_EXTRA -O check -p "$port" "$target" 2>/dev/null; then
+		return 0
+	fi
+	# The master forks into the background holding its stdio, so its
+	# messages go to a file rather than a pipe.
+	err=$(mktemp "$MIDR_SSH_CONTROL_DIR/login.XXXXXX")
+	local master=(-f -N -o ControlMaster=yes -o "$path"
+		-o "ControlPersist=$MIDR_SSH_PERSIST" -o ConnectTimeout=10)
+	# shellcheck disable=SC2086
+	if ssh "${master[@]}" -o BatchMode=yes $MIDR_SSH_EXTRA -p "$port" "$target" \
+		</dev/null >/dev/null 2>"$err"; then
+		rm -f "$err"
+		return 0
+	fi
+	if ! grep -Eq 'Permission denied|Too many authentication failures' "$err"; then
+		printf 'ssh %s port %s: %s\n' "$target" "$port" "$(tr '\n' ' ' <"$err")" >&2
+		rm -f "$err"
+		return 1
+	fi
+	if [ "${MIDR_SSH_PASSWORD_FALLBACK:-yes}" != yes ] || ! { : </dev/tty; } 2>/dev/null; then
+		echo "public-key login to $target port $port was refused;" \
+			'install the key with install-ssh-keys.sh, or run from a terminal to use a password' >&2
+		rm -f "$err"
+		return 1
+	fi
+	echo "public-key login to $target port $port was refused; falling back to a password" >&2
+	master+=(-o BatchMode=no -o PubkeyAuthentication=no
+		-o PreferredAuthentications=keyboard-interactive,password)
+	if [ "${MIDR_SSH_SHARED_PASSWORD:-no}" = yes ]; then
+		midr_ssh_shared_password || { rm -f "$err"; return 1; }
+		# shellcheck disable=SC2086
+		SSH_ASKPASS=$MIDR_SSH_ASKPASS SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-midr:0} \
+			ssh "${master[@]}" -o NumberOfPasswordPrompts=1 $MIDR_SSH_EXTRA \
+			-p "$port" "$target" </dev/null >/dev/null 2>"$err"
+	else
+		# ssh reads the password from the terminal itself.
+		# shellcheck disable=SC2086
+		ssh "${master[@]}" -o NumberOfPasswordPrompts=3 $MIDR_SSH_EXTRA \
+			-p "$port" "$target" </dev/null >/dev/null 2>"$err"
+	fi
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf 'password login to %s port %s failed: %s\n' "$target" "$port" \
+			"$(tr '\n' ' ' <"$err")" >&2
+	fi
+	rm -f "$err"
+	return "$rc"
+}
+
+# midr_ssh_login_nodes NAME... : log in to the named profile nodes in turn,
+# so any password prompts come first and in order.
+midr_ssh_login_nodes() {
+	local name row host port user failed=0
+	for name in "$@"; do
+		row=$(midr_nodes_select name ssh_host ssh_port ssh_user | awk -F, -v n="$name" '$1 == n')
+		[ -n "$row" ] || { echo "node not in $MIDR_NODES_FILE: $name" >&2; failed=1; continue; }
+		IFS=, read -r _ host port user <<<"$row"
+		midr_ssh_login "$port" "$user@$host" || failed=1
+	done
+	return "$failed"
 }

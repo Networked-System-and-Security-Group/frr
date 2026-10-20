@@ -16,6 +16,10 @@ to be edited for each release.
 
 The profile (default: profiles/fiti, or $MIDR_PROFILE) provides nodes.csv,
 node-configs/ and profile.env.
+
+SSH uses the public key; when the node refuses it, the script asks for the
+password on the terminal (see lib/profile.sh, MIDR_SSH_PASSWORD_FALLBACK and
+MIDR_SSH_SHARED_PASSWORD).
 USAGE
 }
 
@@ -83,9 +87,10 @@ row=$(midr_nodes_select name ssh_host ssh_port ssh_user | awk -F, -v node="$NODE
 [ -n "$row" ] || { echo "node not in $MIDR_NODES_FILE: $NODE" >&2; exit 1; }
 IFS=, read -r _name host port user <<<"$row"
 target="$user@$host"
+midr_ssh_login "$port" "$target" || exit 1
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/midr-stage-$NODE.XXXXXX")
-cleanup() { rm -rf "$stage"; }
+cleanup() { rm -rf "$stage"; midr_ssh_cleanup; }
 trap cleanup EXIT
 mkdir -p "$stage/release"
 

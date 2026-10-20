@@ -41,14 +41,15 @@ run_one() {
         esac
     fi
     echo "$name gateway=$gateway mode=$MODE"
+    midr_ssh_login "$port" "$user@$host" || return 1
 
     if [ "$MODE" = dry-run ]; then
-        ssh -n -o BatchMode=yes -o ConnectTimeout=10 -p "$port" "$user@$host" \
+        midr_ssh -n -p "$port" "$user@$host" \
             "hostname; ip -6 route show default; grep -F '$gateway' /etc/netplan/61-l3.yaml || true"
         return
     fi
 
-    ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$port" "$user@$host" \
+    midr_ssh -p "$port" "$user@$host" \
         "MIDR_GATEWAY='$gateway' bash -s" <<'REMOTE'
 set -eu
 stamp=$(date -u +%Y%m%dT%H%M%SZ)

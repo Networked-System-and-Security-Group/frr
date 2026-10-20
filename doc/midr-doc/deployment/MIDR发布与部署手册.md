@@ -204,15 +204,19 @@ end
 
 ## 7. 部署前检查
 
-### 7.1 SSH 公钥
+### 7.1 SSH 登录
 
-管理机必须能用公钥（BatchMode）登录所有节点：
+各脚本登录节点时先用公钥。节点拒绝公钥时，如果是在终端里运行，会提示输入该节点的密码；密码由 ssh 自己从终端读取，不出现在命令行和日志里。登录成功后，管理机为每台节点保留一条复用连接（OpenSSH ControlMaster，默认 15 分钟），同一节点之后的上传、安装、查询都走这条连接，不会再次提示。
 
-```bash
-tools/midr-deploy/install-ssh-keys.sh --shared-password
-```
+| 方式 | 命令或设置 | 说明 |
+|---|---|---|
+| 永久安装公钥（推荐） | `tools/midr-deploy/install-ssh-keys.sh --shared-password` | 逐台验证公钥登录，只给登录失败的节点安装公钥；默认 `~/.ssh/id_ed25519.pub`，`--key` 另行指定 |
+| 预先登录全部节点 | `tools/midr-deploy/ssh-login.sh [--shared-password] [节点名...]` | 一次性把密码输完，之后 15 分钟内所有脚本都不再提示 |
+| 各节点密码相同 | `--shared-password`（`deploy-batch.sh`、`ssh-login.sh`），或 `MIDR_SSH_SHARED_PASSWORD=yes` | 只问一次密码，运行结束后删除临时口令文件 |
+| 禁止密码回退 | `MIDR_SSH_PASSWORD_FALLBACK=no` | 只用公钥，适合无人值守运行；没有终端时也不会回退 |
+| 复用连接时长 | `MIDR_SSH_PERSIST`（默认 `15m`） | 提前关闭：`ssh -O exit -o ControlPath=/tmp/midr-ssh-$UID/%C -p 端口 用户@主机` |
 
-脚本先逐台验证公钥登录，只有登录失败的节点才会提示输入密码并安装公钥。默认使用 `~/.ssh/id_ed25519.pub`，可用 `--key` 另行指定。
+`deploy-batch.sh` 在每个阶段开始前依次登录本阶段的全部节点，需要输入的密码都集中在最前面，输完之后才开始改动节点；任何节点登录失败时整个阶段不执行（加 `--continue` 时跳过该节点）。只有"认证被拒绝"才回退到密码；连接超时、端口拒绝等网络错误会直接报告。
 
 ### 7.2 underlay
 
@@ -279,6 +283,7 @@ tools/midr-deploy/deploy-batch.sh --phase members --mode apply
 - **等待入群**：apply 模式下，每装完一台非 bootstrap 节点，脚本通过 `show midr join` 等待它报告非 0 的本地群号，再处理下一台，默认最多等 300 秒。代表和成员接连重启、不等收敛时，节点可能选中一个正在重启的群代表，入群过程会长时间无法完成。`--wait-joined 0` 关闭等待；超时按失败处理。
 - 默认遇到第一个失败的节点就停止。确认失败节点不影响其余节点时，才使用 `--continue`。
 - 日志写在 `$RUN_ROOT/<phase>/` 下，`RUN_ROOT` 默认为当前目录下的 `midr-deploy-<UTC时间>`。
+- 节点未安装公钥时，阶段开始前会逐台提示输入密码；各节点密码相同时加 `--shared-password`，见 7.1 节。
 
 **升级**也使用同样的流程：构建新发布包，设置新的 `RELEASE_SRC`，按三个阶段 apply。不要单独替换某个二进制。
 

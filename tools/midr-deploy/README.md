@@ -13,7 +13,8 @@
 tools/midr-deploy/build-release.sh --tag mytag
 export RELEASE_SRC=/tmp/midr-<上一步输出的目录名>
 
-# 2. 管理机到各节点的公钥登录与 underlay 只读检查
+# 2. 管理机到各节点的登录与 underlay 只读检查
+#    装公钥后不再需要密码；不装也可以，脚本会在公钥被拒时提示输入密码
 tools/midr-deploy/install-ssh-keys.sh --shared-password
 tools/midr-deploy/collect-underlay.sh
 tools/midr-deploy/check-transport-matrix.sh
@@ -44,6 +45,7 @@ python3 tools/midr-deploy/collect-midr-state.py --output "midr-state-$(date -u +
 | `collect-underlay.sh` | 只读采集 underlay 地址、路由和现有 FRR 状态 |
 | `check-transport-matrix.sh` | 按 TCP 5871 查询每台节点到全部 locator 的本机路由 |
 | `install-ssh-keys.sh` | 把管理机公钥装到各节点，并逐台验证公钥登录 |
+| `ssh-login.sh` | 预先登录各节点并保留复用连接；公钥被拒时提示密码，`--shared-password` 只问一次 |
 | `lib/profile.sh` | 各脚本共用的 profile 读取函数 |
 | `node/` | 安装到目标节点的文件：systemd 单元、启动脚本、`setup-midr-underlay.py`、Prefix Provider、`midrd-vty.py`、日志轮转和 needrestart 配置 |
 | `profiles/fiti/` | 默认 profile，见其中的 [README](profiles/fiti/README.md) |
@@ -82,6 +84,9 @@ profile.env          可选，环境级默认值
 | `MIDR_UNDERLAY_INTERFACE` | `ens5` | transport 出口接口，写入各节点的 `node.env` |
 | `MIDR_PROTECTED_NETPLAN` | 空 | 安装前后必须保持不变的 `/etc/netplan/` 文件名，空格分隔 |
 | `MIDR_SSH_EXTRA` | 空 | 追加给 ssh/scp 的选项，例如跳板机 `-o ProxyJump=...` |
+| `MIDR_SSH_PASSWORD_FALLBACK` | `yes` | `no` 时只用公钥，不提示密码 |
+| `MIDR_SSH_SHARED_PASSWORD` | `no` | `yes` 时各节点共用一个密码，只问一次 |
+| `MIDR_SSH_PERSIST` | `15m` | 每台节点复用连接的保持时间 |
 | `MIDR_LOCATOR_PREFIX_LEN` | IPv6 64、IPv4 24 | 由 locator 推出 locator 前缀的长度，用于 Provider 排除列表、反向发布的出口过滤和本机 locator 通告 |
 
 ## 发布包格式

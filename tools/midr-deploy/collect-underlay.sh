@@ -7,8 +7,8 @@ Usage: collect-underlay.sh [--profile DIR | --inventory FILE] [--output DIR]
                            [--interactive]
 
 Collect read-only underlay state from every MIDR host of the profile
-(default profiles/fiti).  By default SSH must already work with
-BatchMode=yes; --interactive prompts for authentication one node at a time.
+(default profiles/fiti).  SSH uses the public key and falls back to a
+password prompt per node; --interactive skips the key and always asks.
 This script never changes a node.  --inventory takes a legacy file with
 columns name,host,port,user,locator,node_id,role,group.
 EOF
@@ -114,13 +114,7 @@ run_one() {
         else
             printf 'FAIL %s\n' "$name" >"$status"
         fi
-    elif ssh -n -o BatchMode=yes \
-        -o PreferredAuthentications=publickey \
-        -o PubkeyAuthentication=yes \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o ConnectTimeout=10 -p "$port" \
-        "$user@$host" "$remote_script" >"$raw" 2>&1; then
+    elif midr_ssh -n -p "$port" "$user@$host" "$remote_script" >"$raw" 2>&1; then
         printf 'PASS %s\n' "$name" >"$status"
     else
         printf 'FAIL %s\n' "$name" >"$status"
@@ -136,6 +130,13 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         run_one "$name" "$host" "$port" "$user"
     done < "$INVENTORY"
 else
+    # Log in one node at a time (password prompts), then collect in parallel.
+    while IFS=, read -r name host port user transport node_id role group_id; do
+        case "$name" in
+            ''|'#'*) continue ;;
+        esac
+        midr_ssh_login "$port" "$user@$host" || true
+    done < "$INVENTORY"
     while IFS=, read -r name host port user transport node_id role group_id; do
         case "$name" in
             ''|'#'*) continue ;;

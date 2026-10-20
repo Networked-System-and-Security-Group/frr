@@ -7,7 +7,7 @@ Usage: check-transport-matrix.sh [--profile DIR | --inventory FILE] [--output DI
 
 Read-only IPv6 route lookup for TCP 5871 from each host's transport-address
 to every listed endpoint. This checks the local FIB, not end-to-end delivery.
-SSH must already work with public-key BatchMode=yes.
+SSH uses the public key, falling back to a password prompt per node.
 
 Nodes come from the profile's nodes.csv (default profiles/fiti); --inventory
 takes a legacy file with columns name,host,port,user,locator,node_id,role,group.
@@ -92,13 +92,7 @@ run_one() {
     local status="$OUTPUT/status/$name.txt"
     local remote_script="transport_source='${TARGETS[$index]}'"$'\n'"$target_script"
 
-    if ssh -n -o BatchMode=yes \
-        -o PreferredAuthentications=publickey \
-        -o PubkeyAuthentication=yes \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o ConnectTimeout=10 \
-        -p "${PORTS[$index]}" "${USERS[$index]}@${HOSTS[$index]}" \
+    if midr_ssh -n -p "${PORTS[$index]}" "${USERS[$index]}@${HOSTS[$index]}" \
         "$remote_script" >"$raw" 2>&1; then
         if grep -Eq 'ROUTE_LOOKUP_FAILED|Network is unreachable|RTNETLINK answers:|unreachable ' "$raw"; then
             printf 'FAIL %s route-unreachable\n' "$name" >"$status"
@@ -110,6 +104,10 @@ run_one() {
     fi
 }
 
+# Log in one node at a time (password prompts), then query in parallel.
+for ((i = 0; i < ${#NAMES[@]}; i++)); do
+    midr_ssh_login "${PORTS[$i]}" "${USERS[$i]}@${HOSTS[$i]}" || true
+done
 for ((i = 0; i < ${#NAMES[@]}; i++)); do
     run_one "$i" &
 done

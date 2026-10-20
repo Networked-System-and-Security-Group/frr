@@ -5,6 +5,7 @@ usage() {
     cat <<'USAGE'
 Usage: deploy-batch.sh --phase bootstrap|representatives|members
        [--mode check|apply] [--profile DIR] [--wait-joined SECS] [--continue]
+       [--shared-password]
 
 Run deploy-node.sh for every node of one role, in nodes.csv order.  Deploy
 the phases in order: bootstrap, representatives, members.
@@ -16,6 +17,11 @@ the phases in order: bootstrap, representatives, members.
                     node pick a group whose representative is restarting too.
 --continue          Record a failed node and carry on with the rest of the
                     phase instead of stopping at the first failure.
+--shared-password   Nodes that refuse the public key share one password: ask
+                    it once instead of once per node.
+
+All nodes of the phase are logged in to first, so any password prompts come
+before the first node is changed.
 
 RELEASE_SRC selects the release directory built by build-release.sh.
 USAGE
@@ -42,6 +48,7 @@ while [ "$#" -gt 0 ]; do
         --profile) need_value "$1" "$#"; PROFILE_DIR=$2; shift 2 ;;
         --wait-joined) need_value "$1" "$#"; WAIT_JOINED=$2; shift 2 ;;
         --continue) CONTINUE=1; shift ;;
+        --shared-password) export MIDR_SSH_SHARED_PASSWORD=yes; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -83,6 +90,11 @@ wait_joined() {
     echo "NOT JOINED $node within ${WAIT_JOINED}s" >&2
     return 1
 }
+
+trap midr_ssh_cleanup EXIT
+if ! midr_ssh_login_nodes "${selected[@]}"; then
+    [ "$CONTINUE" -eq 1 ] || { echo "SSH login failed; no node of phase $PHASE was changed" >&2; exit 1; }
+fi
 
 run_root=${RUN_ROOT:-$PWD/midr-deploy-$(date -u +%Y%m%dT%H%M%SZ)}
 mkdir -p "$run_root/$PHASE"
