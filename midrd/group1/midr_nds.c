@@ -5828,6 +5828,19 @@ static void midr_nds_remote_node_update(const struct midr_remote_node_info *node
  * CREATE 出孤岛群。真死的节点在落定后由 midr_nds_flush_deferred_withdraws()
  * 补删，活着的会在此之前重新收到事实、清掉标记。
  */
+/*
+ * 加入是否在进行中：处于探测阶段，或者本轮刚开始、已向引导发出 REP_LIST_REQ
+ * 正在等目录（REJOIN/LEAVE 重开一轮后 join_phase 先回到 IDLE，目录到达前
+ * bootstrap_cur 指向当前在问的引导；目录到达或候选耗尽时收起）。只看
+ * join_intent 不够：候选耗尽时加入意图会保留，暂缓的撤销就永远不补做。
+ * 暂缓判断与补做判断共用本函数，二者保持一致。
+ */
+static bool midr_join_active(const struct midr_nds *mi)
+{
+	return mi->join_phase != MIDR_JOIN_IDLE ||
+	       (mi->join_intent && mi->bootstrap_cur);
+}
+
 static bool midr_join_protects_node(struct midr_nds *mi,
 				    const struct midr_node_entry *entry)
 {
@@ -5835,7 +5848,7 @@ static bool midr_join_protects_node(struct midr_nds *mi,
 	struct midr_rep_entry *r;
 	int i;
 
-	if (mi->join_phase == MIDR_JOIN_IDLE)
+	if (!midr_join_active(mi))
 		return false;
 	for (ALL_LIST_ELEMENTS_RO(mi->rep_dir, node, r))
 		if (IPV4_ADDR_SAME(&r->rep_rid, &entry->node_id.u.prefix4))
@@ -5855,7 +5868,7 @@ void midr_nds_flush_deferred_withdraws(struct midr_g1 *g1)
 	struct midr_node_entry *entry;
 	bool removed = false;
 
-	if (mi->join_phase != MIDR_JOIN_IDLE || mi->join_intent)
+	if (midr_join_active(mi))
 		return;
 
 	frr_each_safe (midr_node_hash, &mi->global_view->nodes, entry) {

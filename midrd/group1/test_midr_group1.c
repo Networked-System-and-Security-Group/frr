@@ -860,6 +860,49 @@ static void test_join_defers_remote_withdraw(struct midr_g1 *g1)
 	printf("join defers withdrawals of evaluated representatives until it settles: PASS\n");
 }
 
+/* D2 window: REJOIN/LEAVE restart the round with join_phase back at IDLE
+ * while the directory request is in flight.  Withdrawals are still deferred
+ * then; once no bootstrap is being asked (candidates exhausted) the join is
+ * no longer running and deferred withdrawals are applied. */
+static void test_join_window_defers_remote_withdraw(struct midr_g1 *g1)
+{
+	struct midr_nds *mi = g1->midr_nds_info;
+	struct ipaddr neighbour = v4(0xc0000207);
+	struct in_addr rep_rid = { .s_addr = 0x0b00000aU };
+	struct in_addr bootstrap_rid = { .s_addr = 0x0d00000aU };
+	struct ipaddr bootstrap = v4(0xc000020d);
+	union sockunion su;
+
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0xc000020b, 1, false);
+	assert(view_node(g1, rep_rid.s_addr));
+	midr_rep_dir_add(g1, 5, v4(0xc000020b), 0, rep_rid);
+
+	assert(midr_ipaddr_to_sockunion(&bootstrap, &su));
+	midr_join_via_bootstrap(g1, &su, 65013, bootstrap_rid);
+	assert(mi->join_intent && mi->join_phase == MIDR_JOIN_IDLE &&
+	       mi->bootstrap_cur);
+
+	/* Waiting for the directory: deferred, and not applied yet. */
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0, 2, true);
+	assert(view_node(g1, rep_rid.s_addr) &&
+	       view_node(g1, rep_rid.s_addr)->withdraw_deferred);
+	midr_nds_flush_deferred_withdraws(g1);
+	assert(view_node(g1, rep_rid.s_addr));
+
+	/* Candidates exhausted: the intent is kept but nothing is running. */
+	mi->bootstrap_cur = NULL;
+	midr_nds_flush_deferred_withdraws(g1);
+	assert(!view_node(g1, rep_rid.s_addr));
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0xc000020b, 3, false);
+	node_adv(g1, &neighbour, rep_rid.s_addr, 5, 0, 4, true);
+	assert(!view_node(g1, rep_rid.s_addr));
+
+	midr_bootstrap_clear(g1);
+	midr_rep_dir_clear(g1);
+	assert(!mi->join_intent);
+	printf("join defers withdrawals while a new round waits for its directory: PASS\n");
+}
+
 /* D1: REJOIN restarts the round and counts it; settling resets the count. */
 static void test_rejoin_round(struct midr_g1 *g1)
 {
@@ -1012,6 +1055,7 @@ int main(void)
 	test_anchor_representative_cleanup(g1);
 	test_received_anchor_and_role_transition(g1);
 	test_join_defers_remote_withdraw(g1);
+	test_join_window_defers_remote_withdraw(g1);
 	test_rejoin_round(g1);
 	test_anchor_repair(g1);
 	test_terminate_with_queued_events(g1);
