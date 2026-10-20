@@ -96,6 +96,17 @@ if [ "${MIDR_OSPF6_LEAF_MIGRATION:-no}" != yes ] && [ -r /etc/frr/frr.conf ] && 
     echo 'FRR includes additional routing configuration; migrate it before applying this deployment' >&2
     exit 1
 fi
+# Reverse export of MIDR routes to the site gateway (bgpd only for now).
+case "${MIDR_ROUTE_EXPORT:-no}" in
+    no) ;;
+    yes)
+        [ "$MIDR_EDGE_BGP" = yes ] || { echo 'MIDR_ROUTE_EXPORT=yes requires an edge node' >&2; exit 1; }
+        [ -s "$STAGE/node.locators" ] || { echo 'route export needs the profile locator list' >&2; exit 1; }
+        bash "$STAGE/midr-export-config.sh" "$BGP_CONFIG_SOURCE" "$STAGE/node.locators" \
+            "${MIDR_ROUTE_TAG:-199}" >/dev/null
+        ;;
+    *) echo 'MIDR_ROUTE_EXPORT must be yes or no' >&2; exit 1 ;;
+esac
 if [ "$MODE" = check ]; then
     printf 'CHECK PASS %s node-id=%s role=%s edge-bgp=%s\n' \
         "$MIDR_NODE_NAME" "$MIDR_NODE_ID" "$MIDR_ROLE" "$MIDR_EDGE_BGP"
@@ -241,6 +252,15 @@ install -m 600 "$STAGE/node.env" /etc/midr/node.env
 install -m 600 "$STAGE/node.commands" /etc/midr/node.commands
 if [ -n "$BGP_CONFIG_SOURCE" ]; then
     install -m 600 "$BGP_CONFIG_SOURCE" /etc/midr/bgpd.conf
+fi
+# Locator prefixes of every MIDR node: never imported as MIDR prefixes by
+# the Prefix Provider, never exported to the gateway.
+if [ -s "$STAGE/node.locators" ]; then
+    install -m 644 "$STAGE/node.locators" /etc/midr/locators.txt
+fi
+if [ "${MIDR_ROUTE_EXPORT:-no}" = yes ]; then
+    bash "$STAGE/midr-export-config.sh" /etc/midr/bgpd.conf /etc/midr/locators.txt \
+        "${MIDR_ROUTE_TAG:-199}" >>/etc/midr/bgpd.conf
 fi
 printf 'hostname %s-zebra\n' "$MIDR_NODE_NAME" >/etc/midr/zebra.conf
 chmod 600 /etc/midr/zebra.conf

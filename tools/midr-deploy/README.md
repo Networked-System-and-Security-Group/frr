@@ -44,6 +44,7 @@ python3 tools/midr-deploy/collect-midr-state.py --output "midr-state-$(date -u +
 | `collect-underlay.sh` | 只读采集 underlay 地址、路由和现有 FRR 状态 |
 | `check-transport-matrix.sh` | 按 TCP 5871 查询每台节点到全部 locator 的本机路由 |
 | `install-ssh-keys.sh` | 把管理机公钥装到各节点，并逐台验证公钥登录 |
+| `gen-gateway-locator-config.sh` | 打印各站网关为反向发布需要添加的 locator /64 通告和推荐入口策略，不登录网关 |
 | `lib/profile.sh` | 各脚本共用的 profile 读取函数 |
 | `node/` | 安装到目标节点的文件：systemd 单元、启动脚本、`setup-midr-underlay.py`、Prefix Provider、`midrd-vty.py`、日志轮转和 needrestart 配置 |
 | `profiles/fiti/` | 默认 profile，见其中的 [README](profiles/fiti/README.md) |
@@ -82,6 +83,7 @@ profile.env          可选，环境级默认值
 | `MIDR_UNDERLAY_INTERFACE` | `ens5` | transport 出口接口，写入各节点的 `node.env` |
 | `MIDR_PROTECTED_NETPLAN` | 空 | 安装前后必须保持不变的 `/etc/netplan/` 文件名，空格分隔 |
 | `MIDR_SSH_EXTRA` | 空 | 追加给 ssh/scp 的选项，例如跳板机 `-o ProxyJump=...` |
+| `MIDR_LOCATOR_PREFIX_LEN` | IPv6 64、IPv4 24 | 由 locator 推出 locator 前缀的长度，用于 Provider 排除列表、出口过滤和网关配置 |
 
 ## 发布包格式
 

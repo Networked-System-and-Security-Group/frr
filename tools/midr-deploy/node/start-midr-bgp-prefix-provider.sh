@@ -23,6 +23,11 @@ provider_args=(
     --max-as-path-length "${MIDR_PREFIX_MAX_AS_PATH_LENGTH:-1}"
     --midr-route-tag "${MIDR_ROUTE_TAG:-199}"
 )
+# Locator prefixes reach the node from the gateway once the gateway
+# advertises them for the underlay; they must never become MIDR prefixes.
+if [ -z "${MIDR_PREFIX_EXCLUDE_FILE:-}" ] && [ -s /etc/midr/locators.txt ]; then
+    MIDR_PREFIX_EXCLUDE_FILE=/etc/midr/locators.txt
+fi
 if [ -n "${MIDR_PREFIX_EXCLUDE_FILE:-}" ]; then
     provider_args+=(--exclude-prefix-file "$MIDR_PREFIX_EXCLUDE_FILE")
 fi

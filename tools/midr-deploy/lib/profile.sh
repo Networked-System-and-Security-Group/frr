@@ -67,6 +67,27 @@ midr_nodes_select() {
 	' "$MIDR_NODES_FILE"
 }
 
+# midr_locator_prefix ADDRESS / midr_locator_prefixes : print the prefix
+# covering one locator, or every node locator
+# (MIDR_LOCATOR_PREFIX_LEN, default /64 for IPv6 and /24 for IPv4), one per
+# line, sorted and unique.  Site gateways advertise these prefixes in the
+# underlay; MIDR neither imports nor exports them.
+midr_locator_prefix() {
+	python3 -c '
+import ipaddress, sys
+address, width = sys.argv[1], sys.argv[2]
+width = width or ("64" if ":" in address else "24")
+print(ipaddress.ip_interface(address + "/" + width).network)
+' "$1" "${MIDR_LOCATOR_PREFIX_LEN:-}"
+}
+
+midr_locator_prefixes() {
+	local locator
+	midr_nodes_select locator | while IFS= read -r locator; do
+		[ -n "$locator" ] && midr_locator_prefix "$locator"
+	done | sort -u
+}
+
 # midr_node_field NAME FIELD : print one column of one node.
 midr_node_field() {
 	midr_nodes_select name "$2" | awk -F, -v node="$1" '$1 == node { print $2; found = 1 }

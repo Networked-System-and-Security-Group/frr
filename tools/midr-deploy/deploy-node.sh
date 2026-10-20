@@ -103,6 +103,7 @@ mkdir -p "$stage/release"
     done
 } >"$stage/node.env"
 cp "$MIDR_NODE_CONFIGS/$NODE.commands" "$stage/node.commands"
+midr_locator_prefixes >"$stage/node.locators"
 if [ -r "$MIDR_NODE_CONFIGS/$NODE.bgpd.conf" ]; then
     cp "$MIDR_NODE_CONFIGS/$NODE.bgpd.conf" "$stage/node.bgpd.conf"
 fi

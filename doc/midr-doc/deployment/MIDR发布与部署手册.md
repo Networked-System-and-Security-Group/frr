@@ -168,6 +168,9 @@ MIDR_PREFIX_MODE=socket
 |---|---|
 | `MIDR_PREFIX_MODE` | 边缘节点为 `socket`（接 Provider），其余为 `none` |
 | `MIDR_PREFIX_MAX_AS_PATH_LENGTH` | Provider 导出到 MIDR 的最大 AS_PATH 长度，默认 1；不影响 bgpd 自身的路由表 |
+| `MIDR_ROUTE_EXPORT` | `yes` 时把 MIDR 路由发布给本站网关，默认 `no`，见第 14 节 |
+| `MIDR_ROUTE_TAG` | midrd 给安装路由打的 tag，默认 199；Provider 和出口配置使用同一个值 |
+| `MIDR_PREFIX_EXCLUDE_FILE` | Provider 不导入的前缀列表，默认 `/etc/midr/locators.txt`（全部 locator 前缀） |
 
 **`<name>.commands`**：安装为 `/etc/midr/node.commands`，midrd 每次启动后自动加载。
 
@@ -197,6 +200,7 @@ end
 | `MIDR_UNDERLAY_INTERFACE` | `ens5` | `ens5` | transport 出口接口 |
 | `MIDR_PROTECTED_NETPLAN` | 空 | `60-ens4.yaml 61-l3.yaml` | 安装前后必须保持不变的 `/etc/netplan/` 文件 |
 | `MIDR_SSH_EXTRA` | 空 | 空 | 追加给 ssh/scp 的选项，如 `-o ProxyJump=jump@host` |
+| `MIDR_LOCATOR_PREFIX_LEN` | IPv6 为 64，IPv4 为 24 | 默认 | 由 locator 推出 locator 前缀时使用的长度 |
 
 ## 7. 部署前检查
 
@@ -378,3 +382,37 @@ tools/midr-deploy/deploy-node.sh --node <name> --mode apply
 | 磁盘被日志写满 | `midr-logrotate.timer` 是否 active；zebra 日志大量增长的问题见[待解决问题](../MIDR待解决问题.md) P-03 |
 
 **表 1990**：midrd 启动前，`setup-midr-underlay.py` 根据 `MIDR_LOCATOR`、`MIDR_GATEWAY`、`MIDR_UNDERLAY_INTERFACE` 建立 IPv6 路由表 1990 和优先级 19900～19905 的策略规则，把本机 locator 发出的 MIDR 控制、探测和 GRE 外层报文送到本站网关。这样，即使 MIDR 学到的业务前缀覆盖了 locator，协议报文也不会递归进入隧道。表 1990 与 `proto 199` 是两回事：前者是 underlay 转发表，后者标记 main 表中由 MIDR 安装的业务路由。
+
+## 14. 反向发布 MIDR 路由到网关
+
+反向发布让边缘 MIDR 把从 MIDR 学到的远端前缀发布给本站网关，普通终端的流量因此可以经网关进入 MIDR。默认关闭，目前只生成 BGP 网关的配置。
+
+### 14.1 前置条件：网关单独通告 locator 前缀
+
+远端站点的前缀（如 `240a:a00f:300::/48`）通常覆盖远端 MIDR 的 locator（`240a:a00f:300:1::2`）。网关从本站 MIDR 学到这个 /48 之后，会把发往远端 locator 的 GRE 外层和控制报文也送回本站 MIDR，形成环路，Session 和隧道随之中断。因此开启反向发布之前，每个站点的网关都要在 underlay 中单独通告本站 locator 所在的 /64，靠最长匹配让 locator 流量留在 underlay。
+
+```bash
+tools/midr-deploy/gen-gateway-locator-config.sh --asn <网关AS>                  # 全部节点
+tools/midr-deploy/gen-gateway-locator-config.sh --node MIDR_wlq --asn 4200000003
+```
+
+脚本只打印配置，不登录网关。输出包括必须添加的 `network <locator>/64`，以及推荐的入口策略模板：对来自 MIDR 的路由设置 `no-export` 和较高的 local-preference。MIDR 节点和网关通常不在同一个 AS，所以 `no-export` 必须由网关在入口设置。核对后在网关上用 `vtysh -f` 加载，并 `write memory`。应用后，在其他站点的网关上执行 `ip -6 route get <远端locator>`，确认走的是 underlay。
+
+### 14.2 MIDR 侧
+
+在边缘节点的 `node-configs/<name>.env` 中设置 `MIDR_ROUTE_EXPORT=yes`，再执行 check 和 apply。安装器会：
+
+- 把 profile 中全部 locator 前缀写入 `/etc/midr/locators.txt`。网关把 locator /64 发给本站 MIDR 后，Prefix Provider 依据这个文件不导入它们。
+- 用 `node/midr-export-config.sh` 在 `/etc/midr/bgpd.conf` 末尾追加出口配置：route-map `MIDR-EXPORT` 只放行带 MIDR tag 的路由，拒绝默认路由和 locator 前缀；IPv4、IPv6 都执行 `redistribute midr route-map MIDR-EXPORT`。AS 号取自原有的 `router bgp` 配置。
+
+### 14.3 验证
+
+```bash
+# 网关：远端站点前缀来自本站 MIDR，远端 locator 走 underlay
+vtysh -c 'show bgp ipv6 unicast <远端站点前缀>'
+ip -6 route get <远端locator>
+# 边缘 MIDR：本站 locator /64 没有进入 MIDR
+ip -6 route show proto 199
+```
+
+两站点实验 `midr-test/route-export-lab/test.sh` 复现了环路，并验证了上述配置能消除它，结果记录在[待解决问题](../MIDR待解决问题.md) P-04。
