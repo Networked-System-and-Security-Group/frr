@@ -65,6 +65,33 @@ test -f midr-test/fiti-deploy/node-configs/MIDR_fudan.commands
 
 Provider 默认只向 MIDR 导出有效选中且 `AS_PATH` 长度不超过 1 的 BGP 路径，长度过滤不影响 bgpd 自身学习和安装其他路由。节点 env 可通过 `MIDR_PREFIX_MAX_AS_PATH_LENGTH` 设置上限；未设置时为 1。策略回归命令为 `python3 midr-test/fiti-deploy/test_bgp_prefix_provider.py -v`。
 
+## 节点日常查询
+
+以下命令在已部署的目标 MIDR 节点执行。当前发布包的 vtysh 支持 midrd、Zebra 和 bgpd：
+
+```bash
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# 交互入口，可输入 show midr self、show midr join、show midr spf 等
+"$MIDR_DIR/vtysh" --vty_socket /run/midr
+
+# 单次 MIDR 和 Zebra 查询
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
+  -c 'show midr self' -c 'show midr join' -c 'show midr virtual-links' \
+  -c 'show midr spf'
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d zebra \
+  -c 'show ipv6 route 240a:a00f:300::/48'
+
+# 仅边缘 MIDR 执行
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d bgpd \
+  -c 'show bgp ipv6 unicast summary'
+
+ip -6 route show proto 199
+```
+
+`midrd-vty.py` 继续由启动加载和集中采集脚本使用。`--commands-file /etc/midr/node.commands` 会执行配置并可能重新触发入群，不能用作日常查询；正常启动时 systemd 已自动加载。完整用法见 [00 文档第 8 节](../../doc/midr-doc/FITI部署测试/00-公共前置与版本部署.md#8-持久配置和-vty-加载)。
+
 ## 发布包要求
 
 发布包必须是一个完整目录，至少包含：

@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MIDR FITI 当前验收快照</title>
+  <style>
+    :root {
+      --bg: #f4f7f9;
+      --ink: #17232f;
+      --muted: #607181;
+      --line: #d8e1e8;
+      --panel: #fff;
+      --navy: #173b59;
+      --blue: #1769aa;
+      --teal: #087f7a;
+      --green: #16734b;
+      --amber: #9a6700;
+      --red: #ae3946;
+      --shadow: 0 8px 24px rgba(26, 49, 69, .08);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, select { font: inherit; }
+    button { cursor: pointer; }
+    header { background: var(--navy); color: #fff; padding: 22px 28px 20px; }
+    .header-inner, main { max-width: 1500px; margin: 0 auto; }
+    .header-inner { display: flex; gap: 22px; align-items: end; justify-content: space-between; }
+    h1 { margin: 0 0 4px; font-size: 23px; letter-spacing: .01em; }
+    .subtitle { color: #c8d8e5; }
+    .release { color: #dbe8f1; text-align: right; font-size: 12px; }
+    main { padding: 22px 24px 48px; }
+    .notice { border-left: 4px solid var(--teal); background: #eaf8f6; color: #145c59; border-radius: 0 6px 6px 0; padding: 11px 14px; margin-bottom: 17px; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-bottom: 16px; }
+    .toolbar label { color: var(--muted); font-size: 13px; }
+    select, .btn { border: 1px solid #b9c8d4; border-radius: 6px; background: #fff; color: var(--ink); padding: 8px 11px; }
+    .btn:hover, select:focus { border-color: var(--blue); }
+    .btn.primary { border-color: var(--blue); background: var(--blue); color: #fff; }
+    .btn.active { background: #e6f1fb; border-color: var(--blue); color: #125487; }
+    .toolbar .spacer { flex: 1; }
+    .layout-status { color: var(--muted); font-size: 12px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; }
+    .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; background: #9aa9b5; }
+    .legend .bootstrap::before { background: #8d5a18; }
+    .legend .rep::before { background: #1769aa; }
+    .legend .member::before { background: #087f7a; }
+    .legend .edge::before { background: #71a9cf; }
+    .metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 17px; }
+    .metric, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+    .metric { padding: 12px 13px; }
+    .metric strong { display: block; color: var(--navy); font-size: 22px; line-height: 1.1; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .grid { display: grid; grid-template-columns: minmax(600px, 1.45fr) minmax(340px, .8fr); gap: 16px; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--line); padding: 13px 16px; }
+    .panel-head h2 { margin: 0; font-size: 15px; }
+    .panel-head small { color: var(--muted); }
+    .panel-body { padding: 14px 16px; min-width: 0; }
+    .grid > * { min-width: 0; }
+    .topology-panel { grid-row: span 1; }
+    .address-panel { grid-column: 1 / -1; }
+    svg { display: block; width: 100%; height: 580px; background: #f9fbfc; border: 1px solid var(--line); border-radius: 6px; touch-action: none; }
+    .map-note { color: var(--muted); font-size: 12px; margin-top: 9px; }
+    .path-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #f8fbfc; }
+    .path-controls label { color: var(--muted); font-size: 12px; }
+    .path-controls select { min-width: 155px; max-width: 100%; padding: 6px 8px; }
+    .path-summary { color: var(--muted); font-size: 12px; margin-top: 9px; min-height: 18px; }
+    .path-summary strong { color: var(--navy); }
+    .path-summary .path-error { color: var(--red); }
+    .group-label { font-size: 12px; font-weight: 700; fill: #526674; }
+    .group-hull { stroke-width: 1.5; stroke-dasharray: 5 5; opacity: .9; }
+    .overlay-edge { stroke: #7ea9c4; stroke-width: 2; opacity: .62; }
+    .overlay-edge.same { stroke: #258b84; }
+    .overlay-edge.cross { stroke: #bd7d20; stroke-dasharray: 6 4; }
+    .overlay-edge.path { stroke: #e0522f; stroke-width: 5; opacity: 1; }
+    .overlay-edge.dim { opacity: .1; }
+    .node { cursor: grab; }
+    .node.dragging { cursor: grabbing; }
+    .node circle { stroke: #fff; stroke-width: 3; filter: drop-shadow(0 2px 2px rgba(16, 43, 63, .2)); }
+    .node text { pointer-events: none; }
+    .node .label { fill: var(--ink); font-size: 11px; font-weight: 700; text-anchor: middle; }
+    .node .meta { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+    .node.selected circle { stroke: #e26f2f; stroke-width: 4; }
+    .node.bootstrap circle { fill: #8d5a18; }
+    .node.rep circle { fill: #1769aa; }
+    .node.member circle { fill: #087f7a; }
+    .node.edge circle { stroke: #d4edf5; }
+    .node.internal circle { fill: #4e8e89; }
+    .node.path-node circle { stroke: #e0522f; stroke-width: 5; }
+    .node.path-origin circle { stroke: #8d5bd1; stroke-width: 5; }
+    .node.dim { opacity: .3; }
+    .groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 11px; }
+    .group-chip { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 5px 9px; color: var(--muted); font-size: 12px; cursor: pointer; }
+    .group-chip:hover, .group-chip.active { border-color: var(--blue); color: var(--blue); background: #edf6fd; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 740px; }
+    th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid #e7edf1; white-space: nowrap; }
+    th { color: var(--muted); background: #f6f9fb; font-size: 12px; font-weight: 600; position: sticky; top: 0; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover, tbody tr.selected { background: #eef7fb; }
+    .name { color: var(--navy); font-weight: 700; }
+    .sub { color: var(--muted); font-size: 11px; }
+    .pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 700; }
+    .pill.ok { color: #0b6542; background: #dcf5e9; }
+    .pill.neutral { color: #4d6575; background: #eaf0f4; }
+    .pill.warn { color: #805400; background: #fff0c7; }
+    .detail { min-height: 330px; }
+    .empty { color: var(--muted); padding: 26px 3px; }
+    .detail-title { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+    .detail-title h3 { margin: 0; color: var(--navy); font-size: 19px; }
+    .detail-title p { margin: 3px 0 0; color: var(--muted); }
+    dl { display: grid; grid-template-columns: 128px 1fr; gap: 7px 12px; margin: 18px 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .checks { border-top: 1px solid var(--line); padding-top: 12px; }
+    .check { display: flex; gap: 8px; align-items: center; padding: 5px 0; }
+    .check i { width: 18px; height: 18px; border-radius: 50%; display: inline-grid; place-items: center; background: #dcf5e9; color: var(--green); font-style: normal; font-weight: 700; }
+    .check span { flex: 1; }
+    .check small { color: var(--muted); }
+    .route-table-title { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 15px; font-weight: 700; color: var(--navy); }
+    .route-table-wrap { max-height: 250px; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 5px; }
+    table.route-table { min-width: 700px; font-size: 11px; }
+    table.route-table th, table.route-table td { padding: 6px 7px; }
+    table.route-table th { position: sticky; top: 0; }
+    table.route-table td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .no-routes { color: var(--muted); padding: 10px; background: #f8fafb; font-size: 12px; }
+    .route-list { display: grid; gap: 8px; }
+    .route { border: 1px solid var(--line); border-left: 4px solid var(--teal); border-radius: 5px; padding: 9px 10px; background: #fbfdfe; }
+    .route strong { display: block; color: var(--navy); font-size: 12px; }
+    .route code { color: #33576f; font-size: 12px; }
+    .route small { display: block; color: var(--muted); margin-top: 3px; }
+    .footnote { color: var(--muted); font-size: 12px; margin-top: 12px; }
+    @media (max-width: 1120px) { .metrics { grid-template-columns: repeat(3, 1fr); } .grid { grid-template-columns: 1fr; } .topology-panel { grid-row: auto; } }
+    @media (max-width: 650px) { header { padding: 18px; } main { padding: 16px 12px 34px; } .header-inner { display: block; } .release { text-align: left; margin-top: 9px; } .metrics { grid-template-columns: repeat(2, 1fr); } .toolbar { align-items: stretch; } .path-controls { align-items: stretch; } .path-controls label { align-self: center; } .path-controls select { flex: 1 1 150px; min-width: 0; } svg { height: 470px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div><h1>MIDR FITI 当前验收快照</h1><div class="subtitle">控制面、Overlay 互联、分群与业务路由视图</div></div>
+      <div class="release">采集基线<br><strong>94a3ca3c94ed-aspathfix-20261007T055433Z</strong><br>顺序冷启动验收 · 2026-10-07</div>
+    </div>
+  </header>
+  <main>
+    <div class="toolbar">
+      <label for="groupFilter">显示群组</label>
+      <select id="groupFilter"><option value="all">全部群组</option><option value="0">G0 Bootstrap</option><option value="1">G1</option><option value="2">G2</option><option value="3">G3</option><option value="4">G4</option><option value="5">G5</option><option value="6">G6</option></select>
+      <button class="btn active" data-role="all">全部角色</button>
+      <button class="btn" data-role="bootstrap">Bootstrap</button>
+      <button class="btn" data-role="rep">群代表</button>
+      <button class="btn" data-role="member">普通成员</button>
+      <button class="btn" id="saveLayout">保存布局</button>
+      <button class="btn" id="exportLayoutHtml">导出当前布局 HTML</button>
+      <button class="btn" id="resetLayout">恢复默认布局</button>
+      <span class="layout-status" id="layoutStatus">默认布局</span>
+      <span class="spacer"></span>
+      <div class="legend"><span class="bootstrap">Bootstrap</span><span class="rep">群代表</span><span class="member">成员</span><span class="edge">边缘 BGP</span></div>
+    </div>
+    <div class="grid">
+      <section class="panel topology-panel">
+        <div class="panel-head"><h2>Overlay 拓扑</h2><small>仅显示 MIDR Overlay，不显示 BGP underlay</small></div>
+        <div class="panel-body">
+          <div class="path-controls">
+            <label for="pathStart">起点</label><select id="pathStart"></select>
+            <label for="pathEnd">终点业务网段</label><select id="pathEnd"></select>
+            <button class="btn primary" id="highlightPath">高亮路径</button>
+            <button class="btn" id="clearPath">清除高亮</button>
+          </div>
+          <svg id="map" viewBox="0 0 920 580" role="img" aria-label="MIDR overlay topology"></svg>
+          <div class="path-summary" id="pathSummary" role="status" aria-live="polite">尚未选择路径</div>
+          <div class="map-note">验收快照 · 同群实线 / 跨群虚线 · 橙色为业务路径。最终出口使用本地 BGP，不一定是目的站点的 MIDR 节点。</div>
+          <div class="groups" id="groupChips"></div>
+        </div>
+      </section>
+      <section class="panel detail"><div class="panel-head"><h2>节点详情</h2><small id="detailHint">选择一个节点</small></div><div class="panel-body" id="detailBody"><div class="empty">点击拓扑节点或节点表中的一行。</div></div></section>
+      <section class="panel address-panel"><div class="panel-head"><h2>地址后缀与节点对照</h2><small>用于对应路由表中的业务前缀</small></div><div class="panel-body table-wrap"><table><thead><tr><th>地址后缀</th><th>完整业务前缀</th><th>对应站点 / 节点</th><th>MIDR transport locator</th><th>说明</th></tr></thead><tbody>
+        <tr><td><strong>100</strong></td><td><code>240a:a00f:100::/48</code></td><td>MIDR_fudan</td><td><code>240a:a00f:100:1::2</code></td><td>复旦业务前缀</td></tr>
+        <tr><td><strong>200</strong></td><td><code>240a:a00f:200::/48</code></td><td>MIDR_buaa</td><td><code>240a:a00f:200:1::2</code></td><td>北航业务前缀</td></tr>
+        <tr><td><strong>300</strong></td><td><code>240a:a00f:300::/48</code></td><td>MIDR_wlq</td><td><code>240a:a00f:300:1::2</code></td><td>乌鲁木齐业务前缀</td></tr>
+        <tr><td><strong>400</strong></td><td><code>240a:a00f:400::/48</code></td><td>MIDR_kmn</td><td><code>240a:a00f:400:1::2</code></td><td>昆明业务前缀</td></tr>
+        <tr><td><strong>500</strong></td><td><code>240a:a00f:500::/48</code></td><td>MIDR_qda</td><td><code>240a:a00f:500:1::2</code></td><td>青岛业务前缀</td></tr>
+        <tr><td><strong>600</strong></td><td><code>240a:a00f:600::/48</code></td><td>T1 BGP-R</td><td>—</td><td>Tier-1 业务前缀，不对应 MIDR 节点</td></tr>
+        <tr><td><strong>800</strong></td><td><code>240a:a00f:800::/48</code></td><td>云 A：MIDR-R1/R2/R3_wh</td><td><code>800:1::2 / 800:2::2 / 800:3::2</code></td><td>云 A 业务前缀</td></tr>
+        <tr><td><strong>810</strong></td><td><code>240a:a00f:810::/48</code></td><td>云 B：MIDR-R1/R2/R3_zhz</td><td><code>810:1::2 / 810:2::2 / 810:3::2</code></td><td>云 B 业务前缀</td></tr>
+        <tr><td><strong>f000:737</strong></td><td><code>240a:a00f:f000:737::/64</code></td><td>TEIN-MIDR_pku</td><td><code>240a:a00f:f000:737::f037</code></td><td>北京 TEIN MIDR 业务前缀</td></tr>
+      </tbody></table></div></section>
+      <section class="panel"><div class="panel-head"><h2>节点验收表</h2><small>点击查看详情</small></div><div class="panel-body table-wrap"><table><thead><tr><th>节点</th><th>角色</th><th>Group</th><th>Session</th><th>Link</th><th>SPF</th><th>GRE</th><th>FIB</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+
+    </div>
+  </main>
+  <script>
+    const nodes = [
+      {name:'MIDR_fudan', id:101, locator:'240a:a00f:100:1::2', group:2, role:'rep', roleLabel:'群代表', edge:true, sessions:4, links:2, reachable:9, local:4, intra:1, inter:4, gre:2, proto:5, prefixes:4, routes:[['240a:a00f:300::/48','fe80::6a00:0:6500:0','mgre-6a000000'],['240a:a00f:400::/48','fe80::6a00:0:6500:0','mgre-6a000000'],['240a:a00f:500::/48','fe80::6a00:0:6500:0','mgre-6a000000'],['240a:a00f:810::/48','fe80::6a00:0:6500:0','mgre-6a000000'],['240a:a00f:f000:737::/64','fe80::6a00:0:6500:0','mgre-6a000000']], x:255, y:145},
+      {name:'MIDR_buaa', id:102, locator:'240a:a00f:200:1::2', group:1, role:'rep', roleLabel:'群代表', edge:true, sessions:9, links:7, reachable:9, local:4, intra:0, inter:5, gre:7, proto:5, prefixes:4, routes:[['240a:a00f:300::/48','fe80::6700:0:6600:0','mgre-67000000'],['240a:a00f:400::/48','fe80::6800:0:6600:0','mgre-68000000'],['240a:a00f:500::/48','fe80::6900:0:6600:0','mgre-69000000'],['240a:a00f:810::/48','fe80::6b00:0:6600:0','mgre-6b000000'],['240a:a00f:f000:737::/64','fe80::6b00:0:6600:0','mgre-6b000000']], x:420, y:115},
+      {name:'MIDR_wlq', id:103, locator:'240a:a00f:300:1::2', group:3, role:'rep', roleLabel:'自动群代表', edge:true, sessions:4, links:2, reachable:9, local:2, intra:0, inter:7, gre:2, proto:7, prefixes:2, routes:[['240a:a00f:100::/48','fe80::6600:0:6700:0','mgre-66000000'],['240a:a00f:200::/48','fe80::6600:0:6700:0','mgre-66000000'],['240a:a00f:400::/48','fe80::6800:0:6700:0','mgre-68000000'],['240a:a00f:500::/48','fe80::6600:0:6700:0','mgre-66000000'],['240a:a00f:800::/48','fe80::6600:0:6700:0','mgre-66000000'],['240a:a00f:810::/48','fe80::6600:0:6700:0','mgre-66000000'],['240a:a00f:f000:737::/64','fe80::6600:0:6700:0','mgre-66000000']], x:130, y:315},
+      {name:'MIDR_kmn', id:104, locator:'240a:a00f:400:1::2', group:4, role:'rep', roleLabel:'自动群代表', edge:true, sessions:5, links:3, reachable:9, local:2, intra:0, inter:7, gre:3, proto:7, prefixes:2, routes:[['240a:a00f:100::/48','fe80::6600:0:6800:0','mgre-66000000'],['240a:a00f:200::/48','fe80::6600:0:6800:0','mgre-66000000'],['240a:a00f:300::/48','fe80::6700:0:6800:0','mgre-67000000'],['240a:a00f:500::/48','fe80::6900:0:6800:0','mgre-69000000'],['240a:a00f:800::/48','fe80::6600:0:6800:0','mgre-66000000'],['240a:a00f:810::/48','fe80::6600:0:6800:0','mgre-66000000'],['240a:a00f:f000:737::/64','fe80::6600:0:6800:0','mgre-66000000']], x:275, y:390},
+      {name:'MIDR_qda', id:105, locator:'240a:a00f:500:1::2', group:5, role:'rep', roleLabel:'自动群代表', edge:true, sessions:8, links:6, reachable:9, local:2, intra:0, inter:7, gre:6, proto:7, prefixes:2, routes:[['240a:a00f:100::/48','fe80::6a00:0:6900:0','mgre-6a000000'],['240a:a00f:200::/48','fe80::6a00:0:6900:0','mgre-6a000000'],['240a:a00f:300::/48','fe80::6600:0:6900:0','mgre-66000000'],['240a:a00f:400::/48','fe80::6800:0:6900:0','mgre-68000000'],['240a:a00f:800::/48','fe80::6a00:0:6900:0','mgre-6a000000'],['240a:a00f:810::/48','fe80::6a00:0:6900:0','mgre-6a000000'],['240a:a00f:f000:737::/64','fe80::6a00:0:6900:0','mgre-6a000000']], x:560, y:395},
+      {name:'MIDR-R1_wh', id:106, locator:'240a:a00f:800:1::2', group:2, role:'member', roleLabel:'普通成员', edge:true, sessions:6, links:6, reachable:9, local:4, intra:1, inter:4, gre:6, proto:5, prefixes:4, routes:[['240a:a00f:300::/48','fe80::6600:0:6a00:0','mgre-66000000'],['240a:a00f:400::/48','fe80::6600:0:6a00:0','mgre-66000000'],['240a:a00f:500::/48','fe80::6900:0:6a00:0','mgre-69000000'],['240a:a00f:800::/48','fe80::6500:0:6a00:0','mgre-65000000'],['240a:a00f:f000:737::/64','fe80::6e00:0:6a00:0','mgre-6e000000']], x:210, y:225},
+      {name:'MIDR-R2_wh', id:107, locator:'240a:a00f:800:2::2', group:2, role:'member', roleLabel:'内部节点', edge:false, sessions:6, links:6, reachable:9, local:0, intra:5, inter:4, gre:6, proto:9, prefixes:0, routes:[['240a:a00f:100::/48','fe80::6a00:0:6b00:0','mgre-6a000000'],['240a:a00f:200::/48','fe80::6a00:0:6b00:0','mgre-6a000000'],['240a:a00f:300::/48','fe80::6600:0:6b00:0','mgre-66000000'],['240a:a00f:400::/48','fe80::6600:0:6b00:0','mgre-66000000'],['240a:a00f:500::/48','fe80::6900:0:6b00:0','mgre-69000000'],['240a:a00f:600::/48','fe80::6a00:0:6b00:0','mgre-6a000000'],['240a:a00f:800::/48','fe80::6500:0:6b00:0','mgre-65000000'],['240a:a00f:810::/48','fe80::6a00:0:6b00:0','mgre-6a000000'],['240a:a00f:f000:737::/64','fe80::6e00:0:6b00:0','mgre-6e000000']], x:125, y:190},
+      {name:'MIDR-R3_wh', id:108, locator:'240a:a00f:800:3::2', group:0, role:'bootstrap', roleLabel:'专职 Bootstrap', edge:false, sessions:7, links:0, reachable:0, local:0, intra:0, inter:0, gre:0, proto:0, prefixes:0, routes:[], x:70, y:145},
+      {name:'MIDR-R1_zhz', id:109, locator:'240a:a00f:810:1::2', group:6, role:'rep', roleLabel:'自动群代表', edge:true, sessions:6, links:4, reachable:9, local:4, intra:0, inter:5, gre:4, proto:5, prefixes:4, routes:[['240a:a00f:100::/48','fe80::6e00:0:6d00:0','mgre-6e000000'],['240a:a00f:200::/48','fe80::6e00:0:6d00:0','mgre-6e000000'],['240a:a00f:300::/48','fe80::6e00:0:6d00:0','mgre-6e000000'],['240a:a00f:400::/48','fe80::6e00:0:6d00:0','mgre-6e000000'],['240a:a00f:500::/48','fe80::6e00:0:6d00:0','mgre-6e000000']], x:710, y:235},
+      {name:'MIDR-R2_zhz', id:110, locator:'240a:a00f:810:2::2', group:6, role:'member', roleLabel:'内部节点', edge:false, sessions:5, links:5, reachable:9, local:0, intra:4, inter:5, gre:5, proto:9, prefixes:0, routes:[['240a:a00f:100::/48','fe80::6b00:0:6e00:0','mgre-6b000000'],['240a:a00f:200::/48','fe80::6b00:0:6e00:0','mgre-6b000000'],['240a:a00f:300::/48','fe80::6b00:0:6e00:0','mgre-6b000000'],['240a:a00f:400::/48','fe80::6b00:0:6e00:0','mgre-6b000000'],['240a:a00f:500::/48','fe80::6b00:0:6e00:0','mgre-6b000000'],['240a:a00f:600::/48','fe80::6d00:0:6e00:0','mgre-6d000000'],['240a:a00f:800::/48','fe80::6d00:0:6e00:0','mgre-6d000000'],['240a:a00f:810::/48','fe80::6d00:0:6e00:0','mgre-6d000000'],['240a:a00f:f000:737::/64','fe80::6d00:0:6e00:0','mgre-6d000000']], x:790, y:300},
+      {name:'MIDR-R3_zhz', id:111, locator:'240a:a00f:810:3::2', group:0, role:'bootstrap', roleLabel:'专职 Bootstrap', edge:false, sessions:7, links:0, reachable:0, local:0, intra:0, inter:0, gre:0, proto:0, prefixes:0, routes:[], x:845, y:195},
+      {name:'TEIN-MIDR_pku', id:112, locator:'240a:a00f:f000:737::f037', group:6, role:'member', roleLabel:'普通成员', edge:true, sessions:5, links:5, reachable:9, local:2, intra:2, inter:5, gre:5, proto:7, prefixes:2, routes:[['240a:a00f:100::/48','fe80::6b00:0:7000:0','mgre-6b000000'],['240a:a00f:200::/48','fe80::6b00:0:7000:0','mgre-6b000000'],['240a:a00f:300::/48','fe80::6b00:0:7000:0','mgre-6b000000'],['240a:a00f:400::/48','fe80::6b00:0:7000:0','mgre-6b000000'],['240a:a00f:500::/48','fe80::6b00:0:7000:0','mgre-6b000000'],['240a:a00f:600::/48','fe80::6d00:0:7000:0','mgre-6d000000'],['240a:a00f:800::/48','fe80::6d00:0:7000:0','mgre-6d000000']], x:650, y:365}
+    ];
+    const edges = [[101,106],[101,107],[102,103],[102,104],[102,105],[102,106],[102,107],[102,109],[102,110],[103,104],[104,105],[105,106],[105,107],[105,109],[105,112],[106,107],[106,110],[106,112],[107,110],[107,112],[109,110],[109,112],[110,112]];
+    const prefixOrigins = {
+      '240a:a00f:100::/48':'MIDR_fudan',
+      '240a:a00f:200::/48':'MIDR_buaa',
+      '240a:a00f:300::/48':'MIDR_wlq',
+      '240a:a00f:400::/48':'MIDR_kmn',
+      '240a:a00f:500::/48':'MIDR_qda',
+      '240a:a00f:600::/48':'T1 BGP-R',
+      '240a:a00f:800::/48':'云 A BGP-R',
+      '240a:a00f:810::/48':'云 B BGP-R',
+      '240a:a00f:f000:737::/64':'TEIN-MIDR_pku'
+    };
+    const prefixOriginNodes = {
+      '240a:a00f:100::/48':101,
+      '240a:a00f:200::/48':102,
+      '240a:a00f:300::/48':103,
+      '240a:a00f:400::/48':104,
+      '240a:a00f:500::/48':105,
+      '240a:a00f:f000:737::/64':112
+    };
+    // Selected non-MIDR FIB entries from the acceptance snapshot. A local
+    // BGP/kernel route terminates the Overlay trace at that node.
+    const localFibs = {
+      101:['240a:a00f:100::/48','240a:a00f:200::/48','240a:a00f:600::/48','240a:a00f:800::/48'],
+      102:['240a:a00f:100::/48','240a:a00f:200::/48','240a:a00f:600::/48','240a:a00f:800::/48'],
+      103:['240a:a00f:300::/48','240a:a00f:600::/48'],
+      104:['240a:a00f:400::/48','240a:a00f:600::/48'],
+      105:['240a:a00f:500::/48','240a:a00f:600::/48'],
+      106:['240a:a00f:100::/48','240a:a00f:200::/48','240a:a00f:600::/48','240a:a00f:810::/48'],
+      109:['240a:a00f:600::/48','240a:a00f:800::/48','240a:a00f:810::/48','240a:a00f:f000:737::/64'],
+      112:['240a:a00f:810::/48','240a:a00f:f000:737::/64']
+    };
+    const tunnelPeers = {
+      101: {'mgre-6a000000':['MIDR-R1_wh','240a:a00f:800:1::2']},
+      102: {'mgre-67000000':['MIDR_wlq','240a:a00f:300:1::2'],'mgre-68000000':['MIDR_kmn','240a:a00f:400:1::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2'],'mgre-6b000000':['MIDR-R2_wh','240a:a00f:800:2::2']},
+      103: {'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-68000000':['MIDR_kmn','240a:a00f:400:1::2']},
+      104: {'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-67000000':['MIDR_wlq','240a:a00f:300:1::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2']},
+      105: {'mgre-6a000000':['MIDR-R1_wh','240a:a00f:800:1::2'],'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-68000000':['MIDR_kmn','240a:a00f:400:1::2']},
+      106: {'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2'],'mgre-65000000':['MIDR_fudan','240a:a00f:100:1::2'],'mgre-6e000000':['MIDR-R2_zhz','240a:a00f:810:2::2']},
+      107: {'mgre-6a000000':['MIDR-R1_wh','240a:a00f:800:1::2'],'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2'],'mgre-65000000':['MIDR_fudan','240a:a00f:100:1::2'],'mgre-6e000000':['MIDR-R2_zhz','240a:a00f:810:2::2']},
+      109: {'mgre-6e000000':['MIDR-R2_zhz','240a:a00f:810:2::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2'],'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-70000000':['TEIN-MIDR_pku','240a:a00f:f000:737::f037']},
+      110: {'mgre-6d000000':['MIDR-R1_zhz','240a:a00f:810:1::2'],'mgre-6b000000':['MIDR-R2_wh','240a:a00f:800:2::2'],'mgre-6a000000':['MIDR-R1_wh','240a:a00f:800:1::2'],'mgre-66000000':['MIDR_buaa','240a:a00f:200:1::2'],'mgre-70000000':['TEIN-MIDR_pku','240a:a00f:f000:737::f037']},
+      112: {'mgre-6e000000':['MIDR-R2_zhz','240a:a00f:810:2::2'],'mgre-6d000000':['MIDR-R1_zhz','240a:a00f:810:1::2'],'mgre-6b000000':['MIDR-R2_wh','240a:a00f:800:2::2'],'mgre-6a000000':['MIDR-R1_wh','240a:a00f:800:1::2'],'mgre-69000000':['MIDR_qda','240a:a00f:500:1::2']}
+    };
+    const groupColors = {0:'#f2e7d2',1:'#e3eff9',2:'#dfeff0',3:'#eee8f8',4:'#f5e8dc',5:'#e5f2e5',6:'#f4e4ec'};
+    const LAYOUT_KEY = 'midr-fiti-snapshot-layout-v1';
+    const EMBEDDED_LAYOUT = null;
+    if (EMBEDDED_LAYOUT) nodes.forEach(n => { const p=EMBEDDED_LAYOUT[n.id]; if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { n.x=p.x; n.y=p.y; } });
+    const defaultLayout = Object.fromEntries(nodes.map(n => [n.id, {x:n.x, y:n.y}]));
+    let groupFilter = 'all', roleFilter = 'all', selected = null, drag = null, suppressClick = false;
+    let activePath = null;
+    function loadLayout() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}');
+        const layout = Object.keys(saved).length ? saved : (EMBEDDED_LAYOUT || {});
+        nodes.forEach(n => { const p = layout[n.id]; if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) { n.x = Math.max(35, Math.min(885, p.x)); n.y = Math.max(35, Math.min(500, p.y)); } });
+        if (Object.keys(saved).length) document.getElementById('layoutStatus').textContent = '已加载保存布局';
+        else if (Object.keys(EMBEDDED_LAYOUT || {}).length) document.getElementById('layoutStatus').textContent = '已加载文件内布局';
+      } catch (_) { localStorage.removeItem(LAYOUT_KEY); }
+    }
+    function saveLayout() {
+      const saved = Object.fromEntries(nodes.map(n => [n.id, {x:Math.round(n.x), y:Math.round(n.y)}]));
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(saved));
+      document.getElementById('layoutStatus').textContent = '布局已保存';
+    }
+    function exportLayoutHtml() {
+      const layout = Object.fromEntries(nodes.map(n => [n.id, {x:Math.round(n.x), y:Math.round(n.y)}]));
+      const marker = /^    const EMBEDDED_LAYOUT = .*;$/m;
+      const source = '<!doctype html>\n' + document.documentElement.outerHTML;
+      if (!marker.test(source)) {
+        document.getElementById('layoutStatus').textContent = '导出失败：找不到布局标记';
+        return;
+      }
+      const exported = source.replace(marker, '    const EMBEDDED_LAYOUT = ' + JSON.stringify(layout) + ';');
+      const blob = new Blob([exported], {type:'text/html;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = url;
+      link.download = 'midr-fiti-snapshot-layout-' + stamp + '.html';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      document.getElementById('layoutStatus').textContent = '已导出当前布局 HTML';
+    }
+    function resetLayout() {
+      localStorage.removeItem(LAYOUT_KEY);
+      nodes.forEach(n => { n.x = defaultLayout[n.id].x; n.y = defaultLayout[n.id].y; });
+      document.getElementById('layoutStatus').textContent = '默认布局';
+      selected = null;
+      render();
+    }
+    function svgPoint(evt) {
+      const svg = document.getElementById('map');
+      const point = svg.createSVGPoint();
+      point.x = evt.clientX; point.y = evt.clientY;
+      const transformed = point.matrixTransform(svg.getScreenCTM().inverse());
+      return {x: transformed.x, y: transformed.y};
+    }
+    const byId = id => nodes.find(n => n.id === id);
+    const roleName = n => n.role === 'bootstrap' ? '专职 Bootstrap' : n.roleLabel;
+    const visible = n => (groupFilter === 'all' || String(n.group) === groupFilter) && (roleFilter === 'all' || n.role === roleFilter);
+    function localFibProtocol(id, prefix) {
+      return id === 112 && prefix === '240a:a00f:f000:737::/64' ? 'Kernel 直连' : 'BGP';
+    }
+    // Follow the selected FIB; stop at a confirmed BGP or connected exit.
+    function traceSnapshotPath(startId, prefix) {
+      const hops = [], segments = [], visited = new Set();
+      let current = byId(startId);
+      if (!current || !Object.hasOwn(prefixOrigins, prefix))
+        return {hops, segments, error:'请选择有效的起点和业务网段'};
+      while (current) {
+        if (visited.has(current.id))
+          return {hops, segments, error:'快照路由出现循环，无法确认完整路径'};
+        visited.add(current.id);
+        hops.push(current.id);
+        if (current.role === 'bootstrap')
+          return {hops, segments, error:'Bootstrap 不承担业务转发，没有业务 FIB 路径'};
+        if ((localFibs[current.id] || []).includes(prefix))
+          return {hops, segments, egress:current.id, prefix, local:true};
+        const route = current.routes.find(r => r[0] === prefix);
+        if (!route) {
+          return {hops, segments, error:current.name+' 的快照缺少此网段的路由'};
+        }
+        const mapping = (tunnelPeers[current.id] || {})[route[2]];
+        const next = mapping && nodes.find(n => n.name === mapping[0] && n.locator === mapping[1]);
+        if (!next || !edges.some(([a,b]) => (a===current.id && b===next.id) || (b===current.id && a===next.id)))
+          return {hops, segments, error:current.name+' 的下一跳缺少有效 Overlay 映射'};
+        segments.push([current.id, next.id]);
+        current = next;
+      }
+      return {hops, segments, error:'快照中没有完整路径'};
+    }
+    function highlightPath() {
+      activePath = traceSnapshotPath(Number(document.getElementById('pathStart').value), document.getElementById('pathEnd').value);
+      groupFilter = 'all'; roleFilter = 'all';
+      document.getElementById('groupFilter').value = 'all';
+      selected = activePath.hops[0] || null;
+      render();
+    }
+    function clearPath() { activePath = null; render(); }
+    function renderPathSummary() {
+      const summary = document.getElementById('pathSummary');
+      summary.replaceChildren();
+      if (!activePath) { summary.textContent='尚未选择路径'; return; }
+      const pathLabel = document.createElement('strong');
+      pathLabel.textContent='MIDR Overlay：'+activePath.hops.map(id => byId(id).name).join(' -> ');
+      summary.append(pathLabel);
+      if (activePath.error) {
+        const error = document.createElement('div'); error.className='path-error';
+        error.textContent=activePath.error; summary.append(error); return;
+      }
+      const exitLabel = document.createElement('div');
+      exitLabel.textContent='Overlay 出口：'+byId(activePath.egress).name+' -> 本地 '+localFibProtocol(activePath.egress,activePath.prefix);
+      const originId=prefixOriginNodes[activePath.prefix];
+      const externalLabel=document.createElement('div');
+      externalLabel.textContent=originId && originId!==activePath.egress
+        ? 'BGP/Underlay 继续：'+byId(activePath.egress).name+' -> '+byId(originId).name+' · 目的前缀 '+activePath.prefix
+        : '目的前缀：'+prefixOrigins[activePath.prefix]+' ('+activePath.prefix+')';
+      const routeSteps = document.createElement('div');
+      routeSteps.textContent='逐跳 FIB：'+activePath.hops.map(id=>{ const n=byId(id); if ((localFibs[id]||[]).includes(activePath.prefix)) return n.name+' [本地 '+localFibProtocol(id,activePath.prefix)+']'; const r=n.routes.find(x=>x[0]===activePath.prefix); const peer=r && (tunnelPeers[id]||{})[r[2]]; return n.name+' [proto 199 -> '+(peer?peer[0]:r?r[2]:'unknown')+']'; }).join(' -> ');
+      summary.append(exitLabel);
+      summary.append(externalLabel);
+      summary.append(routeSteps);
+      const hidden = activePath.hops.filter(id => !visible(byId(id))).length;
+      if (hidden) { const note=document.createElement('div'); note.textContent='当前筛选隐藏了 '+hidden+' 个路径节点'; summary.append(note); }
+    }
+    function initPathControls() {
+      const start=document.getElementById('pathStart'), end=document.getElementById('pathEnd');
+      start.replaceChildren(); end.replaceChildren();
+      nodes.forEach(n => start.add(new Option(n.name+(n.role==='bootstrap'?' (Bootstrap)':''), String(n.id))));
+      Object.entries(prefixOrigins).forEach(([prefix,name]) => end.add(new Option(name+' ('+prefix+')',prefix)));
+      start.value='101'; end.value='240a:a00f:300::/48';
+      start.onchange=clearPath; end.onchange=clearPath;
+      document.getElementById('highlightPath').onclick=highlightPath;
+      document.getElementById('clearPath').onclick=clearPath;
+    }
+    function draw() {
+      const svg = document.getElementById('map'); svg.innerHTML = '';
+      const ns = 'http://www.w3.org/2000/svg';
+      const visibleIds = new Set(nodes.filter(visible).map(n => n.id));
+      [0,1,2,3,4,5,6].forEach(g => { const members = nodes.filter(n => n.group === g && visible(n)); if (!members.length) return; const minX=Math.min(...members.map(n=>n.x))-49, maxX=Math.max(...members.map(n=>n.x))+49, minY=Math.min(...members.map(n=>n.y))-46, maxY=Math.max(...members.map(n=>n.y))+70; const r=document.createElementNS(ns,'rect'); r.setAttribute('x',minX); r.setAttribute('y',minY); r.setAttribute('width',Math.max(98,maxX-minX)); r.setAttribute('height',Math.max(116,maxY-minY)); r.setAttribute('rx','22'); r.setAttribute('fill',groupColors[g]); r.setAttribute('stroke',g===0?'#b99358':'#a5bec7'); r.setAttribute('class','group-hull'); svg.appendChild(r); const t=document.createElementNS(ns,'text'); t.setAttribute('x',minX+12); t.setAttribute('y',minY+19); t.setAttribute('class','group-label'); t.textContent='G'+g+(g===0?' Bootstrap':''); svg.appendChild(t); });
+      const pathNodes = new Set(activePath ? activePath.hops : []);
+      const originId = activePath ? prefixOriginNodes[activePath.prefix] : null;
+      edges.forEach(([a,b]) => { const na=byId(a), nb=byId(b); if (!visibleIds.has(a) || !visibleIds.has(b)) return; const line=document.createElementNS(ns,'line'); line.setAttribute('x1',na.x); line.setAttribute('y1',na.y); line.setAttribute('x2',nb.x); line.setAttribute('y2',nb.y); const onPath=activePath && activePath.segments.some(([x,y]) => (x===a && y===b) || (x===b && y===a)); line.setAttribute('class','overlay-edge '+(na.group===nb.group?'same':'cross')+(activePath?(onPath?' path':' dim'):'')); svg.appendChild(line); });
+      nodes.filter(visible).forEach(n => { const g=document.createElementNS(ns,'g'); const onPath=pathNodes.has(n.id), isOrigin=originId===n.id && !onPath; g.setAttribute('class','node '+n.role+' '+(n.edge?'edge':'internal')+(selected===n.id?' selected':'')+(activePath?(onPath?' path-node':isOrigin?' path-origin':' dim'):'')); g.dataset.id=n.id; g.addEventListener('pointerdown', beginDrag); g.addEventListener('click',()=>{ if (suppressClick) { suppressClick=false; return; } selected=n.id; render(); }); const c=document.createElementNS(ns,'circle'); c.setAttribute('cx',n.x); c.setAttribute('cy',n.y); c.setAttribute('r',n.role==='bootstrap'?18:16); g.appendChild(c); const t=document.createElementNS(ns,'text'); t.setAttribute('x',n.x); t.setAttribute('y',n.y+34); t.setAttribute('class','label'); t.textContent=n.name; g.appendChild(t); const m=document.createElementNS(ns,'text'); m.setAttribute('x',n.x); m.setAttribute('y',n.y+48); m.setAttribute('class','meta'); m.textContent='G'+n.group+' · '+(n.edge?'edge':'internal'); g.appendChild(m); svg.appendChild(g); });
+    }
+    function beginDrag(evt) {
+      if (evt.button !== 0) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      const n = byId(Number(evt.currentTarget.dataset.id));
+      const p = svgPoint(evt);
+      drag = {id:n.id, dx:n.x-p.x, dy:n.y-p.y, moved:false};
+      selected = n.id;
+      evt.currentTarget.classList.add('dragging');
+    }
+    function moveDrag(evt) {
+      if (!drag) return;
+      const n = byId(drag.id);
+      const p = svgPoint(evt);
+      const nextX = Math.max(35, Math.min(885, p.x + drag.dx));
+      const nextY = Math.max(35, Math.min(500, p.y + drag.dy));
+      if (Math.abs(nextX-n.x) > .2 || Math.abs(nextY-n.y) > .2) drag.moved = true;
+      n.x = nextX; n.y = nextY;
+      draw();
+    }
+    function endDrag() {
+      if (!drag) return;
+      suppressClick = drag.moved;
+      drag = null;
+      render();
+    }
+    function renderRows() { const body=document.getElementById('rows'); body.innerHTML=''; nodes.filter(visible).forEach(n=>{ const tr=document.createElement('tr'); if(selected===n.id) tr.className='selected'; tr.onclick=()=>{selected=n.id;render();}; tr.innerHTML='<td><div class="name">'+n.name+'</div><div class="sub">node-id '+n.id+'</div></td><td><span class="pill '+(n.role==='bootstrap'?'warn':n.role==='rep'?'ok':'neutral')+'">'+roleName(n)+'</span><br><span class="sub">'+(n.edge?'边缘 BGP':'内部')+'</span></td><td>G'+n.group+'</td><td>'+n.sessions+' <span class="sub">Established</span></td><td>'+n.links+' <span class="sub">Up</span></td><td>'+n.reachable+' <span class="sub">reachable</span></td><td>'+n.gre+' <span class="sub">READY</span></td><td>'+n.proto+' <span class="sub">proto 199</span></td>'; body.appendChild(tr);}); }
+    function renderDetail() {
+      const hint=document.getElementById('detailHint'), body=document.getElementById('detailBody'), n=byId(selected);
+      if(!n || !visible(n)){ hint.textContent='选择一个节点'; body.innerHTML='<div class="empty">点击拓扑节点或节点表中的一行。</div>'; return; }
+      hint.textContent='node-id '+n.id;
+      const routeRows = n.routes.length ? n.routes.map(r=>{ const peer=(tunnelPeers[n.id]||{})[r[2]]||['未知','未知']; const origin=prefixOrigins[r[0]]||'未知来源'; return '<tr><td>'+r[0]+' ('+origin+')</td><td>'+r[1]+'</td><td>'+r[2]+'</td><td>'+peer[1]+' ('+peer[0]+')</td><td>20</td></tr>'; }).join('') : '<tr><td colspan="5" class="no-routes">该节点是专职 Bootstrap，当前验收快照未安装业务 proto 199 路由。</td></tr>';
+      body.innerHTML='<div class="detail-title"><div><h3>'+n.name+'</h3><p>'+roleName(n)+' · '+(n.edge?'边缘 BGP/Provider':'MIDR 内部节点')+'</p></div><span class="pill ok">验收快照</span></div><dl><dt>Transport locator</dt><dd>'+n.locator+'</dd><dt>Group-ID</dt><dd>'+n.group+'</dd></dl><div class="route-table-title">最终安装的 MIDR 路由表（proto 199）</div><div class="route-table-wrap"><table class="route-table"><thead><tr><th>Prefix（来源）</th><th>Overlay 下一跳</th><th>Overlay 出接口</th><th>GRE outer remote</th><th>内核安装 metric</th></tr></thead><tbody>'+routeRows+'</tbody></table></div><p class="footnote">路由来自顺序冷启动验收快照的 <code>ip -6 route show proto 199</code>。Prefix 括号内标注业务前缀来源；GRE outer remote 括号内标注 Overlay 对端节点。表中的 <code>fe80::...</code> 是 Overlay link-local 下一跳，<code>mgre-*</code> 是虚拟接口；内核安装 metric 固定为 20，SPF 路径 metric 见 <code>show midr spf</code>。</p>';
+    }
+    function renderChips(){ const c=document.getElementById('groupChips'); c.innerHTML=''; [0,1,2,3,4,5,6].forEach(g=>{const ns=nodes.filter(n=>n.group===g), b=document.createElement('button'); b.className='group-chip '+(groupFilter===String(g)?'active':''); b.textContent='G'+g+' · '+(g===0?'Bootstrap':ns.filter(n=>n.role==='rep').map(n=>n.name).join(', ')||'成员'); b.onclick=()=>{groupFilter=String(g);document.getElementById('groupFilter').value=groupFilter;render();}; c.appendChild(b);}); }
+    function render(){ draw(); renderRows(); renderDetail(); renderChips(); renderPathSummary(); document.querySelectorAll('[data-role]').forEach(b=>b.classList.toggle('active',b.dataset.role===roleFilter)); }
+    document.getElementById('groupFilter').onchange=e=>{groupFilter=e.target.value;render();}; document.querySelectorAll('[data-role]').forEach(b=>b.onclick=()=>{roleFilter=b.dataset.role;render();});
+    document.getElementById('saveLayout').onclick=saveLayout;
+    document.getElementById('exportLayoutHtml').onclick=exportLayoutHtml;
+    document.getElementById('resetLayout').onclick=resetLayout;
+    window.addEventListener('pointermove', moveDrag);
+    window.addEventListener('pointerup', endDrag);
+    initPathControls();
+    loadLayout();
+    render();
+  </script>
+</body>
+</html>

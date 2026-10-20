@@ -89,9 +89,9 @@ test -S /run/midr/zserv.api
 test -S /run/midr/midrd.vty
 ss -tnp | grep ':5871'
 
-NEW_DIR=$(readlink -f /opt/midr-current)
-python3 "$NEW_DIR/midrd-vty.py" \
-  --socket /run/midr/midrd.vty \
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
   -c 'show midr neighbors' \
   -c 'show midr links' \
   -c 'show midr virtual-links'
@@ -152,8 +152,9 @@ ip -4 route get 198.18.101.1 from 198.18.102.1
 先记录基线：
 
 ```bash
-NEW_DIR=$(readlink -f /opt/midr-current)
-python3 "$NEW_DIR/midrd-vty.py" --socket /run/midr/midrd.vty \
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
   -c 'show midr virtual-links' \
   -c 'show midr links'
 ```
@@ -174,8 +175,9 @@ ip link del "$VLINK"
 systemctl restart midrd.service
 systemctl is-active midrd.service
 test -S /run/midr/midrd.vty
-NEW_DIR=$(readlink -f /opt/midr-current)
-python3 "$NEW_DIR/midrd-vty.py" --socket /run/midr/midrd.vty \
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
   -c 'show midr neighbors' \
   -c 'show midr virtual-links'
 ```

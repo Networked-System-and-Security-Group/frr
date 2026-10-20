@@ -96,13 +96,14 @@ ip -6 route get 240a:a00f:100:1::2 from 240a:a00f:200:1::2
 
 ## 4. VTY 控制面验收
 
-在每台节点执行以下命令。`NEW_DIR` 由当前版本符号链接解析，不需要手工填写发布目录：
+在每台节点使用当前发布包的 `vtysh` 查询 MIDR；统一交互入口和 Zebra/BGP 查询见 00 文档第 8 节：
 
 ```bash
-NEW_DIR=$(readlink -f /opt/midr-current)
-python3 "$NEW_DIR/midrd-vty.py" \
-  --socket /run/midr/midrd.vty \
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
   -c 'show midr self' \
+  -c 'show midr join' \
   -c 'show midr neighbors' \
   -c 'show midr nodes' \
   -c 'show midr links' \
@@ -134,8 +135,9 @@ journalctl -u midrd.service -n 100 --no-pager
 systemctl restart midrd.service
 systemctl is-active midrd.service
 test -S /run/midr/midrd.vty
-NEW_DIR=$(readlink -f /opt/midr-current)
-python3 "$NEW_DIR/midrd-vty.py" --socket /run/midr/midrd.vty \
+export MIDR_DIR=/opt/midr-current
+export LD_LIBRARY_PATH="$MIDR_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$MIDR_DIR/vtysh" --vty_socket /run/midr -d midrd \
   -c 'show midr neighbors'
 ```
 
