@@ -30,6 +30,10 @@ SNAPSHOT_END = 4
 EOR = 5
 FRAME_LEN = 48
 MAX_AS_PATH_LENGTH_DEFAULT = 1
+# midrd tags every route it installs (midrd --route-tag).  A bgpd path carrying
+# this tag was redistributed from MIDR and must never be exported back into
+# MIDR as a local prefix.
+MIDR_ROUTE_TAG_DEFAULT = 199
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,16 @@ def path_is_usable(path: dict[str, Any]) -> bool:
     if "valid" in path and not truthy(path["valid"]):
         return False
     return True
+
+
+def path_is_midr(path: dict[str, Any], midr_route_tag: int) -> bool:
+    """True when bgpd learned this path by redistributing a MIDR route."""
+    if not midr_route_tag:
+        return False
+    try:
+        return int(path.get("tag", 0)) == midr_route_tag
+    except (TypeError, ValueError):
+        return False
 
 
 def path_is_selected(path: dict[str, Any]) -> bool:
@@ -177,7 +191,8 @@ def route_paths(route: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def parse_bgp_json(payload: Any, excluded: set[ipaddress._BaseNetwork],
-                   max_as_path_length: int = MAX_AS_PATH_LENGTH_DEFAULT) -> dict[str, Prefix]:
+                   max_as_path_length: int = MAX_AS_PATH_LENGTH_DEFAULT,
+                   midr_route_tag: int = MIDR_ROUTE_TAG_DEFAULT) -> dict[str, Prefix]:
     result: dict[str, Prefix] = {}
     seen: set[tuple[str, str]] = set()
     for text, route in iter_route_entries(payload):
@@ -190,15 +205,26 @@ def parse_bgp_json(payload: Any, excluded: set[ipaddress._BaseNetwork],
         seen.add(key)
         paths = route_paths(route)
         usable = [path for path in paths if path_is_usable(path)]
+        midr_selected = any(path_is_selected(path) and
+                            path_is_midr(path, midr_route_tag) for path in usable)
+        usable = [path for path in usable
+                  if not path_is_midr(path, midr_route_tag)]
         if not usable:
             continue
         selected = [path for path in usable if path_is_selected(path)]
         if not selected:
-            # Some FRR versions omit best/selected for a route with one valid
-            # path.  Accept that unambiguous case only.
-            if len(usable) != 1:
+            if midr_selected:
+                # The redistributed MIDR route won bestpath (local weight)
+                # and hid the remaining paths.  They are what bgpd would
+                # select without it, so they still prove an independent
+                # exit; the AS_PATH policy below applies to them as usual.
+                selected = usable
+            elif len(usable) == 1:
+                # Some FRR versions omit best/selected for a route with one
+                # valid path.  Accept that unambiguous case only.
+                selected = usable
+            else:
                 continue
-            selected = usable
         selected = [path for path in selected
                     if (length := as_path_length(path)) is not None
                     and length <= max_as_path_length]
@@ -248,10 +274,14 @@ class Provider:
 
     def query_prefixes(self) -> dict[str, Prefix]:
         result: dict[str, Prefix] = {}
-        for command in ("show bgp ipv4 unicast json", "show bgp ipv6 unicast json"):
+        # "detail" is required: only the detailed path JSON carries the route
+        # tag that identifies paths redistributed from MIDR.
+        for command in ("show bgp ipv4 unicast json detail",
+                        "show bgp ipv6 unicast json detail"):
             payload = self.query(command)
             result.update(parse_bgp_json(payload, self.excluded,
-                                         self.args.max_as_path_length))
+                                         self.args.max_as_path_length,
+                                         self.args.midr_route_tag))
         return result
 
     def close(self) -> None:
@@ -345,6 +375,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-as-path-length", type=int,
                         default=MAX_AS_PATH_LENGTH_DEFAULT,
                         help="maximum exported AS_PATH hop count (default: 1)")
+    parser.add_argument("--midr-route-tag", type=int,
+                        default=MIDR_ROUTE_TAG_DEFAULT,
+                        help="route tag of paths redistributed from MIDR; they "
+                             "are never exported (default: 199, 0 disables)")
     parser.add_argument("--log-level", default="INFO",
                         choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args()
@@ -356,6 +390,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("interval must be positive")
     if not 0 <= args.max_as_path_length <= 0xFFFFFFFF:
         parser.error("max-as-path-length must be in 0..4294967295")
+    if not 0 <= args.midr_route_tag <= 0xFFFFFFFF:
+        parser.error("midr-route-tag must be in 0..4294967295")
     return args
 
 
@@ -365,7 +401,8 @@ def main() -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
         excluded = read_excludes(args)
-        logging.info("Prefix export policy: max-as-path-length=%d", args.max_as_path_length)
+        logging.info("Prefix export policy: max-as-path-length=%d midr-route-tag=%d",
+                     args.max_as_path_length, args.midr_route_tag)
         Provider(args, excluded).run()
     except (OSError, ValueError) as exc:
         logging.error("provider stopped: %s", exc)

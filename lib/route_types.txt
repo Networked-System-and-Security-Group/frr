@@ -57,9 +57,11 @@ ZEBRA_ROUTE_OSPF,       ospf,      ospfd,  'O', 1, 0, 1,     "OSPF",          os
 ZEBRA_ROUTE_OSPF6,      ospf6,     ospf6d, 'O', 0, 1, 1,     "OSPFv3",        ospf6d
 ZEBRA_ROUTE_ISIS,       isis,      isisd,  'I', 1, 1, 1,     "IS-IS",         isisd
 ZEBRA_ROUTE_BGP,        bgp,       bgpd,   'B', 1, 1, 1,     "BGP",           bgpd
-# Reason: keep RFC 9815 SPF-computed routes separate from ordinary BGP and
-# avoid enabling redistribution before policy/loop handling is implemented.
-ZEBRA_ROUTE_BGP_MIDR, midr, bgpd,  'l', 1, 1, 0,     "MIDR",    bgpd
+# Reason: keep MIDR SPF-computed routes separate from ordinary BGP.  They are
+# installed by the standalone midrd and may be redistributed by any routing
+# daemon ("redistribute midr") toward the site gateway; midrd tags them so
+# export policy and the Prefix Provider can recognise and filter them.
+ZEBRA_ROUTE_BGP_MIDR, midr, midrd, 'l', 1, 1, 1,     "MIDR",    zebra
 ZEBRA_ROUTE_PIM,	pim,	   pimd,   'P', 0, 0, 0,     "PIM",           pimd
 ZEBRA_ROUTE_EIGRP,      eigrp,     eigrpd, 'E', 1, 0, 1,     "EIGRP",         eigrpd
 ZEBRA_ROUTE_NHRP,       nhrp,      nhrpd,  'N', 1, 1, 1,     "NHRP",          nhrpd

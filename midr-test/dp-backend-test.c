@@ -183,7 +183,7 @@ static void test_encoding_modes(void)
 	struct midr_path path = {};
 	struct midr_path ecmp[2] = {};
 	struct midr_path sid_path = {};
-	struct midr_path_result result;
+	struct midr_path_result result = {};
 	struct midr_path_result ecmp_result = {
 		.paths = ecmp,
 		.path_count = 2,
@@ -221,6 +221,8 @@ static void test_encoding_modes(void)
 	assert(api->instance == MIDR_INSTANCE_SPF);
 	assert(api->metric == 42);
 	assert(api->distance == ZEBRA_BGP_MIDR_DISTANCE_DEFAULT);
+	assert(CHECK_FLAG(api->message, ZAPI_MESSAGE_TAG));
+	assert(api->tag == MIDR_DP_ROUTE_TAG_DEFAULT);
 	assert(CHECK_FLAG(api->flags, ZEBRA_FLAG_ALLOW_RECURSION));
 	assert(!CHECK_FLAG(api->flags, ZEBRA_FLAG_USE_RECURSIVE_WEIGHT));
 	assert(api->nexthop_num == 1);
@@ -347,6 +349,65 @@ static void test_encoding_modes(void)
 
 /*
  * =========================================================================
+ *  Route tag: fixed before start, configurable, 0 disables tagging
+ * =========================================================================
+ */
+static void test_route_tag(void)
+{
+	struct midr_context ctx;
+	struct prefix p = prefix_v4("10.30.0.0", 24);
+	struct midr_path path = {};
+	struct midr_path_result result = {
+		.paths = &path,
+		.path_count = 1,
+		.instance = MIDR_INSTANCE_SPF,
+	};
+	struct zapi_route *api;
+
+	assert(midr_dp_backend_route_tag() == MIDR_DP_ROUTE_TAG_DEFAULT);
+	path_v4(&path, "192.0.2.1", 7, 42, 0);
+
+	/* A custom tag is carried on the ADD; it cannot change while running. */
+	assert(midr_dp_backend_set_route_tag(4242) == 0);
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-tag-test");
+	assert(ctx.master);
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+	assert(midr_dp_backend_set_route_tag(1) == -EBUSY);
+	assert(midr_dp_backend_route_tag() == 4242);
+	assert(midr_zebra_route_add(&ctx, &p, &result) == 0);
+	assert(midr_zebra_route_flush(&ctx) == 0);
+	assert(capture_count == 1);
+	api = &captures[0].api;
+	assert(CHECK_FLAG(api->message, ZAPI_MESSAGE_TAG));
+	assert(api->tag == 4242);
+	midr_dp_backend_stop();
+	midr_ted_destroy(&ctx.ted);
+
+	/* Tag 0 leaves the ZAPI tag unset. */
+	assert(midr_dp_backend_set_route_tag(0) == 0);
+	ted_create(&ctx);
+	ctx.master = event_master_create("midrd-dp-tag0-test");
+	assert(ctx.master);
+	capture_reset();
+	assert(midr_dp_backend_start(&ctx, ctx.master, VRF_DEFAULT) == 0);
+	backend_fake_socket();
+	assert(midr_zebra_route_add(&ctx, &p, &result) == 0);
+	assert(midr_zebra_route_flush(&ctx) == 0);
+	assert(capture_count == 1);
+	api = &captures[0].api;
+	assert(!CHECK_FLAG(api->message, ZAPI_MESSAGE_TAG));
+	assert(api->tag == 0);
+	midr_dp_backend_stop();
+	midr_ted_destroy(&ctx.ted);
+
+	assert(midr_dp_backend_set_route_tag(MIDR_DP_ROUTE_TAG_DEFAULT) == 0);
+}
+
+/*
+ * =========================================================================
  *  Rejected submissions never fake installed state
  * =========================================================================
  */
@@ -356,7 +417,7 @@ static void test_send_failure_and_abort(void)
 	struct midr_dp_status dp;
 	struct prefix p = prefix_v4("10.20.0.0", 24);
 	struct midr_path path = {};
-	struct midr_path_result result;
+	struct midr_path_result result = {};
 
 	ted_create(&ctx);
 	ctx.master = event_master_create("midrd-dp-test");
@@ -1066,6 +1127,7 @@ static void test_gre_api(void)
 int main(void)
 {
 	test_encoding_modes();
+	test_route_tag();
 	test_send_failure_and_abort();
 	test_adapter_pipeline_and_recovery();
 	test_deferred_partial_batch_failure();

@@ -573,6 +573,8 @@ uint8_t proto_redistnum(int afi, const char *s)
 			return ZEBRA_ROUTE_ISIS;
 		else if (strmatch(s, "bgp"))
 			return ZEBRA_ROUTE_BGP;
+		else if (strmatch(s, "midr"))
+			return ZEBRA_ROUTE_BGP_MIDR;
 		else if (strmatch(s, "table"))
 			return ZEBRA_ROUTE_TABLE;
 		else if (strmatch(s, "vnc"))
@@ -607,6 +609,8 @@ uint8_t proto_redistnum(int afi, const char *s)
 			return ZEBRA_ROUTE_ISIS;
 		else if (strmatch(s, "bgp"))
 			return ZEBRA_ROUTE_BGP;
+		else if (strmatch(s, "midr"))
+			return ZEBRA_ROUTE_BGP_MIDR;
 		else if (strmatch(s, "table"))
 			return ZEBRA_ROUTE_TABLE;
 		else if (strmatch(s, "vnc"))

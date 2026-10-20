@@ -185,6 +185,7 @@ static const char midrd_help[] =
 	"  --zserv-path PATH        Zebra ZAPI socket (enables route install)\n"
 	"  --vrf-id N               VRF the installed routes belong to\n"
 	"  --no-zebra               Disable the Zebra/FIB data-plane backend\n"
+	"  --route-tag N            Tag on installed routes (default 199, 0 off)\n"
 	"  --pidfile PATH           Compatibility alias for --pid_file\n";
 
 /* clang-format off */
@@ -219,6 +220,7 @@ enum midrd_option {
 	MIDRD_OPT_VRF_ID,
 	MIDRD_OPT_NO_ZEBRA,
 	MIDRD_OPT_PIDFILE,
+	MIDRD_OPT_ROUTE_TAG,
 };
 
 static const struct option midrd_longopts[] = {
@@ -241,6 +243,7 @@ static const struct option midrd_longopts[] = {
 	{"vrf-id", required_argument, NULL, MIDRD_OPT_VRF_ID},
 	{"no-zebra", no_argument, NULL, MIDRD_OPT_NO_ZEBRA},
 	{"pidfile", required_argument, NULL, MIDRD_OPT_PIDFILE},
+	{"route-tag", required_argument, NULL, MIDRD_OPT_ROUTE_TAG},
 	{0},
 };
 
@@ -3376,6 +3379,19 @@ int main(int argc, char **argv, char **envp)
 		case MIDRD_OPT_PIDFILE:
 			midrd_di.pid_file = optarg;
 			break;
+		case MIDRD_OPT_ROUTE_TAG: {
+			char *end;
+			unsigned long tag;
+
+			errno = 0;
+			tag = strtoul(optarg, &end, 10);
+			if (errno || end == optarg || *end || tag > UINT32_MAX ||
+			    midr_dp_backend_set_route_tag((uint32_t)tag)) {
+				fprintf(stderr, "invalid --route-tag: %s\n", optarg);
+				return 2;
+			}
+			break;
+		}
 		case 0:
 			break;
 		default:

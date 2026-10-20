@@ -81,6 +81,50 @@ class PrefixPolicyTest(unittest.TestCase):
             {"2001:db8::/48": {"paths": [self.path("64501")]}},
             {ipaddress.ip_network("2001:db8::/48")}))
 
+    def test_midr_redistributed_path_is_never_exported(self):
+        # A redistributed MIDR route is local in bgpd (empty AS_PATH, tag 199).
+        midr = self.path("", tag=provider.MIDR_ROUTE_TAG_DEFAULT,
+                         sourced=True, weight=32768)
+        self.assertFalse(self.route(midr))
+        # Other tags and untagged local paths stay exportable.
+        self.assertTrue(self.route(self.path("", tag=7)))
+        self.assertTrue(self.route(self.path("")))
+        # Tag 0 disables the filter; a custom tag is honoured.
+        self.assertTrue(provider.parse_bgp_json(
+            {"routes": {"2001:db8::/48": [midr]}}, set(), 1, 0))
+        self.assertFalse(provider.parse_bgp_json(
+            {"routes": {"2001:db8::/48": [self.path("", tag=4242)]}},
+            set(), 1, 4242))
+
+    def test_midr_bestpath_falls_back_to_independent_paths(self):
+        midr = self.path("", tag=provider.MIDR_ROUTE_TAG_DEFAULT)
+        # The MIDR path won bestpath; an independent site path remains.
+        result = self.route(midr, self.path("64501", bestpath=False, metric=5))
+        self.assertEqual(result["2001:db8::/48"].metric, 5)
+        # The remaining path is still subject to the AS_PATH policy.
+        self.assertFalse(self.route(midr, self.path("64501 64502", bestpath=False)))
+
+    def test_frr_detail_json_with_midr_tag(self):
+        payload = {"routes": {"240a:a00f:300::/48": {
+            "prefix": "240a:a00f:300::/48",
+            "paths": [{
+                "aspath": {"string": "Local", "segments": [], "length": 0},
+                "origin": "incomplete", "metric": 3, "weight": 32768,
+                "tag": 199, "valid": True, "sourced": True,
+                "bestpath": {"overall": True},
+            }],
+        }, "240a:a00f:100::/48": {
+            "prefix": "240a:a00f:100::/48",
+            "paths": [{
+                "aspath": {"string": "Local", "segments": [], "length": 0},
+                "origin": "IGP", "metric": 0, "valid": True,
+                "bestpath": {"overall": True},
+                "peer": {"peerId": "240a:a00f:100:1::1", "type": "internal"},
+            }],
+        }}}
+        self.assertEqual(sorted(provider.parse_bgp_json(payload, set())),
+                         ["240a:a00f:100::/48"])
+
     def test_policy_transition_withdraws_disallowed_prefix(self):
         args = type("Args", (), {})()
         instance = provider.Provider(args, set())

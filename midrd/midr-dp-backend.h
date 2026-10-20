@@ -48,6 +48,9 @@ struct midr_context;
 struct midr_dp_backend;
 struct zclient;
 
+/* Default route tag on installed MIDR routes; matches the kernel proto 199. */
+#define MIDR_DP_ROUTE_TAG_DEFAULT 199U
+
 /* Runtime diagnostics for operators and integration gates. */
 struct midr_dp_status {
 	bool zebra_up;
@@ -99,6 +102,13 @@ vrf_id_t midr_dp_backend_vrf_id(void);
 bool midr_dp_backend_ready(void);
 
 void midr_dp_backend_status_get(struct midr_dp_status *status);
+
+/*
+ * Route tag set on every installed route (0 disables tagging).  It must be
+ * chosen before midr_dp_backend_start(); returns -EBUSY while running.
+ */
+int midr_dp_backend_set_route_tag(uint32_t tag);
+uint32_t midr_dp_backend_route_tag(void);
 
 /* One-line runtime summary for the midrd log (shutdown/diagnostic gates). */
 void midr_dp_backend_log_status(const char *tag);

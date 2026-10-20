@@ -106,6 +106,13 @@ enum midr_dp_recovery_state {
  * MIDR routes. */
 #define MIDR_DP_DISTANCE ZEBRA_BGP_MIDR_DISTANCE_DEFAULT
 
+/* Route tag carried on every installed MIDR route.  Daemons redistributing
+ * "midr" toward the site gateway match it in their export policy, and the
+ * Prefix Provider uses it to refuse feeding MIDR routes back as local
+ * prefixes.  Process-wide and fixed before the backend starts, so installed
+ * routes never need a re-tag replay. */
+static uint32_t midr_dp_route_tag = MIDR_DP_ROUTE_TAG_DEFAULT;
+
 enum midr_op_type {
 	MIDR_OP_ADD,
 	MIDR_OP_DEL,
@@ -498,6 +505,11 @@ static int dp_result_to_zapi(struct midr_dp_backend *b, const struct prefix *p,
 
 	SET_FLAG(api->message, ZAPI_MESSAGE_DISTANCE);
 	api->distance = MIDR_DP_DISTANCE;
+
+	if (midr_dp_route_tag) {
+		SET_FLAG(api->message, ZAPI_MESSAGE_TAG);
+		api->tag = midr_dp_route_tag;
+	}
 
 	SET_FLAG(api->flags, ZEBRA_FLAG_ALLOW_RECURSION);
 	SET_FLAG(api->message, ZAPI_MESSAGE_NEXTHOP);
@@ -1240,6 +1252,19 @@ bool midr_dp_backend_ready(void)
 {
 	return midr_dp_current && midr_dp_current->zc &&
 	       midr_dp_current->zc->sock >= 0;
+}
+
+int midr_dp_backend_set_route_tag(uint32_t tag)
+{
+	if (midr_dp_current)
+		return -EBUSY;
+	midr_dp_route_tag = tag;
+	return 0;
+}
+
+uint32_t midr_dp_backend_route_tag(void)
+{
+	return midr_dp_route_tag;
 }
 
 void midr_dp_backend_status_get(struct midr_dp_status *status)

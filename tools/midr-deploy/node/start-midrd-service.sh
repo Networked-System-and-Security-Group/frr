@@ -60,6 +60,12 @@ args=(
     --lifetime 30000
     --hold-time 10000
 )
+# Only override midrd's built-in default (199) when explicitly configured, so
+# this script also starts releases that predate --route-tag.  The Prefix
+# Provider reads the same MIDR_ROUTE_TAG.
+if [ -n "${MIDR_ROUTE_TAG:-}" ]; then
+    args+=(--route-tag "$MIDR_ROUTE_TAG")
+fi
 case "$MIDR_PREFIX_MODE" in
     none) ;;
     socket)
