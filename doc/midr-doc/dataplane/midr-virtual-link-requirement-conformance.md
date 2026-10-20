@@ -2,7 +2,7 @@
 
 > 审计员：第三组数据面需求符合性审计（静态，不实测）
 > 审计基线：仓库 `/Users/yangmengyu/githubdocuments/frr`，`git rev-parse HEAD` = `027bde5bc8ad0a6ac4d8afb3b2286014a6641ce1`（工作树无未提交改动，`git status --short` 为空）。
-> 准一来源（需求）：`doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md`
+> 准一来源（需求）：`doc/midr-doc/dataplane/midr-virtual-link-third-group-implementation.md`
 > 支撑文档：`midr-virtual-link-api.md`（接口契约）、`midr-virtual-link-api-countersign.md`（会签包）、`midr-virtual-link-third-group-verification.md`（实测报告）
 > 方法：只读文档 + 读代码 + grep；每条结论带 `文件:行号`。实测结论不在本文给出，另列 §4 交 remote-verifier。
 > 纪律：本文严格区分「代码里真的有」/「文档声称有」/「测试真的覆盖」/「无法静态判断，需实测」。凡属第四类集中列在 §4。

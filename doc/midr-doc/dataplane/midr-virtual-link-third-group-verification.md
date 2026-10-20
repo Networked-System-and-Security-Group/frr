@@ -5,14 +5,14 @@
 > 远端：`ssh -i ~/.ssh/frr yangmy@101.6.30.220 -p 50022`（`dell-PowerEdge-R750`，Linux 5.15.0-139，112 核）
 > 构建容器：`frr-ubuntu24-ymy`（镜像 `frr-ubuntu24:latest`），源码树 `/home/frr/frr-midrd3`
 > 本轮日期：2026-09-29（**W3 轮**：D1–D4 修复 + W0 通知事件/overlay 承载合入后的**再从零重建实测**轮）
-> 依赖契约：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（P0 冻结；W3 修订见该文头部与会签包 C6/C7）
+> 依赖契约：`doc/midr-doc/dataplane/midr-virtual-link-api.md`（P0 冻结；W3 修订见该文头部与会签包 C6/C7）
 >
 > **阅读约定（重要）**：本报告的计数与 md5 **只对标注「W3 / 本轮」的段落有效**。
 > 凡标注「上一轮（旧源码）」的表格与摘录，均为 W3 **之前**的源码与二进制所产，
 > **不得**当作当前树的证据；受影响的旧值已逐处更正（见 §1.1 勘误）。
 >
 > **升级指针（当前权威）**：本轮（W3/W4 之后）的最新独立实测见
-> `doc/midr-doc/dp-doc/midr-virtual-link-runtime-evidence.md`（**PASS=179 / FAIL=3**，
+> `doc/midr-doc/dataplane/midr-virtual-link-runtime-evidence.md`（**PASS=179 / FAIL=3**，
 > 3 个 FAIL 已逐一归因、与 overlay 逻辑无关）。本报告的计数（106 / 112 等）**只对其标注的轮次有效**；
 > 读者请以 runtime-evidence 为当前权威。
 
@@ -115,7 +115,7 @@ md5 `07a7acefa7eee7e24af11d2b1d2c8f9a`（1187 行）。本报告一切以 §1.1 
 e8d0161c674211a811956a38af21e0bb  midr-test/virtual-link-test.c              1393 行（上一轮（旧源码）747 行）
 e2646a2b0f8f07daaf73dbf546b41fd0  midrd/gre-link-tool.c                   386 行（本轮因注释块修复而变，§3.5）
 8cf57126d3798ed8af44e1668f3d77a7  midr-test/midr-gre-connectivity-test.sh     388 行（上一轮 md5 739de8439c21a9c1785be284275dd68b）
-0dbb7b7e36db5b33dd46a79a216adb86  doc/midr-doc/dp-doc/midr-virtual-link-api.md  644 行（上一轮（旧源码）482 行）
+0dbb7b7e36db5b33dd46a79a216adb86  doc/midr-doc/dataplane/midr-virtual-link-api.md  644 行（上一轮（旧源码）482 行）
 ```
 
 > **注记（行数口径，2026-09-29 补）**：上表 `midr-virtual-link-api.md` 的 **644 行**是 **W3 当轮值**
@@ -281,7 +281,7 @@ $ grep -c 'warning:' topmake.log
 
 ### 3.2 缺陷 2（上一轮（旧源码）修复）：契约 §5.4 事实错误 —— `lib_handlers[]` **不含** 地址变更通知
 
-- **位置**：`doc/midr-doc/dp-doc/midr-virtual-link-api.md` §5.4（契约文本），影响 `lib/zclient.c` 的默认分发表。
+- **位置**：`doc/midr-doc/dataplane/midr-virtual-link-api.md` §5.4（契约文本），影响 `lib/zclient.c` 的默认分发表。
 - **根因**：契约初版断言 `lib/zclient.c` 的 `lib_handlers[]` 同时包含接口级与**地址级**通知。
   本轮行号实测：`lib_handlers[]` 定义于 `lib/zclient.c:4757-4776`，其中接口级项为
   `:4765-4768`（`ZEBRA_INTERFACE_ADD/DELETE/UP/DOWN` 这 4 个），**不含**
@@ -604,7 +604,7 @@ midrrtr eth0: 10.20.1.254/24   eth1: 10.20.2.254/24
 | U-5 | MIDR Session / EOR / SPF 闭环 | **本组边界外** | 契约 §1：本组只做设备/地址/状态与 ifindex 可用性；Session/SPF 由一/二组联合验证。 |
 | U-6 | stage E 容器与网络 | **本轮（W3）已复核：无残留** | 本轮 W3 的 stage E 跑完后已复核：`docker ps -a` 中无 `midra`/`midrb`/`midrrtr`，`docker network ls` 中无 `midr-stagee-*`；`node1`/`node2` 内 `gre1`/`gre2`/`gre6` 均不存在且 zebra 已停（`pgrep -x zebra` 无结果）。上一轮同项亦已清理。仍残留的仅 `测试机上的 stage E 临时配置目录` 目录与 `测试机上的 zserv socket 路径` socket（脚本不清理，见 U-9）。 |
 | U-7 | 门禁 `midr-test/check-zapi-numbering.sh` | **本轮（W3）已补跑：PASS（`EXIT=0`）** | 在本地工作树执行，输出 `check-zapi-numbering: PASS (baseline 1adb4c92d0 vs working tree)`；脚本与被测 ZAPI 文件 md5 本轮均未变（§1.1、§2.3）。作为**独立门禁项**记录，不并入「三套实测」的 112。门禁有效性（更早一轮的 mutation-teeth 检查：人为破坏编号应 FAIL）仍成立（§2.3）。 |
-| U-8 | **第一组（调用方）会签** | **仍待会签（未取得回签）** | 会签材料 `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（§3 变更清单 C1–C7 及对调用方的影响、§4 九问、§7 回签表）**尚无第一组签名/日期**；与契约 §11 第 1 条一致。本报告 §3.4 已把 W0/C6 与 D1–D4/C7 的对调用方影响逐条复述，供回签引用。 |
+| U-8 | **第一组（调用方）会签** | **仍待会签（未取得回签）** | 会签材料 `doc/midr-doc/dataplane/midr-virtual-link-api-countersign.md`（§3 变更清单 C1–C7 及对调用方的影响、§4 九问、§7 回签表）**尚无第一组签名/日期**；与契约 §11 第 1 条一致。本报告 §3.4 已把 W0/C6 与 D1–D4/C7 的对调用方影响逐条复述，供回签引用。 |
 | U-9 | 测试脚本的**环境清理** | **未处理（须做 housekeeping）** | 两个测试脚本**都不**清理运行时残留：`midr-test/midr-gre-connectivity-test.sh` 的 `cleanup()` 只 `rm -rf "$STAGE"`（`:256`），其 `SOCK`（`:46`）在退出后仍可能留在测试机上；宿主侧 stage E 脚本产生的临时配置目录同样不在任何脚本的清理范围内（本轮 grep：仓库内无 `stageE-conf` 命中）。属 housekeeping，**不影响**任何断言结果，但会随轮次累积。 |
 
 **跨组提示（第一组 → 第二组，属他人接口，本组不实现）**：第一组从 `READY` 通知/状态中拿到的是

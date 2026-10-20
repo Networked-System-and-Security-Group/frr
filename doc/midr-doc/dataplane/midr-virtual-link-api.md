@@ -2,7 +2,7 @@
 
 > 状态：**P0 契约冻结**（lead 产出），作为 P1/P2/P3 共同的编码依据。
 > 基线：分支 `feat/midr-three-way-integration`，HEAD `443c51474b`。
-> 上游任务说明：`doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md`。
+> 上游任务说明：`doc/midr-doc/dataplane/midr-virtual-link-third-group-implementation.md`。
 > 底层既有 API：`midrd/midr-gre.{c,h}`（保留，不改语义）。
 >
 > **本轮修订（W3，2026-09-29，经 lead 确认实现已冻结）**：在**回调签名不变**（调用方源码兼容）
@@ -625,7 +625,7 @@ overlay 双向 ping 成功、返回 `ifindex` 有效、删除后设备与地址�
 
 ## 11. 待第一组会签与开放问题
 
-> **会签材料已单独成包**：`doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`
+> **会签材料已单独成包**：`doc/midr-doc/dataplane/midr-virtual-link-api-countersign.md`
 > （含最终 API 摘要、自草案以来的 7 条变更清单（C1–C7）及其对调用方的影响、请第一组回答的
 > 9 个问题、期望调用序列示例与回签表）。请第一组以该包为准逐条回签。
 

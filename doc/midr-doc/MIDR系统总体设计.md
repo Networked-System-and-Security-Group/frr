@@ -43,7 +43,7 @@ GRE 封装将一条 Overlay 邻接的远端 locator 用作外层目的地址，�
 |---|---|---|
 | 第一组：邻居关系构建 | Bootstrap 引导、节点目录、Session 意图、分群、跨群锚点、测量及 avoid-tier1 准入 | `midrd/group1/`，`midrd/midr-topology.h`、`midrd/midr-session.h` |
 | 第二组：链路状态传播与 SPF | 四类对象的生成、同步、洪泛、生命周期、LSDB/TED、同群与跨群 SPF、计算结果与安装侧衔接 | `midrd/midr-core.*`、`midr-owned.*`、`midr-engine.*`、`midr-scope.*`、`midr-lsdb.*`、`midr-ted.*`、`midr-spf.*`、`midr-spf-install.*` |
-| 第三组：路由安装 | GRE 接口与地址、ZAPI/Zebra 后端、FIB 提交、边界前缀接入及路由发布策略 | `midrd/midr-gre.*`、`midrd/midr-dp-backend.*`、`lib/zclient.*`、`zebra/`、`midr-test/fiti-deploy/midr-bgp-prefix-provider.py` |
+| 第三组：路由安装 | GRE 接口与地址、ZAPI/Zebra 后端、FIB 提交、边界前缀接入及路由发布策略 | `midrd/midr-gre.*`、`midrd/midr-dp-backend.*`、`lib/zclient.*`、`zebra/`、`tools/midr-deploy/node/midr-bgp-prefix-provider.py` |
 
 MIDR 原生 Session 与对象传输使用 `midrd` 自身的协议，不依赖 BGP OPEN/UPDATE、AFI/SAFI、BGP RIB 或 TCP/179。FITI 中 MIDR 对象会话使用 TCP/5871，第一组控制和目录通道使用 5859；具体传输与帧定义见 `midrd/midr-transport.h`、`midrd/midr-wire.h` 和 `midrd/group1/`。
 
@@ -51,7 +51,7 @@ MIDR 原生 Session 与对象传输使用 `midrd` 自身的协议，不依赖 BG
 
 边缘角色与 MIDR 群角色是两个维度。边缘节点运行 `zebra + bgpd + midrd + Prefix Provider`，负责从本站 BGP-R 获取外部前缀。内部业务节点运行 `zebra + midrd`，消费 MIDR 传播的前缀和路由。专职 Bootstrap 运行 `zebra + midrd`，提供引导和目录服务，不作为业务前缀出口、不承担业务 GRE/FIB。
 
-FITI 使用武汉 R3、郑州 R3 作为专职 Bootstrap；北航为初始群 1 代表，复旦为初始群 2 代表。武汉、郑州各自使用 R1 作为边缘节点，R2 作为内部节点。其他站点 MIDR 为边缘节点。完整节点表与持久参数见 [03 多节点生产式自动发现与整网验收](FITI部署测试/03-多节点生产式自动发现与整网验收.md) 和 `midr-test/fiti-deploy/nodes-12.csv`。
+FITI 使用武汉 R3、郑州 R3 作为专职 Bootstrap；北航为初始群 1 代表，复旦为初始群 2 代表。武汉、郑州各自使用 R1 作为边缘节点，R2 作为内部节点。其他站点 MIDR 为边缘节点。完整节点表与持久参数见 [FITI profile](../../tools/midr-deploy/profiles/fiti/README.md) 和 `tools/midr-deploy/profiles/fiti/nodes.csv`。
 
 ```text
 load local identity / locator / role / Bootstrap seeds
@@ -81,7 +81,7 @@ site BGP-R -> local bgpd
   -> Node Prefix / Group Prefix -> TED / SPF
 ```
 
-Provider 默认仅导出符合有效、选中或 multipath 条件且 `AS_PATH` 长度不超过 1 的路径；无法解析路径时不导出。参数为 `--max-as-path-length`，持久环境变量为 `MIDR_PREFIX_MAX_AS_PATH_LENGTH`。该过滤只约束输入 MIDR 的前缀，不删除 bgpd 自身的路由。策略和计数规则见 [AS_PATH 过滤验收](FITI部署测试/05-AS_PATH过滤修复与部署结果-20261007.md)。
+Provider 默认仅导出符合有效、选中或 multipath 条件且 `AS_PATH` 长度不超过 1 的路径；无法解析路径时不导出。参数为 `--max-as-path-length`，持久环境变量为 `MIDR_PREFIX_MAX_AS_PATH_LENGTH`。该过滤只约束输入 MIDR 的前缀，不删除 bgpd 自身的路由。策略和计数规则见 [AS_PATH 过滤验收](FITI部署记录/05-AS_PATH过滤修复与部署结果-20261007.md)。
 
 本地 `connected`、`static` 或 `network` 前缀只有被配置引入本机 BGP RIB 并通过 Provider 策略，或由另一个明确配置的 Prefix Provider 提供时，才成为 MIDR 输入。当前 BGP Provider 不直接扫描全部内核 connected/static 路由。SPF 标为 `local` 表示本节点发布该前缀的出口，不表示该网段直接连接在 MIDR 接口上；远端业务可经 GRE 到这个出口后，再经本站 BGP-R 到达终端。
 
@@ -103,13 +103,11 @@ FITI 的 `setup-midr-underlay.py` 在服务启动前建立 IPv6 表 1990，并�
 
 | 文档 | 适用内容 |
 |---|---|
-| [00 公共前置与版本部署](FITI部署测试/00-公共前置与版本部署.md) | 匹配版本、发布包、进程、持久配置、vtysh 和运维命令 |
-| [03 整网验收](FITI部署测试/03-多节点生产式自动发现与整网验收.md) | 固定角色、自动分群、阶段部署和集中验收 |
-| [04 单节点运维](FITI部署测试/04-单节点部署运维与自动化手册.md) | systemd、配置加载、安装与回滚 |
-| [第一组迁入 midrd](midr-group1-midrd-integration.md) | Topology/Session 接线和节点目录；文中旧分支状态按其记录日期理解 |
-| [第三组输出接口](midr-third-group-output-handoff.md) | TED/SPF generation、下一跳及安装适配契约 |
-| [路径计算接口规范](MIDR-TED路径计算接口规范.md) | 路径计算与 Zebra backend 的公开约定 |
-| [AS_PATH 发布验收](FITI部署测试/05-AS_PATH过滤修复与部署结果-20261007.md) | 最新正式发布包、过滤策略和 12 节点验收证据 |
-| [部署汇报与录屏台本](FITI部署测试/08-MIDR部署汇报与录屏台本.md) | 逐跳 FIB、GRE 对端映射、underlay 分段探测和业务演示 |
+| [发布与部署手册](deployment/MIDR发布与部署手册.md) | 发布包构建、profile、分阶段部署、运维、验收与回滚 |
+| [第一组迁入 midrd](design/midr-group1-midrd-integration.md) | Topology/Session 接线和节点目录；文中旧分支状态按其记录日期理解 |
+| [第三组输出接口](design/midr-third-group-output-handoff.md) | TED/SPF generation、下一跳及安装适配契约 |
+| [路径计算接口规范](design/MIDR-TED路径计算接口规范.md) | 路径计算与 Zebra backend 的公开约定 |
+| [AS_PATH 发布验收](FITI部署记录/05-AS_PATH过滤修复与部署结果-20261007.md) | 最新正式发布包、过滤策略和 12 节点验收证据 |
+| [部署汇报与录屏台本](FITI部署记录/08-MIDR部署汇报与录屏台本.md) | 逐跳 FIB、GRE 对端映射、underlay 分段探测和业务演示 |
 
 早期 `bgpd` 内嵌设计、SAFI/MP_REACH 传播说明及迁移前实施交接保留作历史资料。当前独立 `midrd` 的运行依赖、原生帧格式和正式代码入口以本文及现行分支为准。

@@ -192,6 +192,6 @@ kind 正确）；IPv4 与 IPv6 overlay 流量经该隧道双向 ping 通；IPv6 
 | 共享 zclient | `midrd/midr-gre.c` 第 32-35 行 → `midrd/midr-dp-backend.c` 第 927 行 |
 | ZAPI 路径 | `lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c` |
 | 旧版本 | 兄弟检出 `frr/frr`（HEAD `f8f4e81f2f`）的 `bgpd/bgp_midr_gre.{c,h}` |
-| 旧测试基线 | `frr/frr/doc/midr-doc/midr-gre-test-report.md`（21/21 PASS）、`frr/frr/doc/midr-doc/midr-gre-interface-api.md` |
+| 旧测试基线 | `frr/frr/doc/midr-doc/dataplane/midr-gre-test-report.md`（21/21 PASS）、`frr/frr/doc/midr-doc/dataplane/midr-gre-interface-api.md` |
 | 新测试（组件层） | `midr-test/dp-backend-test.c` `test_gre_api()`（校验路径） |
 | 新测试（真实双容器） | `midr-test/midr-gre-connectivity-test.sh` PASS=24 FAIL=0；宿主日志 `/tmp/gre-test.log` |

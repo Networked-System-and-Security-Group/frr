@@ -1,6 +1,6 @@
-# 02 GRE 虚链路独立实验部署与测试
+# 两节点 GRE 虚链路测试
 
-本文用于独立完成 Fudan-Buaa 两节点的 MIDR 数据面实验：建立 Session，自动创建 GRE 虚链路，验证 overlay 地址和双向业务 Ping，并验证删除接口后的自动恢复。本文依赖 00 文档定义的发布包、systemd 服务、持久配置和回滚目录，但不要求先执行 01；需要控制面单独验收时可参考 01。
+本文用于独立完成 Fudan-Buaa 两节点的 MIDR 数据面实验：建立 Session，自动创建 GRE 虚链路，验证 overlay 地址和双向业务 Ping，并验证删除接口后的自动恢复。本文依赖[发布与部署手册](MIDR发布与部署手册.md)定义的发布包、systemd 服务、持久配置和回滚目录，但不要求先执行[两节点 Session 测试](两节点Session测试.md)；需要控制面单独验收时可参考该文。
 
 ## 1. 测试拓扑和边界
 
@@ -22,26 +22,26 @@
 
 ## 2. 发布和安装
 
-先在 90 上完成 00 文档的发布包构建、SSH 公钥和 underlay 检查，然后执行：
+先按[手册](MIDR发布与部署手册.md)完成发布包构建、SSH 公钥和 underlay 检查，然后执行：
 
 ```bash
-cd /home/guest/yhy/frr
-export RELEASE_SRC="/tmp/midr-$RELEASE_ID"
+cd <仓库根目录>
+export RELEASE_SRC=/tmp/midr-<发布包目录名>
 test -f "$RELEASE_SRC/SHA256SUMS"
 
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_fudan --mode check
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_buaa --mode check
 
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_fudan --mode apply
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_buaa --mode apply
 ```
 
 
-在完成两台节点的 `apply` 后，在 90 上写入本实验专用的两节点持久配置。该配置用于独立实验，与 03 的自动加入配置分别使用。
+在完成两台节点的 `apply` 后，在管理机上写入本实验专用的两节点持久配置。该配置用于独立实验，与 12 节点的自动加入配置分别使用。
 
 ```bash
 ssh -p 15503 root@118.229.43.234 'bash -s' <<'FUDAN'
@@ -75,7 +75,7 @@ systemctl restart midrd.service
 BUAA
 ```
 
-`systemctl restart midrd` 自动加载这份文件；90 的正式 `node-configs/` 保持 12 节点自动发现配置。执行 03 的 `apply` 会重新安装正式配置。
+`systemctl restart midrd` 自动加载这份文件；profile 中的 `node-configs/` 仍是 12 节点自动发现配置，之后按手册批量 apply 会重新安装正式配置。
 
 
 ## 3. 控制面和虚链路检查
@@ -212,4 +212,4 @@ systemctl stop midr-bgpd.service       # 边缘节点
 systemctl stop midr-zebra.service
 ```
 
-需要恢复旧版本时，使用 00 文档定义的 `/var/lib/midr/deploy-backups/` 和完整发布目录，同时恢复匹配版本的 `midrd`、`zebra`、`bgpd` 与 `lib/`。不要只替换单个二进制，也不要删除 sequence 文件。
+需要恢复旧版本时，使用手册定义的 `/var/lib/midr/deploy-backups/` 和完整发布目录，同时恢复匹配版本的 `midrd`、`zebra`、`bgpd` 与 `lib/`。不要只替换单个二进制，也不要删除 sequence 文件。

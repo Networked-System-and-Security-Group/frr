@@ -27,7 +27,7 @@
 | 六个无返回值入口（`route_add/del/update_deferred/flush/init/fini`） | 五个返回 `int` 的 backend ops（init/fini 由 `midr_dp_backend_start/stop` 承担） |
 
 旧公开入口签名见 `bgpd/bgp_midr_zebra.h` 第 186/195/207/217/223/229 行；
-新契约见 `doc/midr-doc/MIDR-TED路径计算接口规范.md` 第 88-107 行。
+新契约见 `doc/midr-doc/design/MIDR-TED路径计算接口规范.md` 第 88-107 行。
 
 ### 2.2 可直接复用
 
@@ -153,4 +153,4 @@ zebra 重连路径（清 installed hash + `midr_spf_install_replay()`）。依�
 | 旧实现行数与入口 | 兄弟检出 `frr/frr`（分支 `feat/te-dp-interface`，HEAD `f8f4e81f2f`）的 `bgpd/bgp_midr_zebra.{c,h}`、`bgpd/bgp_midr_gre.{c,h}` |
 | 公共层 GRE 支撑 | 同上仓库 `lib/log.c`、`lib/zclient.{c,h}`、`zebra/zapi_msg.c`、`zebra/zebra_dplane.{c,h}`、`zebra/if_netlink.c`、`zebra/kernel_netlink.c` |
 | 新实现 | `midrd/midr-dp-backend.{c,h}`、`midrd/midr-gre.{c,h}`、`midr-test/dp-backend-test.c`、`midrd/Makefile`、`Makefile.am`、`midrd/midrd.c` |
-| 接口契约 | `doc/midr-doc/14_midrd与第三组输出接口交接.md`、`doc/midr-doc/MIDR-TED路径计算接口规范.md` |
+| 接口契约 | `doc/midr-doc/design/14_midrd与第三组输出接口交接.md`、`doc/midr-doc/design/MIDR-TED路径计算接口规范.md` |

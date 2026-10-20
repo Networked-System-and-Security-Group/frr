@@ -156,7 +156,7 @@ git version 2.43.0
 `make check`** 的命令（`docker build -t frr-ubuntu24:latest -f docker/ubuntu-ci/Dockerfile .`、
 `docker run -d --init --privileged --name frr-ubuntu24 ...`、`docker exec frr-ubuntu24 bash -c 'cd ~/frr ; make check'`）。
 本环境的镜像与容器**已按该 README 部署完毕**（容器已 Up 3 周），因此本轮**没有重建镜像**，
-而是在既有容器内按仓库自身文档（`midr-test/README.md` “编译”节、`doc/midr-doc/dp-doc/dp-02-build-and-test.md` §3/§4）
+而是在既有容器内按仓库自身文档（`midr-test/README.md` “编译”节、`doc/midr-doc/dataplane/dp-02-build-and-test.md` §3/§4）
 构建源码树：`bootstrap.sh` → `configure` → `make -j112`，再加 `midrd/` 独立组件构建与测试。
 `make check`（顶层 automake 测试）与 `tests/topotests` **本轮未运行**，理由见 §5。
 

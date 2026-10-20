@@ -313,4 +313,4 @@ bash /home/frr/frr-midrd3/midr-test/r7-dp-fib-smoke.sh
 | FIB 断言（group-aware） | `midr-test/r7-dp-fib-smoke.sh` 第 80-101 行 `fib_nhid()`/`fib_nh_list()` |
 | 单容器 loopback E2E | `midr-test/r7-dp-e2e-zapi.sh`：三节点 `routes=3`，3 个远端前缀中 2 个带 MIDR underlay nexthop 入 proto-199 FIB，peer loss 撤销并重收敛 `routes=2`，zebra 重启 replay；日志 `/tmp/tp-e2e4.log` |
 | group-2 传输层修复 | `midrd/midr-transport.c` 第 203-229 行 `find_peer_by_address()` 歧义返回 NULL、`midr_transport_promote()` 第 959 行；`midrd/midr-session.c` provisional 处理第 249-251/330-357 行、identity mismatch 第 281-287 行；`midr-test/transport-test.c` `test_shared_address_promote()` |
-| 旧覆盖基线 | `frr/frr/doc/midr-doc/midr-gre-test-report.md`、`frr/frr/doc/midr-doc/test-steps/01..06` |
+| 旧覆盖基线 | `frr/frr/doc/midr-doc/dataplane/midr-gre-test-report.md`、`frr/frr/doc/midr-doc/dataplane/test-steps/01..06` |

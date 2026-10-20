@@ -5,7 +5,7 @@
  *
  * zclient_route_send() is wrapped so the encoded zapi_route can be inspected
  * without a running zebra.  Real ZAPI/Linux-FIB, GRE netdevice and containerlab
- * coverage lives in the shell/harness tests; see doc/midr-doc/dp-doc/.
+ * coverage lives in the shell/harness tests; see doc/midr-doc/dataplane/.
  */
 
 #define main midrd_program_main
@@ -1004,7 +1004,7 @@ static void test_cold_path_submit_failure(void)
  *  GRE provisioning API
  * =========================================================================
  *  Validation paths only: the tunnel itself is created against a real zebra
- *  in the two-container connectivity test (doc/midr-doc/dp-doc).
+ *  in the two-container connectivity test (doc/midr-doc/dataplane).
  */
 static void test_gre_api(void)
 {

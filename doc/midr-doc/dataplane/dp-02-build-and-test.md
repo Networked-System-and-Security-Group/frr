@@ -71,7 +71,7 @@ bgpd/bgp_midr_nds.c:3375:13: warning: 'midr_bootstrap_seed_load_cb' defined but 
 ```
 
 这 11 条都在 `bgpd/` 内、且都不在本分支的改动集里，属于既存问题。审查依据
-`doc/midr-doc/第三组最新midrd分支审查反馈与同步建议-2026-09-20.md` 第 6 节
+`doc/midr-doc/archive/第三组最新midrd分支审查反馈与同步建议-2026-09-20.md` 第 6 节
 （「不在本次同步范围内的内容」）明确要求第三组**不**合并第一组的 group1 接线 /
 peer discovery / session observer，因此本组**有意不**把这类 bgpd 改动拉进来，
 它们**不计入本分支的修复验收**。
@@ -187,7 +187,7 @@ zebra → FIB（含 zebra 重启 replay 与 SIGTERM 撤销）；ECMP/UCMP/IPv6 �
 | 5 | 公共分支 `origin/fix/midrd-integration-hardening` 相对 HEAD 多出的每个提交，必须在 HEAD 中有**同标题**的对应提交（cherry-pick 后 hash 变化也能通过；漏同步会 FAIL）。可用 `MIDR_COMMON_REF` 覆盖分支名 |
 
 断言 4/5 的反证（每条都能让门禁 FAIL）见
-`doc/midr-doc/第三组midrd第二轮修复与验证报告-2026-09-21.md` §4。
+`doc/midr-doc/archive/第三组midrd第二轮修复与验证报告-2026-09-21.md` §4。
 
 ## 5. 两阶段边界扫描
 

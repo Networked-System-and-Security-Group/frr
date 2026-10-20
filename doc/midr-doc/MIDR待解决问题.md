@@ -1,6 +1,6 @@
 # MIDR 待解决问题
 
-维护起点：2026-10-16。本文是持续更新的问题清单，接替 [项目交接-20261009](MIDR项目交接-20261009.md) 第 3 节的任务表；交接文档保留为当日快照，不再更新任务状态。协议设计层面的长期 FOLLOW 事项仍记录在科研目录 `03_开发与审查/02_MIDR链路状态传播FOLLOW事项.md`，本文只在需要时引用。
+维护起点：2026-10-16。本文是持续更新的问题清单，接替 [项目交接-20261009](handoff/MIDR项目交接-20261009.md) 第 3 节的任务表；交接文档保留为当日快照，不再更新任务状态。协议设计层面的长期 FOLLOW 事项仍记录在科研目录 `03_开发与审查/02_MIDR链路状态传播FOLLOW事项.md`，本文只在需要时引用。
 
 状态取值：`待分析`、`已定位`、`方案待定`、`开发中`、`待验证`、`已解决`。已解决的条目移到文末“已关闭”，保留结论和证据路径。
 
@@ -9,7 +9,7 @@
 | 编号 | 问题 | 主责 | 状态 | 影响 |
 |---|---|---|---|---|
 | P-01 | 节点重启后入群卡死、群间不建锚点，overlay 分裂 | 第一组 | 待验证（`02e0905344` 实验回归通过，未上 FITI） | 现网 overlay 自 2026-10-15/16 起失效 |
-| P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 已定位（待处置） | P-01 的现网触发源 |
+| P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 部署脚本已处置，随下次 apply 生效 | P-01 的现网触发源 |
 | P-03 | midrd/zebra 日志无限增长 | 第三组（zebra/mgmtd）、第二组（midrd 输出）、部署 | 现网已缓解（logrotate），根因待修 | 已有节点磁盘写满；zebra 因无 mgmtd 每台每天约 4 GB 错误日志 |
 | P-04 | 反向发布的 locator 环路 | 第三组、环境维护方 | 方案待定 | 反向发布上线的前置条件 |
 | P-05 | MIDR 路由反向发布到网关 | 第三组 | 开发中 | 普通终端尚不能自动进入 overlay |
@@ -85,7 +85,7 @@
 4. Bootstrap 随即把 106、107 作为“群 1 代表”发给后续加入者。kmn 选群时北航链路降级，r1wh 时延更优，于是选了“群 1 代表 106”，向其发 `MEMBER_LIST_REQ`。
 5. r1wh 此时已按部署顺序再次重启，群号 0、无代表位，日志 `ignoring MEMBER_LIST_REQ for group …`。kmn 5 次重传后 `MEMBER_LIST_REQ 尝试 5 次无响应，放弃`，此后没有任何动作，永久停在 `probing-members`。
 
-给第一组的完整说明（实验过程、日志与修改建议）：[重启后入群卡死问题说明-致第一组-20261019](重启后入群卡死问题说明-致第一组-20261019.md)。
+给第一组的完整说明（实验过程、日志与修改建议）：[重启后入群卡死问题说明-致第一组-20261019](handoff/重启后入群卡死问题说明-致第一组-20261019.md)。
 
 ### 缺陷清单（第一组）
 
@@ -116,7 +116,7 @@
 - 验证：编译 0 告警；`test_midr_group1`、candidate-fallback 60/60、midrd 组件测试 27 项通过；复现实验重放 10-07 序列，约 12 分钟 10 台业务节点全部入群、每群一个代表。
 
 - `feat/midr-three-way-integration` 已快进到 `02e0905344`（GitHub 与 90 一致）。
-- 发布包：`NetArchLab90:/tmp/midr-02e090534468-g1rejoin-20261020T072257Z`（00 文档格式，含 Prefix Provider 与 `lib/` 三个库；ldd、ELF、SHA256SUMS 校验通过），尚未部署到 FITI。
+- 发布包：`NetArchLab90:/tmp/midr-02e090534468-g1rejoin-20261020T072257Z`（手册第 5 节格式，含 Prefix Provider 与 `lib/` 三个库；ldd、ELF、SHA256SUMS 校验通过），尚未部署到 FITI。
 
 保留的设计改进：
 
@@ -135,7 +135,7 @@
 
 ### 现网恢复
 
-按 03 的顺序冷启动可恢复。现网用于汇报，恢复前需用户确认；恢复后若不先处置 P-02，下一次自动升级仍会再次触发。
+按[发布与部署手册](deployment/MIDR发布与部署手册.md)的阶段顺序冷启动可恢复。现网用于汇报，恢复前需用户确认；恢复后若不先处置 P-02，下一次自动升级仍会再次触发。
 
 ## P-02 unattended-upgrades/needrestart 自动重启 MIDR 服务
 
@@ -147,6 +147,8 @@
 
 - 在 needrestart 中排除 `midr-*.service`（`$nrconf{override_rc}`），保留安全更新；或
 - 关闭 MIDR 节点的自动升级（`apt-daily-upgrade.timer`），改为维护窗口手动升级。
+
+**2026-10-20**：`tools/midr-deploy` 的安装器在节点存在 needrestart 时安装 `/etc/needrestart/conf.d/midr.conf`，排除 `midr*` 服务的自动重启，安全更新照常进行。现网 12 台节点尚未重新 apply，排除项随下次部署生效。
 
 即使处置了 P-02，P-01 仍需代码修复：节点故障、人工重启和滚动发布同样会触发。
 
@@ -160,7 +162,7 @@
 
 - 处置前：北航、郑州 R3 根分区已满（100%），武汉 R3 为 100%，其余 84%～94%。zebra 日志 51～57 GB，是主要来源。
 - 12 台节点：清空 zebra 日志；midrd 日志保留最后 100 MB，压缩到 `/var/log/midr/archive/` 后清空。处置后各节点根分区均为 9%。
-- 安装 `/etc/midr/logrotate.conf`：`/var/log/midr/*.log` 超过 256 MB 即以 copytruncate 方式轮转，保留 4 份压缩文件。由 `midr-logrotate.timer` 每 15 分钟执行一次，独立状态文件 `/var/lib/logrotate/midr.status`，不需要重启服务。
+- 安装 `/etc/midr/logrotate.conf`：`/var/log/midr/*.log` 超过 256 MB 即以 copytruncate 方式轮转，保留 4 份压缩文件。由 `midr-logrotate.timer` 每 15 分钟执行一次，独立状态文件 `/var/lib/logrotate/midr.status`，不需要重启服务。部署脚本 `tools/midr-deploy` 已同样安装该定时器，新部署的节点自动具备。
 - 磁盘写满期间，北航的 midrd 与 zebra 没有重启，序号文件恢复正常增长。
 
 **zebra 刷屏的根因（待修）**

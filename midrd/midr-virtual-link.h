@@ -163,7 +163,7 @@ typedef void (*midr_vlink_notify_cb)(const struct midr_virtual_link_status *st,
 
 /*
  * =========================================================================
- *  Public API (contract doc/midr-doc/dp-doc/midr-virtual-link-api.md §4)
+ *  Public API (contract doc/midr-doc/dataplane/midr-virtual-link-api.md §4)
  * =========================================================================
  */
 

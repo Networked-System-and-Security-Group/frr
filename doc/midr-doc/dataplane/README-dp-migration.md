@@ -10,7 +10,7 @@
   的第三组实现）、GRE 虚拟接口下发、真实 ZAPI/FIB 与 GRE 连通性验收。
 - **不在范围**：TED、SPF、diff、generation、READY/NOT_READY 策略由第二组
   `midrd/midr-spf-install.*` 承担（见
-  `doc/midr-doc/14_midrd与第三组输出接口交接.md`）。
+  `doc/midr-doc/design/14_midrd与第三组输出接口交接.md`）。
 - **基线**：
   - 宿主仓库：`/Users/yangmengyu/githubdocuments/frr`，分支
     `feat/yhy-midr-single-instance-ls-flooding`，HEAD `e8956ea83e`。
@@ -27,8 +27,8 @@
   IPv4/IPv6 native smoke、distinct loopback alias 探针、单容器 E2E 均通过
   （见第 6 节）。
 - **接口契约**：
-  - `doc/midr-doc/14_midrd与第三组输出接口交接.md`
-  - `doc/midr-doc/MIDR-TED路径计算接口规范.md`
+  - `doc/midr-doc/design/14_midrd与第三组输出接口交接.md`
+  - `doc/midr-doc/design/MIDR-TED路径计算接口规范.md`
 
 ## 2. 文档清单
 

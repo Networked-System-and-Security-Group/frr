@@ -3,7 +3,7 @@
 > 被测接口：`bgpd/bgp_midr_gre.h`
 > 测试脚本：`tests/bgpd/midr_gre_connectivity_test.sh`
 > 辅助程序：`tests/bgpd/test_midr_gre_link.c`
-> 接口说明：`doc/midr-doc/midr-gre-interface-api.md`
+> 接口说明：`doc/midr-doc/dataplane/midr-gre-interface-api.md`
 
 ## 1. 测试目标
 

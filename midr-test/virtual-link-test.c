@@ -2,7 +2,7 @@
 /*
  * MIDR high-level virtual-link component tests.
  *
- * Covers the twelve cases frozen in doc/midr-doc/dp-doc/midr-virtual-link-api.md
+ * Covers the twelve cases frozen in doc/midr-doc/dataplane/midr-virtual-link-api.md
  * §9.2 plus the registry allocation-failure path of §4.1 and the third-group
  * D1-D4 regression cases 13..18:
  *

@@ -16,9 +16,9 @@
 | `tests/bgpd/test_midr_gre_e2e.c` | 单机 E2E 测试（IPv4 + IPv6 + 状态 API） |
 | `tests/bgpd/test_midr_gre_link.c` | 双容器连通性测试辅助程序（setup/teardown） |
 | `tests/bgpd/midr_gre_connectivity_test.sh` | 双容器 IPv4/IPv6 连通性测试脚本 |
-| `doc/midr-doc/midr-gre-interface-api.md` | **接口说明与使用文档** |
-| `doc/midr-doc/midr-gre-test-report.md` | **连通性测试报告** |
-| `doc/midr-doc/midr-gre-interface.md` | 本文档 |
+| `doc/midr-doc/dataplane/midr-gre-interface-api.md` | **接口说明与使用文档** |
+| `doc/midr-doc/dataplane/midr-gre-test-report.md` | **连通性测试报告** |
+| `doc/midr-doc/dataplane/midr-gre-interface.md` | 本文档 |
 
 ### 修改文件
 
@@ -221,7 +221,7 @@ struct midr_gre_tunnel {
 ### 4.3 对外 API
 
 > 完整的接口说明（功能/参数/返回值/调用示例）见
-> `doc/midr-doc/midr-gre-interface-api.md`。
+> `doc/midr-doc/dataplane/midr-gre-interface-api.md`。
 
 ```c
 /* 创建/更新 GRE 接口；status 返回立即结果（UP / PENDING / FAILED） */

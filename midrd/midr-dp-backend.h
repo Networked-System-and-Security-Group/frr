@@ -11,8 +11,8 @@
  * technology-neutral midr_path_result produced by the SPF adapter into
  * ZAPI route messages for zebra.
  *
- * See doc/midr-doc/MIDR-TED路径计算接口规范.md for the contract and
- * doc/midr-doc/dp-doc/ for the migration notes.
+ * See doc/midr-doc/design/MIDR-TED路径计算接口规范.md for the contract and
+ * doc/midr-doc/dataplane/ for the migration notes.
  *
  * Deferred-batch failure semantics (frozen contract section 6, review 2.2):
  * update_deferred() reports success as soon as the batch is queued, so a

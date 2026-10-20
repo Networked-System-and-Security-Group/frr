@@ -2,9 +2,9 @@
 
 > 用途：第三组（数据面）请第一组（控制面/调用方）对虚链路设备服务接口**逐条确认并回签**。
 > 基线：分支 `feat/midr-three-way-integration`，HEAD `443c51474b`。
-> 会签对象（唯一准一来源）：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（**651 行**；口径：以回签当场 `wc -l` 实测为准，出包日 2026-09-29 实测 = 651）。
+> 会签对象（唯一准一来源）：`doc/midr-doc/dataplane/midr-virtual-link-api.md`（**651 行**；口径：以回签当场 `wc -l` 实测为准，出包日 2026-09-29 实测 = 651）。
 > 实现（权威签名）：`midrd/midr-virtual-link.h`。
-> 上游任务说明：`doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md`。
+> 上游任务说明：`doc/midr-doc/dataplane/midr-virtual-link-third-group-implementation.md`。
 > 出包日期：2026-09-29。
 
 ---
@@ -22,8 +22,8 @@
 > `event`/`overlay_prefix_len`/`overlay_ready` 字段，并按 D1-D4 修正自主检测与重建语义
 > （见 §3 的 **C6 / C7**）。**回调签名不变，调用方源码兼容。**
 > **本轮扩展后的实测已完成**：W3 当轮为 **112 PASS / 0 FAIL**（见
-> `doc/midr-doc/dp-doc/midr-virtual-link-third-group-verification.md` §0）；**最新独立实测（当前权威）见
-> `doc/midr-doc/dp-doc/midr-virtual-link-runtime-evidence.md`：PASS=179 / FAIL=3**，
+> `doc/midr-doc/dataplane/midr-virtual-link-third-group-verification.md` §0）；**最新独立实测（当前权威）见
+> `doc/midr-doc/dataplane/midr-virtual-link-runtime-evidence.md`：PASS=179 / FAIL=3**，
 > 3 个 FAIL 均已归因（① 出厂 manifest 与 `tests/bgpd/subdir.am` 不同步 → exit=2；
 > ② 以 root 跑组件套件时 `test_midr_sequence` 的 `-EACCES` 断言失败，换 `-u frr` 即 PASS；
 > ③ fixture 二进制当时未构建，构建后 PASS），**与 overlay 逻辑无关**；
@@ -297,7 +297,7 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 
 | 项 | 内容 |
 |---|---|
-| 会签对象 | `doc/midr-doc/dp-doc/midr-virtual-link-api.md`（行数见 §7.1）+ 本包 §3 变更清单（C1–C7）+ §4 九问 |
+| 会签对象 | `doc/midr-doc/dataplane/midr-virtual-link-api.md`（行数见 §7.1）+ 本包 §3 变更清单（C1–C7）+ §4 九问 |
 | 第三组（数据面） | 接口已冻结。**W3 实测：组件套件 27 PASS / 0 FAIL、GRE 51 PASS / 0 FAIL、stage E 34 PASS / 0 FAIL（合计 112 PASS），另 ZAPI 编号门禁 PASS**；**可核查摘要见 `midr-virtual-link-runtime-evidence.md`（本轮最新独立实测 PASS=179 / FAIL=3，3 个 FAIL 已归因、与 overlay 无关；W3 的 112 见 `midr-virtual-link-third-group-verification.md` §0）** —— 签名：__________ 日期：__________ |
 | 第一组（控制面/调用方） | 结论：☐ 照此批准　☐ 需修改（见下） —— 签名：__________ 日期：__________ |
 | 修改清单（若需修改） | 1. ____________________　2. ____________________　3. ____________________ |
@@ -307,8 +307,8 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 
 | 文件 | 行数 | 测量命令 |
 |---|---|---|
-| `doc/midr-doc/dp-doc/midr-virtual-link-api.md` | **651**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
-| `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（本包） | **328**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
+| `doc/midr-doc/dataplane/midr-virtual-link-api.md` | **651**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
+| `doc/midr-doc/dataplane/midr-virtual-link-api-countersign.md`（本包） | **328**（2026-09-29 出包实测） | `wc -l`（口径：以回签当场实测为准） |
 
 ---
 
@@ -316,9 +316,9 @@ name = d.ifname[0] ? d.ifname : st.ifname;   /* ifname 留空时用 st.ifname */
 
 | 类型 | 位置 |
 |---|---|
-| 接口契约（准一来源） | `doc/midr-doc/dp-doc/midr-virtual-link-api.md` |
-| 任务说明 | `doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md` |
-| 验证报告（实测） | `doc/midr-doc/dp-doc/midr-virtual-link-third-group-verification.md` |
+| 接口契约（准一来源） | `doc/midr-doc/dataplane/midr-virtual-link-api.md` |
+| 任务说明 | `doc/midr-doc/dataplane/midr-virtual-link-third-group-implementation.md` |
+| 验证报告（实测） | `doc/midr-doc/dataplane/midr-virtual-link-third-group-verification.md` |
 | 权威签名（代码） | `midrd/midr-virtual-link.h` |
 | 底层设备 API（被复用，语义未改） | `midrd/midr-gre.{c,h}` |
 | 新增 ZAPI | `lib/zclient.{c,h}`（`ZEBRA_INTERFACE_ADDRESS_SET/_UNSET/SET_ADMIN_UP`，追加在 enum 末尾）、`zebra/zapi_msg.c` |

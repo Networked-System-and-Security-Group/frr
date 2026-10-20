@@ -4,8 +4,8 @@
 > 发件人：第三组（数据面 / OVERLAY 组）
 > 日期：2026-09-29
 > 基线：分支 `feat/midr-three-way-integration`，HEAD `027bde5bc8`
-> 依据（唯一准一来源）：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（P0 契约冻结，651 行）
-> ＋ `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`（会签包，C1–C7）
+> 依据（唯一准一来源）：`doc/midr-doc/dataplane/midr-virtual-link-api.md`（P0 契约冻结，651 行）
+> ＋ `doc/midr-doc/dataplane/midr-virtual-link-api-countersign.md`（会签包，C1–C7）
 > ＋ 本轮三份结论：`midr-virtual-link-requirement-conformance.md`（需求符合性）、
 >   `midr-virtual-link-runtime-evidence.md`（实测：PASS=179 / FAIL=3，3 项 FAIL 已归因）、
 >   `midr-gre-overlay-interface-design.md`（接口归属与层次裁决）
@@ -197,7 +197,7 @@ struct midr_link_update {
 | 步骤 | 内容 | 谁负责 / 谁签字 |
 | --- | --- | --- |
 | 1 | 第一组**书面**提出：要哪几个字段、在什么时机填入、由谁写、写入失败时如何表达 | 第一组提出（可在本稿 §7 回签表里写，或另出修改清单） |
-| 2 | **改契约**：在 `doc/midr-doc/dp-doc/midr-virtual-link-api.md` 显式写明字段 / 时机 / 责任方（要求原文见会签包 C6），并同步修订 `midr-virtual-link-api-countersign.md` 的 C6 | 第三组草拟，第 3 步会签确认 |
+| 2 | **改契约**：在 `doc/midr-doc/dataplane/midr-virtual-link-api.md` 显式写明字段 / 时机 / 责任方（要求原文见会签包 C6），并同步修订 `midr-virtual-link-api-countersign.md` 的 C6 | 第三组草拟，第 3 步会签确认 |
 | 3 | **会签**：第一组签字（「照此批准」或修改清单）+ 第三组签字 | 第一组 + 第三组 |
 | 4 | 在**同一次提交**内同时改文档与代码（会签包明确要求「单次提交内同步文档 + 代码」），并补契约 §9.2 用例、重跑组件套件 + 编号门禁 | 第三组执行；实测计数以独立实测报告 `midr-virtual-link-runtime-evidence.md` 为准 |
 
@@ -489,7 +489,7 @@ sed -n '176,202p' midrd/midr-virtual-link.h
 sed -n '164,174p' midrd/midr-gre.h
 ```
 
-> 备注：本稿的技术结论与 `doc/midr-doc/dp-doc/midr-gre-overlay-interface-design.md`
+> 备注：本稿的技术结论与 `doc/midr-doc/dataplane/midr-gre-overlay-interface-design.md`
 > （本轮 GRE / overlay 接口归属与层次裁决）一致。若两者出现出入，以该裁决文件与
 > `midr-virtual-link-api.md` 为准，并请告知第三组修订本稿。
 

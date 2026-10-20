@@ -3,8 +3,8 @@
 > 头文件：`bgpd/bgp_midr_gre.h`
 > 实现：`bgpd/bgp_midr_gre.c`
 > 底层：`lib/zclient.{c,h}` → `zebra/{zapi_msg.c,zebra_dplane.c,kernel_netlink.c,if_netlink.c}`
-> 设计说明见：`doc/midr-doc/midr-gre-interface.md`
-> 测试报告见：`doc/midr-doc/midr-gre-test-report.md`
+> 设计说明见：`doc/midr-doc/dataplane/midr-gre-interface.md`
+> 测试报告见：`doc/midr-doc/dataplane/midr-gre-test-report.md`
 
 本组接口是 MIDR 控制面（标准 SPF / TE CSPF）**唯一**用于创建与消除 GRE
 虚拟链路接口的入口。控制面只描述"要什么"（两端点地址等），不接触 netlink，

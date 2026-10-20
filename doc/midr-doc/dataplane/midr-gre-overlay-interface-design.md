@@ -2,8 +2,8 @@
 
 > 作者：第三组（数据面）接口设计员
 > 审计/复核基线：仓库 `/Users/yangmengyu/githubdocuments/frr`，`git rev-parse HEAD` = `027bde5bc8ad0a6ac4d8afb3b2286014a6641ce1`。
-> 准一来源（需求）：`doc/midr-doc/dp-doc/midr-virtual-link-third-group-implementation.md`（尤其 §4、§5.1、§7）
-> 已冻结契约：`doc/midr-doc/dp-doc/midr-virtual-link-api.md`（651 行）+ 会签包 `doc/midr-doc/dp-doc/midr-virtual-link-api-countersign.md`
+> 准一来源（需求）：`doc/midr-doc/dataplane/midr-virtual-link-third-group-implementation.md`（尤其 §4、§5.1、§7）
+> 已冻结契约：`doc/midr-doc/dataplane/midr-virtual-link-api.md`（651 行）+ 会签包 `doc/midr-doc/dataplane/midr-virtual-link-api-countersign.md`
 > 权威签名（代码）：`midrd/midr-virtual-link.h`；底层设备 API：`midrd/midr-gre.h`
 > 方法：只读文档 + 读代码 + grep，全部结论带 `文件:行号`。本文不改任何代码，不动他人文档。
 > 纪律：严格区分「代码里真的有」/「文档声称有」/「需要跨组决策」。
@@ -149,7 +149,7 @@ midr_virtual_link_del(ctx, ifname, status)                 midrd/midr-virtual-li
 
 **「若第一组坚持要改」的具体代价（本组不推荐、本轮不执行）**——仅用于让 lead 看清成本：
 
-- 必须**先改契约**：`doc/midr-doc/dp-doc/midr-virtual-link-api.md` §2/§3.1（`midr-virtual-link-api.md:126-182`）与会签包 C6（`midr-virtual-link-api-countersign.md:118`）要显式写明新字段、填充时机、责任方、失败语义（尤其 `overlay_ready` 在 GRE 层的假就绪如何避免）。
+- 必须**先改契约**：`doc/midr-doc/dataplane/midr-virtual-link-api.md` §2/§3.1（`midr-virtual-link-api.md:126-182`）与会签包 C6（`midr-virtual-link-api-countersign.md:118`）要显式写明新字段、填充时机、责任方、失败语义（尤其 `overlay_ready` 在 GRE 层的假就绪如何避免）。
 - 才改代码：`midrd/midr-gre.h`（`struct midr_gre_status` @ :129-137 追加字段）、`midrd/midr-gre.c`（`midr_gre_notify` @ :299 / :353 / :363 / :581 / :656 的填充点要回填 overlay），并让 vlink 层在每次状态变化时**回写** GRE 层（`midrd/midr-virtual-link.c` 多处）；或新增镜像 API。
 - 风险：重新引入「设备 UP 但地址未配」的**假就绪陷阱**；GRE 层本无 overlay 概念（`midrd/midr-gre.h:3-46` 设计声明），语义被污染。
 - 测试影响（追加式字段本身一般安全，但语义改动会影响断言）：
@@ -170,10 +170,10 @@ midr_virtual_link_del(ctx, ifname, status)                 midrd/midr-virtual-li
    - overlay 必须**同前缀**（C5，:156）；复用 outer endpoint 对前建议先 `del()`（:153-155）。
 2. **需第一组确认对本裁决的接受**：`midr_gre_status` **不加** overlay 字段（§2-a、§6）；第一组若不同意，须走「先改契约」流程，由 lead 决定。
 3. **需第一/第二组确认 §5 的字段归属与 wire 是否同步**：`struct midr_link_update` 追加 `overlay_prefix_len`/`has_overlay_prefix` 是否可接受、是否要扩 wire（`midrd/midr-core.h:58-83`、`midrd/midr-wire.c:118/132-133/146/158-159`）。**第三组不越界**。
-4. **需实测交叉校验（T2 产物已出现）**：`doc/midr-doc/dp-doc/midr-virtual-link-runtime-evidence.md`
+4. **需实测交叉校验（T2 产物已出现）**：`doc/midr-doc/dataplane/midr-virtual-link-runtime-evidence.md`
    - 本轮汇总 **PASS=179 / FAIL=3**（该文档 `:22`）；其中 **2 个 FAIL 是「以 root 运行组件套件」的环境偏差**（`test_midr_sequence` 的 EACCES 期望只在非特权下成立），**1 个 FAIL 是出厂 manifest 与注册集不一致**（`run-midr-component-suite.sh` 未跑用例即 exit 2，`:20` / `:313-323`）。
    - **结论：3 个 FAIL 均为 manifest / root 环境偏差，无一属于 overlay 逻辑失败**；overlay 关键路径在内核级已被证实（overlay 为 host 地址 `192.168.100.1/30`、`192.168.100.0/30` 命中 0、IFF_UP 存在、拆除后清理干净，`:19`）。
-5. **需与 T1 静态符合性审计交叉校验**：`doc/midr-doc/dp-doc/midr-virtual-link-requirement-conformance.md`
+5. **需与 T1 静态符合性审计交叉校验**：`doc/midr-doc/dataplane/midr-virtual-link-requirement-conformance.md`
    - T1 判定「整体部分符合（≈95%）」，其标记的 5 处「部分符合」含 **§3.4 生产调用方缺失**：`midrd` 进程内只有 `init`（`midrd.c:3488`）/`fini`（`midrd.c:3175`），**没有生产 `add()` 调用方**，创建仍只由 `gre-link-tool.c:331`（独立工具）与组件测试驱动。**这一点与本裁决一致**：第三组接口已就绪，缺的是第一组把「请求 → `midr_virtual_link_add()`」接进守护进程（属第一组调用方工作，非第三组改代码）。
    - T1 另指「overlay 可达性检查为本地前缀推断而非真实探测」——与本裁决不冲突（契约 §5.3 已声明 v1 约束）；若第一组要求真实探测，须按契约 §11 走 Session/路由扩展（`midr-virtual-link-api.md:313-320`），不在本设备 API 范围。
 6. **待办交叉引用**：本裁决以 T1（静态符合性）与 T2（运行时证据）为准一事实来源的补充；若两者后续结论与本裁决冲突，**以 lead 的最终裁定为准**，并优先回到契约 C6 的「先改契约再改实现」流程。

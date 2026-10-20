@@ -1,6 +1,6 @@
-# 01 MIDR Session 独立测试
+# 两节点 Session 测试
 
-本文用于独立验证两台 FITI MIDR 节点的 underlay 可达性、TCP 控制面、MIDR Session、Node directory、基础 Link 和 SPF 控制面状态。GRE 虚链路、MIDR FIB 和业务 Prefix 属于 02 文档，不作为本文的通过条件。
+本文用于独立验证两台 FITI MIDR 节点的 underlay 可达性、TCP 控制面、MIDR Session、Node directory、基础 Link 和 SPF 控制面状态。GRE 虚链路、MIDR FIB 和业务 Prefix 属于[两节点 GRE 虚链路测试](两节点GRE虚链路测试.md)，不作为本文的通过条件。
 
 ## 1. 测试对象和预期
 
@@ -11,32 +11,32 @@
 
 两台节点使用同一发布包和正式 systemd 服务。Session 配置写入 `/etc/midr/node.commands`，由 `midrd.service` 在每次启动后自动加载；不在实验步骤中使用 `nohup`、`--peer`、`--link` 或 `--link-addr`。
 
-Session 通过条件是：两端服务 active，目标节点可通过 underlay 到达，TCP 5871 为 `ESTAB`，日志出现 `established remote=` 和 `sync type=6`，`show midr neighbors` 显示远端为 `Established`。`show midr links` 暂时为空不单独判为 Session 失败；Link/GRE 在 02 中验收。
+Session 通过条件是：两端服务 active，目标节点可通过 underlay 到达，TCP 5871 为 `ESTAB`，日志出现 `established remote=` 和 `sync type=6`，`show midr neighbors` 显示远端为 `Established`。`show midr links` 暂时为空不单独判为 Session 失败；Link/GRE 在 GRE 虚链路测试中验收。
 
-## 2. 在 90 上准备和安装
+## 2. 准备和安装
 
-先完成 [00-公共前置与版本部署](00-公共前置与版本部署.md) 的发布包、SSH 公钥和 underlay 门禁。发布包目录必须是实际存在的目录，例如 `/tmp/midr-5228cff9b3be-20261001T153820Z`；不要照抄不存在的目录名。
+先按[发布与部署手册](MIDR发布与部署手册.md)构建发布包，并完成 SSH 公钥和 underlay 检查。发布包目录必须是实际存在的目录，例如 `/tmp/midr-5228cff9b3be-20261001T153820Z`；不要照抄不存在的目录名。
 
 ```bash
-cd /home/guest/yhy/frr
-export RELEASE_SRC="/tmp/midr-$RELEASE_ID"
+cd <仓库根目录>
+export RELEASE_SRC=/tmp/midr-<发布包目录名>
 test -f "$RELEASE_SRC/SHA256SUMS"
 
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_fudan --mode check
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_buaa --mode check
 
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_fudan --mode apply
-bash midr-test/fiti-deploy/deploy-node-from-90.sh \
+tools/midr-deploy/deploy-node.sh \
   --node MIDR_buaa --mode apply
 ```
 
-`check` 只检查发布包、地址、默认路由、配置和动态库；`apply` 会在目标节点备份旧状态，停止旧 FRR/MIDR，安装匹配的 zebra/bgpd/midrd，写入持久配置并启动 systemd 服务。边缘节点按其 `.env` 中的 `MIDR_EDGE_BGP=yes` 启动 `midr-bgpd.service`；服务清单和配置位置见 00 文档。
+`check` 只检查发布包、地址、默认路由、配置和动态库；`apply` 会在目标节点备份旧状态，停止旧 FRR/MIDR，安装匹配的 zebra/bgpd/midrd，写入持久配置并启动 systemd 服务。边缘节点按其 `.env` 中的 `MIDR_EDGE_BGP=yes` 启动 `midr-bgpd.service`；服务清单和配置位置见[手册](MIDR发布与部署手册.md)。
 
 
-在完成两台节点的 `apply` 后，在 90 上写入本实验专用的两节点持久配置。该配置用于独立实验，与 03 的自动加入配置分别使用。
+在完成两台节点的 `apply` 后，在管理机上写入本实验专用的两节点持久配置。该配置用于独立实验，与 12 节点的自动加入配置分别使用。
 
 ```bash
 ssh -p 15503 root@118.229.43.234 'bash -s' <<'FUDAN'
@@ -70,7 +70,7 @@ systemctl restart midrd.service
 BUAA
 ```
 
-`systemctl restart midrd` 自动加载这份文件；90 的正式 `node-configs/` 保持 12 节点自动发现配置。执行 03 的 `apply` 会重新安装正式配置。
+`systemctl restart midrd` 自动加载这份文件；profile 中的 `node-configs/` 仍是 12 节点自动发现配置，之后按手册批量 apply 会重新安装正式配置。
 
 ## 3. 目标节点基础检查
 
@@ -96,7 +96,7 @@ ip -6 route get 240a:a00f:100:1::2 from 240a:a00f:200:1::2
 
 ## 4. VTY 控制面验收
 
-在每台节点使用当前发布包的 `vtysh` 查询 MIDR；统一交互入口和 Zebra/BGP 查询见 00 文档第 8 节：
+在每台节点使用当前发布包的 `vtysh` 查询 MIDR；统一交互入口和 Zebra/BGP 查询见[手册](MIDR发布与部署手册.md)第 10.2 节：
 
 ```bash
 export MIDR_DIR=/opt/midr-current
@@ -151,4 +151,4 @@ systemctl stop midr-bgpd.service       # 边缘节点
 systemctl stop midr-zebra.service
 ```
 
-如果只是结束本实验，保留 `/etc/midr/node.commands`、sequence 文件和发布目录，下一次可直接 `systemctl start` 或执行 00 文档的升级流程。只有确认要切回原系统 FRR 时，才按 00 文档的备份和回滚步骤恢复 `frr.service`。
+如果只是结束本实验，保留 `/etc/midr/node.commands`、sequence 文件和发布目录，下一次可直接 `systemctl start` 或按[手册](MIDR发布与部署手册.md)的升级流程处理。只有确认要切回原系统 FRR 时，才按手册的回滚步骤恢复 `frr.service`。
