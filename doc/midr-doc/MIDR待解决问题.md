@@ -22,7 +22,6 @@
 | P-12 | 差异化链路条件下的分群与选路实验 | 第一组、第二组、环境维护方 | 待分析 | netem 条件未验收 |
 | P-13 | 设计文档修订（01/04/顶层） | 第二组 | 方案待定 | 旧文档仍含 bgpd 内嵌语义 |
 | P-14 | 原版 bgpd 遇到 lib 遗留的 MIDR SAFI 时断言退出 | 第三组 | 已修复并部署（2026-10-26） | 旧版本在现网实际崩溃过 |
-| P-15 | AS_PATH≤1 导入策略把直连邻居站点的前缀当作本站前缀 | 第三组 | 方案待定 | 复旦与北航之间的终端流量不经 MIDR |
 
 ## P-01 节点重启后入群卡死、群间不建锚点
 
@@ -227,7 +226,7 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 
 **2026-10-26 FITI 部署验证**：5 个边缘站点开启 `MIDR_ROUTE_EXPORT=yes`，check 确认全部与本站 BGP-R 为 iBGP。从乌鲁木齐、昆明、青岛 BGP-R 以终端网段地址为源，ping 其他 4 个站点的终端（`240a:a00f:X00::10`），12 组全部 0 丢包；各 BGP-R 对远端站点前缀的最优路径来自本站 MIDR（`no-export`），去远端终端的出口指向本站 MIDR，去远端 locator 的出口走 underlay，没有环路。GRE 计数确认请求和应答都经过 overlay。复旦、北航的 BGP-R 和各站终端需要密码登录，尚未装公钥，所以终端到终端的直接测试还没有做；终端流量与上述测试只差终端到本站 BGP-R 这一跳。
 
-终端到终端（同日，公钥装好后）：5 台终端 `240a:a00f:X00::10` 两两互 ping，20 组每组 10 个包全部 0 丢包。5 台 BGP-R 中，18 组终端流量的出口指向本站 MIDR，去远端 locator 的流量全部走 underlay；复旦与北航之间的 2 组走两站 BGP-R 直连的 underlay 链路，原因见 P-15。复旦终端向乌鲁木齐终端发 100 个 ping 时，两端 MIDR 的 GRE 收发计数各增加 100 以上；traceroute 显示 `BGP-R_fudan → MIDR_fudan → (overlay 内不回应) → Terminal_wlq`。
+终端到终端（同日，公钥装好后）：5 台终端 `240a:a00f:X00::10` 两两互 ping，20 组每组 10 个包全部 0 丢包。5 台 BGP-R 中，18 组终端流量的出口指向本站 MIDR，去远端 locator 的流量全部走 underlay；复旦与北航之间的 2 组走两站 BGP-R 直连的 BGP 链路，这是 AS_PATH≤1 导入策略的预期行为（见文末已关闭的 P-15）。复旦终端向乌鲁木齐终端发 100 个 ping 时，两端 MIDR 的 GRE 收发计数各增加 100 以上；traceroute 显示 `BGP-R_fudan → MIDR_fudan → (overlay 内不回应) → Terminal_wlq`。
 
 ## P-06 同 sequence 异内容未隔离
 
@@ -289,12 +288,11 @@ FITI 现网运行的版本同样包含这个遗留定义，只是目前的配置
 
 2026-10-26 部署时确认：旧发布包的 bgpd 在 R1_wh、R1_zhz 上停止服务时因 `afindex()` 断言崩溃（core-dump），两台日志中还各有一次更早的同类崩溃（10-21 R1_wh 由 systemd 自动拉起）。新发布包已不含该 SAFI。
 
-## P-15 AS_PATH≤1 导入策略把直连邻居站点的前缀当作本站前缀
-
-Prefix Provider 默认把 AS_PATH 长度不超过 1 的 BGP 路由作为本节点前缀导入 MIDR。复旦 BGP-R 与北航 BGP-R 之间有直连的 eBGP 链路，北航的 `240a:a00f:200::/48` 到复旦时 AS_PATH 为 `4200000002`（长度 1），于是复旦 MIDR 也把它作为本站前缀导入（`show midr spf`：`200::/48 origin 101.0.0.0 local`），北航对复旦的前缀同样如此。本站前缀不作为 MIDR 路由安装，也就不会反向发布给 BGP-R，两站之间的终端流量因此走 BGP-R 直连的 underlay，不经 MIDR（2026-10-26 终端测试中复旦⇄北航 2 组）。上海 Tier1 的 `600::/48` 也因同一原因被复旦等节点作为本站前缀导入。
-
-候选方案：导出上限改为 0，只导入本站 BGP-R 自己发布的前缀（`MIDR_PREFIX_MAX_AS_PATH_LENGTH=0`）；或保留上限 1，但排除其他 MIDR 站点的前缀（由 profile 生成排除列表）。需要先确认 05 AS_PATH 修复时选择上限 1 所要覆盖的场景。
-
 ## 已关闭
 
-暂无。
+### P-15 直连邻居站点的前缀按本站前缀导入（按设计，2026-10-26 关闭）
+
+现象：复旦 BGP-R 与北航 BGP-R 有直连 eBGP 链路，对方站点的 `/48` 到达时 AS_PATH 长度为 1，被本站 Prefix Provider 作为本站前缀导入 MIDR（`show midr spf` 显示 `local`），因而不安装为 MIDR 路由、不反向发布，两站之间的终端流量走 BGP 直连链路。上海 Tier1 的 `600::/48` 同理。
+
+结论：符合设计。导入上限 AS_PATH≤1 的目的，是只把本站可直达、最邻近的 BGP 前缀交给 MIDR；AS_PATH 更长的前缀若也导入，会被全网 MIDR 节点当作本地前缀传播，业务反而都留在 BGP 上，不走 MIDR。直连邻居的前缀满足"本站邻近"，直接走 BGP 是合理的。
+
