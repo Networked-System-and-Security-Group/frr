@@ -8,11 +8,11 @@
 
 | 编号 | 问题 | 主责 | 状态 | 影响 |
 |---|---|---|---|---|
-| P-01 | 节点重启后入群卡死、群间不建锚点，overlay 分裂 | 第一组 | 待验证（`02e0905344` 实验回归通过，未上 FITI） | 现网 overlay 自 2026-10-15/16 起失效 |
-| P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 部署脚本已处置，随下次 apply 生效 | P-01 的现网触发源 |
+| P-01 | 节点重启后入群卡死、群间不建锚点，overlay 分裂 | 第一组 | FITI 已验证（2026-10-26，`093bc9e5e6`） | 现网 overlay 已恢复 |
+| P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 已处置（2026-10-26 随部署装到 12 台节点） | P-01 的现网触发源 |
 | P-03 | midrd/zebra 日志无限增长 | 第三组（zebra/mgmtd）、第二组（midrd 输出）、部署 | 现网已缓解（logrotate），根因待修 | 已有节点磁盘写满；zebra 因无 mgmtd 每台每天约 4 GB 错误日志 |
 | P-04 | 反向发布的 locator 环路 | 第三组 | 方案待确定（暂定边缘 MIDR 经 iBGP 通告本机 locator /64，实验已验证） | 反向发布上线的前置条件 |
-| P-05 | MIDR 路由反向发布到网关 | 第三组 | 待验证（实验通过，未上 FITI） | 普通终端尚不能自动进入 overlay |
+| P-05 | MIDR 路由反向发布到网关 | 第三组 | FITI 已验证（2026-10-26，网关侧；终端登录待公钥） | 普通终端尚不能自动进入 overlay |
 | P-06 | 同 sequence 异内容未隔离 | 第二组 | 已定位 | 冲突时按到达顺序生效 |
 | P-07 | 未持久化或丢失 sequence 时，重启节点被邻居长期拒绝 | 第二组 | 已定位（待修复） | backbone 实验必现；FITI 已配置持久化，未受影响 |
 | P-08 | 重连 snapshot 不补发 WITHDRAWN | 第二组 | 已定位 | 旧对象最多多留一个寿命周期 |
@@ -21,7 +21,7 @@
 | P-11 | avoid-tier1 部署与效果验收 | 第一组（二、三组配合） | 待分析 | 现网关闭 |
 | P-12 | 差异化链路条件下的分群与选路实验 | 第一组、第二组、环境维护方 | 待分析 | netem 条件未验收 |
 | P-13 | 设计文档修订（01/04/顶层） | 第二组 | 方案待定 | 旧文档仍含 bgpd 内嵌语义 |
-| P-14 | 原版 bgpd 遇到 lib 遗留的 MIDR SAFI 时断言退出 | 第三组 | 已修复（`feat/midr-route-export-v2`，未发布） | 现网版本存在隐患 |
+| P-14 | 原版 bgpd 遇到 lib 遗留的 MIDR SAFI 时断言退出 | 第三组 | 已修复并部署（2026-10-26） | 旧版本在现网实际崩溃过 |
 
 ## P-01 节点重启后入群卡死、群间不建锚点
 
@@ -138,6 +138,13 @@
 
 按[发布与部署手册](deployment/MIDR发布与部署手册.md)的阶段顺序冷启动可恢复。现网用于汇报，恢复前需用户确认；恢复后若不先处置 P-02，下一次自动升级仍会再次触发。
 
+**2026-10-26 FITI 部署验证**（发布包 `midr-093bc9e5e643-e2e-20261026T022237Z`，证据在 90 的 `/home/guest/yhy/midr-evidence/e2e-20261026/`）：
+
+- 分阶段部署：8 台普通成员逐台入群，用时 121～183 s。
+- 单台重启：普通成员昆明重启后 184 s 重新入群，经 MIDR 的业务同时恢复；代表北航重启后立即回到群 1，业务未中断。
+- 10 台业务节点同时重启（模拟 10-15/16 的自动升级）：134 s 时全部入群；随后多台节点同时建立的群 17 出现重复代表，经让位后 5 台重新加入，约 8 分钟（02:51:49 → 02:59:42）全部稳定，之后端到端测试全部通过。未再出现卡在探测阶段的情况。
+- 遗留：同时重启时的群号竞争会带来约 8 分钟的二次收敛，期间部分节点的业务退回 underlay。
+
 ## P-02 unattended-upgrades/needrestart 自动重启 MIDR 服务
 
 12 台节点的 `apt-daily-upgrade` 在 2026-10-15/16 各自随机时间执行 unattended-upgrades，升级 `libsystemd0`、`systemd` 等库；needrestart 随后自动重启了依赖这些库的服务，包括 `midr-zebra`、`midr-bgpd`、`midrd`、`midr-bgp-prefix-provider`，以及 `systemd-networkd`。期间无人工 SSH 登录，虚机未重启，`NRestarts=0`。证据：复旦 `/var/log/apt/history.log` 06:23:48～06:24:28 的升级记录，以及同一时段 journal 中 midr-* 的 Stopping/Started。
@@ -217,6 +224,8 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 
 剩余：随下一次整体发布部署到 FITI（R1_wh、R1_zhz 改为内部节点也在那时生效），然后做终端业务与撤销验证；OSPF 等其他协议的出口配置尚未生成。限制：不带 instance 的 `redistribute midr` 只取 instance 0（SPF）路由。
 
+**2026-10-26 FITI 部署验证**：5 个边缘站点开启 `MIDR_ROUTE_EXPORT=yes`，check 确认全部与本站 BGP-R 为 iBGP。从乌鲁木齐、昆明、青岛 BGP-R 以终端网段地址为源，ping 其他 4 个站点的终端（`240a:a00f:X00::10`），12 组全部 0 丢包；各 BGP-R 对远端站点前缀的最优路径来自本站 MIDR（`no-export`），去远端终端的出口指向本站 MIDR，去远端 locator 的出口走 underlay，没有环路。GRE 计数确认请求和应答都经过 overlay。复旦、北航的 BGP-R 和各站终端需要密码登录，尚未装公钥，所以终端到终端的直接测试还没有做；终端流量与上述测试只差终端到本站 BGP-R 这一跳。
+
 ## P-06 同 sequence 异内容未隔离
 
 `midr_core_upsert()` 返回 `MIDR_CORE_CONFLICT`，但 midrd 无调用方处理，先到达的内容继续进入 TED。与 01/04 设计的“identity 级隔离”不符。需补隔离状态、诊断计数和回归测试。
@@ -274,6 +283,8 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 - 双方同时建连、删除重复 peer 时（`bgp_establish` → `peer_delete` → `peer_af_delete`）。
 
 FITI 现网运行的版本同样包含这个遗留定义，只是目前的配置和建连时序没有触发。`feat/midr-route-export-v2` 已把这三个文件中的相关部分恢复为原版，独立 midrd 不使用该 SAFI（`midr-test/extraction-boundary-test.sh` 禁止引用）。修复后同一实验中 bgpd 不再退出。`tests/bgpd/` 下 bgpd 内嵌时期的测试仍引用该符号，它们随 bgpd 恢复原版时已失效，未处理。
+
+2026-10-26 部署时确认：旧发布包的 bgpd 在 R1_wh、R1_zhz 上停止服务时因 `afindex()` 断言崩溃（core-dump），两台日志中还各有一次更早的同类崩溃（10-21 R1_wh 由 systemd 自动拉起）。新发布包已不含该 SAFI。
 
 ## 已关闭
 
