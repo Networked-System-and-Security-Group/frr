@@ -12,7 +12,7 @@
 | P-02 | unattended-upgrades/needrestart 自动重启全部 MIDR 服务 | 部署 | 已处置（2026-10-26 随部署装到 12 台节点） | P-01 的现网触发源 |
 | P-03 | midrd/zebra 日志无限增长 | 第三组（zebra/mgmtd）、第二组（midrd 输出）、部署 | 现网已缓解（logrotate），根因待修 | 已有节点磁盘写满；zebra 因无 mgmtd 每台每天约 4 GB 错误日志 |
 | P-04 | 反向发布的 locator 环路 | 第三组 | 方案待确定（暂定边缘 MIDR 经 iBGP 通告本机 locator /64，实验已验证） | 反向发布上线的前置条件 |
-| P-05 | MIDR 路由反向发布到网关 | 第三组 | FITI 已验证（2026-10-26，网关侧；终端登录待公钥） | 普通终端尚不能自动进入 overlay |
+| P-05 | MIDR 路由反向发布到网关 | 第三组 | FITI 已验证（2026-10-26，终端到终端 20/20） | 普通终端尚不能自动进入 overlay |
 | P-06 | 同 sequence 异内容未隔离 | 第二组 | 已定位 | 冲突时按到达顺序生效 |
 | P-07 | 未持久化或丢失 sequence 时，重启节点被邻居长期拒绝 | 第二组 | 已定位（待修复） | backbone 实验必现；FITI 已配置持久化，未受影响 |
 | P-08 | 重连 snapshot 不补发 WITHDRAWN | 第二组 | 已定位 | 旧对象最多多留一个寿命周期 |
@@ -22,6 +22,7 @@
 | P-12 | 差异化链路条件下的分群与选路实验 | 第一组、第二组、环境维护方 | 待分析 | netem 条件未验收 |
 | P-13 | 设计文档修订（01/04/顶层） | 第二组 | 方案待定 | 旧文档仍含 bgpd 内嵌语义 |
 | P-14 | 原版 bgpd 遇到 lib 遗留的 MIDR SAFI 时断言退出 | 第三组 | 已修复并部署（2026-10-26） | 旧版本在现网实际崩溃过 |
+| P-15 | AS_PATH≤1 导入策略把直连邻居站点的前缀当作本站前缀 | 第三组 | 方案待定 | 复旦与北航之间的终端流量不经 MIDR |
 
 ## P-01 节点重启后入群卡死、群间不建锚点
 
@@ -226,6 +227,8 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 
 **2026-10-26 FITI 部署验证**：5 个边缘站点开启 `MIDR_ROUTE_EXPORT=yes`，check 确认全部与本站 BGP-R 为 iBGP。从乌鲁木齐、昆明、青岛 BGP-R 以终端网段地址为源，ping 其他 4 个站点的终端（`240a:a00f:X00::10`），12 组全部 0 丢包；各 BGP-R 对远端站点前缀的最优路径来自本站 MIDR（`no-export`），去远端终端的出口指向本站 MIDR，去远端 locator 的出口走 underlay，没有环路。GRE 计数确认请求和应答都经过 overlay。复旦、北航的 BGP-R 和各站终端需要密码登录，尚未装公钥，所以终端到终端的直接测试还没有做；终端流量与上述测试只差终端到本站 BGP-R 这一跳。
 
+终端到终端（同日，公钥装好后）：5 台终端 `240a:a00f:X00::10` 两两互 ping，20 组每组 10 个包全部 0 丢包。5 台 BGP-R 中，18 组终端流量的出口指向本站 MIDR，去远端 locator 的流量全部走 underlay；复旦与北航之间的 2 组走两站 BGP-R 直连的 underlay 链路，原因见 P-15。复旦终端向乌鲁木齐终端发 100 个 ping 时，两端 MIDR 的 GRE 收发计数各增加 100 以上；traceroute 显示 `BGP-R_fudan → MIDR_fudan → (overlay 内不回应) → Terminal_wlq`。
+
 ## P-06 同 sequence 异内容未隔离
 
 `midr_core_upsert()` 返回 `MIDR_CORE_CONFLICT`，但 midrd 无调用方处理，先到达的内容继续进入 TED。与 01/04 设计的“identity 级隔离”不符。需补隔离状态、诊断计数和回归测试。
@@ -285,6 +288,12 @@ ZEBRA: NB_OP_CHANGE: oper_walk_done: ERROR: Error sending notification message f
 FITI 现网运行的版本同样包含这个遗留定义，只是目前的配置和建连时序没有触发。`feat/midr-route-export-v2` 已把这三个文件中的相关部分恢复为原版，独立 midrd 不使用该 SAFI（`midr-test/extraction-boundary-test.sh` 禁止引用）。修复后同一实验中 bgpd 不再退出。`tests/bgpd/` 下 bgpd 内嵌时期的测试仍引用该符号，它们随 bgpd 恢复原版时已失效，未处理。
 
 2026-10-26 部署时确认：旧发布包的 bgpd 在 R1_wh、R1_zhz 上停止服务时因 `afindex()` 断言崩溃（core-dump），两台日志中还各有一次更早的同类崩溃（10-21 R1_wh 由 systemd 自动拉起）。新发布包已不含该 SAFI。
+
+## P-15 AS_PATH≤1 导入策略把直连邻居站点的前缀当作本站前缀
+
+Prefix Provider 默认把 AS_PATH 长度不超过 1 的 BGP 路由作为本节点前缀导入 MIDR。复旦 BGP-R 与北航 BGP-R 之间有直连的 eBGP 链路，北航的 `240a:a00f:200::/48` 到复旦时 AS_PATH 为 `4200000002`（长度 1），于是复旦 MIDR 也把它作为本站前缀导入（`show midr spf`：`200::/48 origin 101.0.0.0 local`），北航对复旦的前缀同样如此。本站前缀不作为 MIDR 路由安装，也就不会反向发布给 BGP-R，两站之间的终端流量因此走 BGP-R 直连的 underlay，不经 MIDR（2026-10-26 终端测试中复旦⇄北航 2 组）。上海 Tier1 的 `600::/48` 也因同一原因被复旦等节点作为本站前缀导入。
+
+候选方案：导出上限改为 0，只导入本站 BGP-R 自己发布的前缀（`MIDR_PREFIX_MAX_AS_PATH_LENGTH=0`）；或保留上限 1，但排除其他 MIDR 站点的前缀（由 profile 生成排除列表）。需要先确认 05 AS_PATH 修复时选择上限 1 所要覆盖的场景。
 
 ## 已关闭
 
